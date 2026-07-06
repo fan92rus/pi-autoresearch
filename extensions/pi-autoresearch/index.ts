@@ -1099,14 +1099,40 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     pi.registerTool(tool);
   };
 
+  // Ensure the gated tools are present in the active tool set. Returns true if a
+  // change was made. In headless/subagent sessions the agent loop snapshots
+  // state.tools once per prompt(); tools activated mid-loop (via a slash command
+  // tool call) never reach the model. Keeping the gated tools always-active puts
+  // them in that initial snapshot, so they're callable; each handler still gates
+  // execution on runtime.autoresearchMode (see assertModeActive).
+  const ensureGatedToolsActive = (): boolean => {
+    const active = new Set(pi.getActiveTools());
+    let changed = false;
+    for (const name of gatedToolNames) {
+      if (!active.has(name)) { active.add(name); changed = true; }
+    }
+    if (changed) pi.setActiveTools([...active]);
+    return changed;
+  };
+
+  // Execution-time gate for the gated tools. Because the tools are kept
+  // always-active (so they reach the model), each handler must refuse to run
+  // when autoresearch mode is off. Returns a tool-result shape when blocked.
+  const assertModeActive = (ctx: ExtensionContext): { content: { type: "text"; text: string }[] } | undefined => {
+    if (getRuntime(ctx).autoresearchMode) return undefined;
+    return {
+      content: [{ type: "text", text: "Autoresearch mode is OFF. Run /autoresearch on first." }],
+    };
+  };
+
   // The one place mode flips: gated tools follow the flag, never drifting from it.
   const setAutoresearchMode = (ctx: ExtensionContext, enabled: boolean): void => {
     getRuntime(ctx).autoresearchMode = enabled;
-    const activeTools = new Set(pi.getActiveTools()); // setActiveTools replaces the whole set
-    for (const tool of gatedToolNames) {
-      enabled ? activeTools.add(tool) : activeTools.delete(tool);
-    }
-    pi.setActiveTools([...activeTools]);
+    // Keep gated tools always-active (see ensureGatedToolsActive). The mode flag
+    // itself gates execution inside each handler, so we no longer add/remove
+    // tools from the active set here — that path is unreliable in headless
+    // sessions where the agent loop has already snapshotted state.tools.
+    ensureGatedToolsActive();
   };
 
   const recordAutoresearchActivation = (workDir: string, active: boolean): void => {
@@ -1471,7 +1497,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }));
   };
 
-  pi.on("session_start", async (_e, ctx) => reconstructState(ctx));
+  pi.on("session_start", async (_e, ctx) => {
+    reconstructState(ctx);
+    ensureGatedToolsActive();
+  });
   pi.on("session_tree", async (_e, ctx) => reconstructState(ctx));
   pi.on("session_before_switch", async () => {
     clearOverlay();
@@ -1584,6 +1613,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     parameters: InitParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
       const runtime = getRuntime(ctx);
       const state = runtime.state;
 
@@ -1704,6 +1735,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     parameters: RunParams,
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
       const runtime = getRuntime(ctx);
       const state = runtime.state;
 
@@ -2224,6 +2257,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     parameters: LogParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
       const runtime = getRuntime(ctx);
       const state = runtime.state;
 
