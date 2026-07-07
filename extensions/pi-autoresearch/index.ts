@@ -385,7 +385,12 @@ async function execBashScript(
 ): Promise<{ stdout: string; stderr: string; code: number; killed: boolean }> {
   const bashSpawn = getBashSpawnOptions();
   return new Promise((resolve) => {
-    const child = spawn(bashSpawn.shell, [...bashSpawn.spawnArgs, ...args], {
+    // Pass args directly to bash — do NOT prepend spawnArgs (["-c"]).
+    // The caller decides the invocation convention:
+    //   execBashScript([scriptPath])     → bash scriptPath    (execute file)
+    //   execBashScript(["-c", cmdStr])   → bash -c cmdStr       (run command)
+    // This mirrors the original pi.exec("bash", args) semantics.
+    const child = spawn(bashSpawn.shell, args, {
       cwd: options.cwd,
       detached: bashSpawn.detached,
       stdio: ["ignore", "pipe", "pipe"],
