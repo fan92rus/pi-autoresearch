@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 
 import { hasAutoresearchConfigHeader } from "./jsonl.ts";
-import { hookScriptPath } from "./paths.ts";
+import { hookScriptPath, globalHookPath } from "./paths.ts";
 
 const TIMEOUT_MS = 30_000;
 const STDOUT_MAX_BYTES = 8 * 1024;
@@ -118,7 +118,9 @@ const notFired: HookResult = {
 };
 
 export async function runHook(payload: HookPayload): Promise<HookResult> {
-  const script = hookScriptPath(payload.cwd, payload.event);
+  // Project-local hook takes precedence; global hook is a fallback.
+  const localScript = hookScriptPath(payload.cwd, payload.event);
+  const script = isExecutableFile(localScript) ? localScript : globalHookPath(payload.event);
   if (!isExecutableFile(script)) return notFired;
 
   const t0 = Date.now();
