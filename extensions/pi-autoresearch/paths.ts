@@ -8,6 +8,7 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
 export const AUTO_DIR = ".auto";
@@ -46,6 +47,11 @@ function currentHookPath(workDir: string, stage: HookStage): string {
 
 function legacyHookPath(workDir: string, stage: HookStage): string {
   return path.join(workDir, LEGACY_HOOKS_DIR, `${stage}.sh`);
+}
+
+/** Global hook path — fires for ALL sessions as a fallback when no project-local hook exists. */
+export function globalHookPath(stage: HookStage): string {
+  return path.join(os.homedir(), ".pi", "agent", "autoresearch", "hooks", `${stage}.sh`);
 }
 
 function currentLayoutExists(dir: string): boolean {
