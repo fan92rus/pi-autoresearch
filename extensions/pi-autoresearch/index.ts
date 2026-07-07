@@ -371,6 +371,78 @@ function killTree(pid: number): void {
 }
 
 /**
+ * Execute a bash script/command using the SAME Git Bash that getBashSpawnOptions()
+ * resolves — never WSL2's C:\Windows\System32\bash.exe.
+ *
+ * This is a drop-in replacement for `pi.exec("bash", args, opts)` that correctly
+ * resolves Git Bash on Windows (where bare "bash" in Windows PATH is WSL2).
+ *
+ * Returns the same shape as pi.exec: { stdout, stderr, code, killed }.
+ */
+async function execBashScript(
+  args: string[],
+  options: { cwd?: string; timeout?: number; signal?: AbortSignal },
+): Promise<{ stdout: string; stderr: string; code: number; killed: boolean }> {
+  const bashSpawn = getBashSpawnOptions();
+  return new Promise((resolve) => {
+    const child = spawn(bashSpawn.shell, [...bashSpawn.spawnArgs, ...args], {
+      cwd: options.cwd,
+      detached: bashSpawn.detached,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let killed = false;
+
+    child.stdout?.on("data", (data: Buffer) => { stdout += data.toString(); });
+    child.stderr?.on("data", (data: Buffer) => { stderr += data.toString(); });
+
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+
+    const cleanup = () => {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      if (options.signal) options.signal.removeEventListener("abort", onAbort);
+    };
+
+    const onAbort = () => {
+      if (!killed) {
+        killed = true;
+        if (child.pid) killTree(child.pid);
+      }
+    };
+
+    if (options.signal) {
+      if (options.signal.aborted) {
+        onAbort();
+      } else {
+        options.signal.addEventListener("abort", onAbort, { once: true });
+      }
+    }
+
+    if (options.timeout && options.timeout > 0) {
+      timeoutHandle = setTimeout(() => {
+        if (!killed) {
+          killed = true;
+          if (child.pid) killTree(child.pid);
+        }
+      }, options.timeout);
+    }
+
+    child.on("close", (code) => {
+      cleanup();
+      resolve({ stdout, stderr, code: code ?? 0, killed });
+    });
+
+    child.on("error", (err) => {
+      cleanup();
+      resolve({ stdout, stderr: stderr + err.message, code: 1, killed: true });
+    });
+  });
+}
+
+/**
  * Check if a command's primary purpose is running the benchmark script.
  *
  * Strategy: strip common harmless prefixes (env vars, env/time/nice wrappers)
@@ -1976,7 +2048,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const checksTimeout = (params.checks_timeout_seconds ?? 300) * 1000;
         const ct0 = Date.now();
         try {
-          const checksResult = await pi.exec("bash", [checksPath], {
+          const checksResult = await execBashScript([checksPath], {
             signal,
             timeout: checksTimeout,
             cwd: workDir,
@@ -2486,7 +2558,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             git checkout -- . ':(exclude,glob)**/${AUTO_DIR}' ':(exclude,glob)**/${AUTO_DIR}/**' ':(exclude,glob)**/autoresearch.*' ':(exclude,glob)**/autoresearch.*/**'
             git clean -fd -e '${AUTO_DIR}' -e '**/${AUTO_DIR}/**' -e 'autoresearch.*' -e '**/autoresearch.*/**' 2>/dev/null
           `;
-          await pi.exec("bash", ["-c", revertScript], { cwd: workDir, timeout: 10000 });
+          await execBashScript(["-c", revertScript], { cwd: workDir, timeout: 10000 });
           text += `\n📝 Git: reverted changes (${params.status}) — autoresearch files preserved`;
         } catch (e) {
           text += `\n⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
