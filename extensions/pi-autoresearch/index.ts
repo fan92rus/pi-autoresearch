@@ -1147,7 +1147,7 @@ function renderDashboardLines(
 // ---------------------------------------------------------------------------
 
 export default function autoresearchExtension(pi: ExtensionAPI) {
-  const MAX_AUTORESUME_TURNS = 20;
+  const MAX_AUTORESUME_TURNS = 300;
   const BENCHMARK_GUARDRAIL =
     "Be careful not to overfit to the benchmarks and do not cheat on the benchmarks.";
 
@@ -1650,7 +1650,32 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       `\nExperiment rules: ${mdPath} — read this file at the start of every session and after compaction.` +
       "\nWrite promising but deferred optimizations as bullet points to .auto/ideas.md — don't let good ideas get lost." +
       `\n${BENCHMARK_GUARDRAIL}` +
-      "\nIf the user sends a follow-on message while an experiment is running, finish the current run_experiment + log_experiment cycle first, then address their message in the next iteration.";
+      "\nIf the user sends a follow-on message while an experiment is running, finish the current run_experiment + log_experiment cycle first, then address their message in the next iteration." +
+      "\n\n## Experiment Protocol (MANDATORY — follow for EVERY iteration)" +
+      "\n  1. HYPOTHESIS — What will you change and WHY? What do you EXPECT?" +
+      "\n     Example: \"Replace array.indexOf with Set → expect Op1 O(n²)→O(n), ~30% gain\"" +
+      "\n  2. EDIT — Make the code change." +
+      "\n  3. SMOKE TEST — Quick sanity check (NOT a full benchmark):" +
+      "\n     - Run on tiny input or `node -e \"require('./module')\"` to verify no crashes." +
+      "\n     - If broken → DEBUG, fix, re-smoke-test. Do NOT proceed to full experiment with broken code." +
+      "\n  4. EXPERIMENT — run_experiment (full benchmark measurement)." +
+      "\n  5. DECISION GATE — Answer ALL before logging:" +
+      "\n     - Metric value: ___" +
+      "\n     - Current best: ___ → Better? Yes/No (state the delta)" +
+      "\n     - Did checks pass? Yes/No" +
+      "\n     - What did you LEARN? (1-2 sentences — even if the experiment failed)" +
+      "\n  6. LOG — log_experiment with status: keep/discard/crash." +
+      "\n     ⛔ NEVER skip this step. Every run_experiment MUST be logged." +
+      "\n  7. NEXT — Updated hypothesis based on what you learned." +
+      "\n     If stuck (3+ non-improving runs) → check .auto/ideas.md for alternative directions." +
+      "\n\n## Observer Hooks" +
+      "\nIf you receive a 🔄 STAGNATION steer — STOP experimenting and REFLECT on the pattern." +
+      "\nIf you receive a 🎯 MILESTONE steer — Consider strategic alternatives and orthogonal directions." +
+      "\n\n## Rules" +
+      "\n⛔ NEVER call run_experiment without a stated hypothesis." +
+      "\n⛔ NEVER skip log_experiment after run_experiment." +
+      "\n⛔ NEVER skip the smoke test — broken code wastes experiment time." +
+      "✅ Write promising but untried ideas to .auto/ideas.md.";
 
     if (hasChecks) {
       extra +=
