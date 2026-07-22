@@ -2507,7 +2507,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         : undefined;
 
       const experiment: ExperimentResult = {
-        commit: params.commit.slice(0, 7),
+        commit: (params.commit ?? "").slice(0, 7),
         metric: params.metric,
         metrics: secondaryMetrics,
         status: params.status,
