@@ -80,4 +80,6 @@ export interface BestOfNResult {
   appliedDiffSummary?: string;
   /** Advisory: parallelism was limited by CPU contention. */
   cpuWarning?: string;
+  /** Per-candidate selection-bias re-measure results (cascade). */
+  remeasure?: Array<{ index: number; decision: "keep" | "discard" | "skip"; finalMetric: number | null; reason?: string }>;
 }

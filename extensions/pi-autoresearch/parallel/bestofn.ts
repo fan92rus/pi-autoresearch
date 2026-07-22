@@ -268,20 +268,42 @@ export async function runBestOfN(ctx: OrchestratorContext, opts: BestOfNOptions)
       return { baselineMetric, winnerIndex: null, ranked, finalMetric: null, decision: "discard", reason };
     }
 
-    // 5. selection-bias correction: re-measure winner on main in full.
-    const winner = ranked[0]!;
-    const winnerResult = finalResults[winner.index]!;
-    const rem = await reMeasureWinner(exec, workDir, opts.metricName, opts.direction, baselineMetric, noiseFloor, winnerResult.diff, budgetSeconds, runCmd);
+    // 5. selection-bias correction: cascade re-measure in ranked order.
+    //    Re-measure candidates best-first on main (BENCH_MODE=full); the FIRST that
+    //    confirms a genuine improvement (above noise floor) wins. If #1 fails, try
+    //    #2, #3, ... — do NOT discard the whole round just because the quick-winner
+    //    was a noisy outlier. Each failed candidate is reverted before the next.
+    const remeasure: Array<{ index: number; decision: "keep" | "discard" | "skip"; finalMetric: number | null; reason?: string }> = [];
+    let confirmedIndex: number | null = null;
+    let confirmedMetric: number | null = null;
+    let confirmedSummary: string | undefined;
+    for (const candidate of ranked) {
+      const result = finalResults[candidate.index]!;
+      if (candidate.status !== "ok" || !result.diff.trim()) {
+        remeasure.push({ index: candidate.index, decision: "skip", finalMetric: null, reason: "no_valid_diff" });
+        continue;
+      }
+      const rem = await reMeasureWinner(exec, workDir, opts.metricName, opts.direction, baselineMetric, noiseFloor, result.diff, budgetSeconds, runCmd);
+      remeasure.push({ index: candidate.index, decision: rem.decision, finalMetric: rem.finalMetric, reason: rem.reason });
+      if (rem.decision === "keep") {
+        confirmedIndex = candidate.index;
+        confirmedMetric = rem.finalMetric;
+        confirmedSummary = truncateDiffSummary(result.diff);
+        break; // first survivor wins — stop testing further candidates
+      }
+      // candidate failed re-measure → already reverted by reMeasureWinner; try next
+    }
 
     return {
       baselineMetric,
-      winnerIndex: rem.decision === "keep" ? winner.index : null,
+      winnerIndex: confirmedIndex,
       ranked,
-      finalMetric: rem.finalMetric,
-      decision: rem.decision,
-      reason: rem.reason,
-      appliedDiffSummary: rem.decision === "keep" ? truncateDiffSummary(winnerResult.diff) : undefined,
+      finalMetric: confirmedMetric,
+      decision: confirmedIndex !== null ? "keep" : "discard",
+      reason: confirmedIndex !== null ? undefined : "none_confirmed_on_remeasure",
+      appliedDiffSummary: confirmedSummary,
       cpuWarning,
+      remeasure,
     };
   } finally {
     // 6. cleanup worktrees (best-effort, never throws out of finally).
