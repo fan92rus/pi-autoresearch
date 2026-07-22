@@ -55,6 +55,11 @@ import { resolveAutoresearchShortcuts } from "./shortcuts.ts";
 import { sessionFilePath, sessionFileCandidates, ensureParentDir, AUTO_DIR } from "./paths.ts";
 import { RpcClient } from "./parallel/rpc.ts";
 import { runBestOfN } from "./parallel/bestofn.ts";
+import { runCheckOrthogonal } from "./parallel/orthogonal.ts";
+import { initBeam, stepBeam, finishBeam, statusBeam, clearBeam } from "./parallel/spacesearch.ts";
+import { runValleyProbe } from "./parallel/valley.ts";
+import { reMeasureWinner } from "./parallel/remeasure.ts";
+import { computeNoiseFloor } from "./parallel/aggregate.ts";
 import { resolveConfig, defaultConcurrency } from "./parallel/config.ts";
 import { resolveRepoRoot, cleanupAllWorktrees } from "./parallel/worktree.ts";
 import { newPhaseStore, startPhase, recordExploreStep, endPhaseDecision, clearPhase, markBestCheckpoint, persistPhase, clearPersistedPhase, commitPhaseGit, abortPhaseGit } from "./parallel/phases.ts";
@@ -3374,6 +3379,62 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     },
   });
 
+  pi.registerTool({
+    name: "valleyProbe",
+    label: "Valley probe — escape a stuck phase",
+    description:
+      "Фаза застряла в долине (дошла до maxSteps без улучшения). Пускает параллельные worktree от best-checkpoint (или phaseBase) с разными стратегиями продолжения. Переиспользует BestOfN-инфру. Победитель возвращается как diff для apply+re-measure на main (ТЗ §11.5 М2).",
+    promptSnippet: "Spawn parallel continuations from a phase checkpoint",
+    parameters: Type.Object({
+      from_commit: Type.Optional(Type.String({ description: "Commit to probe from (default: active phase best-checkpoint, else phaseBase)." })),
+      strategies: Type.Array(Type.String()),
+      baseline_metric: Type.Optional(Type.Number()),
+      metric_name: Type.Optional(Type.String()),
+      direction: Type.Optional(Type.String()),
+      model: Type.Optional(Type.String()),
+      budget_seconds: Type.Optional(Type.Number()),
+      concurrency: Type.Optional(Type.Number()),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const runtime = getRuntime(ctx);
+      if (!runtime.autoresearchMode) return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF." }], details: {} };
+      const workDir = resolveWorkDir(ctx.cwd);
+      const repoRoot = resolveRepoRoot(ctx.cwd);
+      const config = resolveConfig(readConfigJson(workDir));
+      const rpc = new RpcClient(pi.events);
+      if (!await rpc.ping()) return { content: [{ type: "text", text: "❌ pi-subagents RPC bridge not ready." }], details: {} };
+      const phase = runtime.phaseStore.active;
+      const fromCommit = params.from_commit ?? phase?.bestCheckpointSha ?? phase?.phaseBase;
+      const baselineMetric = params.baseline_metric ?? phase?.baselineMetric ?? runtime.state.bestMetric;
+      if (!fromCommit || baselineMetric === null || baselineMetric === undefined) {
+        return { content: [{ type: "text", text: "❌ Need from_commit + baseline_metric (or an active phase with a checkpoint)." }], details: {} };
+      }
+      try {
+        const probe = await runValleyProbe(
+          { rpc, exec: execAsParallel, runCmd: runBashForParallel, repoRoot, workDir, config },
+          {
+            fromCommit, baselineMetric, strategies: params.strategies,
+            metricName: params.metric_name ?? runtime.state.metricName,
+            direction: (params.direction as Direction) ?? runtime.state.bestDirection,
+            sessionName: runtime.state.name ?? "parallel-valley",
+            modelOverride: params.model, budgetSeconds: params.budget_seconds, concurrency: params.concurrency,
+          },
+        );
+        if (!probe.escaped) {
+          return { content: [{ type: "text", text: `Valley probe: no strategy escaped the valley. Ranked:\n` + probe.ranked.map((r) => `  #${r.index + 1} ${r.status} metric=${r.medianMetric ?? "-"}`).join("\n") + "\n→ abortPhase to revert." }], details: probe };
+        }
+        // Selection-bias correction: re-measure the winning continuation on main in full.
+        const rem = await reMeasureWinner(execAsParallel, workDir, runtime.state.metricName, runtime.state.bestDirection, baselineMetric, computeNoiseFloor(probe.results), probe.winnerDiff, params.budget_seconds ?? config.budgetSeconds, runBashForParallel);
+        let text = `Valley probe escaped! winner metric(quick)=${probe.winnerMetric}, re-measure(full)=${rem.finalMetric} → ${rem.decision}.`;
+        if (rem.decision === "keep") text += `\n→ log_experiment(status="keep", metric=${rem.finalMetric}, description="valley probe winner")`;
+        else text += `\n→ log_experiment(status="discard", metric=0, description="valley probe not confirmed")`;
+        return { content: [{ type: "text", text }], details: { ...probe, remeasure: rem } };
+      } catch (e) {
+        return { content: [{ type: "text", text: `❌ valleyProbe failed: ${e instanceof Error ? e.message : String(e)}` }], details: {} };
+      }
+    },
+  });
+
   // Helper: log a phase outcome as a normal experiment result (bestMetric-based keep/discard).
   async function logPhaseResult(ctx: ExtensionContext, metric: number, status: "keep" | "discard", description: string): Promise<void> {
     const runtime = getRuntime(ctx);
@@ -3398,11 +3459,52 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     name: "CheckOrthogonal",
     label: "Stack orthogonal patches",
     description:
-      "(P1, stub) Проверяет ортогональные патчи по file-scope и стекаёт их. Будет реализован в Фазе 6 (ТЗ §10).",
-    promptSnippet: "Stack independent patches (Phase 6)",
-    parameters: Type.Object({ patches: Type.Array(Type.Object({ name: Type.String(), hypothesis: Type.String() })) }),
-    async execute() {
-      return { content: [{ type: "text", text: "ℹ️ CheckOrthogonal — будет реализован в Фазе 6 (см. docs/TZ.md §10). MVP покрывает режим A (BestOfN)." }], details: {} };
+      "Проверяет ортогональные патчи (по фактическому file-scope из diff) и стекаёт их на main с re-measure после каждого. File-scope пересечение → отказ. Реализует ТЗ §10.",
+    promptSnippet: "Stack independent file-scoped patches with per-patch re-measure",
+    parameters: Type.Object({
+      patches: Type.Array(Type.Object({ name: Type.String(), hypothesis: Type.String(), file_scope: Type.Optional(Type.Array(Type.String())) })),
+      metric_name: Type.String(),
+      direction: Type.Optional(Type.String()),
+      metric_unit: Type.Optional(Type.String()),
+      model: Type.Optional(Type.String()),
+      budget_seconds: Type.Optional(Type.Number()),
+      concurrency: Type.Optional(Type.Number()),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const runtime = getRuntime(ctx);
+      if (!runtime.autoresearchMode) return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF." }], details: {} };
+      const workDir = resolveWorkDir(ctx.cwd);
+      const repoRoot = resolveRepoRoot(ctx.cwd);
+      const config = resolveConfig(readConfigJson(workDir));
+      const rpc = new RpcClient(pi.events);
+      if (!await rpc.ping()) return { content: [{ type: "text", text: "❌ pi-subagents RPC bridge not ready." }], details: {} };
+      try {
+        const result = await runCheckOrthogonal(
+          { rpc, exec: execAsParallel, runCmd: runBashForParallel, repoRoot, workDir, config },
+          {
+            patches: params.patches.map((p: { name: string; hypothesis: string; file_scope?: string[] }) => ({ name: p.name, hypothesis: p.hypothesis, fileScope: p.file_scope })),
+            metricName: params.metric_name,
+            direction: (params.direction as Direction) ?? "lower",
+            metricUnit: params.metric_unit,
+            sessionName: runtime.state.name ?? "parallel-orthogonal",
+            modelOverride: params.model,
+            budgetSeconds: params.budget_seconds,
+            concurrency: params.concurrency,
+          },
+        );
+        let text = `CheckOrthogonal: ${result.decision}` + (result.reason ? ` (${result.reason})` : "") + "\n";
+        text += `orthogonal=${result.independence.orthogonal}  stacked=${result.stackedMetric ?? "-"}  baseline=${result.baselineMetric}\n`;
+        if (!result.independence.orthogonal) {
+          for (const c of result.independence.conflicts) text += `  ⚠️ conflict ${c.a} ↔ ${c.b}: ${c.sharedFiles.join(", ")}\n`;
+        }
+        for (const p of result.perPatch) text += `  ${p.name} — ${p.status} metric=${p.metric ?? "-"} Δ=${p.improvement ?? "-"} files=[${p.fileScopeActual.join(",")}]\n`;
+        for (const r of result.rejected) text += `  rejected ${r.name}: ${r.reason}\n`;
+        if (result.applied.length) text += `\napplied: ${result.applied.join(", ")}\n→ log_experiment(status="keep", metric=${result.stackedMetric}, description="orthogonal stack")`;
+        else text += `\n→ log_experiment(status="discard", metric=0, description="orthogonal stack none")`;
+        return { content: [{ type: "text", text }], details: result };
+      } catch (e) {
+        return { content: [{ type: "text", text: `❌ CheckOrthogonal failed: ${e instanceof Error ? e.message : String(e)}` }], details: {} };
+      }
     },
   });
 
@@ -3410,11 +3512,65 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     name: "SpaceSearch",
     label: "Beam space search",
     description:
-      "(P2, stub) Stateful beam search (K состояний × M кандидатов на шаг). Будет реализован в Фазе 7 (ТЗ §11, §11.5 М3).",
-    promptSnippet: "Beam search across solution space (Phase 7)",
-    parameters: Type.Object({ action: Type.String(), beam_width: Type.Optional(Type.Number()) }),
-    async execute() {
-      return { content: [{ type: "text", text: "ℹ️ SpaceSearch — будет реализован в Фазе 7 (см. docs/TZ.md §11). MVP покрывает режим A (BestOfN)." }], details: {} };
+      "Stateful beam search: init → step (×K состояний × M кандидатов с diversity hints) → finish (cherry-pick цепочки лучшего state, re-measure full). С regression-lookahead pruning — beam может регрессировать до allowedRegressionSteps прежде чем быть отсечённым. Реализует ТЗ §11, §11.5 М3.",
+    promptSnippet: "Beam search across solution space (stateful: init/step/finish/status)",
+    parameters: Type.Object({
+      action: Type.String({ description: "init | step | finish | status" }),
+      beam_width: Type.Optional(Type.Number()),
+      candidates_per_state: Type.Optional(Type.Number()),
+      diversity_hints: Type.Optional(Type.Array(Type.String())),
+      metric_name: Type.Optional(Type.String()),
+      direction: Type.Optional(Type.String()),
+      metric_unit: Type.Optional(Type.String()),
+      model: Type.Optional(Type.String()),
+      budget_seconds: Type.Optional(Type.Number()),
+      allowed_regression_steps: Type.Optional(Type.Number()),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const runtime = getRuntime(ctx);
+      if (!runtime.autoresearchMode) return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF." }], details: {} };
+      const workDir = resolveWorkDir(ctx.cwd);
+      const repoRoot = resolveRepoRoot(ctx.cwd);
+      const config = resolveConfig(readConfigJson(workDir));
+      const rpc = new RpcClient(pi.events);
+      const sctx = { rpc, exec: execAsParallel, runCmd: runBashForParallel, repoRoot, workDir, config };
+      const sopts = {
+        beamWidth: params.beam_width, candidatesPerState: params.candidates_per_state, diversityHints: params.diversity_hints,
+        metricName: params.metric_name ?? runtime.state.metricName, direction: (params.direction as Direction) ?? runtime.state.bestDirection,
+        metricUnit: params.metric_unit, sessionName: runtime.state.name ?? "parallel-spacesearch",
+        modelOverride: params.model, budgetSeconds: params.budget_seconds, allowedRegressionSteps: params.allowed_regression_steps,
+      };
+      try {
+        if (params.action === "status") {
+          const s = statusBeam(workDir);
+          return { content: [{ type: "text", text: s ? `beam step=${s.step}, width=${s.beamWidth}, states=${s.states.length}\n` + s.states.map((x: { commit: string; metric: number; hypothesis: string; depth: number }) => `  ${x.commit} metric=${x.metric} depth=${x.depth} (${x.hypothesis})`).join("\n") : "No active beam." }], details: { beam: s } };
+        }
+        if (params.action === "init") {
+          if (!await rpc.ping()) return { content: [{ type: "text", text: "❌ pi-subagents RPC bridge not ready." }], details: {} };
+          const r = await initBeam(sctx, sopts);
+          if (!r.ok) return { content: [{ type: "text", text: `❌ init failed: ${r.error}` }], details: { reason: r.reason } };
+          return { content: [{ type: "text", text: `Beam initialized: width=${r.beam.beamWidth}, candidates/state=${r.beam.candidatesPerState}, baseline=${r.beam.states[0]?.metric}. Drive with action=step until converged, then action=finish.` }], details: { beam: r.beam } };
+        }
+        if (params.action === "step") {
+          if (!await rpc.ping()) return { content: [{ type: "text", text: "❌ pi-subagents RPC bridge not ready." }], details: {} };
+          const r = await stepBeam(sctx, sopts);
+          if (!r.ok) return { content: [{ type: "text", text: `❌ step failed: ${r.error}` }], details: {} };
+          let text = `step ${r.beam.step}: improved=${r.improved}, converged=${r.converged}\n`;
+          for (const x of r.beam.states) text += `  ${x.commit} metric=${x.metric} depth=${x.depth} (${x.hypothesis}) streak=${x.regressionStreak}\n`;
+          if (r.converged) text += `\nBeam converged (no improvement). Call action=finish to cherry-pick the best chain + re-measure.`;
+          return { content: [{ type: "text", text }], details: { beam: r.beam, improved: r.improved, converged: r.converged } };
+        }
+        if (params.action === "finish") {
+          const r = await finishBeam(sctx, sopts);
+          let text = `finish: ${r.decision}` + (r.reason ? ` (${r.reason})` : "") + ` final=${r.finalMetric ?? "-"}\n`;
+          if (r.decision === "keep") text += `→ log_experiment(status="keep", metric=${r.finalMetric}, description="space search winner")`;
+          else text += `→ log_experiment(status="discard", metric=0, description="space search no winner")`;
+          return { content: [{ type: "text", text }], details: r };
+        }
+        return { content: [{ type: "text", text: "❌ action must be init|step|finish|status" }], details: {} };
+      } catch (e) {
+        return { content: [{ type: "text", text: `❌ SpaceSearch failed: ${e instanceof Error ? e.message : String(e)}` }], details: {} };
+      }
     },
   });
 
