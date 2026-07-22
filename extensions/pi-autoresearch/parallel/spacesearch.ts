@@ -16,7 +16,7 @@ import * as path from "node:path";
 
 import type { RpcClient, SpawnedWorker } from "./rpc.ts";
 import type { ExecFn } from "./worktree.ts";
-import { provisionWorktree, cleanupWorktree, currentHead, type WorktreeHandle } from "./worktree.ts";
+import { provisionWorktree, cleanupWorktree, cleanupAllWorktrees, currentHead, type WorktreeHandle } from "./worktree.ts";
 import { runMeasure } from "./remeasure.ts";
 import { isBetter } from "./aggregate.ts";
 import type { ParallelConfig } from "./config.ts";
@@ -136,6 +136,8 @@ export async function stepBeam(ctx: SpaceSearchContext, opts: SpaceSearchOptions
   const wts: WorktreeHandle[] = [];
   let wtIdx = 0;
   try {
+    // clear leftovers from a crashed previous run (wt-* names are reused)
+    await cleanupAllWorktrees(exec, repoRoot).catch(() => {});
     const tasks: Array<Promise<void>> = [];
     for (const state of beam.states) {
       for (let j = 0; j < M; j++) {
