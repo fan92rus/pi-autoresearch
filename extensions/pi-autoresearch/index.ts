@@ -1424,17 +1424,22 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const autoresearchHelp = () =>
     [
-      "Usage: /autoresearch [off|clear|export|<text>]",
+      "Usage: /autoresearch [off|clear|export|<text>|parallel-*]",
       "",
       "<text> enters autoresearch mode and starts or resumes the loop.",
       "off leaves autoresearch mode.",
       "clear deletes the session log (.auto/log.jsonl) and turns autoresearch mode off.",
       "export opens a local live dashboard for the session log in your browser.",
-
+      "",
+      "Parallel modes (fan out worker subagents over the event bus):",
+      "  parallel-best-of-n <N> <goal>   — try N hypotheses at once, keep the best (re-measured)",
+      "  parallel-stack <subsystems...>  — stack independent file-scoped optimizations",
+      "  parallel-search <goal>          — beam search (K states × M candidates) for multimodal landscapes",
       "",
       "Examples:",
       "  /autoresearch optimize unit test runtime, monitor correctness",
       "  /autoresearch model training, run 5 minutes of train.py and note the loss ratio as optimization target",
+      "  /autoresearch parallel-best-of-n 4 speed up JSON parsing in src/parse.ts",
       "  /autoresearch export",
     ].join("\n");
 

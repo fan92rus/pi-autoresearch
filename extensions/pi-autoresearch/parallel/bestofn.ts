@@ -23,6 +23,7 @@ import type { ExecFn } from "./worktree.ts";
 import { provisionWorktree, cleanupWorktree, currentHead, resolveRepoRoot, type WorktreeHandle } from "./worktree.ts";
 import { median, computeNoiseFloor, rankCandidates, isBetter } from "./aggregate.ts";
 import { runMeasure, reMeasureWinner, parseMetricLines } from "./remeasure.ts";
+import { sampleCpuLoad, calibrateConcurrency } from "./cpu.ts";
 import type { ParallelConfig } from "./config.ts";
 import { resolveTier, defaultConcurrency } from "./config.ts";
 import type { BenchMode, BestOfNResult, Candidate, Direction, RankedCandidate, Tier, WorkerResult, WorkerStatus } from "./types.ts";
@@ -169,11 +170,13 @@ export async function runBestOfN(ctx: OrchestratorContext, opts: BestOfNOptions)
   const { rpc, exec, runCmd, repoRoot, workDir, config } = ctx;
   const budgetSeconds = opts.budgetSeconds ?? config.budgetSeconds;
   const cascade = opts.cascade ?? config.cascade;
-  const concurrency = opts.concurrency ?? config.concurrency ?? defaultConcurrency();
 
   // 0. pre-flight baseline measure (BENCH_MODE=quick) must fit the budget.
+  // Sample CPU load concurrently to calibrate concurrency.
   const baselineSha = await currentHead(exec, repoRoot);
+  const cpuSampleP = sampleCpuLoad(exec, 500);
   const pre = await runMeasure(exec, workDir, opts.metricName, "quick", budgetSeconds, runCmd);
+  const cpuSample = await cpuSampleP.catch(() => null);
   if (pre.timedOut || pre.metric === null) {
     return {
       baselineMetric: NaN,
@@ -182,10 +185,14 @@ export async function runBestOfN(ctx: OrchestratorContext, opts: BestOfNOptions)
       finalMetric: null,
       decision: "discard",
       reason: "baseline_over_budget",
-      ...(pre.timedOut ? {} : {}),
     };
   }
   const baselineMetric = pre.metric;
+
+  // Calibrate concurrency against measured CPU load.
+  const requestedConcurrency = opts.concurrency ?? config.concurrency ?? defaultConcurrency();
+  const { concurrency: calibratedConcurrency, cpuWarning } = calibrateConcurrency(requestedConcurrency, cpuSample);
+  const concurrency = calibratedConcurrency;
 
   // 1. provision worktrees
   const wts: WorktreeHandle[] = [];
@@ -274,6 +281,7 @@ export async function runBestOfN(ctx: OrchestratorContext, opts: BestOfNOptions)
       decision: rem.decision,
       reason: rem.reason,
       appliedDiffSummary: rem.decision === "keep" ? truncateDiffSummary(winnerResult.diff) : undefined,
+      cpuWarning,
     };
   } finally {
     // 6. cleanup worktrees (best-effort, never throws out of finally).
