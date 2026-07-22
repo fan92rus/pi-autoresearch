@@ -20,7 +20,7 @@ import * as path from "node:path";
 
 import type { RpcClient, SpawnedWorker } from "./rpc.ts";
 import type { ExecFn } from "./worktree.ts";
-import { provisionWorktree, cleanupWorktree, currentHead, resolveRepoRoot, type WorktreeHandle } from "./worktree.ts";
+import { provisionWorktree, cleanupWorktree, cleanupAllWorktrees, currentHead, resolveRepoRoot, type WorktreeHandle } from "./worktree.ts";
 import { median, computeNoiseFloor, rankCandidates, isBetter } from "./aggregate.ts";
 import { runMeasure, reMeasureWinner, parseMetricLines } from "./remeasure.ts";
 import { sampleCpuLoad, calibrateConcurrency } from "./cpu.ts";
@@ -193,6 +193,10 @@ export async function runBestOfN(ctx: OrchestratorContext, opts: BestOfNOptions)
   const requestedConcurrency = opts.concurrency ?? config.concurrency ?? defaultConcurrency();
   const { concurrency: calibratedConcurrency, cpuWarning } = calibrateConcurrency(requestedConcurrency, cpuSample);
   const concurrency = calibratedConcurrency;
+
+  // 0b. clear any worktrees left behind by a crashed/killed previous run so they
+  //     don't collide with fresh provisioning (wt-1/2/3 names are reused).
+  await cleanupAllWorktrees(exec, repoRoot).catch(() => {});
 
   // 1. provision worktrees
   const wts: WorktreeHandle[] = [];

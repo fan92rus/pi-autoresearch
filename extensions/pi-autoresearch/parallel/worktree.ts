@@ -84,6 +84,7 @@ export async function provisionWorktree(
   const wtPath = path.join(repoRoot, PARALLEL_DIR, `wt-${index}`);
   // Ensure the parent dir exists (git worktree add needs it absent, but parent present).
   await fs.promises.mkdir(path.dirname(wtPath), { recursive: true });
+  await ensureParallelGitignore(repoRoot);
   // Remove a stale worktree at the same path (best-effort).
   try { await fs.promises.rm(wtPath, { recursive: true, force: true }); } catch { /* ignore */ }
 
@@ -107,19 +108,35 @@ export async function provisionWorktree(
   return { path: wtPath, index };
 }
 
+/** Ensure .auto/parallel/ is gitignored in repoRoot so worktree artifacts (worker
+ * result JSON, subagent session logs, Windows 'nul' files) never leak into commits. */
+async function ensureParallelGitignore(repoRoot: string): Promise<void> {
+  const gi = path.join(repoRoot, ".gitignore");
+  const entry = ".auto/parallel/";
+  let existing = "";
+  try { existing = await fs.promises.readFile(gi, "utf8"); } catch { /* none */ }
+  if (!existing.includes(entry)) {
+    const prefix = existing.length && !existing.endsWith("\n") ? "\n" : "";
+    await fs.promises.writeFile(gi, existing + prefix + "# pi-autoresearch parallel worktrees\n" + entry + "\n", "utf8");
+  }
+}
+
 /** Remove a worktree and its scratch .auto/. Safe to call in finally{}. */
 export async function cleanupWorktree(exec: ExecFn, repoRoot: string, handle: WorktreeHandle): Promise<void> {
-  // `git worktree remove --force` also deletes the directory.
+  // 1. unregister from git (best-effort).
   try {
     await gitExec(exec, ["worktree", "remove", "--force", handle.path], {
       cwd: repoRoot,
       timeout: 30000,
     });
   } catch {
-    // If git refuses (e.g. worker left files), prune then try rm directly.
+    // If git refuses (already detached, worker left files), prune then fall through to rm.
     try { await gitExec(exec, ["worktree", "prune"], { cwd: repoRoot, timeout: 10000 }); } catch { /* ignore */ }
-    try { await fs.promises.rm(handle.path, { recursive: true, force: true }); } catch { /* ignore */ }
   }
+  // 2. ALWAYS rm the physical directory. On Windows `git worktree remove --force`
+  //    can report success yet leave the directory behind (file locks, detached
+  //    worktree already pruned from metadata). fs.rm is idempotent + swallowed.
+  try { await fs.promises.rm(handle.path, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
 /** Remove all worktrees under .auto/parallel (housekeeping on startup/errors). */

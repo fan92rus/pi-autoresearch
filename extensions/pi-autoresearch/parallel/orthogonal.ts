@@ -19,7 +19,7 @@ import * as path from "node:path";
 
 import type { RpcClient, SpawnedWorker } from "./rpc.ts";
 import type { ExecFn } from "./worktree.ts";
-import { provisionWorktree, cleanupWorktree, currentHead, type WorktreeHandle } from "./worktree.ts";
+import { provisionWorktree, cleanupWorktree, cleanupAllWorktrees, currentHead, type WorktreeHandle } from "./worktree.ts";
 import { runMeasure, applyDiff, revertWorkdir } from "./remeasure.ts";
 import { isBetter } from "./aggregate.ts";
 import type { ParallelConfig } from "./config.ts";
@@ -124,6 +124,8 @@ export async function runCheckOrthogonal(ctx: OrthogonalContext, opts: Orthogona
   const wts: WorktreeHandle[] = [];
   const results: WorkerResult[] = [];
   try {
+    // clear leftovers from a crashed previous run (wt-* names are reused)
+    await cleanupAllWorktrees(exec, repoRoot).catch(() => {});
     for (let i = 0; i < opts.patches.length; i++) {
       wts.push(await provisionWorktree(exec, repoRoot, i + 1, baselineSha));
     }
