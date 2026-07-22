@@ -53,6 +53,11 @@ import {
 } from "./compaction.ts";
 import { resolveAutoresearchShortcuts } from "./shortcuts.ts";
 import { sessionFilePath, sessionFileCandidates, ensureParentDir, AUTO_DIR } from "./paths.ts";
+import { RpcClient } from "./parallel/rpc.ts";
+import { runBestOfN } from "./parallel/bestofn.ts";
+import { resolveConfig, defaultConcurrency } from "./parallel/config.ts";
+import { resolveRepoRoot, cleanupAllWorktrees } from "./parallel/worktree.ts";
+import type { Direction } from "./parallel/types.ts";
 
 // ---------------------------------------------------------------------------
 // Experiment output limits (sent to LLM — keep small to save context)
@@ -77,7 +82,7 @@ interface ExperimentResult {
   metric: number;
   /** Additional tracked metrics: { name: value } */
   metrics: Record<string, number>;
-  status: "keep" | "discard" | "crash" | "checks_failed";
+  status: "keep" | "discard" | "crash" | "checks_failed" | "budget_exceeded";
   description: string;
   timestamp: number;
   /** Segment index — increments on each config header. Current segment = highest. */
@@ -118,6 +123,8 @@ interface RunDetails {
   passed: boolean;
   crashed: boolean;
   timedOut: boolean;
+  /** True if killed specifically because it exceeded budget_seconds (not the hard timeout_seconds). */
+  budgetExceeded: boolean;
   tailOutput: string;
   /** null = checks not run (no file or benchmark failed), true/false = ran */
   checksPass: boolean | null;
@@ -174,6 +181,18 @@ const RunParams = Type.Object({
         "Kill .auto/checks.sh after this many seconds (default: 300). Only relevant when the checks file exists.",
     })
   ),
+  budget_seconds: Type.Optional(
+    Type.Number({
+      description:
+        "Soft time budget in seconds. If the command runs longer, it is killed and the result is flagged budget_exceeded (a steer tells you to speed up measure.sh). Must be <= timeout_seconds. Used by parallel modes so each worker stays bounded. Default: unset (only the hard timeout_seconds applies).",
+    })
+  ),
+  bench_mode: Type.Optional(
+    Type.String({
+      description:
+        'Sets the BENCH_MODE env var for the command (e.g. "quick", "full", "smoke"). measure.sh convention: parallel workers measure with BENCH_MODE=quick (a fast subset), the parent re-measures the winner with BENCH_MODE=full. Default: unset.',
+    })
+  ),
 });
 
 const InitParams = Type.Object({
@@ -205,7 +224,7 @@ export const LogParams = Type.Object({
     description:
       "The primary optimization metric value (e.g. seconds, val_bpb). 0 for crashes.",
   }),
-  status: StringEnum(["keep", "discard", "crash", "checks_failed"] as const),
+  status: StringEnum(["keep", "discard", "crash", "checks_failed", "budget_exceeded"] as const),
   description: Type.String({
     description: "Short description of what this experiment tried",
   }),
@@ -1863,7 +1882,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
-      const timeout = (params.timeout_seconds ?? 600) * 1000;
+      // Budget: a soft kill below the hard timeout. When set and <= timeout,
+      // the kill timer uses the budget and the result is flagged budget_exceeded.
+      const hardTimeoutMs = (params.timeout_seconds ?? 600) * 1000;
+      const budgetMs = params.budget_seconds != null ? params.budget_seconds * 1000 : null;
+      const killedByBudget = budgetMs !== null && budgetMs <= hardTimeoutMs;
+      const timeout = killedByBudget ? budgetMs! : hardTimeoutMs;
 
       // Guard: if the benchmark script exists, only allow running it
       const autoresearchShPath = autoresearchScriptPath(workDir);
@@ -1881,6 +1905,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             passed: false,
             crashed: true,
             timedOut: false,
+            budgetExceeded: false,
             tailOutput: "",
             checksPass: null,
             checksTimedOut: false,
@@ -1913,6 +1938,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           cwd: workDir,
           detached: bashSpawn.detached,
           stdio: ["ignore", "pipe", "pipe"],
+          env: params.bench_mode ? { ...process.env, BENCH_MODE: params.bench_mode } : process.env,
           windowsHide: true,
         });
 
@@ -2133,6 +2159,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         passed,
         crashed: !passed,
         timedOut,
+        budgetExceeded: timedOut && killedByBudget,
         tailOutput: displayTruncation.content,
         checksPass,
         checksTimedOut,
@@ -2146,7 +2173,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // Build LLM response
       let text = "";
-      if (details.timedOut) {
+      if (details.budgetExceeded) {
+        text += `⏰ BUDGET EXCEEDED after ${durationSeconds.toFixed(1)}s (budget ${params.budget_seconds}s)\n`;
+        text += `Log this as 'budget_exceeded'. The experiment is too slow — before continuing, speed up measure.sh (add a BENCH_MODE=quick subset, cache prebuilt artifacts, or cut fixture/iter count) so a single run fits the budget.\n`;
+      } else if (details.timedOut) {
         text += `⏰ TIMEOUT after ${durationSeconds.toFixed(1)}s\n`;
       } else if (!benchmarkPassed) {
         text += `💥 FAILED (exit code ${exitCode}) in ${durationSeconds.toFixed(1)}s\n`;
@@ -2582,7 +2612,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         text += `\n⚠️ Failed to write .auto/log.jsonl: ${e instanceof Error ? e.message : String(e)}`;
       }
 
-      if (params.status !== "keep") {
+      if (params.status !== "keep" && params.status !== "budget_exceeded") {
         try {
           const revertScript = `
             git checkout -- . ':(exclude,glob)**/${AUTO_DIR}' ':(exclude,glob)**/${AUTO_DIR}/**' ':(exclude,glob)**/autoresearch.*' ':(exclude,glob)**/autoresearch.*/**'
@@ -2593,6 +2623,25 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         } catch (e) {
           text += `\n⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
         }
+      }
+
+      // budget_exceeded: revert like crash, but emit a dedicated steer so the
+      // loop does not keep burning budget on a too-slow measure.sh.
+      if (params.status === "budget_exceeded") {
+        try {
+          const revertScript = `
+            git checkout -- . ':(exclude,glob)**/${AUTO_DIR}' ':(exclude,glob)**/${AUTO_DIR}/**' ':(exclude,glob)**/autoresearch.*' ':(exclude,glob)**/autoresearch.*/**'
+            git clean -fd -e '${AUTO_DIR}' -e '**/${AUTO_DIR}/**' -e 'autoresearch.*' -e '**/autoresearch.*/**' 2>/dev/null
+          `;
+          await execBashScript(["-c", revertScript], { cwd: workDir, timeout: 10000 });
+          text += `\n📝 Git: reverted changes (budget_exceeded) — autoresearch files preserved`;
+        } catch (e) {
+          text += `\n⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
+        }
+        pi.sendUserMessage(
+          `⏰ Experiment exceeded the time budget. DO NOT continue the loop with this slow measure.sh.\nOptions: 1) add a BENCH_MODE=quick subset to measure.sh; 2) cache prebuilt setup steps; 3) cut fixture/iter count. Rewrite measure.sh, then re-run.`,
+          { deliverAs: "steer" }
+        );
       }
 
       const afterSteer = await fireHook({
@@ -3088,6 +3137,132 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   }
 
   // -----------------------------------------------------------------------
+  // ===== Parallel modes (best-of-N / stack / space-search) =====
+  // Tools fan out worker subagents over the shared pi.events EventBus via the
+  // pi-subagents RPC bridge. The parent is the sole git mutator + log writer.
+
+  function readConfigJson(workDir: string): unknown {
+    try {
+      const p = sessionFilePath(workDir, "config");
+      const c = p && fs.existsSync(p) ? p : path.join(workDir, ".auto", "config.json");
+      if (!fs.existsSync(c)) return null;
+      return JSON.parse(fs.readFileSync(c, "utf-8"));
+    } catch { return null; }
+  }
+
+  function formatBestOfNResult(r: { baselineMetric: number; winnerIndex: number | null; ranked: Array<{ label?: string; medianMetric: number | null; status: string; improvement: number | null; within_noise?: boolean; index: number; tier?: string; notes?: string; error?: string }>; finalMetric: number | null; decision: string; reason?: string; appliedDiffSummary?: string; cpuWarning?: string }): string {
+    let text = `BestOfN: ${r.decision}` + (r.reason ? ` (${r.reason})` : "") + "\n";
+    text += `baseline=${r.baselineMetric}  final=${r.finalMetric ?? "-"}  winner=${r.winnerIndex ?? "none"}\n`;
+    for (const c of r.ranked) {
+      const imp = c.improvement !== null ? (c.improvement >= 0 ? "+" : "") + c.improvement.toFixed(2) : "-";
+      const flag = c.within_noise ? " [noise]" : "";
+      text += `  #${c.index + 1} ${c.label ?? ""} — ${c.status} metric=${c.medianMetric ?? "-"} Δ=${imp}${flag}${c.tier ? ` tier=${c.tier}` : ""}\n`;
+      if (c.error) text += `      error: ${c.error.slice(0, 120)}\n`;
+    }
+    if (r.appliedDiffSummary) text += `applied: ${r.appliedDiffSummary}\n`;
+    if (r.cpuWarning) text += `⚠️ ${r.cpuWarning}\n`;
+    if (r.decision === "keep") text += `\n→ log_experiment(status="keep", metric=${r.finalMetric}, description="BestOfN winner")`;
+    else text += `\n→ log_experiment(status="discard", metric=0, description="BestOfN no winner")`;
+    return text;
+  }
+
+  const BestOfNParams = Type.Object({
+    candidates: Type.Array(Type.Object({
+      hypothesis: Type.String({ description: "Текст гипотезы, которую worker реализует в коде." }),
+      label: Type.Optional(Type.String()),
+      complexity: Type.Optional(Type.String({ description: "simple|medium|hard — определяет тир модели/бюджет." })),
+    })),
+    metric_name: Type.String(),
+    direction: Type.Optional(Type.String()),
+    metric_unit: Type.Optional(Type.String()),
+    model: Type.Optional(Type.String({ description: "Override тира модели для всех кандидатов." })),
+    cascade: Type.Optional(Type.Boolean()),
+    budget_seconds: Type.Optional(Type.Number()),
+    concurrency: Type.Optional(Type.Number()),
+  });
+
+  const execAsParallel = async (cmd: string, args: string[], o?: { cwd?: string; timeout?: number }) => {
+    const r = await pi.exec(cmd, args, o);
+    return { stdout: r.stdout, stderr: r.stderr, code: r.code, killed: (r as { killed?: boolean }).killed };
+  };
+  // Bash-capable runner matching the extension's Windows-aware spawn.
+  const runBashForParallel = async (cmd: string, args: string[], o: unknown) => {
+    const opts = (o ?? {}) as { cwd?: string; timeout?: number; env?: Record<string, string> };
+    const r = await execBashScript(args, opts);
+    return { stdout: r.stdout ?? "", stderr: r.stderr ?? "", code: r.code, killed: !!r.killed };
+  };
+
+  pi.registerTool({
+    name: "BestOfN",
+    label: "Best-of-N parallel hypotheses",
+    description:
+      "Проверяет N гипотез параллельно: каждвый worker реализует гипотезу в изолированном worktree и измеряет (BENCH_MODE=quick). Инструмент ранжирует, переизмеряет победителя на main (BENCH_MODE=full, против selection-bias) и возвращает keep/discard. Parent — единственный писатель git/лога. Требует включённого autoresearch-режима и установленного pi-subagents.",
+    promptSnippet: "Run N hypothesis candidates in parallel and pick the best (re-measured)",
+    parameters: BestOfNParams,
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const runtime = getRuntime(ctx);
+      if (!runtime.autoresearchMode) {
+        return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF. Run /autoresearch on first." }], details: {} };
+      }
+      const workDir = resolveWorkDir(ctx.cwd);
+      const repoRoot = resolveRepoRoot(ctx.cwd);
+      const config = resolveConfig(readConfigJson(workDir));
+      const rpc = new RpcClient(pi.events);
+      const ready = await rpc.ping();
+      if (!ready) {
+        return { content: [{ type: "text", text: "❌ pi-subagents RPC bridge not ready. Убедитесь, что расширение pi-subagents установлено и активно." }], details: {} };
+      }
+      try {
+        const result = await runBestOfN(
+          { rpc, exec: execAsParallel, runCmd: runBashForParallel, repoRoot, workDir, config },
+          {
+            candidates: params.candidates.map((c: { hypothesis: string; label?: string; complexity?: string }) => ({
+              hypothesis: c.hypothesis,
+              label: c.label,
+              complexity: c.complexity as "simple" | "medium" | "hard" | undefined,
+            })),
+            metricName: params.metric_name,
+            direction: (params.direction as Direction) ?? "lower",
+            metricUnit: params.metric_unit,
+            sessionName: runtime.state.name ?? "parallel-bestofn",
+            modelOverride: params.model,
+            cascade: params.cascade,
+            budgetSeconds: params.budget_seconds,
+            concurrency: params.concurrency,
+          },
+        );
+        const text = formatBestOfNResult(result);
+        return { content: [{ type: "text", text }], details: result };
+      } catch (e) {
+        return { content: [{ type: "text", text: `❌ BestOfN failed: ${e instanceof Error ? e.message : String(e)}` }], details: {} };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "CheckOrthogonal",
+    label: "Stack orthogonal patches",
+    description:
+      "(P1, stub) Проверяет ортогональные патчи по file-scope и стекаёт их. Будет реализован в Фазе 6 (ТЗ §10).",
+    promptSnippet: "Stack independent patches (Phase 6)",
+    parameters: Type.Object({ patches: Type.Array(Type.Object({ name: Type.String(), hypothesis: Type.String() })) }),
+    async execute() {
+      return { content: [{ type: "text", text: "ℹ️ CheckOrthogonal — будет реализован в Фазе 6 (см. docs/TZ.md §10). MVP покрывает режим A (BestOfN)." }], details: {} };
+    },
+  });
+
+  pi.registerTool({
+    name: "SpaceSearch",
+    label: "Beam space search",
+    description:
+      "(P2, stub) Stateful beam search (K состояний × M кандидатов на шаг). Будет реализован в Фазе 7 (ТЗ §11, §11.5 М3).",
+    promptSnippet: "Beam search across solution space (Phase 7)",
+    parameters: Type.Object({ action: Type.String(), beam_width: Type.Optional(Type.Number()) }),
+    async execute() {
+      return { content: [{ type: "text", text: "ℹ️ SpaceSearch — будет реализован в Фазе 7 (см. docs/TZ.md §11). MVP покрывает режим A (BestOfN)." }], details: {} };
+    },
+  });
+
   // /autoresearch command — enter autoresearch mode
   // -----------------------------------------------------------------------
 
@@ -3165,6 +3340,23 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         } else {
           ctx.ui.notify("No session log found. Autoresearch mode OFF", "info");
         }
+        return;
+      }
+
+      // ===== parallel subcommands: activate mode + inject the parallel skill =====
+      const parallelMatch = command.match(/^parallel-(best-of-n|stack|search)\b/);
+      if (parallelMatch) {
+        const workDir = resolveWorkDir(ctx.cwd);
+        // clean any stale worktrees from a previous crashed round
+        await cleanupAllWorktrees(async (cmd: string, args: string[], o?: { cwd?: string; timeout?: number }) => {
+          const r = await pi.exec(cmd, args, o); return { stdout: r.stdout, stderr: r.stderr, code: r.code };
+        }, resolveRepoRoot(ctx.cwd)).catch(() => {});
+        recordAutoresearchActivation(workDir, true);
+        setAutoresearchMode(ctx, true);
+        runtime.autoResumeTurns = 0;
+        const kickoff = `/skill:autoresearch-parallel ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`.replace(/\s+/g, " ").trim();
+        ctx.ui.notify(`Parallel mode ON (${parallelMatch[1]}) — loaded autoresearch-parallel skill`, "info");
+        sendWhenReady(ctx, kickoff);
         return;
       }
 
