@@ -3205,7 +3205,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     } catch { return null; }
   }
 
-  function formatBestOfNResult(r: { baselineMetric: number; winnerIndex: number | null; ranked: Array<{ label?: string; medianMetric: number | null; status: string; improvement: number | null; within_noise?: boolean; index: number; tier?: string; notes?: string; error?: string }>; finalMetric: number | null; decision: string; reason?: string; appliedDiffSummary?: string; cpuWarning?: string }): string {
+  function formatBestOfNResult(r: { baselineMetric: number; winnerIndex: number | null; ranked: Array<{ label?: string; medianMetric: number | null; status: string; improvement: number | null; within_noise?: boolean; index: number; tier?: string; notes?: string; error?: string }>; finalMetric: number | null; decision: string; reason?: string; appliedDiffSummary?: string; cpuWarning?: string; remeasure?: Array<{ index: number; decision: string; finalMetric: number | null; reason?: string }> }): string {
     let text = `BestOfN: ${r.decision}` + (r.reason ? ` (${r.reason})` : "") + "\n";
     text += `baseline=${r.baselineMetric}  final=${r.finalMetric ?? "-"}  winner=${r.winnerIndex ?? "none"}\n`;
     for (const c of r.ranked) {
@@ -3213,6 +3213,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const flag = c.within_noise ? " [noise]" : "";
       text += `  #${c.index + 1} ${c.label ?? ""} — ${c.status} metric=${c.medianMetric ?? "-"} Δ=${imp}${flag}${c.tier ? ` tier=${c.tier}` : ""}\n`;
       if (c.error) text += `      error: ${c.error.slice(0, 120)}\n`;
+    }
+    if (r.remeasure && r.remeasure.length > 0) {
+      text += "re-measure cascade:\n";
+      for (const rm of r.remeasure) text += `  #${rm.index + 1} → ${rm.decision} metric=${rm.finalMetric ?? "-"}${rm.reason ? ` (${rm.reason})` : ""}\n`;
     }
     if (r.appliedDiffSummary) text += `applied: ${r.appliedDiffSummary}\n`;
     if (r.cpuWarning) text += `⚠️ ${r.cpuWarning}\n`;
