@@ -53,6 +53,17 @@ import {
 } from "./compaction.ts";
 import { resolveAutoresearchShortcuts } from "./shortcuts.ts";
 import { sessionFilePath, sessionFileCandidates, ensureParentDir, AUTO_DIR } from "./paths.ts";
+import { RpcClient } from "./parallel/rpc.ts";
+import { runBestOfN } from "./parallel/bestofn.ts";
+import { runCheckOrthogonal } from "./parallel/orthogonal.ts";
+import { initBeam, stepBeam, finishBeam, statusBeam, clearBeam } from "./parallel/spacesearch.ts";
+import { runValleyProbe } from "./parallel/valley.ts";
+import { reMeasureWinner } from "./parallel/remeasure.ts";
+import { computeNoiseFloor } from "./parallel/aggregate.ts";
+import { resolveConfig, defaultConcurrency } from "./parallel/config.ts";
+import { resolveRepoRoot, cleanupAllWorktrees } from "./parallel/worktree.ts";
+import { newPhaseStore, startPhase, recordExploreStep, endPhaseDecision, clearPhase, markBestCheckpoint, persistPhase, clearPersistedPhase, commitPhaseGit, abortPhaseGit } from "./parallel/phases.ts";
+import type { Direction } from "./parallel/types.ts";
 
 // ---------------------------------------------------------------------------
 // Experiment output limits (sent to LLM — keep small to save context)
@@ -77,7 +88,7 @@ interface ExperimentResult {
   metric: number;
   /** Additional tracked metrics: { name: value } */
   metrics: Record<string, number>;
-  status: "keep" | "discard" | "crash" | "checks_failed";
+  status: "keep" | "discard" | "crash" | "checks_failed" | "budget_exceeded" | "explore";
   description: string;
   timestamp: number;
   /** Segment index — increments on each config header. Current segment = highest. */
@@ -118,6 +129,8 @@ interface RunDetails {
   passed: boolean;
   crashed: boolean;
   timedOut: boolean;
+  /** True if killed specifically because it exceeded budget_seconds (not the hard timeout_seconds). */
+  budgetExceeded: boolean;
   tailOutput: string;
   /** null = checks not run (no file or benchmark failed), true/false = ran */
   checksPass: boolean | null;
@@ -152,6 +165,8 @@ interface AutoresearchRuntime {
   pendingResumeTimer: ReturnType<typeof setTimeout> | null;
   /** Resume message to send when the pending timer fires. */
   pendingResumeMessage: string | null;
+  /** Active phase state for valley-crossing multi-step optimizations (ТЗ §11.5). */
+  phaseStore: ReturnType<typeof newPhaseStore>;
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +187,18 @@ const RunParams = Type.Object({
     Type.Number({
       description:
         "Kill .auto/checks.sh after this many seconds (default: 300). Only relevant when the checks file exists.",
+    })
+  ),
+  budget_seconds: Type.Optional(
+    Type.Number({
+      description:
+        "Soft time budget in seconds. If the command runs longer, it is killed and the result is flagged budget_exceeded (a steer tells you to speed up measure.sh). Must be <= timeout_seconds. Used by parallel modes so each worker stays bounded. Default: unset (only the hard timeout_seconds applies).",
+    })
+  ),
+  bench_mode: Type.Optional(
+    Type.String({
+      description:
+        'Sets the BENCH_MODE env var for the command (e.g. "quick", "full", "smoke"). measure.sh convention: parallel workers measure with BENCH_MODE=quick (a fast subset), the parent re-measures the winner with BENCH_MODE=full. Default: unset.',
     })
   ),
 });
@@ -205,7 +232,7 @@ export const LogParams = Type.Object({
     description:
       "The primary optimization metric value (e.g. seconds, val_bpb). 0 for crashes.",
   }),
-  status: StringEnum(["keep", "discard", "crash", "checks_failed"] as const),
+  status: StringEnum(["keep", "discard", "crash", "checks_failed", "budget_exceeded", "explore"] as const),
   description: Type.String({
     description: "Short description of what this experiment tried",
   }),
@@ -815,6 +842,7 @@ function createSessionRuntime(): AutoresearchRuntime {
     state: createExperimentState(),
     pendingResumeTimer: null,
     pendingResumeMessage: null,
+    phaseStore: newPhaseStore(),
   };
 }
 
@@ -1396,17 +1424,22 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const autoresearchHelp = () =>
     [
-      "Usage: /autoresearch [off|clear|export|<text>]",
+      "Usage: /autoresearch [off|clear|export|<text>|parallel-*]",
       "",
       "<text> enters autoresearch mode and starts or resumes the loop.",
       "off leaves autoresearch mode.",
       "clear deletes the session log (.auto/log.jsonl) and turns autoresearch mode off.",
       "export opens a local live dashboard for the session log in your browser.",
-
+      "",
+      "Parallel modes (fan out worker subagents over the event bus):",
+      "  parallel-best-of-n <N> <goal>   — try N hypotheses at once, keep the best (re-measured)",
+      "  parallel-stack <subsystems...>  — stack independent file-scoped optimizations",
+      "  parallel-search <goal>          — beam search (K states × M candidates) for multimodal landscapes",
       "",
       "Examples:",
       "  /autoresearch optimize unit test runtime, monitor correctness",
       "  /autoresearch model training, run 5 minutes of train.py and note the loss ratio as optimization target",
+      "  /autoresearch parallel-best-of-n 4 speed up JSON parsing in src/parse.ts",
       "  /autoresearch export",
     ].join("\n");
 
@@ -1863,7 +1896,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
-      const timeout = (params.timeout_seconds ?? 600) * 1000;
+      // Budget: a soft kill below the hard timeout. When set and <= timeout,
+      // the kill timer uses the budget and the result is flagged budget_exceeded.
+      const hardTimeoutMs = (params.timeout_seconds ?? 600) * 1000;
+      const budgetMs = params.budget_seconds != null ? params.budget_seconds * 1000 : null;
+      const killedByBudget = budgetMs !== null && budgetMs <= hardTimeoutMs;
+      const timeout = killedByBudget ? budgetMs! : hardTimeoutMs;
 
       // Guard: if the benchmark script exists, only allow running it
       const autoresearchShPath = autoresearchScriptPath(workDir);
@@ -1881,6 +1919,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             passed: false,
             crashed: true,
             timedOut: false,
+            budgetExceeded: false,
             tailOutput: "",
             checksPass: null,
             checksTimedOut: false,
@@ -1913,6 +1952,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           cwd: workDir,
           detached: bashSpawn.detached,
           stdio: ["ignore", "pipe", "pipe"],
+          env: params.bench_mode ? { ...process.env, BENCH_MODE: params.bench_mode } : process.env,
           windowsHide: true,
         });
 
@@ -2133,6 +2173,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         passed,
         crashed: !passed,
         timedOut,
+        budgetExceeded: timedOut && killedByBudget,
         tailOutput: displayTruncation.content,
         checksPass,
         checksTimedOut,
@@ -2146,7 +2187,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // Build LLM response
       let text = "";
-      if (details.timedOut) {
+      if (details.budgetExceeded) {
+        text += `⏰ BUDGET EXCEEDED after ${durationSeconds.toFixed(1)}s (budget ${params.budget_seconds}s)\n`;
+        text += `Log this as 'budget_exceeded'. The experiment is too slow — before continuing, speed up measure.sh (add a BENCH_MODE=quick subset, cache prebuilt artifacts, or cut fixture/iter count) so a single run fits the budget.\n`;
+      } else if (details.timedOut) {
         text += `⏰ TIMEOUT after ${durationSeconds.toFixed(1)}s\n`;
       } else if (!benchmarkPassed) {
         text += `💥 FAILED (exit code ${exitCode}) in ${durationSeconds.toFixed(1)}s\n`;
@@ -2386,6 +2430,46 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
 
+      // ===== explore status: phase step logging (no commit, no revert) =====
+      if (params.status === "explore") {
+        const phase = runtime.phaseStore.active;
+        if (!phase) {
+          return { content: [{ type: "text", text: "❌ status=explore requires an active phase. Call startPhase first." }], details: {} };
+        }
+        const outcome = recordExploreStep(runtime.phaseStore, { metric: params.metric, direction: state.bestDirection });
+        // best-checkpoint: if this step improved, snapshot HEAD
+        if (params.metric !== null && outcome.kind === "continue") {
+          const head = (await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: workDir, timeout: 5000 })).stdout.trim();
+          markBestCheckpoint(runtime.phaseStore, head);
+        }
+        // append a scratch entry to the log (no git mutation)
+        try {
+          const jsonlPath = autoresearchJsonlPath(workDir);
+          ensureParentDir(jsonlPath);
+          fs.appendFileSync(jsonlPath, JSON.stringify({ run: state.results.length + 1, commit: params.commit, metric: params.metric, status: "explore", description: params.description, segment: state.currentSegment, phaseStep: phase.stepsTaken }) + "\n");
+        } catch { /* best-effort */ }
+        persistPhase(runtime.phaseStore, workDir);
+
+        let exploreText = `🔄 explore step ${phase.stepsTaken}/${phase.maxSteps}: metric=${params.metric}`;
+        if (outcome.kind === "continue") {
+          exploreText += ` (within bounds, continue the phase)`;
+          return { content: [{ type: "text", text: exploreText }], details: { phaseStep: phase.stepsTaken, outcome: outcome.kind } };
+        }
+        if (outcome.kind === "steer_deep") {
+          exploreText += ` ⚠️ deep valley (${outcome.deltaPct.toFixed(1)}%) — consider commitPhase soon.`;
+          pi.sendUserMessage(`Phase "${phase.name}" is in a deep valley (${outcome.deltaPct.toFixed(1)}% vs baseline). Consider whether to continue or commitPhase.`, { deliverAs: "steer" });
+          return { content: [{ type: "text", text: exploreText }], details: { phaseStep: phase.stepsTaken, outcome: outcome.kind } };
+        }
+        // auto-abort cases (floor / steps / budget)
+        const reason = outcome.kind === "auto_abort_floor" ? `hard floor breached (${outcome.deltaPct.toFixed(1)}%)`
+          : outcome.kind === "auto_abort_steps" ? "maxSteps reached"
+          : "phase budget exceeded";
+        await abortPhaseGit(execAsParallel, workDir, phase);
+        clearPhase(runtime.phaseStore);
+        clearPersistedPhase(workDir);
+        return { content: [{ type: "text", text: `${exploreText}\n🛑 Phase auto-aborted: ${reason}. Reverted to phase base (autoresearch files preserved).` }], details: { phaseStep: phase.stepsTaken, outcome: outcome.kind, aborted: true } };
+      }
+
       // Validate secondary metrics consistency (after first experiment establishes them)
       if (state.secondaryMetrics.length > 0) {
         const knownNames = new Set(state.secondaryMetrics.map((m) => m.name));
@@ -2582,7 +2666,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         text += `\n⚠️ Failed to write .auto/log.jsonl: ${e instanceof Error ? e.message : String(e)}`;
       }
 
-      if (params.status !== "keep") {
+      if (params.status !== "keep" && params.status !== "budget_exceeded" && params.status !== "explore") {
         try {
           const revertScript = `
             git checkout -- . ':(exclude,glob)**/${AUTO_DIR}' ':(exclude,glob)**/${AUTO_DIR}/**' ':(exclude,glob)**/autoresearch.*' ':(exclude,glob)**/autoresearch.*/**'
@@ -2593,6 +2677,25 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         } catch (e) {
           text += `\n⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
         }
+      }
+
+      // budget_exceeded: revert like crash, but emit a dedicated steer so the
+      // loop does not keep burning budget on a too-slow measure.sh.
+      if (params.status === "budget_exceeded") {
+        try {
+          const revertScript = `
+            git checkout -- . ':(exclude,glob)**/${AUTO_DIR}' ':(exclude,glob)**/${AUTO_DIR}/**' ':(exclude,glob)**/autoresearch.*' ':(exclude,glob)**/autoresearch.*/**'
+            git clean -fd -e '${AUTO_DIR}' -e '**/${AUTO_DIR}/**' -e 'autoresearch.*' -e '**/autoresearch.*/**' 2>/dev/null
+          `;
+          await execBashScript(["-c", revertScript], { cwd: workDir, timeout: 10000 });
+          text += `\n📝 Git: reverted changes (budget_exceeded) — autoresearch files preserved`;
+        } catch (e) {
+          text += `\n⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
+        }
+        pi.sendUserMessage(
+          `⏰ Experiment exceeded the time budget. DO NOT continue the loop with this slow measure.sh.\nOptions: 1) add a BENCH_MODE=quick subset to measure.sh; 2) cache prebuilt setup steps; 3) cut fixture/iter count. Rewrite measure.sh, then re-run.`,
+          { deliverAs: "steer" }
+        );
       }
 
       const afterSteer = await fireHook({
@@ -3088,6 +3191,394 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   }
 
   // -----------------------------------------------------------------------
+  // ===== Parallel modes (best-of-N / stack / space-search) =====
+  // Tools fan out worker subagents over the shared pi.events EventBus via the
+  // pi-subagents RPC bridge. The parent is the sole git mutator + log writer.
+
+  function readConfigJson(workDir: string): unknown {
+    try {
+      const p = sessionFilePath(workDir, "config");
+      const c = p && fs.existsSync(p) ? p : path.join(workDir, ".auto", "config.json");
+      if (!fs.existsSync(c)) return null;
+      return JSON.parse(fs.readFileSync(c, "utf-8"));
+    } catch { return null; }
+  }
+
+  function formatBestOfNResult(r: { baselineMetric: number; winnerIndex: number | null; ranked: Array<{ label?: string; medianMetric: number | null; status: string; improvement: number | null; within_noise?: boolean; index: number; tier?: string; notes?: string; error?: string }>; finalMetric: number | null; decision: string; reason?: string; appliedDiffSummary?: string; cpuWarning?: string }): string {
+    let text = `BestOfN: ${r.decision}` + (r.reason ? ` (${r.reason})` : "") + "\n";
+    text += `baseline=${r.baselineMetric}  final=${r.finalMetric ?? "-"}  winner=${r.winnerIndex ?? "none"}\n`;
+    for (const c of r.ranked) {
+      const imp = c.improvement !== null ? (c.improvement >= 0 ? "+" : "") + c.improvement.toFixed(2) : "-";
+      const flag = c.within_noise ? " [noise]" : "";
+      text += `  #${c.index + 1} ${c.label ?? ""} — ${c.status} metric=${c.medianMetric ?? "-"} Δ=${imp}${flag}${c.tier ? ` tier=${c.tier}` : ""}\n`;
+      if (c.error) text += `      error: ${c.error.slice(0, 120)}\n`;
+    }
+    if (r.appliedDiffSummary) text += `applied: ${r.appliedDiffSummary}\n`;
+    if (r.cpuWarning) text += `⚠️ ${r.cpuWarning}\n`;
+    if (r.decision === "keep") text += `\n→ log_experiment(status="keep", metric=${r.finalMetric}, description="BestOfN winner")`;
+    else text += `\n→ log_experiment(status="discard", metric=0, description="BestOfN no winner")`;
+    return text;
+  }
+
+  const BestOfNParams = Type.Object({
+    candidates: Type.Array(Type.Object({
+      hypothesis: Type.String({ description: "Текст гипотезы, которую worker реализует в коде." }),
+      label: Type.Optional(Type.String()),
+      complexity: Type.Optional(Type.String({ description: "simple|medium|hard — определяет тир модели/бюджет." })),
+    })),
+    metric_name: Type.String(),
+    direction: Type.Optional(Type.String()),
+    metric_unit: Type.Optional(Type.String()),
+    model: Type.Optional(Type.String({ description: "Override тира модели для всех кандидатов." })),
+    cascade: Type.Optional(Type.Boolean()),
+    budget_seconds: Type.Optional(Type.Number()),
+    concurrency: Type.Optional(Type.Number()),
+  });
+
+  const execAsParallel = async (cmd: string, args: string[], o?: { cwd?: string; timeout?: number }) => {
+    const r = await pi.exec(cmd, args, o);
+    return { stdout: r.stdout, stderr: r.stderr, code: r.code, killed: (r as { killed?: boolean }).killed };
+  };
+  // Bash-capable runner matching the extension's Windows-aware spawn.
+  const runBashForParallel = async (cmd: string, args: string[], o: unknown) => {
+    const opts = (o ?? {}) as { cwd?: string; timeout?: number; env?: Record<string, string> };
+    const r = await execBashScript(args, opts);
+    return { stdout: r.stdout ?? "", stderr: r.stderr ?? "", code: r.code, killed: !!r.killed };
+  };
+
+  pi.registerTool({
+    name: "BestOfN",
+    label: "Best-of-N parallel hypotheses",
+    description:
+      "Проверяет N гипотез параллельно: каждвый worker реализует гипотезу в изолированном worktree и измеряет (BENCH_MODE=quick). Инструмент ранжирует, переизмеряет победителя на main (BENCH_MODE=full, против selection-bias) и возвращает keep/discard. Parent — единственный писатель git/лога. Требует включённого autoresearch-режима и установленного pi-subagents.",
+    promptSnippet: "Run N hypothesis candidates in parallel and pick the best (re-measured)",
+    parameters: BestOfNParams,
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const runtime = getRuntime(ctx);
+      if (!runtime.autoresearchMode) {
+        return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF. Run /autoresearch on first." }], details: {} };
+      }
+      const workDir = resolveWorkDir(ctx.cwd);
+      const repoRoot = resolveRepoRoot(ctx.cwd);
+      const config = resolveConfig(readConfigJson(workDir));
+      const rpc = new RpcClient(pi.events);
+      const ready = await rpc.ping();
+      if (!ready) {
+        return { content: [{ type: "text", text: "❌ pi-subagents RPC bridge not ready. Убедитесь, что расширение pi-subagents установлено и активно." }], details: {} };
+      }
+      try {
+        const result = await runBestOfN(
+          { rpc, exec: execAsParallel, runCmd: runBashForParallel, repoRoot, workDir, config },
+          {
+            candidates: params.candidates.map((c: { hypothesis: string; label?: string; complexity?: string }) => ({
+              hypothesis: c.hypothesis,
+              label: c.label,
+              complexity: c.complexity as "simple" | "medium" | "hard" | undefined,
+            })),
+            metricName: params.metric_name,
+            direction: (params.direction as Direction) ?? "lower",
+            metricUnit: params.metric_unit,
+            sessionName: runtime.state.name ?? "parallel-bestofn",
+            modelOverride: params.model,
+            cascade: params.cascade,
+            budgetSeconds: params.budget_seconds,
+            concurrency: params.concurrency,
+          },
+        );
+        const text = formatBestOfNResult(result);
+        return { content: [{ type: "text", text }], details: result };
+      } catch (e) {
+        return { content: [{ type: "text", text: `❌ BestOfN failed: ${e instanceof Error ? e.message : String(e)}` }], details: {} };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "startPhase",
+    label: "Start a multi-step phase (valley crossing)",
+    description:
+      "Начать транзакцию: внутри фазы авто-revert отключён, валидируется только финальная метрика (commitPhase). Для многошаговых оптимизаций, где нужно ухудшиться, чтобы потом улучшиться (рефакторинг, смена алгоритма, instrumentation, precompute). Hard floor (40%) и maxSteps (5) предохраняют от ухода в худшую сторону.",
+    promptSnippet: "Start a phase tolerating temporary regressions",
+    parameters: Type.Object({
+      name: Type.String(),
+      rationale: Type.Optional(Type.String()),
+      max_steps: Type.Optional(Type.Number()),
+      max_regression_pct: Type.Optional(Type.Number()),
+      hard_floor_pct: Type.Optional(Type.Number()),
+      budget_seconds: Type.Optional(Type.Number()),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const runtime = getRuntime(ctx);
+      if (!runtime.autoresearchMode) return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF." }], details: {} };
+      const workDir = resolveWorkDir(ctx.cwd);
+      const repoRoot = resolveRepoRoot(ctx.cwd);
+      const baselineMetric = runtime.state.bestMetric;
+      if (baselineMetric === null) return { content: [{ type: "text", text: "❌ No baseline metric yet — run a baseline experiment first (init_experiment + run_experiment)." }], details: {} };
+      const head = (await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: repoRoot, timeout: 5000 })).stdout.trim();
+      const res = startPhase(runtime.phaseStore, {
+        name: params.name,
+        rationale: params.rationale ?? "",
+        phaseBase: head,
+        baselineMetric,
+        maxSteps: params.max_steps,
+        maxRegressionPct: params.max_regression_pct,
+        hardFloorPct: params.hard_floor_pct,
+        budgetMs: params.budget_seconds ? params.budget_seconds * 1000 : undefined,
+      });
+      if (!res.ok) return { content: [{ type: "text", text: `❌ ${res.error}` }], details: {} };
+      persistPhase(runtime.phaseStore, workDir);
+      const p = res.phase;
+      return { content: [{ type: "text", text: `🔄 Phase "${p.name}" started. phaseBase=${p.phaseBase}, baseline=${p.baselineMetric}. maxSteps=${p.maxSteps}, hardFloor=${p.hardFloorPct}%. Log intermediate steps as status="explore" (no commit/revert). End with commitPhase or abortPhase.` }], details: { phaseId: p.id, phaseBase: p.phaseBase, baselineMetric: p.baselineMetric } };
+    },
+  });
+
+  pi.registerTool({
+    name: "commitPhase",
+    label: "Commit a multi-step phase",
+    description:
+      "Завершить фазу: measure финальной метрики; если лучше baseline → git commit всей цепочки правок; если хуже → revert к phaseBase (или best-checkpoint). Только финальная метрика валидируется.",
+    promptSnippet: "Commit/abort a phase by its final metric",
+    parameters: Type.Object({
+      final_metric: Type.Number({ description: "Финальная метрика фазы (после всех шагов)." }),
+      description: Type.String(),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const runtime = getRuntime(ctx);
+      if (!runtime.autoresearchMode) return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF." }], details: {} };
+      const workDir = resolveWorkDir(ctx.cwd);
+      const phase = runtime.phaseStore.active;
+      if (!phase) return { content: [{ type: "text", text: "❌ No active phase. Call startPhase first." }], details: {} };
+      const direction = runtime.state.bestDirection;
+      const dec = endPhaseDecision(runtime.phaseStore, params.final_metric, direction);
+      let text = `Phase "${phase.name}": ${dec.decision}` + (dec.reason ? ` (${dec.reason})` : "") + `. baseline=${phase.baselineMetric}, final=${params.final_metric}, steps=${phase.stepsTaken}.`;
+      if (dec.decision === "keep") {
+        const r = await commitPhaseGit(execAsParallel, workDir, phase, params.description);
+        text += r.committed ? `\n📝 Git: committed (chain of ${phase.stepsTaken} steps).` : "\n📝 Git: nothing to commit.";
+        await logPhaseResult(ctx, params.final_metric, "keep", params.description);
+      } else {
+        await abortPhaseGit(execAsParallel, workDir, phase);
+        text += "\n📝 Git: reverted to phase base (autoresearch files preserved).";
+        await logPhaseResult(ctx, params.final_metric, "discard", `phase aborted: ${params.description}`);
+      }
+      clearPhase(runtime.phaseStore);
+      clearPersistedPhase(workDir);
+      return { content: [{ type: "text", text }], details: { decision: dec.decision, phaseId: phase.id } };
+    },
+  });
+
+  pi.registerTool({
+    name: "abortPhase",
+    label: "Abort a multi-step phase",
+    description: "Прервать фазу: revert к phaseBase/best-checkpoint без валидации финальной метрики.",
+    promptSnippet: "Abort active phase, revert to base",
+    parameters: Type.Object({ reason: Type.Optional(Type.String()) }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const runtime = getRuntime(ctx);
+      const workDir = resolveWorkDir(ctx.cwd);
+      const phase = runtime.phaseStore.active;
+      if (!phase) return { content: [{ type: "text", text: "ℹ️ No active phase to abort." }], details: {} };
+      await abortPhaseGit(execAsParallel, workDir, phase);
+      clearPhase(runtime.phaseStore);
+      clearPersistedPhase(workDir);
+      return { content: [{ type: "text", text: `🛑 Phase "${phase.name}" aborted${params.reason ? `: ${params.reason}` : ""}. Reverted to base.` }], details: { aborted: true, phaseId: phase.id } };
+    },
+  });
+
+  pi.registerTool({
+    name: "valleyProbe",
+    label: "Valley probe — escape a stuck phase",
+    description:
+      "Фаза застряла в долине (дошла до maxSteps без улучшения). Пускает параллельные worktree от best-checkpoint (или phaseBase) с разными стратегиями продолжения. Переиспользует BestOfN-инфру. Победитель возвращается как diff для apply+re-measure на main (ТЗ §11.5 М2).",
+    promptSnippet: "Spawn parallel continuations from a phase checkpoint",
+    parameters: Type.Object({
+      from_commit: Type.Optional(Type.String({ description: "Commit to probe from (default: active phase best-checkpoint, else phaseBase)." })),
+      strategies: Type.Array(Type.String()),
+      baseline_metric: Type.Optional(Type.Number()),
+      metric_name: Type.Optional(Type.String()),
+      direction: Type.Optional(Type.String()),
+      model: Type.Optional(Type.String()),
+      budget_seconds: Type.Optional(Type.Number()),
+      concurrency: Type.Optional(Type.Number()),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const runtime = getRuntime(ctx);
+      if (!runtime.autoresearchMode) return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF." }], details: {} };
+      const workDir = resolveWorkDir(ctx.cwd);
+      const repoRoot = resolveRepoRoot(ctx.cwd);
+      const config = resolveConfig(readConfigJson(workDir));
+      const rpc = new RpcClient(pi.events);
+      if (!await rpc.ping()) return { content: [{ type: "text", text: "❌ pi-subagents RPC bridge not ready." }], details: {} };
+      const phase = runtime.phaseStore.active;
+      const fromCommit = params.from_commit ?? phase?.bestCheckpointSha ?? phase?.phaseBase;
+      const baselineMetric = params.baseline_metric ?? phase?.baselineMetric ?? runtime.state.bestMetric;
+      if (!fromCommit || baselineMetric === null || baselineMetric === undefined) {
+        return { content: [{ type: "text", text: "❌ Need from_commit + baseline_metric (or an active phase with a checkpoint)." }], details: {} };
+      }
+      try {
+        const probe = await runValleyProbe(
+          { rpc, exec: execAsParallel, runCmd: runBashForParallel, repoRoot, workDir, config },
+          {
+            fromCommit, baselineMetric, strategies: params.strategies,
+            metricName: params.metric_name ?? runtime.state.metricName,
+            direction: (params.direction as Direction) ?? runtime.state.bestDirection,
+            sessionName: runtime.state.name ?? "parallel-valley",
+            modelOverride: params.model, budgetSeconds: params.budget_seconds, concurrency: params.concurrency,
+          },
+        );
+        if (!probe.escaped) {
+          return { content: [{ type: "text", text: `Valley probe: no strategy escaped the valley. Ranked:\n` + probe.ranked.map((r) => `  #${r.index + 1} ${r.status} metric=${r.medianMetric ?? "-"}`).join("\n") + "\n→ abortPhase to revert." }], details: probe };
+        }
+        // Selection-bias correction: re-measure the winning continuation on main in full.
+        const rem = await reMeasureWinner(execAsParallel, workDir, runtime.state.metricName, runtime.state.bestDirection, baselineMetric, computeNoiseFloor(probe.results), probe.winnerDiff, params.budget_seconds ?? config.budgetSeconds, runBashForParallel);
+        let text = `Valley probe escaped! winner metric(quick)=${probe.winnerMetric}, re-measure(full)=${rem.finalMetric} → ${rem.decision}.`;
+        if (rem.decision === "keep") text += `\n→ log_experiment(status="keep", metric=${rem.finalMetric}, description="valley probe winner")`;
+        else text += `\n→ log_experiment(status="discard", metric=0, description="valley probe not confirmed")`;
+        return { content: [{ type: "text", text }], details: { ...probe, remeasure: rem } };
+      } catch (e) {
+        return { content: [{ type: "text", text: `❌ valleyProbe failed: ${e instanceof Error ? e.message : String(e)}` }], details: {} };
+      }
+    },
+  });
+
+  // Helper: log a phase outcome as a normal experiment result (bestMetric-based keep/discard).
+  async function logPhaseResult(ctx: ExtensionContext, metric: number, status: "keep" | "discard", description: string): Promise<void> {
+    const runtime = getRuntime(ctx);
+    const state = runtime.state;
+    const head = (await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: resolveRepoRoot(ctx.cwd), timeout: 5000 })).stdout.trim() || "0000000";
+    state.results.push({
+      commit: head.slice(0, 7), metric, metrics: {}, status, description,
+      timestamp: Date.now(), segment: state.currentSegment, confidence: null,
+    });
+    runtime.experimentsThisSession++;
+    state.bestMetric = findBaselineMetric(state.results, state.currentSegment);
+    state.confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection);
+    try {
+      const jsonlPath = autoresearchJsonlPath(resolveWorkDir(ctx.cwd));
+      ensureParentDir(jsonlPath);
+      fs.appendFileSync(jsonlPath, JSON.stringify({ run: state.results.length, commit: head.slice(0, 7), metric, status, description, segment: state.currentSegment, source: "phase" }) + "\n");
+      broadcastDashboardUpdate(resolveWorkDir(ctx.cwd));
+    } catch { /* best-effort */ }
+  }
+
+  pi.registerTool({
+    name: "CheckOrthogonal",
+    label: "Stack orthogonal patches",
+    description:
+      "Проверяет ортогональные патчи (по фактическому file-scope из diff) и стекаёт их на main с re-measure после каждого. File-scope пересечение → отказ. Реализует ТЗ §10.",
+    promptSnippet: "Stack independent file-scoped patches with per-patch re-measure",
+    parameters: Type.Object({
+      patches: Type.Array(Type.Object({ name: Type.String(), hypothesis: Type.String(), file_scope: Type.Optional(Type.Array(Type.String())) })),
+      metric_name: Type.String(),
+      direction: Type.Optional(Type.String()),
+      metric_unit: Type.Optional(Type.String()),
+      model: Type.Optional(Type.String()),
+      budget_seconds: Type.Optional(Type.Number()),
+      concurrency: Type.Optional(Type.Number()),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const runtime = getRuntime(ctx);
+      if (!runtime.autoresearchMode) return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF." }], details: {} };
+      const workDir = resolveWorkDir(ctx.cwd);
+      const repoRoot = resolveRepoRoot(ctx.cwd);
+      const config = resolveConfig(readConfigJson(workDir));
+      const rpc = new RpcClient(pi.events);
+      if (!await rpc.ping()) return { content: [{ type: "text", text: "❌ pi-subagents RPC bridge not ready." }], details: {} };
+      try {
+        const result = await runCheckOrthogonal(
+          { rpc, exec: execAsParallel, runCmd: runBashForParallel, repoRoot, workDir, config },
+          {
+            patches: params.patches.map((p: { name: string; hypothesis: string; file_scope?: string[] }) => ({ name: p.name, hypothesis: p.hypothesis, fileScope: p.file_scope })),
+            metricName: params.metric_name,
+            direction: (params.direction as Direction) ?? "lower",
+            metricUnit: params.metric_unit,
+            sessionName: runtime.state.name ?? "parallel-orthogonal",
+            modelOverride: params.model,
+            budgetSeconds: params.budget_seconds,
+            concurrency: params.concurrency,
+          },
+        );
+        let text = `CheckOrthogonal: ${result.decision}` + (result.reason ? ` (${result.reason})` : "") + "\n";
+        text += `orthogonal=${result.independence.orthogonal}  stacked=${result.stackedMetric ?? "-"}  baseline=${result.baselineMetric}\n`;
+        if (!result.independence.orthogonal) {
+          for (const c of result.independence.conflicts) text += `  ⚠️ conflict ${c.a} ↔ ${c.b}: ${c.sharedFiles.join(", ")}\n`;
+        }
+        for (const p of result.perPatch) text += `  ${p.name} — ${p.status} metric=${p.metric ?? "-"} Δ=${p.improvement ?? "-"} files=[${p.fileScopeActual.join(",")}]\n`;
+        for (const r of result.rejected) text += `  rejected ${r.name}: ${r.reason}\n`;
+        if (result.applied.length) text += `\napplied: ${result.applied.join(", ")}\n→ log_experiment(status="keep", metric=${result.stackedMetric}, description="orthogonal stack")`;
+        else text += `\n→ log_experiment(status="discard", metric=0, description="orthogonal stack none")`;
+        return { content: [{ type: "text", text }], details: result };
+      } catch (e) {
+        return { content: [{ type: "text", text: `❌ CheckOrthogonal failed: ${e instanceof Error ? e.message : String(e)}` }], details: {} };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "SpaceSearch",
+    label: "Beam space search",
+    description:
+      "Stateful beam search: init → step (×K состояний × M кандидатов с diversity hints) → finish (cherry-pick цепочки лучшего state, re-measure full). С regression-lookahead pruning — beam может регрессировать до allowedRegressionSteps прежде чем быть отсечённым. Реализует ТЗ §11, §11.5 М3.",
+    promptSnippet: "Beam search across solution space (stateful: init/step/finish/status)",
+    parameters: Type.Object({
+      action: Type.String({ description: "init | step | finish | status" }),
+      beam_width: Type.Optional(Type.Number()),
+      candidates_per_state: Type.Optional(Type.Number()),
+      diversity_hints: Type.Optional(Type.Array(Type.String())),
+      metric_name: Type.Optional(Type.String()),
+      direction: Type.Optional(Type.String()),
+      metric_unit: Type.Optional(Type.String()),
+      model: Type.Optional(Type.String()),
+      budget_seconds: Type.Optional(Type.Number()),
+      allowed_regression_steps: Type.Optional(Type.Number()),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const runtime = getRuntime(ctx);
+      if (!runtime.autoresearchMode) return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF." }], details: {} };
+      const workDir = resolveWorkDir(ctx.cwd);
+      const repoRoot = resolveRepoRoot(ctx.cwd);
+      const config = resolveConfig(readConfigJson(workDir));
+      const rpc = new RpcClient(pi.events);
+      const sctx = { rpc, exec: execAsParallel, runCmd: runBashForParallel, repoRoot, workDir, config };
+      const sopts = {
+        beamWidth: params.beam_width, candidatesPerState: params.candidates_per_state, diversityHints: params.diversity_hints,
+        metricName: params.metric_name ?? runtime.state.metricName, direction: (params.direction as Direction) ?? runtime.state.bestDirection,
+        metricUnit: params.metric_unit, sessionName: runtime.state.name ?? "parallel-spacesearch",
+        modelOverride: params.model, budgetSeconds: params.budget_seconds, allowedRegressionSteps: params.allowed_regression_steps,
+      };
+      try {
+        if (params.action === "status") {
+          const s = statusBeam(workDir);
+          return { content: [{ type: "text", text: s ? `beam step=${s.step}, width=${s.beamWidth}, states=${s.states.length}\n` + s.states.map((x: { commit: string; metric: number; hypothesis: string; depth: number }) => `  ${x.commit} metric=${x.metric} depth=${x.depth} (${x.hypothesis})`).join("\n") : "No active beam." }], details: { beam: s } };
+        }
+        if (params.action === "init") {
+          if (!await rpc.ping()) return { content: [{ type: "text", text: "❌ pi-subagents RPC bridge not ready." }], details: {} };
+          const r = await initBeam(sctx, sopts);
+          if (!r.ok) return { content: [{ type: "text", text: `❌ init failed: ${r.error}` }], details: { reason: r.reason } };
+          return { content: [{ type: "text", text: `Beam initialized: width=${r.beam.beamWidth}, candidates/state=${r.beam.candidatesPerState}, baseline=${r.beam.states[0]?.metric}. Drive with action=step until converged, then action=finish.` }], details: { beam: r.beam } };
+        }
+        if (params.action === "step") {
+          if (!await rpc.ping()) return { content: [{ type: "text", text: "❌ pi-subagents RPC bridge not ready." }], details: {} };
+          const r = await stepBeam(sctx, sopts);
+          if (!r.ok) return { content: [{ type: "text", text: `❌ step failed: ${r.error}` }], details: {} };
+          let text = `step ${r.beam.step}: improved=${r.improved}, converged=${r.converged}\n`;
+          for (const x of r.beam.states) text += `  ${x.commit} metric=${x.metric} depth=${x.depth} (${x.hypothesis}) streak=${x.regressionStreak}\n`;
+          if (r.converged) text += `\nBeam converged (no improvement). Call action=finish to cherry-pick the best chain + re-measure.`;
+          return { content: [{ type: "text", text }], details: { beam: r.beam, improved: r.improved, converged: r.converged } };
+        }
+        if (params.action === "finish") {
+          const r = await finishBeam(sctx, sopts);
+          let text = `finish: ${r.decision}` + (r.reason ? ` (${r.reason})` : "") + ` final=${r.finalMetric ?? "-"}\n`;
+          if (r.decision === "keep") text += `→ log_experiment(status="keep", metric=${r.finalMetric}, description="space search winner")`;
+          else text += `→ log_experiment(status="discard", metric=0, description="space search no winner")`;
+          return { content: [{ type: "text", text }], details: r };
+        }
+        return { content: [{ type: "text", text: "❌ action must be init|step|finish|status" }], details: {} };
+      } catch (e) {
+        return { content: [{ type: "text", text: `❌ SpaceSearch failed: ${e instanceof Error ? e.message : String(e)}` }], details: {} };
+      }
+    },
+  });
+
   // /autoresearch command — enter autoresearch mode
   // -----------------------------------------------------------------------
 
@@ -3165,6 +3656,23 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         } else {
           ctx.ui.notify("No session log found. Autoresearch mode OFF", "info");
         }
+        return;
+      }
+
+      // ===== parallel subcommands: activate mode + inject the parallel skill =====
+      const parallelMatch = command.match(/^parallel-(best-of-n|stack|search)\b/);
+      if (parallelMatch) {
+        const workDir = resolveWorkDir(ctx.cwd);
+        // clean any stale worktrees from a previous crashed round
+        await cleanupAllWorktrees(async (cmd: string, args: string[], o?: { cwd?: string; timeout?: number }) => {
+          const r = await pi.exec(cmd, args, o); return { stdout: r.stdout, stderr: r.stderr, code: r.code };
+        }, resolveRepoRoot(ctx.cwd)).catch(() => {});
+        recordAutoresearchActivation(workDir, true);
+        setAutoresearchMode(ctx, true);
+        runtime.autoResumeTurns = 0;
+        const kickoff = `/skill:autoresearch-parallel ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`.replace(/\s+/g, " ").trim();
+        ctx.ui.notify(`Parallel mode ON (${parallelMatch[1]}) — loaded autoresearch-parallel skill`, "info");
+        sendWhenReady(ctx, kickoff);
         return;
       }
 
