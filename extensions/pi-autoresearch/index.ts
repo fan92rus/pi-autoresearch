@@ -227,7 +227,7 @@ const InitParams = Type.Object({
 });
 
 export const LogParams = Type.Object({
-  commit: Type.String({ description: "Git commit hash (short, 7 chars)" }),
+  commit: Type.Optional(Type.String({ description: "Git commit hash (short, 7 chars). Optional for explore/budget_exceeded statuses." })),
   metric: Type.Number({
     description:
       "The primary optimization metric value (e.g. seconds, val_bpb). 0 for crashes.",
@@ -408,7 +408,7 @@ function killTree(pid: number): void {
  */
 async function execBashScript(
   args: string[],
-  options: { cwd?: string; timeout?: number; signal?: AbortSignal },
+  options: { cwd?: string; timeout?: number; signal?: AbortSignal; env?: Record<string, string> },
 ): Promise<{ stdout: string; stderr: string; code: number; killed: boolean }> {
   const bashSpawn = getBashSpawnOptions();
   return new Promise((resolve) => {
@@ -420,6 +420,7 @@ async function execBashScript(
     const child = spawn(bashSpawn.shell, args, {
       cwd: options.cwd,
       detached: bashSpawn.detached,
+      env: options.env,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -3259,7 +3260,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF. Run /autoresearch on first." }], details: {} };
       }
       const workDir = resolveWorkDir(ctx.cwd);
-      const repoRoot = resolveRepoRoot(ctx.cwd);
+      const repoRoot = resolveRepoRoot(workDir);
       const config = resolveConfig(readConfigJson(workDir));
       const rpc = new RpcClient(pi.events);
       const ready = await rpc.ping();
@@ -3311,7 +3312,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const runtime = getRuntime(ctx);
       if (!runtime.autoresearchMode) return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF." }], details: {} };
       const workDir = resolveWorkDir(ctx.cwd);
-      const repoRoot = resolveRepoRoot(ctx.cwd);
+      const repoRoot = resolveRepoRoot(workDir);
       const baselineMetric = runtime.state.bestMetric;
       if (baselineMetric === null) return { content: [{ type: "text", text: "❌ No baseline metric yet — run a baseline experiment first (init_experiment + run_experiment)." }], details: {} };
       const head = (await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: repoRoot, timeout: 5000 })).stdout.trim();
@@ -3404,7 +3405,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const runtime = getRuntime(ctx);
       if (!runtime.autoresearchMode) return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF." }], details: {} };
       const workDir = resolveWorkDir(ctx.cwd);
-      const repoRoot = resolveRepoRoot(ctx.cwd);
+      const repoRoot = resolveRepoRoot(workDir);
       const config = resolveConfig(readConfigJson(workDir));
       const rpc = new RpcClient(pi.events);
       if (!await rpc.ping()) return { content: [{ type: "text", text: "❌ pi-subagents RPC bridge not ready." }], details: {} };
@@ -3444,7 +3445,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   async function logPhaseResult(ctx: ExtensionContext, metric: number, status: "keep" | "discard", description: string): Promise<void> {
     const runtime = getRuntime(ctx);
     const state = runtime.state;
-    const head = (await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: resolveRepoRoot(ctx.cwd), timeout: 5000 })).stdout.trim() || "0000000";
+    const workDir = resolveWorkDir(ctx.cwd);
+    const head = (await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: resolveRepoRoot(workDir), timeout: 5000 })).stdout.trim() || "0000000";
     state.results.push({
       commit: head.slice(0, 7), metric, metrics: {}, status, description,
       timestamp: Date.now(), segment: state.currentSegment, confidence: null,
@@ -3479,7 +3481,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const runtime = getRuntime(ctx);
       if (!runtime.autoresearchMode) return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF." }], details: {} };
       const workDir = resolveWorkDir(ctx.cwd);
-      const repoRoot = resolveRepoRoot(ctx.cwd);
+      const repoRoot = resolveRepoRoot(workDir);
       const config = resolveConfig(readConfigJson(workDir));
       const rpc = new RpcClient(pi.events);
       if (!await rpc.ping()) return { content: [{ type: "text", text: "❌ pi-subagents RPC bridge not ready." }], details: {} };
@@ -3535,7 +3537,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const runtime = getRuntime(ctx);
       if (!runtime.autoresearchMode) return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF." }], details: {} };
       const workDir = resolveWorkDir(ctx.cwd);
-      const repoRoot = resolveRepoRoot(ctx.cwd);
+      const repoRoot = resolveRepoRoot(workDir);
       const config = resolveConfig(readConfigJson(workDir));
       const rpc = new RpcClient(pi.events);
       const sctx = { rpc, exec: execAsParallel, runCmd: runBashForParallel, repoRoot, workDir, config };
@@ -3666,7 +3668,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // clean any stale worktrees from a previous crashed round
         await cleanupAllWorktrees(async (cmd: string, args: string[], o?: { cwd?: string; timeout?: number }) => {
           const r = await pi.exec(cmd, args, o); return { stdout: r.stdout, stderr: r.stderr, code: r.code };
-        }, resolveRepoRoot(ctx.cwd)).catch(() => {});
+        }, resolveRepoRoot(workDir)).catch(() => {});
         recordAutoresearchActivation(workDir, true);
         setAutoresearchMode(ctx, true);
         runtime.autoResumeTurns = 0;
