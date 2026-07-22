@@ -150,21 +150,12 @@ export class RpcClient {
 
   /** Probe whether the pi-subagents RPC bridge is ready. Resolves true/false. */
   async ping(timeoutMs = 2000): Promise<boolean> {
-    // Listen first, then emit — the ready reply may come quickly.
+    // Subscribe before emitting to avoid a missed fast reply (same pattern as spawn).
     const request = buildRequest("ping");
+    const replyP = onceEvent(this.events, replyEventFor(request.requestId), () => true, timeoutMs);
+    this.events.emit(SUBAGENT_RPC_REQUEST_EVENT, request);
     try {
-      await onceEvent(this.events, replyEventFor(request.requestId), () => true, timeoutMs);
-      this.events.emit(SUBAGENT_RPC_REQUEST_EVENT, request);
-      return true;
-    } catch {
-      // Race: emit then wait if the listener-first approach missed it.
-    }
-    // Second attempt: emit and wait.
-    const req2 = buildRequest("ping");
-    const waitP = onceEvent(this.events, replyEventFor(req2.requestId), () => true, timeoutMs);
-    this.events.emit(SUBAGENT_RPC_REQUEST_EVENT, req2);
-    try {
-      await waitP;
+      await replyP;
       return true;
     } catch {
       return false;
