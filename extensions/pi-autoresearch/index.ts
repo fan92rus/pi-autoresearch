@@ -428,6 +428,7 @@ async function execBashScript(
     let stdout = "";
     let stderr = "";
     let killed = false;
+    let closed = false; // T3: guard against timeout/signal race with process exit
 
     child.stdout?.on("data", (data: Buffer) => { stdout += data.toString(); });
     child.stderr?.on("data", (data: Buffer) => { stderr += data.toString(); });
@@ -440,7 +441,7 @@ async function execBashScript(
     };
 
     const onAbort = () => {
-      if (!killed) {
+      if (!killed && !closed) {
         killed = true;
         if (child.pid) killTree(child.pid);
       }
@@ -456,19 +457,30 @@ async function execBashScript(
 
     if (options.timeout && options.timeout > 0) {
       timeoutHandle = setTimeout(() => {
-        if (!killed) {
-          killed = true;
-          if (child.pid) killTree(child.pid);
+        if (!killed && !closed && child.pid) {
+          // Check if process is still alive before killing (T3: Windows race)
+          try {
+            process.kill(child.pid, 0);
+            killed = true;
+            killTree(child.pid);
+          } catch {
+            // Process already exited — timeout is a false positive
+          }
         }
       }, options.timeout);
     }
 
     child.on("close", (code) => {
+      closed = true;
       cleanup();
-      resolve({ stdout, stderr, code: code ?? 0, killed });
+      // T3: if process exited cleanly (code 0), don't report as killed
+      // even if a late timeout/signal set the flag.
+      const effectiveKilled = killed && code !== 0;
+      resolve({ stdout, stderr, code: code ?? 0, killed: effectiveKilled });
     });
 
     child.on("error", (err) => {
+      closed = true;
       cleanup();
       resolve({ stdout, stderr: stderr + err.message, code: 1, killed: true });
     });
@@ -702,6 +714,27 @@ function findBestMetric(
     .map((r) => r.metric);
   if (kept.length === 0) return null;
   return direction === "lower" ? Math.min(...kept) : Math.max(...kept);
+}
+
+/** T5: Find the run number (1-based) where the current best metric was set. */
+function findBestRunNumber(
+  results: ExperimentResult[],
+  segment: number,
+  direction: "lower" | "higher",
+): number {
+  const seg = currentResults(results, segment);
+  let bestIdx = -1;
+  let bestVal: number | null = null;
+  for (let i = 0; i < seg.length; i++) {
+    if (seg[i].status !== "keep" || seg[i].metric === 0) continue;
+    const m = seg[i].metric;
+    if (bestVal === null || (direction === "lower" ? m < bestVal : m > bestVal)) {
+      bestVal = m;
+      bestIdx = i;
+    }
+  }
+  // results are stored per-segment; run numbers are global (1-based within segment)
+  return bestIdx >= 0 ? bestIdx + 1 : seg.length;
 }
 
 // -----------------------------------------------------------------------
@@ -2587,15 +2620,37 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
-      // Show confidence score
+      // Show confidence score (T5: context-aware — different message for keep vs discard)
       if (state.confidence !== null) {
         const confStr = state.confidence.toFixed(1);
-        if (state.confidence >= 2.0) {
-          text += `\n📊 Confidence: ${confStr}× noise floor — improvement is likely real`;
-        } else if (state.confidence >= 1.0) {
-          text += `\n📊 Confidence: ${confStr}× noise floor — improvement is above noise but marginal`;
+        const isKeep = params.status === "keep";
+        // Find the run number where the current best was set
+        const bestRunNum = findBestRunNumber(state.results, state.currentSegment, state.bestDirection);
+
+        if (isKeep) {
+          // This run IS the improvement — confidence refers to THIS run
+          if (state.confidence >= 2.0) {
+            text += `\n📊 Confidence: ${confStr}× noise floor — this improvement is likely real`;
+          } else if (state.confidence >= 1.0) {
+            text += `\n📊 Confidence: ${confStr}× noise floor — this improvement is above noise but marginal`;
+          } else {
+            text += `\n⚠️ Confidence: ${confStr}× noise floor — this improvement is within noise. Consider re-running to confirm before keeping.`;
+          }
         } else {
-          text += `\n⚠️ Confidence: ${confStr}× noise floor — improvement is within noise. Consider re-running to confirm before keeping.`;
+          // This run is discard/crash — confidence refers to the SESSION BEST, not this run
+          text += `\n📊 Best (#${bestRunNum}): ${confStr}× noise floor (set at run #${bestRunNum})`;
+          if (state.bestMetric !== null && params.metric !== 0) {
+            const deltaPct = state.bestDirection === "lower"
+              ? ((params.metric - state.bestMetric) / state.bestMetric * 100)
+              : ((state.bestMetric - params.metric) / state.bestMetric * 100);
+            if (deltaPct > 0) {
+              text += `\n📊 This run: ${formatNum(params.metric, state.metricUnit)} (+${deltaPct.toFixed(1)}% vs best ${formatNum(state.bestMetric, state.metricUnit)}) — worse, not an improvement`;
+            } else if (deltaPct > -1) {
+              text += `\n📊 This run: ${formatNum(params.metric, state.metricUnit)} (~equal to best ${formatNum(state.bestMetric, state.metricUnit)}) — within noise`;
+            } else {
+              text += `\n📊 This run: ${formatNum(params.metric, state.metricUnit)} — see metric above`;
+            }
+          }
         }
       }
 
@@ -3582,6 +3637,72 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       } catch (e) {
         return { content: [{ type: "text", text: `❌ SpaceSearch failed: ${e instanceof Error ? e.message : String(e)}` }], details: {} };
       }
+    },
+  });
+
+  // T4: finalize_research — agent-driven completion signal
+  // Records a finalize entry in log.jsonl and sends a completion steer.
+  // The agent retains control — this does NOT force-stop the session.
+  registerGatedTool({
+    name: "finalize_research",
+    label: "Signal optimization is complete",
+    description:
+      "Signal that the optimization target has reached its structural limit or is otherwise complete. " +
+      "Records a finalize entry in .auto/log.jsonl and sends a completion steer. " +
+      "The agent retains control — this does NOT force-stop the session. " +
+      "Use when profiling or analysis proves further optimization is impossible or not worth the cost.",
+    promptSnippet: "Signal that optimization is complete (floor reached, goal met, etc.)",
+    parameters: {
+      type: "object",
+      properties: {
+        reason: { type: "string", description: "Why the optimization is complete (e.g. 'Process-creation floor reached', 'Goal metric achieved')" },
+        evidence: { type: "string", description: "Proof supporting finalization (profiling data, variance analysis, goal comparison)" },
+        confidence: { type: "number", description: "Confidence in finalization, 0.0 to 1.0. Above 0.8 triggers strong finalize recommendation in observer.", default: 0.8 },
+      },
+      required: ["reason"],
+    } as any,
+    async execute(_toolCallId: string, params: { reason: string; evidence?: string; confidence?: number }, _signal, _onUpdate, ctx: ExtensionContext) {
+      assertModeActive(ctx);
+      const workDir = resolveWorkDir(ctx.cwd);
+      const runtime = getRuntime(ctx);
+      const state = runtime.state;
+      const conf = typeof params.confidence === "number" ? Math.max(0, Math.min(1, params.confidence)) : 0.8;
+
+      const entry = {
+        type: "finalize",
+        reason: params.reason,
+        evidence: params.evidence ?? "",
+        confidence: conf,
+        best_metric: state.bestMetric,
+        run_count: state.results.length,
+        timestamp: Date.now(),
+      };
+
+      try {
+        const jsonlPath = autoresearchJsonlPath(workDir);
+        ensureParentDir(jsonlPath);
+        fs.appendFileSync(jsonlPath, JSON.stringify(entry) + "\n");
+        broadcastDashboardUpdate(workDir);
+      } catch (e) {
+        return { content: [{ type: "text", text: `❌ Failed to write finalize entry: ${e instanceof Error ? e.message : String(e)}` }], details: {} };
+      }
+
+      // Send completion steer to the agent
+      pi.sendUserMessage(
+        `🏁 FINALIZE SIGNAL: Agent reports optimization complete.\n` +
+        `   Reason: ${params.reason}\n` +
+        `   Confidence: ${(conf * 100).toFixed(0)}%\n` +
+        (params.evidence ? `   Evidence: ${params.evidence.slice(0, 200)}\n` : "") +
+        `   Best ${state.metricName}: ${state.bestMetric !== null ? formatNum(state.bestMetric, state.metricUnit) : "?"}\n` +
+        `   Total runs: ${state.results.length}\n\n` +
+        `   Run /autoresearch off to finalize, or continue if you disagree.`,
+        { deliverAs: "steer" }
+      );
+
+      return {
+        content: [{ type: "text", text: `🏁 Finalize signal recorded (confidence=${conf}). The observer will now recommend /autoresearch off in its steers.` }],
+        details: { finalized: true, confidence: conf, bestMetric: state.bestMetric },
+      };
     },
   });
 
