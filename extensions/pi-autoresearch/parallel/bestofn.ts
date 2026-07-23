@@ -283,7 +283,7 @@ export async function runBestOfN(ctx: OrchestratorContext, opts: BestOfNOptions)
       worktreePath: wts[c.index]?.path ?? "",
       diff: finalResults[c.index]?.diff ?? "",
     }));
-    const cascade = await cascadeReMeasure(exec, runCmd, {
+    const remeasureResult = await cascadeReMeasure(exec, runCmd, {
       candidates: remeasureCandidates,
       metricName: opts.metricName,
       direction: opts.direction,
@@ -292,9 +292,9 @@ export async function runBestOfN(ctx: OrchestratorContext, opts: BestOfNOptions)
       budgetSeconds,
       requireDiff: true,
     });
-    const remeasure = cascade.attempts.map((a) => ({ index: a.key as number, decision: a.decision, finalMetric: a.finalMetric, reason: a.reason }));
-    let confirmedIndex: number | null = cascade.confirmedKey as number | null;
-    let confirmedMetric = cascade.confirmedMetric;
+    const remeasure = remeasureResult.attempts.map((a) => ({ index: a.key as number, decision: a.decision, finalMetric: a.finalMetric, reason: a.reason }));
+    let confirmedIndex: number | null = remeasureResult.confirmedKey as number | null;
+    let confirmedMetric = remeasureResult.confirmedMetric;
     let confirmedSummary: string | undefined;
 
     // If a winner was confirmed in a worktree, apply its diff to main now.
