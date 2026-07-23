@@ -361,7 +361,6 @@ function checkParallelOpportunity(
   let ideas: string[];
   try {
     const content = fs.readFileSync(ideasPath, "utf-8");
-    // Extract bullet-point lines (- or *) that are not strikethrough
     ideas = content
       .split("\n")
       .map(function (l) { return l.trim(); })
@@ -371,18 +370,78 @@ function checkParallelOpportunity(
     return null;
   }
 
-  // Need at least 2 untried ideas to make BestOfN worthwhile
   if (ideas.length < 2) return null;
 
   // Check that agent hasn't already used parallel tools recently
   const recentLog = state.recent.slice(-5);
   const usedParallel = recentLog.some(function (r) {
     const desc = String((r as Record<string, unknown>).description ?? "");
-    return /BestOfN|SpaceSearch|CheckOrthogonal|valleyProbe/i.test(desc);
+    return /BestOfN|SpaceSearch|CheckOrthogonal|valleyProbe|startPhase/i.test(desc);
   });
   if (usedParallel) return null;
 
-  // Build a BestOfN suggestion with up to 3 ideas from ideas.md
+  // ── Classify the ideas to pick the RIGHT tool ──
+  const ideasLower = ideas.join(" ").toLowerCase();
+
+  // Pattern: refactor / rewrite / replace algorithm → needs Phases
+  const isRefactor = /refactor|rewrite|replace.*algorithm|restructur|rip out|swap.*engine|change.*approach/i.test(ideasLower);
+
+  // Pattern: ideas target different files/modules → CheckOrthogonal
+  const fileRefs = ideas.filter(function (l) { return /\.(ts|js|go|py|rs|c|cpp|java|rb|sh)\b/i.test(l) || /file|module|function|class\s/i.test(l); });
+  const isIndependent = fileRefs.length >= 2 && ideas.length >= 2;
+
+  // Pattern: fundamentally different strategies → SpaceSearch
+  const strategyKeywords = /strategy|approach|algorithm|technique|method|data structure|cache|batch|stream|lazy|eager|memoiz|precomput/i;
+  const strategyIdeas = ideas.filter(function (l) { return strategyKeywords.test(l); });
+  const isMultimodal = strategyIdeas.length >= 3;
+
+  const prefix = `⚡ PARALLEL OPPORTUNITY: ${ideas.length} untried ideas, ${state.streak} non-improving runs.`;
+  const metric = payload.metricName;
+  const dir = payload.direction;
+
+  // ── Refactor path → Phases (temporary regression expected) ──
+  if (isRefactor) {
+    return [
+      prefix,
+      `   Your ideas involve refactoring/rewriting — this often needs to get WORSE before better.`,
+      `   Use Phases to allow temporary regression without auto-revert:`,
+      `   startPhase({ name:"refactor", rationale:"${ideas[0]!.slice(0, 60)}", max_steps:5 })`,
+      `   Then iterate with status:"explore" (no auto-revert).`,
+      `   If stuck in a valley → valleyProbe({ strategies:["alt1","alt2","alt3"], ... })`,
+    ].join("\n");
+  }
+
+  // ── Independent files → CheckOrthogonal (stack them) ──
+  if (isIndependent && !isMultimodal) {
+    return [
+      prefix,
+      `   Your ideas target different files/modules — they can be stacked independently.`,
+      `   CheckOrthogonal tests + stacks them in one pass:`,
+      `   CheckOrthogonal({ patches: [`,
+      ideas.slice(0, 3).map(function (idea) {
+        const short = idea.length > 60 ? idea.slice(0, 57) + "..." : idea;
+        return `     {name:"opt", hypothesis:"${short}"}`;
+      }).join(",\n"),
+      `   ], metric_name:"${metric}", direction:"${dir}" })`,
+    ].join("\n");
+  }
+
+  // ── Multimodal landscape → SpaceSearch beam ──
+  if (isMultimodal) {
+    const hints = strategyIdeas.slice(0, 3).map(function (idea) {
+      const short = idea.length > 50 ? idea.slice(0, 47) + "..." : idea;
+      return `"${short}"`;
+    }).join(", ");
+    return [
+      prefix,
+      `   Multiple fundamentally different strategies detected — beam search explores them in parallel.`,
+      `   SpaceSearch({ action:"init", beam_width:3, candidates_per_state:3,`,
+      `     diversity_hints:[${hints}], metric_name:"${metric}", direction:"${dir}" })`,
+      `   Then: SpaceSearch({ action:"step" }) to expand, SpaceSearch({ action:"finish" }) to apply best chain.`,
+    ].join("\n");
+  }
+
+  // ── Default: variations of same concept → BestOfN ──
   const top3 = ideas.slice(0, 3);
   const candidates = top3.map(function (idea, i) {
     const short = idea.length > 60 ? idea.slice(0, 57) + "..." : idea;
@@ -390,12 +449,11 @@ function checkParallelOpportunity(
   }).join(",\n");
 
   return [
-    `⚡ PARALLEL OPPORTUNITY: You have ${ideas.length} untried ideas in .auto/ideas.md and ${state.streak} non-improving runs.`,
+    prefix,
     `   Stop testing sequentially — try them ALL AT ONCE with BestOfN:`,
     `   BestOfN({ candidates: [`,
     candidates,
-    `   ], metric_name:"${payload.metricName}", direction:"${payload.direction}" })`,
-    `   BestOfN spawns isolated worktrees, measures each, re-measures the best, returns keep/discard.`,
+    `   ], metric_name:"${metric}", direction:"${dir}" })`,
   ].join("\n");
 }
 
