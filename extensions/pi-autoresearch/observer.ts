@@ -343,7 +343,63 @@ function checkFloor(
   return lines.join("\n");
 }
 
-// ─── Trigger: Stagnation ─────────────────────────────────────────────────────
+// ─── Trigger: Parallel opportunity (proactive, before stagnation) ───────────
+
+function checkParallelOpportunity(
+  state: ObserverState,
+  payload: ObserverPayload,
+  cwd: string,
+  oc: ObserverConfig,
+): string | null {
+  // Fire at streak 3 (before stagnation threshold of 5) — early nudge
+  if (state.streak < 3) return null;
+  if (state.streak >= oc.stagnationThreshold) return null; // stagnation handles >=5
+
+  const ideasPath = path.join(cwd, ".auto", "ideas.md");
+  if (!fs.existsSync(ideasPath)) return null;
+
+  let ideas: string[];
+  try {
+    const content = fs.readFileSync(ideasPath, "utf-8");
+    // Extract bullet-point lines (- or *) that are not strikethrough
+    ideas = content
+      .split("\n")
+      .map(function (l) { return l.trim(); })
+      .filter(function (l) { return /^[\-*]\s+/.test(l) && !/~~/.test(l) && l.length > 10; })
+      .map(function (l) { return l.replace(/^[\-*]\s+/, ""); });
+  } catch {
+    return null;
+  }
+
+  // Need at least 2 untried ideas to make BestOfN worthwhile
+  if (ideas.length < 2) return null;
+
+  // Check that agent hasn't already used parallel tools recently
+  const recentLog = state.recent.slice(-5);
+  const usedParallel = recentLog.some(function (r) {
+    const desc = String((r as Record<string, unknown>).description ?? "");
+    return /BestOfN|SpaceSearch|CheckOrthogonal|valleyProbe/i.test(desc);
+  });
+  if (usedParallel) return null;
+
+  // Build a BestOfN suggestion with up to 3 ideas from ideas.md
+  const top3 = ideas.slice(0, 3);
+  const candidates = top3.map(function (idea, i) {
+    const short = idea.length > 60 ? idea.slice(0, 57) + "..." : idea;
+    return `    {hypothesis:"${short}", complexity:"${i === 0 ? "simple" : "medium"}"}`;
+  }).join(",\n");
+
+  return [
+    `⚡ PARALLEL OPPORTUNITY: You have ${ideas.length} untried ideas in .auto/ideas.md and ${state.streak} non-improving runs.`,
+    `   Stop testing sequentially — try them ALL AT ONCE with BestOfN:`,
+    `   BestOfN({ candidates: [`,
+    candidates,
+    `   ], metric_name:"${payload.metricName}", direction:"${payload.direction}" })`,
+    `   BestOfN spawns isolated worktrees, measures each, re-measures the best, returns keep/discard.`,
+  ].join("\n");
+}
+
+// ─── Trigger: Stagnation ───────────────────────────────────────────────────────
 
 function checkStagnation(
   state: ObserverState,
@@ -569,6 +625,10 @@ export function runObserver(payload: ObserverPayload): string | null {
   // Floor detection
   const floorSteer = checkFloor(state, asi, payload, cwd, oc);
   if (floorSteer) return floorSteer;
+
+  // Parallel opportunity (proactive — fires at streak 3, before stagnation)
+  const parallelSteer = checkParallelOpportunity(state, payload, cwd, oc);
+  if (parallelSteer) return parallelSteer;
 
   // Stagnation
   const stagnationSteer = checkStagnation(state, asi, payload, cwd, oc);
