@@ -13,16 +13,27 @@ Optional scripts that run at iteration boundaries in an autoresearch session. Bo
   after.sh     # fires after each log_experiment (retrospective)
 ```
 
-## Both run: global observer + project-local
+## Hook execution: bundled observer + user hooks
 
-The **global observer** (`~/.pi/agent/autoresearch/hooks/before.sh`, auto-installed by the extension) **always runs** — providing stagnation, floor, noise, and finalize triggers. A **project-local** hook (`.auto/hooks/before.sh`) runs **in addition**, not instead of.
+The **observer** is **extension code** — it ships inside the extension package at `extensions/pi-autoresearch/observer/before.sh` and always runs. It is NOT in user space and cannot be accidentally overwritten.
 
-| Scenario | What runs |
-|----------|----------|
-| No local hook | Global observer only |
-| Local hook exists | **Both**: global observer first, then local hook. Outputs concatenated with `---` separator. |
+**User hooks** live in user space and run **in addition** to the observer:
 
-This means you can add a project-local hook (e.g., Slack notification) without losing the observer's stagnation/floor/noise triggers.
+| Source | Path | Purpose |
+|--------|------|---------|
+| **Bundled observer** | `extensions/pi-autoresearch/observer/before.sh` | Stagnation, floor, noise, finalize triggers (managed by git) |
+| **Global user hook** | `~/.pi/agent/autoresearch/hooks/before.sh` | User global customization (all projects) |
+| **Global user .d/** | `~/.pi/agent/autoresearch/hooks/before.d/*.sh` | Multiple global hooks (alphabetical) |
+| **Project-local hook** | `.auto/hooks/before.sh` | Project-specific hook |
+| **Project-local .d/** | `.auto/hooks/before.d/*.sh` | Multiple project hooks (alphabetical) |
+
+**Execution order**: bundled observer → global user → global .d/ → project-local → project-local .d/
+
+All hooks run independently; outputs are concatenated with `---` separators. A failing user hook never blocks the observer.
+
+### Migration from auto-install
+
+Previous versions auto-installed the observer to `~/.pi/agent/autoresearch/hooks/before.sh`. On load, the extension detects the old managed copy (by `OBSERVER_VERSION` marker) and **deletes it**. User customizations (files without the marker) are left untouched and continue to run as global user hooks.
 
 Both files are optional. Files without the executable bit are silently ignored.
 

@@ -38,7 +38,7 @@ import {
   runHook,
   steerMessageFor,
   appendHookLogEntryIfConfigured,
-  ensureGlobalHook,
+  migrateAutoInstalledHook,
   type HookPayload,
   type SessionSnapshot,
 } from "./hooks.ts";
@@ -1214,21 +1214,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const BENCHMARK_GUARDRAIL =
     "Be careful not to overfit to the benchmarks and do not cheat on the benchmarks.";
 
-  // ── Auto-install the global observer hook ────────────────────────────
-  // The bundled hook lives at extensions/pi-autoresearch/observer/before.sh
-  // and is auto-installed to ~/.pi/agent/autoresearch/hooks/before.sh.
-  // Updates if the bundled version is newer; skips if the user customized it.
-  const __dirname = path.dirname(fileURLToPath(import.meta.url));
-  const bundledHookPath = path.join(__dirname, "observer", "before.sh");
-  ensureGlobalHook(bundledHookPath).then((r) => {
-    if (r.installed) {
-      pi.debug?.("autoresearch: installed global observer hook", {});
-    } else if (r.updated) {
-      pi.debug?.("autoresearch: updated global observer hook (backup at .bak)", {});
-    } else if (r.skipped && r.reason === "user_customized") {
-      pi.debug?.("autoresearch: global hook customized by user, skipping auto-install", {});
-    }
-  }).catch(() => { /* non-fatal: hook is optional */ });
+  // ── Migrate old auto-installed hook ─────────────────────────────────
+  // Previous versions auto-installed the observer to ~/.pi/agent/autoresearch/hooks/before.sh.
+  // Now the observer runs from the extension dir. Remove the old managed copy if present.
+  // User customizations (no OBSERVER_VERSION marker) are left untouched.
+  const migrationR = migrateAutoInstalledHook();
+  if (migrationR.removed) {
+    pi.debug?.("autoresearch: removed old auto-installed observer hook (now bundled)", {});
+  }
 
   // Outlasts pi's internal retry (setTimeout 0) and compaction-continue
   // (setTimeout 100); see badlogic/pi-mono#2023, #2110.

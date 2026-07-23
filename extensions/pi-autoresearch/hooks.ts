@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { hasAutoresearchConfigHeader } from "./jsonl.ts";
 import { hookScriptPath, globalHookPath } from "./paths.ts";
@@ -185,26 +186,58 @@ function mergeResults(global: HookResult, local: HookResult): HookResult {
   };
 }
 
+/** Collect executable *.sh files from a .d directory, sorted alphabetically. */
+function collectHookDir(dirPath: string): string[] {
+  let entries: string[] = [];
+  try {
+    entries = fs.readdirSync(dirPath)
+      .filter(f => f.endsWith(".sh"))
+      .sort();
+  } catch {
+    return [];
+  }
+  return entries
+    .map(f => path.join(dirPath, f))
+    .filter(f => isExecutableFile(f));
+}
+
 /**
- * Run hooks: global observer FIRST, then project-local hook.
- * Both hooks run independently — the observer always fires (stagnation/floor/noise
- * triggers), and the local hook adds project-specific behavior on top.
- * If both produce stdout, outputs are concatenated with a '---' separator.
+ * Run hooks in order: bundled observer → global user → project-local → project-local .d/.
+ * The observer is extension code (always runs, managed by git).
+ * User hooks add behavior on top — they never replace the observer.
  */
 export async function runHook(payload: HookPayload): Promise<HookResult> {
+  const observerScript = bundledHookPath(payload.event);
   const globalScript = globalHookPath(payload.event);
+  const globalDir = path.join(path.dirname(globalScript), `${payload.event}.d`);
   const localScript = hookScriptPath(payload.cwd, payload.event);
+  const localDir = path.join(path.dirname(localScript), `${payload.event}.d`);
 
   const tasks: Promise<HookResult>[] = [];
 
-  // Global observer hook (always runs if executable).
-  if (isExecutableFile(globalScript)) {
+  // 1. Bundled observer hook (extension code, managed by git).
+  if (isExecutableFile(observerScript)) {
+    tasks.push(runSingleScript(observerScript, payload));
+  }
+
+  // 2. Global user hook (~/.pi/agent/autoresearch/hooks/before.sh) — only if NOT a managed leftover.
+  if (isExecutableFile(globalScript) && !isManagedHook(globalScript)) {
     tasks.push(runSingleScript(globalScript, payload));
   }
 
-  // Project-local hook (runs IN ADDITION to global, not instead of).
+  // 3. Global user hooks dir (~/.pi/agent/autoresearch/hooks/before.d/*.sh).
+  for (const script of collectHookDir(globalDir)) {
+    tasks.push(runSingleScript(script, payload));
+  }
+
+  // 4. Project-local hook (.auto/hooks/before.sh).
   if (localScript !== globalScript && isExecutableFile(localScript)) {
     tasks.push(runSingleScript(localScript, payload));
+  }
+
+  // 5. Project-local hooks dir (.auto/hooks/before.d/*.sh).
+  for (script of collectHookDir(localDir)) {
+    tasks.push(runSingleScript(script, payload));
   }
 
   if (tasks.length === 0) return notFired;
@@ -262,78 +295,41 @@ export function appendHookLogEntryIfConfigured(
   }
 }
 
-// ─── Auto-install global observer hook ──────────────────────────────────────
+// ─── Bundled observer hook path ─────────────────────────────────────────────
+// The observer ships inside the extension package (not in user space).
+const EXTENSION_DIR = path.dirname(fileURLToPath(import.meta.url));
+
+/** Path to the bundled observer hook inside the extension directory. */
+export function bundledHookPath(stage: HookStage): string {
+  return path.join(EXTENSION_DIR, "observer", `${stage}.sh`);
+}
 
 const OBSERVER_VERSION_RE = /^#\s*OBSERVER_VERSION=(\d+)/m;
 
-/** Extract the OBSERVER_VERSION=N marker from a hook script. Returns null if not found (user customization). */
-function extractObserverVersion(content: string): number | null {
-  const m = content.match(OBSERVER_VERSION_RE);
-  return m ? parseInt(m[1], 10) : null;
+/** Returns true if a file contains the OBSERVER_VERSION marker (our managed hook). */
+function isManagedHook(filePath: string): boolean {
+  try {
+    return OBSERVER_VERSION_RE.test(fs.readFileSync(filePath, "utf-8"));
+  } catch {
+    return false;
+  }
 }
 
-/** Ensure the global observer hook is installed and up-to-date.
- *
- *  - If the global hook doesn't exist → install it.
- *  - If it exists and has a version marker → update if the bundled version is newer.
- *  - If it exists but has no version marker → skip (user has customized it).
- *
- *  Returns a summary of what happened.
+/**
+ * One-time migration: remove the old auto-installed hook from user space.
+ * Previous versions auto-installed the observer to ~/.pi/agent/autoresearch/hooks/before.sh.
+ * Now the observer runs from the extension dir. If the old file still has our
+ * OBSERVER_VERSION marker, it's a leftover — delete it so it doesn't run twice.
+ * If it has no marker (user customized it), leave it — it runs as a user hook.
  */
-export async function ensureGlobalHook(bundledHookPath: string): Promise<{
-  installed: boolean;
-  updated: boolean;
-  skipped: boolean;
-  reason?: string;
-}> {
-  const destPath = globalHookPath("before");
-
-  // Read bundled hook
-  let sourceContent: string;
+export function migrateAutoInstalledHook(): { removed: boolean; reason?: string } {
+  const globalPath = globalHookPath("before");
+  if (!fs.existsSync(globalPath)) return { removed: false, reason: "not_found" };
+  if (!isManagedHook(globalPath)) return { removed: false, reason: "user_customized" };
   try {
-    sourceContent = await fs.promises.readFile(bundledHookPath, "utf-8");
-  } catch {
-    return { installed: false, updated: false, skipped: true, reason: "bundled_hook_not_found" };
+    fs.unlinkSync(globalPath);
+    return { removed: true };
+  } catch (e) {
+    return { removed: false, reason: "delete_failed" };
   }
-  const sourceVersion = extractObserverVersion(sourceContent);
-  if (sourceVersion === null) {
-    return { installed: false, updated: false, skipped: true, reason: "bundled_hook_no_version" };
-  }
-
-  // Ensure dest directory exists
-  await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
-
-  // Check existing hook
-  let destContent: string | null = null;
-  try {
-    destContent = await fs.promises.readFile(destPath, "utf-8");
-  } catch {
-    // File doesn't exist — install fresh
-  }
-
-  if (destContent === null) {
-    // Fresh install
-    await fs.promises.writeFile(destPath, sourceContent, "utf-8");
-    await fs.promises.chmod(destPath, 0o755);
-    return { installed: true, updated: false, skipped: false };
-  }
-
-  const destVersion = extractObserverVersion(destContent);
-
-  // If dest has no version marker → user customization, skip
-  if (destVersion === null) {
-    return { installed: false, updated: false, skipped: true, reason: "user_customized" };
-  }
-
-  // Update if bundled version is newer
-  if (sourceVersion > destVersion) {
-    // Backup old version
-    const backupPath = destPath + ".bak";
-    try { await fs.promises.copyFile(destPath, backupPath); } catch { /* ignore */ }
-    await fs.promises.writeFile(destPath, sourceContent, "utf-8");
-    await fs.promises.chmod(destPath, 0o755);
-    return { installed: false, updated: true, skipped: false };
-  }
-
-  return { installed: false, updated: false, skipped: true, reason: "up_to_date" };
 }
