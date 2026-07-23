@@ -67,7 +67,7 @@ const L = {
   models: RU ? "🔧 Модели (индивидуально)..." : "🔧 Models (individual)...",
   concurrency: RU ? "⚡ Конкурентность..." : "⚡ Concurrency...",
   budget: RU ? "⏱️  Бюджет..." : "⏱️  Budget...",
-  observer: RU ? "📊 Настройки обсервера..." : "📊 Observer settings...",
+  observer: RU ? "📊 Настройки наблюдателя..." : "📊 Observer settings...",
   done: RU ? "✅ Готово" : "✅ Done",
   back: RU ? "↩️ Назад" : "↩️ Back",
   reset: RU ? "♻️ Сбросить к дефолтам" : "♻️ Reset to defaults",
@@ -75,7 +75,7 @@ const L = {
   // Headers
   configTitle: RU ? "Конфигурация параллельного режима" : "Parallel Configuration",
   currentLabel: RU ? "Текущие:" : "Current:",
-  observerTitle: RU ? "Настройки обсервера — что настроить?" : "Observer Settings — what to configure?",
+  observerTitle: RU ? "Настройки наблюдателя — что настроить?" : "Observer Settings — what to configure?",
   choosePreset: RU ? "Выберите пресет" : "Choose a preset",
   whichTier: RU ? "Какой тир изменить?" : "Which tier to change?",
   modelFor: RU ? "Модель для тира" : "Model for",
@@ -101,9 +101,9 @@ const L = {
   budgetInvalid: RU ? "Неверный бюджет (30-600 секунд)" : "Invalid budget (30-600 seconds)",
 
   // Observer
-  observerReset: RU ? "Сбросить пороги обсервера к дефолтам?" : "Reset all observer thresholds to defaults?",
-  observerResetTitle: RU ? "Сброс обсервера" : "Reset observer",
-  observerResetDone: RU ? "Настройки обсервера сброшены" : "Observer settings reset to defaults",
+  observerReset: RU ? "Сбросить пороги наблюдателя к дефолтам?" : "Reset all observer thresholds to defaults?",
+  observerResetTitle: RU ? "Сброс наблюдателя" : "Reset observer",
+  observerResetDone: RU ? "Настройки наблюдателя сброшены" : "Observer settings reset to defaults",
   observerRange: RU ? "Диапазон" : "Range",
   observerDefault: RU ? "Дефолт" : "Default",
   observerEnter: RU ? "Введите новое значение:" : "Enter new value:",
