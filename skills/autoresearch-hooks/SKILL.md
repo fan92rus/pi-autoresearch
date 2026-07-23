@@ -171,3 +171,38 @@ Each example is a complete, self-contained script with named constants, short he
 - **One concern per script.** If you want research + learnings, put them in separate files (`before.sh` and `after.sh`). Don't bundle.
 
 - **No environment variables.** Everything is on stdin; extract `cwd` (and anything else) with `jq`. There is no `$AUTORESEARCH_WORK_DIR`.
+
+---
+
+## Global observer hook (v3)
+
+A global `before.sh` observer ships with the extension at `~/.pi/agent/autoresearch/hooks/before.sh`. It provides four adaptive triggers (priority order):
+
+| Trigger | Condition | Behavior |
+|---------|-----------|----------|
+| 🔊 **Noise Gate** (T6) | System noise > best + 10% | Warns that the experiment will likely discard. Set `"noise_gate": "hard"` in `.auto/config.json` to skip. |
+| 🔬 **Floor Detection** (T1) | Streak ≥ 15 + low variance (CV < 0.15) | Recommends finalize — the metric has plateaued. Override: `"auto_floor_override": true` in config. |
+| 🏁 **Finalize Signal** (T4) | Agent called `finalize_research()` with confidence > 0.5 | Echoes the agent's finalize reason and recommends `/autoresearch off`. |
+| 🔄 **Stagnation** | Streak ≥ 5 (modulo 5) | Progressive escalation L1→L4 with pattern detection. |
+| 🎯 **Progress** | Every 5 improvements | Trend analysis (linear/diminishing/erratic). |
+
+### ASI-aware steers (T2)
+
+The observer parses `asi` fields from the last 5 log entries and adapts messages:
+- If ASI contains "floor/impossible/provably" → recommends finalize instead of "change direction"
+- If ASI contains "profile/breakdown" → skips "profile the code" advice
+- If `ideas.md` contains "PROVEN COMPLETE/FLOOR REACHED" → treated as floor evidence
+
+### Agent-driven finalize (T4)
+
+The `finalize_research` tool lets the agent signal that optimization is complete:
+
+```javascript
+finalize_research({
+  reason: "Process-creation floor reached: content is 0% of 42ms",
+  evidence: "T = bash_startup(32.5ms) + cmd_overhead(9.5ms) + content(0ms)",
+  confidence: 0.95
+})
+```
+
+This writes a `{type: "finalize"}` entry to `log.jsonl` and sends a steer. The observer detects it on the next iteration and recommends `/autoresearch off`.
