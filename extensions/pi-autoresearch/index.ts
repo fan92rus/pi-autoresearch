@@ -3310,7 +3310,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     name: "BestOfN",
     label: "Best-of-N parallel hypotheses",
     description:
-      "Проверяет N гипотез параллельно: каждвый worker реализует гипотезу в изолированном worktree и измеряет (BENCH_MODE=quick). Инструмент ранжирует, переизмеряет победителя на main (BENCH_MODE=full, против selection-bias) и возвращает keep/discard. Parent — единственный писатель git/лога. Требует включённого autoresearch-режима и установленного pi-subagents.",
+      "Проверяет N гипотез параллельно: каждый worker реализует гипотезу в изолированном worktree и измеряет (BENCH_MODE=quick). Инструмент ранжирует по медиане, cascade-re-measure топ-кандидатов в их worktree'ах (BENCH_MODE=full, против selection-bias) и возвращает keep/discard. Parent — единственный писатель git/лога. Требует включённого autoresearch-режима и установленного pi-subagents.",
     promptSnippet: "Run N hypothesis candidates in parallel and pick the best (re-measured)",
     parameters: BestOfNParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {

@@ -1,32 +1,37 @@
 ---
 name: autoresearch-parallel
-description: Run pi-autoresearch in parallel modes — best-of-N hypothesis testing, orthogonal patch stacking, and beam space-search via worker subagents fanned out over the shared event bus. Use when the optimization has multiple candidate hypotheses to try at once, or when a single sequential loop is too slow / gets stuck in local optima.
+description: Run pi-autoresearch in parallel modes — best-of-N hypothesis testing, orthogonal patch stacking, beam space-search, valley probes, and multi-step phases via worker subagents fanned out over the shared event bus. Use when the optimization has multiple candidate hypotheses to try at once, or when a single sequential loop is too slow / gets stuck in local optima.
 ---
 
 # Autoresearch — Parallel Modes
 
-Three parallel modes that fan out worker subagents in isolated git worktrees, then aggregate and re-measure the winner. The parent agent is the **sole** git mutator and log writer; workers only edit code in their worktree and write a result file.
+Five complementary modes that fan out worker subagents in isolated git worktrees, then aggregate and re-measure the winner. The parent agent is the **sole** git mutator and log writer; workers only edit code in their worktree and write a result file.
 
 ## When to use which
 
-| Mode | Command | When |
-|------|---------|------|
-| **A: Best-of-N** | `/autoresearch parallel-best-of-n <N> <goal>` | You have N distinct hypothesis texts; try them all at once, keep the best (re-measured to remove selection bias). MVP. |
-| **B: Orthogonal stack** | `/autoresearch parallel-stack <subsystems...>` | Independent file-scoped optimizations (Dockerfile + Makefile + webpack) that combine. Phase 6. |
-| **C: Space search** | `/autoresearch parallel-search <goal>` | Multimodal landscape; maintain K diverse states (beam) so the search doesn't get stuck in a local optimum. Phase 7. |
+| Mode | Tool | When |
+|------|------|------|
+| **A: Best-of-N** | `BestOfN({ candidates, ... })` | N distinct hypothesis texts; try all at once, keep the best. MVP. |
+| **B: Orthogonal stack** | `CheckOrthogonal({ patches })` | Independent file-scoped optimizations (Dockerfile + Makefile + webpack) that combine. |
+| **C: Space search** | `SpaceSearch({ action, ... })` | Multimodal landscape; maintain K diverse states (beam) so the search doesn't get stuck. |
+| **D: Phases** | `startPhase` / `commitPhase` / `abortPhase` | Multi-step optimization where you must get *worse* before getting better (refactor, algorithm swap). |
+| **E: Valley probe** | `valleyProbe({ strategies })` | Phase stuck in a valley — spawn parallel continuations from the best checkpoint. |
 
-## Tools
+## Shared cascade re-measure (selection-bias correction)
 
-- **`BestOfN({ candidates, metric_name, direction, ... })`** — fan out N workers (each realizes one hypothesis in its worktree, measures with `BENCH_MODE=quick`), rank by median, **re-measure the winner on main with `BENCH_MODE=full`** (selection-bias correction), return `keep`/`discard`.
-- **`CheckOrthogonal({ patches })`** — (Phase 6) verify file-scope orthogonality, stack with per-patch re-measure.
-- **`SpaceSearch({ action, beam_width })`** — (Phase 7) stateful beam: `init` → `step` (×K states × M candidates) → `finish`.
+All three exploration modes (Best-of-N, SpaceSearch finish, valleyProbe) share the **same** re-measurement engine (`cascadeReMeasure` in `remeasure.ts`). After workers produce quick-mode results:
 
-After `BestOfN` returns, call `log_experiment` with the returned `finalMetric` and the decision (`keep`/`discard`).
+1. **Rank** candidates best-first by median quick metric.
+2. **Skip** any candidate whose quick metric is **not better than baseline** — don't waste a full run on an obvious loser.
+3. **Cascade**: re-measure #1 in its worktree (`BENCH_MODE=full`). If it confirms (beats baseline beyond noise floor) → winner. If not, try #2, #3, ...
+4. **Apply**: only after a candidate confirms in its worktree, apply its changes to main (diff for Best-of-N/valley; cherry-pick for SpaceSearch).
 
-## The Best-of-N flow (Mode A)
+**Key invariant**: the main working directory is **never touched during measurement**. The winner's diff/commits are applied only after confirmation. No apply→measure→revert on main.
 
-1. **Formulate N hypotheses as TEXT.** You (the agent) understand the code — write each hypothesis as a concrete instruction the worker will implement, and **tag complexity** (`simple`/`medium`/`hard`) so the right model tier and budget are used.
-2. **Ensure `measure.sh` supports `BENCH_MODE`.** Workers run `BENCH_MODE=quick` (a fast subset); the parent re-measures the winner in `BENCH_MODE=full`. If `measure.sh` has no `BENCH_MODE` case, it runs as `full` and may blow the budget (pre-flight will refuse to start). Add:
+## Best-of-N (Mode A)
+
+1. **Formulate N hypotheses as TEXT.** Write each as a concrete instruction the worker will implement. Tag `complexity` (`simple`/`medium`/`hard`) so the right model tier and budget are used.
+2. **Ensure `measure.sh` supports `BENCH_MODE`.** Workers run `BENCH_MODE=quick` (fast subset); cascade re-measures in `BENCH_MODE=full`. Add:
    ```bash
    MODE="${BENCH_MODE:-full}"
    case "$MODE" in
@@ -36,22 +41,74 @@ After `BestOfN` returns, call `log_experiment` with the returned `finalMetric` a
    esac
    echo "METRIC <name>=<value>"
    ```
-3. **Call `BestOfN`** with the candidates. The tool:
-   - runs a pre-flight baseline (`BENCH_MODE=quick`) — aborts with a steer if the baseline already exceeds `budget_seconds`;
-   - provisions N worktrees at the baseline commit;
-   - spawns N workers via the pi-subagents RPC (cheap tier first; **cascade**-escalates failures to a stronger tier);
-   - ranks by median, filters noise (MAD noise floor);
-   - re-measures the winner on main (`full`) — only the confirmed metric is kept.
-4. **`log_experiment(decision, finalMetric, description)`** — `keep` auto-commits the applied winner diff; `discard` auto-reverts.
+3. **Call `BestOfN`** — the tool:
+   - Pre-flight baseline (`quick`) — aborts with a steer if baseline exceeds `budget_seconds`.
+   - Provisions N worktrees at the baseline commit.
+   - Spawns N workers (cheap tier first; **cascade**-escalates failures to stronger tier).
+   - Ranks by median, filters noise (MAD noise floor).
+   - **Cascade re-measures** ranked candidates in their worktrees (`full`) — first confirmation wins.
+   - Applies winner's diff to main only after confirmation.
+4. **`log_experiment(decision, finalMetric)`** — `keep` auto-commits; `discard` auto-reverts.
+
+## Phases (Mode D)
+
+A greedy `edit → measure → keep/revert` loop kills any optimization that must get *worse* before it gets better (architectural refactor, algorithm swap, instrumentation, precomputation). Phases solve this:
+
+- **`startPhase({ name, rationale, max_steps, max_regression_pct, hard_floor_pct })`** — start a transaction. Inside a phase, auto-revert is OFF; only the **final** metric is validated at `commitPhase`.
+- **`commitPhase({ final_metric, description })`** — measure the final metric. If better than baseline → `git commit` the whole chain. If worse → revert to phaseBase (or best-checkpoint).
+- **`abortPhase({ reason })`** — revert to phaseBase/best-checkpoint immediately, no validation.
+
+**Safety guardrails:**
+- **Hard floor** (default 40%): auto-abort if a step regresses more than `hard_floor_pct` from baseline.
+- **maxSteps** (default 5): auto-abort if too many steps without improvement.
+- **best-checkpoint**: each improving step snapshots HEAD; `abortPhase` reverts to the best checkpoint, not necessarily phaseBase.
+- **checks.sh** still runs (if present) — invariant violations are caught.
+
+## Space search (Mode C)
+
+Beam search across the optimization landscape. Maintains K diverse states so the search doesn't get stuck in a local optimum.
+
+**Flow: `init` → `step` (×N) → `finish`**
+
+1. **`SpaceSearch({ action: "init", beam_width, candidates_per_state, diversity_hints })`** — provisions baseline worktree, measures baseline. `beam_width` states × `candidates_per_state` candidates per step.
+2. **`SpaceSearch({ action: "step", diversity_hints })`** — for each surviving state, spawn `candidates_per_state` workers (each gets a hint from `diversity_hints`). Prune to top-K by metric, with **regression-lookahead**: a state is dropped only after `allowed_regression_steps` consecutive regressions.
+3. **`SpaceSearch({ action: "finish" })`** — cascade re-measure best states in worktrees (`full`), cherry-pick confirmed winner's commit chain onto main.
+4. **`SpaceSearch({ action: "status" })`** — inspect beam state without stepping.
+
+**Key params:**
+- `diversity_hints` — text labels cycled across candidates (e.g., `["brute", "hash", "sorted"]`), ensuring different approaches are explored.
+- `allowed_regression_steps` (default 2) — how many consecutive regressions before pruning a state. Lets the beam temporarily worsen to escape valleys.
+
+## Valley probe (Mode E)
+
+When a phase is stuck (reached `maxSteps` without improvement), spawn parallel continuations from the best checkpoint with different strategies. Reuses the Best-of-N machinery.
+
+**`valleyProbe({ strategies, baseline_metric, metric_name, direction })`**:
+- Provisions worktrees from the best checkpoint commit.
+- Each worker gets a different continuation strategy from `strategies[]`.
+- Cascade re-measures ranked candidates in worktrees.
+- Returns the confirmed winner as a diff (for `applyDiff` + re-measure on main) or reports no escape.
+
+Use when a phase went deep into a valley and you need diverse strategies to find the way out.
+
+## Orthogonal stack (Mode B)
+
+Stack independent file-scoped optimizations that combine additively (e.g., Dockerfile + Makefile + webpack config).
+
+**`CheckOrthogonal({ patches })`**:
+- Each patch has `name`, `hypothesis`, and `file_scope` (list of files it touches).
+- **File-scope intersection check**: if two patches touch the same file, the tool refuses — merge them or drop one.
+- Stacks patches one by one: apply → re-measure → keep/discard → next.
+- Each patch is independently validated, so a failure in one doesn't block others.
 
 ## Model strategy (cheap by default)
 
-Parallel exploration is **cheap by default**: workers use the `fast` tier (a flash model), not the expensive parent model. Final re-measurement is free (it's just `measure.sh`, no LLM).
+Parallel exploration is **cheap by default**: workers use the `fast` tier (a flash model), not the expensive parent model. Final cascade re-measurement is free (just `measure.sh`, no LLM).
 
-- **Complexity tagging** drives tier + budget + repeats: `simple`→fast:low/1 repeat, `medium`→mid/3, `hard`→strong/3. Tag when you formulate — it's nearly free and you're the best judge.
-- **Cascade** is ON by default: a candidate that fails (`apply_failed`/`crash`/`worker_timeout`) on the cheap tier is retried on a stronger tier. `budget_exceeded` is **not** escalated (it's a measure.sh problem — fix the script).
+- **Complexity tagging** drives tier + budget + repeats: `simple`→fast:low/1 repeat, `medium`→mid/3, `hard`→strong/3.
+- **Cascade** is ON by default: a candidate that fails on the cheap tier is retried on a stronger tier. `budget_exceeded` is **not** escalated (fix `measure.sh` instead).
 
-Override per-call: `model: "provider/model:thinking"`, or globally in `.auto/config.json`:
+Override globally in `.auto/config.json`:
 ```json
 "parallel": {
   "tiers": { "fast": "...:low", "mid": "...:xhigh", "strong": "...:high" },
@@ -64,23 +121,16 @@ Override per-call: `model: "provider/model:thinking"`, or globally in `.auto/con
 
 | Layer | Param | Default | Exceeding it → |
 |-------|-------|---------|----------------|
-| measure | `budget_seconds` | 300s | one `measure.sh` run killed, `budget_exceeded` status + steer to speed up the script |
-| worker | (per-complexity `workerTimeoutMs`) | 5–15min | interrupt RPC, `worker_timeout` |
-| round | (implicit) | — | whole BestOfN bounded by slowest worker |
+| measure | `budget_seconds` | 300s | one `measure.sh` run killed, `budget_exceeded` + steer to speed up |
+| worker | per-complexity `workerTimeoutMs` | 5–15min | interrupt RPC, `worker_timeout` |
+| round | (implicit) | — | bounded by slowest worker |
 
 **Pre-flight guard:** if the baseline measurement itself exceeds `budget_seconds`, the round does NOT start — fix `measure.sh` first (add `BENCH_MODE=quick`).
-
-## Phases & valley exploration (multi-step optimizations)
-
-A greedy `edit → measure → keep/revert` loop kills any optimization that must get *worse* before it gets better (architectural refactor, algorithm swap, instrumentation). For those:
-
-- **Phases** (`startPhase`/`commitPhase`/`abortPhase`) — a transaction: inside a phase, auto-revert is off; only the **final** metric is validated. Hard floor (40%) auto-aborts if a step dives too deep. *(Phase 5.)*
-- **Valley probes** — when a phase is stuck, spawn parallel worktrees from the best checkpoint with different continuation strategies (reuses the BestOfN machinery). *(Phase 8.)*
-- **checks.sh guardrail** — validate invariants (memory, tests) so a speed win that blows memory is caught, not silently kept.
 
 ## Critical rules
 
 - **Workers never call `log_experiment`** — only the parent writes the canonical log and mutates main.
-- **Workers never call `BestOfN`/`subagent`** — anti-recursion (enforced in the worker allowlist).
-- **Selection-bias correction is mandatory** — the winner is re-measured in `full` on main before `keep`; never trust the single `quick` measurement.
+- **Workers never call `BestOfN`/`SpaceSearch`/`subagent`** — anti-recursion (enforced in the worker allowlist).
+- **Selection-bias correction is mandatory** — the winner is cascade re-measured in `full` in its worktree before `keep`; never trust the single `quick` measurement.
+- **Main workdir is never touched during measurement** — only after cascade confirmation.
 - **`budget_exceeded` is a steer, not a failure to escalate** — fix `measure.sh`, don't throw a stronger model at a slow script.
