@@ -22,7 +22,7 @@ import type { RpcClient, SpawnedWorker } from "./rpc.ts";
 import type { ExecFn } from "./worktree.ts";
 import { provisionWorktree, cleanupWorktree, cleanupAllWorktrees, currentHead, resolveRepoRoot, type WorktreeHandle } from "./worktree.ts";
 import { median, computeNoiseFloor, rankCandidates, isBetter } from "./aggregate.ts";
-import { runMeasure, reMeasureWinner, parseMetricLines } from "./remeasure.ts";
+import { runMeasure, applyDiff, parseMetricLines } from "./remeasure.ts";
 import { sampleCpuLoad, calibrateConcurrency } from "./cpu.ts";
 import type { ParallelConfig } from "./config.ts";
 import { resolveTier, defaultConcurrency } from "./config.ts";
@@ -272,11 +272,10 @@ export async function runBestOfN(ctx: OrchestratorContext, opts: BestOfNOptions)
       return { baselineMetric, winnerIndex: null, ranked, finalMetric: null, decision: "discard", reason };
     }
 
-    // 5. selection-bias correction: cascade re-measure in ranked order.
-    //    Re-measure candidates best-first on main (BENCH_MODE=full); the FIRST that
-    //    confirms a genuine improvement (above noise floor) wins. If #1 fails, try
-    //    #2, #3, ... — do NOT discard the whole round just because the quick-winner
-    //    was a noisy outlier. Each failed candidate is reverted before the next.
+    // 5. selection-bias correction: cascade re-measure in worktrees (full mode).
+    //    Re-measure candidates best-first IN THEIR WORKTREES; the FIRST that
+    //    confirms a genuine improvement (above noise floor) wins. Main workdir
+    //    is never touched during measurement. If #1 fails, try #2, #3...
     const remeasure: Array<{ index: number; decision: "keep" | "discard" | "skip"; finalMetric: number | null; reason?: string }> = [];
     let confirmedIndex: number | null = null;
     let confirmedMetric: number | null = null;
@@ -287,15 +286,44 @@ export async function runBestOfN(ctx: OrchestratorContext, opts: BestOfNOptions)
         remeasure.push({ index: candidate.index, decision: "skip", finalMetric: null, reason: "no_valid_diff" });
         continue;
       }
-      const rem = await reMeasureWinner(exec, workDir, opts.metricName, opts.direction, baselineMetric, noiseFloor, result.diff, budgetSeconds, runCmd);
-      remeasure.push({ index: candidate.index, decision: rem.decision, finalMetric: rem.finalMetric, reason: rem.reason });
-      if (rem.decision === "keep") {
+      // Skip candidates whose quick metric is not better than baseline.
+      if (candidate.medianMetric !== null && !isBetter(candidate.medianMetric, baselineMetric, opts.direction)) {
+        remeasure.push({ index: candidate.index, decision: "skip", finalMetric: null, reason: "not_better_than_baseline" });
+        continue;
+      }
+      const wt = wts[candidate.index];
+      if (!wt) {
+        remeasure.push({ index: candidate.index, decision: "skip", finalMetric: null, reason: "worktree_gone" });
+        continue;
+      }
+      // Re-measure in the worktree (full mode) — main workdir stays clean.
+      const m = await runMeasure(exec, wt.path, opts.metricName, "full", budgetSeconds, runCmd);
+      if (m.metric === null || m.timedOut) {
+        remeasure.push({ index: candidate.index, decision: "discard", finalMetric: null, reason: "measure_failed" });
+        continue;
+      }
+      const better = opts.direction === "lower" ? m.metric < baselineMetric : m.metric > baselineMetric;
+      const beyondNoise = Math.abs(m.metric - baselineMetric) > noiseFloor;
+      if (better && beyondNoise) {
         confirmedIndex = candidate.index;
-        confirmedMetric = rem.finalMetric;
+        confirmedMetric = m.metric;
         confirmedSummary = truncateDiffSummary(result.diff);
+        remeasure.push({ index: candidate.index, decision: "keep", finalMetric: m.metric });
         break; // first survivor wins — stop testing further candidates
       }
-      // candidate failed re-measure → already reverted by reMeasureWinner; try next
+      remeasure.push({ index: candidate.index, decision: "discard", finalMetric: m.metric, reason: beyondNoise ? "regression" : "within_noise" });
+    }
+
+    // If a winner was confirmed in a worktree, apply its diff to main now.
+    if (confirmedIndex !== null) {
+      const winnerResult = finalResults[confirmedIndex]!;
+      try {
+        await applyDiff(exec, workDir, winnerResult.diff);
+      } catch {
+        // apply failed — winner stays in worktree only
+        confirmedIndex = null;
+        confirmedMetric = null;
+      }
     }
 
     return {
