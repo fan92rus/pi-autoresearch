@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as path from "node:path";
 
 import { hasAutoresearchConfigHeader } from "./jsonl.ts";
 import { hookScriptPath, globalHookPath } from "./paths.ts";
@@ -217,4 +218,80 @@ export function appendHookLogEntryIfConfigured(
   } catch {
     return false;
   }
+}
+
+// ─── Auto-install global observer hook ──────────────────────────────────────
+
+const OBSERVER_VERSION_RE = /^#\s*OBSERVER_VERSION=(\d+)/m;
+
+/** Extract the OBSERVER_VERSION=N marker from a hook script. Returns null if not found (user customization). */
+function extractObserverVersion(content: string): number | null {
+  const m = content.match(OBSERVER_VERSION_RE);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+/** Ensure the global observer hook is installed and up-to-date.
+ *
+ *  - If the global hook doesn't exist → install it.
+ *  - If it exists and has a version marker → update if the bundled version is newer.
+ *  - If it exists but has no version marker → skip (user has customized it).
+ *
+ *  Returns a summary of what happened.
+ */
+export async function ensureGlobalHook(bundledHookPath: string): Promise<{
+  installed: boolean;
+  updated: boolean;
+  skipped: boolean;
+  reason?: string;
+}> {
+  const destPath = globalHookPath("before");
+
+  // Read bundled hook
+  let sourceContent: string;
+  try {
+    sourceContent = await fs.promises.readFile(bundledHookPath, "utf-8");
+  } catch {
+    return { installed: false, updated: false, skipped: true, reason: "bundled_hook_not_found" };
+  }
+  const sourceVersion = extractObserverVersion(sourceContent);
+  if (sourceVersion === null) {
+    return { installed: false, updated: false, skipped: true, reason: "bundled_hook_no_version" };
+  }
+
+  // Ensure dest directory exists
+  await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+
+  // Check existing hook
+  let destContent: string | null = null;
+  try {
+    destContent = await fs.promises.readFile(destPath, "utf-8");
+  } catch {
+    // File doesn't exist — install fresh
+  }
+
+  if (destContent === null) {
+    // Fresh install
+    await fs.promises.writeFile(destPath, sourceContent, "utf-8");
+    await fs.promises.chmod(destPath, 0o755);
+    return { installed: true, updated: false, skipped: false };
+  }
+
+  const destVersion = extractObserverVersion(destContent);
+
+  // If dest has no version marker → user customization, skip
+  if (destVersion === null) {
+    return { installed: false, updated: false, skipped: true, reason: "user_customized" };
+  }
+
+  // Update if bundled version is newer
+  if (sourceVersion > destVersion) {
+    // Backup old version
+    const backupPath = destPath + ".bak";
+    try { await fs.promises.copyFile(destPath, backupPath); } catch { /* ignore */ }
+    await fs.promises.writeFile(destPath, sourceContent, "utf-8");
+    await fs.promises.chmod(destPath, 0o755);
+    return { installed: false, updated: true, skipped: false };
+  }
+
+  return { installed: false, updated: false, skipped: true, reason: "up_to_date" };
 }

@@ -176,7 +176,17 @@ Each example is a complete, self-contained script with named constants, short he
 
 ## Global observer hook (v3)
 
-A global `before.sh` observer ships with the extension at `~/.pi/agent/autoresearch/hooks/before.sh`. It provides four adaptive triggers (priority order):
+A global `before.sh` observer **ships with the extension** and is **auto-installed** to `~/.pi/agent/autoresearch/hooks/before.sh` when the extension loads.
+
+**Auto-install behavior:**
+
+| Situation | Action |
+|-----------|--------|
+| Global hook doesn't exist | Install bundled hook (chmod +x) |
+| Global hook exists, has `OBSERVER_VERSION=N` | Update if bundled version is newer (backup at `.bak`) |
+| Global hook exists, no version marker | **Skip** — user has customized it |
+
+The bundled source lives at `extensions/pi-autoresearch/observer/before.sh` in the pi-autoresearch repo. To customize: edit the global hook (remove the `# OBSERVER_VERSION` line to prevent auto-updates), or create a project-local `.auto/hooks/before.sh` which takes precedence.
 
 | Trigger | Condition | Behavior |
 |---------|-----------|----------|
