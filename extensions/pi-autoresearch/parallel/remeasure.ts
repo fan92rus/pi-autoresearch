@@ -1,16 +1,100 @@
 /**
- * Re-measurement on the main worktree: apply a diff, run measure.sh, parse the
- * METRIC line, optionally revert. Used for selection-bias correction (the winner
- * is re-measured in BENCH_MODE=full on main before being kept).
+ * Re-measurement utilities: cascade re-measure in worktrees, apply/revert diffs.
  *
- * Kept separate from the worker path so the parent never needs autoresearchMode
- * or the gated run_experiment tool — it just runs measure.sh via exec and parses.
+ * Shared by BestOfN, valleyProbe, and SpaceSearch finishBeam.
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExecFn } from "./worktree.ts";
 import type { BenchMode, Direction } from "./types.ts";
+import { isBetter } from "./aggregate.ts";
+
+type RunCmdFn = (cmd: string, args: string[], opts: unknown) => Promise<{ stdout: string; stderr: string; code: number; killed?: boolean }>;
+
+// ─── Cascade re-measure (shared by BestOfN, valleyProbe, SpaceSearch) ────────
+
+export type ReMeasureKey = string | number;
+
+export interface ReMeasureCandidate {
+  /** Unique key for logging (candidate index, commit SHA, etc.). */
+  key: ReMeasureKey;
+  /** Quick metric from the worker (null if not measured). */
+  quickMetric: number | null;
+  /** Worker status ("ok", "crash", etc.). */
+  status: string;
+  /** Path to the worktree where this candidate's changes live. */
+  worktreePath: string;
+  /** Diff (empty if not applicable — SpaceSearch uses cherry-pick). */
+  diff: string;
+}
+
+export interface ReMeasureAttempt {
+  key: ReMeasureKey;
+  decision: "keep" | "discard" | "skip";
+  finalMetric: number | null;
+  reason?: string;
+}
+
+export interface CascadeResult {
+  confirmedKey: ReMeasureKey | null;
+  confirmedMetric: number | null;
+  attempts: ReMeasureAttempt[];
+}
+
+/**
+ * Cascade re-measure candidates IN THEIR WORKTREES (full mode).
+ * Best-first: first candidate that beats baseline beyond noise → confirmed.
+ * If #1 fails, try #2, #3... Main workdir is never touched.
+ *
+ * Shared by BestOfN, valleyProbe, and SpaceSearch finishBeam.
+ */
+export async function cascadeReMeasure(
+  exec: ExecFn,
+  runCmd: RunCmdFn,
+  opts: {
+    candidates: ReMeasureCandidate[]; // must be in ranked order (best first)
+    metricName: string;
+    direction: Direction;
+    baselineMetric: number;
+    noiseFloor: number;
+    budgetSeconds: number;
+    /** If true, skip candidates with empty diff (BestOfN/valley need diffs). */
+    requireDiff?: boolean;
+  },
+): Promise<CascadeResult> {
+  const attempts: ReMeasureAttempt[] = [];
+  for (const c of opts.candidates) {
+    if (c.status !== "ok") {
+      attempts.push({ key: c.key, decision: "skip", finalMetric: null, reason: `status=${c.status}` });
+      continue;
+    }
+    if (opts.requireDiff && !c.diff.trim()) {
+      attempts.push({ key: c.key, decision: "skip", finalMetric: null, reason: "no_valid_diff" });
+      continue;
+    }
+    // Skip candidates whose quick metric is not better than baseline.
+    if (c.quickMetric !== null && !isBetter(c.quickMetric, opts.baselineMetric, opts.direction)) {
+      attempts.push({ key: c.key, decision: "skip", finalMetric: null, reason: "not_better_than_baseline" });
+      continue;
+    }
+    const m = await runMeasure(exec, c.worktreePath, opts.metricName, "full", opts.budgetSeconds, runCmd);
+    if (m.metric === null || m.timedOut) {
+      attempts.push({ key: c.key, decision: "discard", finalMetric: null, reason: m.timedOut ? "timeout" : "no_metric" });
+      continue;
+    }
+    const better = opts.direction === "lower" ? m.metric < opts.baselineMetric : m.metric > opts.baselineMetric;
+    const beyondNoise = Math.abs(m.metric - opts.baselineMetric) > opts.noiseFloor;
+    if (better && beyondNoise) {
+      attempts.push({ key: c.key, decision: "keep", finalMetric: m.metric });
+      return { confirmedKey: c.key, confirmedMetric: m.metric, attempts };
+    }
+    attempts.push({ key: c.key, decision: "discard", finalMetric: m.metric, reason: beyondNoise ? "regression" : "within_noise" });
+  }
+  return { confirmedKey: null, confirmedMetric: null, attempts };
+}
+
+// ─── Lower-level utilities (apply, revert, measure) ──────────────────────
 
 const METRIC_LINE_PREFIX = "METRIC";
 
