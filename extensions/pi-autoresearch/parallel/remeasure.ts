@@ -74,7 +74,16 @@ export async function applyDiff(exec: ExecFn, workDir: string, diff: string): Pr
   await fs.promises.mkdir(path.dirname(tmp), { recursive: true });
   await fs.promises.writeFile(tmp, diff, "utf-8");
   try {
-    await exec("git", ["apply", "--whitespace=nowarn", tmp], { cwd: workDir, timeout: 15000 });
+    // --3way falls back to 3-way merge when the patch context doesn't match
+    //   exactly (CRLF drift, partial overlap). --whitespace=nowarn silences
+    //   line-ending warnings. We MUST check the exit code — exec does not throw
+    //   on non-zero, and a silent apply-failure makes reMeasureWinner run the
+    //   benchmark on unchanged code, producing a meaningless "regression".
+    const res = await exec("git", ["apply", "--3way", "--whitespace=nowarn", tmp], { cwd: workDir, timeout: 15000 });
+    if (res.code !== 0) {
+      const detail = (res.stdout + res.stderr).trim().slice(0, 300);
+      throw new Error(`git apply failed (exit ${res.code}): ${detail}`);
+    }
   } finally {
     try { await fs.promises.rm(tmp, { force: true }); } catch { /* ignore */ }
   }

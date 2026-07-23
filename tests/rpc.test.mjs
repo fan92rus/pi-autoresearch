@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseSpawnReply, replyEventFor, buildRequest, RpcClientError } from "../extensions/pi-autoresearch/parallel/rpc.ts";
-import { parseMetricLines } from "../extensions/pi-autoresearch/parallel/remeasure.ts";
+import { parseMetricLines, applyDiff } from "../extensions/pi-autoresearch/parallel/remeasure.ts";
 
 test("replyEventFor", () => {
   assert.equal(replyEventFor("abc-123"), "subagents:rpc:v1:reply:abc-123");
@@ -55,4 +55,32 @@ test("parseMetricLines", () => {
 test("parseMetricLines empty", () => {
   assert.equal(parseMetricLines("no metrics here").size, 0);
   assert.equal(parseMetricLines("").size, 0);
+});
+
+test("applyDiff throws on non-zero exit code", async () => {
+  // E2E bug #9: applyDiff used to silently swallow git apply failures (non-zero exit).
+  // Now it must throw so reMeasureWinner reports "apply_failed" instead of
+  // running the benchmark on unchanged code and producing a meaningless "regression".
+  const failingExec = async () => ({ code: 1, stdout: "", stderr: "error: patch failed" });
+  await assert.rejects(
+    () => applyDiff(failingExec, "/tmp/fake-workdir", "diff --git a/f b/f\n--- a/f\n+++ b/f\n"),
+    /git apply failed/,
+  );
+});
+
+test("applyDiff succeeds on zero exit code", async () => {
+  const okExec = async () => ({ code: 0, stdout: "", stderr: "" });
+  // Should not throw — the temp file write + mkdir are mocked implicitly
+  // (the exec mock returns 0, and the finally block best-effort rms the temp).
+  // We need a real tmp dir for the mkdir/writeFile to succeed:
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const tmpDir = path.join(os.tmpdir(), `applyDiff-test-${Date.now()}`);
+  const fs = await import("node:fs");
+  fs.mkdirSync(path.join(tmpDir, ".auto", "parallel"), { recursive: true });
+  try {
+    await applyDiff(okExec, tmpDir, "diff --git a/f b/f\n--- a/f\n+++ b/f\n");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
