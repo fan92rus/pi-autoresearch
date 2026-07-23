@@ -19,6 +19,7 @@ import { readWorkerResult, collectWorker } from "./bestofn.ts";
 import type { ParallelConfig } from "./config.ts";
 import { defaultConcurrency } from "./config.ts";
 import { buildWorkerTask } from "./bestofn.ts";
+import { runMeasure } from "./remeasure.ts";
 import type { BenchMode, Direction, RankedCandidate, WorkerResult } from "./types.ts";
 
 export interface ValleyProbeContext {
@@ -48,8 +49,12 @@ export interface ValleyProbeOptions {
 
 export interface ValleyProbeResult {
   escaped: boolean;
-  winner: RankedCandidate | null;
+  /** Winner confirmed by full re-measurement in its worktree (null if none confirmed). */
+  confirmed: RankedCandidate | null;
+  confirmedMetric: number | null;
   winnerDiff: string;
+  /** Best candidate by quick measurement (before confirmation). */
+  winner: RankedCandidate | null;
   winnerMetric: number | null;
   ranked: RankedCandidate[];
   results: WorkerResult[];
@@ -57,12 +62,14 @@ export interface ValleyProbeResult {
 
 /**
  * Fan out continuation strategies from `fromCommit`. Each worker runs in a
- * worktree seeded at that commit, applies its strategy, measures. The caller is
- * responsible for applying the winning diff on main + re-measuring (selection
- * bias) + log_experiment — same contract as BestOfN.
+ * worktree seeded at that commit, applies its strategy, measures (quick).
+ * Then we cascade through ranked candidates re-measuring in their worktrees
+ * (full mode) until one confirms — main workdir is never touched for measurement.
+ * Returns the confirmed winner's diff (for the caller to apply on main) or
+ * null if no probe escaped the valley.
  */
 export async function runValleyProbe(ctx: ValleyProbeContext, opts: ValleyProbeOptions): Promise<ValleyProbeResult> {
-  const { rpc, exec, repoRoot, config } = ctx;
+  const { rpc, exec, repoRoot, config, runCmd } = ctx;
   const budgetSeconds = opts.budgetSeconds ?? config.budgetSeconds;
   const benchMode: BenchMode = config.workerBenchMode;
   const concurrency = opts.concurrency ?? config.concurrency ?? defaultConcurrency();
@@ -96,11 +103,34 @@ export async function runValleyProbe(ctx: ValleyProbeContext, opts: ValleyProbeO
     const noiseFloor = computeNoiseFloor(results);
     const { ranked, winnerIndex } = rankCandidates(opts.baselineMetric, opts.direction, results, noiseFloor, opts.strategies);
     const winner = winnerIndex !== null ? ranked.find((r) => r.index === winnerIndex) ?? null : null;
-    const winnerResult = winner ? results[winner.index] : null;
+
+    // Cascade re-measurement: try each ranked candidate in its worktree (full mode).
+    // First one that beats baseline beyond noise → confirmed winner. Main workdir
+    // is never touched — no applyDiff/revertWorkdir needed.
+    let confirmed: RankedCandidate | null = null;
+    let confirmedMetric: number | null = null;
+    for (const candidate of ranked) {
+      if (candidate.status !== "ok" || candidate.medianMetric === null) continue;
+      const wt = wts[candidate.index];
+      if (!wt) continue;
+      const m = await runMeasure(exec, wt.path, opts.metricName, "full", budgetSeconds, runCmd);
+      if (m.metric === null || m.timedOut) continue;
+      const better = opts.direction === "lower" ? m.metric < opts.baselineMetric : m.metric > opts.baselineMetric;
+      const beyondNoise = Math.abs(m.metric - opts.baselineMetric) > noiseFloor;
+      if (better && beyondNoise) {
+        confirmed = candidate;
+        confirmedMetric = m.metric;
+        break;
+      }
+    }
+
+    const winnerResult = confirmed ? results[confirmed.index] : null;
     return {
-      escaped: winner !== null,
-      winner: winner ?? null,
+      escaped: confirmed !== null,
+      confirmed,
+      confirmedMetric,
       winnerDiff: winnerResult?.diff ?? "",
+      winner,
       winnerMetric: winner?.medianMetric ?? null,
       ranked,
       results,

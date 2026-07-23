@@ -58,7 +58,7 @@ import { runBestOfN } from "./parallel/bestofn.ts";
 import { runCheckOrthogonal } from "./parallel/orthogonal.ts";
 import { initBeam, stepBeam, finishBeam, statusBeam, clearBeam } from "./parallel/spacesearch.ts";
 import { runValleyProbe } from "./parallel/valley.ts";
-import { reMeasureWinner } from "./parallel/remeasure.ts";
+import { reMeasureWinner, applyDiff } from "./parallel/remeasure.ts";
 import { computeNoiseFloor } from "./parallel/aggregate.ts";
 import { resolveConfig, defaultConcurrency } from "./parallel/config.ts";
 import { resolveRepoRoot, cleanupAllWorktrees } from "./parallel/worktree.ts";
@@ -3485,15 +3485,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             modelOverride: params.model, budgetSeconds: params.budget_seconds, concurrency: params.concurrency,
           },
         );
-        if (!probe.escaped) {
-          return { content: [{ type: "text", text: `Valley probe: no strategy escaped the valley. Ranked:\n` + probe.ranked.map((r) => `  #${r.index + 1} ${r.status} metric=${r.medianMetric ?? "-"}`).join("\n") + "\n→ abortPhase to revert." }], details: probe };
+        if (!probe.escaped || !probe.confirmed) {
+          return { content: [{ type: "text", text: `Valley probe: no strategy confirmed at full re-measure. Ranked (quick):
+` + probe.ranked.map((r) => `  #${r.index + 1} ${r.status} quick=${r.medianMetric ?? "-"}`).join("\n") + "\n→ abortPhase to revert." }], details: probe };
         }
-        // Selection-bias correction: re-measure the winning continuation on main in full.
-        const rem = await reMeasureWinner(execAsParallel, workDir, runtime.state.metricName, runtime.state.bestDirection, baselineMetric, computeNoiseFloor(probe.results), probe.winnerDiff, params.budget_seconds ?? config.budgetSeconds, runBashForParallel);
-        let text = `Valley probe escaped! winner metric(quick)=${probe.winnerMetric}, re-measure(full)=${rem.finalMetric} → ${rem.decision}.`;
-        if (rem.decision === "keep") text += `\n→ log_experiment(status="keep", metric=${rem.finalMetric}, description="valley probe winner")`;
-        else text += `\n→ log_experiment(status="discard", metric=0, description="valley probe not confirmed")`;
-        return { content: [{ type: "text", text }], details: { ...probe, remeasure: rem } };
+        // Winner was confirmed by full re-measurement in its worktree.
+        // Apply the diff to main so the agent can log_experiment(keep).
+        try {
+          await applyDiff(execAsParallel, workDir, probe.winnerDiff);
+        } catch (e) {
+          return { content: [{ type: "text", text: `❌ valleyProbe: confirmed winner but diff apply failed: ${e instanceof Error ? e.message : String(e)}` }], details: probe };
+        }
+        const text = `Valley probe escaped! winner quick=${probe.winnerMetric}, confirmed(full)=${probe.confirmedMetric} (cascade tried ${probe.ranked.filter((r) => r.status === "ok").length} candidates).`;
+        return { content: [{ type: "text", text: text + `\n→ log_experiment(status="keep", metric=${probe.confirmedMetric}, description="valley probe confirmed")` }], details: probe };
       } catch (e) {
         return { content: [{ type: "text", text: `❌ valleyProbe failed: ${e instanceof Error ? e.message : String(e)}` }], details: {} };
       }
