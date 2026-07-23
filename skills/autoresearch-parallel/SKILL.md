@@ -117,6 +117,8 @@ Override globally in `.auto/config.json`:
 }
 ```
 
+**Or use the interactive configurator** — run `/autoresearch config` for a TUI dialog with presets (Budget / Balanced / Premium), individual model overrides, concurrency, and budget. No need to edit JSON manually.
+
 ## Time budget — three layers
 
 | Layer | Param | Default | Exceeding it → |

@@ -62,6 +62,7 @@ import { runValleyProbe } from "./parallel/valley.ts";
 import { reMeasureWinner, applyDiff } from "./parallel/remeasure.ts";
 import { computeNoiseFloor } from "./parallel/aggregate.ts";
 import { resolveConfig, defaultConcurrency } from "./parallel/config.ts";
+import { interactiveParallelConfig } from "./parallel/config-ui.ts";
 import { resolveRepoRoot, cleanupAllWorktrees } from "./parallel/worktree.ts";
 import { newPhaseStore, startPhase, recordExploreStep, endPhaseDecision, clearPhase, markBestCheckpoint, persistPhase, clearPersistedPhase, commitPhaseGit, abortPhaseGit } from "./parallel/phases.ts";
 import type { Direction } from "./parallel/types.ts";
@@ -1468,11 +1469,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const autoresearchHelp = () =>
     [
-      "Usage: /autoresearch [off|clear|export|<text>|parallel-*]",
+      "Usage: /autoresearch [off|clear|config|export|<text>|parallel-*]",
       "",
       "<text> enters autoresearch mode and starts or resumes the loop.",
       "off leaves autoresearch mode.",
       "clear deletes the session log (.auto/log.jsonl) and turns autoresearch mode off.",
+      "config opens an interactive dialog to set worker models, concurrency, and budget.",
       "export opens a local live dashboard for the session log in your browser.",
       "",
       "Parallel modes (fan out worker subagents over the event bus):",
@@ -3797,6 +3799,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         } else {
           ctx.ui.notify("No session log found. Autoresearch mode OFF", "info");
         }
+        return;
+      }
+
+      // ===== config subcommand: interactive parallel mode configuration =====
+      if (command === "config") {
+        const workDir = resolveWorkDir(ctx.cwd);
+        if (!ctx.hasUI) {
+          ctx.ui.notify("Interactive config requires TUI mode. Edit .auto/config.json manually.", "warning");
+          return;
+        }
+        await interactiveParallelConfig(ctx, workDir);
         return;
       }
 
