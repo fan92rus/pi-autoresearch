@@ -3386,8 +3386,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (!ready) {
         return { content: [{ type: "text", text: "❌ pi-subagents RPC bridge not ready. Убедитесь, что расширение pi-subagents установлено и активно." }], details: {} };
       }
+      const _progressLines: string[] = [];
       const onProgress = onUpdate ? (msg: string) => {
-        onUpdate({ content: [{ type: "text", text: msg }], details: { phase: "bestofn" } });
+        _progressLines.push(msg);
+        onUpdate({ content: [{ type: "text", text: _progressLines.join("\n") }], details: { phase: "bestofn" } });
       } : undefined;
       try {
         const result = await runBestOfN(
@@ -3537,8 +3539,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (!fromCommit || baselineMetric === null || baselineMetric === undefined) {
         return { content: [{ type: "text", text: "❌ Need from_commit + baseline_metric (or an active phase with a checkpoint)." }], details: {} };
       }
+      const _progressLines: string[] = [];
       const onProgress = onUpdate ? (msg: string) => {
-        onUpdate({ content: [{ type: "text", text: msg }], details: { phase: "valley" } });
+        _progressLines.push(msg);
+        onUpdate({ content: [{ type: "text", text: _progressLines.join("\n") }], details: { phase: "valley" } });
       } : undefined;
       try {
         const probe = await runValleyProbe(
@@ -3614,8 +3618,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const config = resolveConfig(readConfigJson(workDir));
       const rpc = new RpcClient(pi.events);
       if (!await rpc.ping()) return { content: [{ type: "text", text: "❌ pi-subagents RPC bridge not ready." }], details: {} };
+      const _progressLines: string[] = [];
       const onProgress = onUpdate ? (msg: string) => {
-        onUpdate({ content: [{ type: "text", text: msg }], details: { phase: "orthogonal" } });
+        _progressLines.push(msg);
+        onUpdate({ content: [{ type: "text", text: _progressLines.join("\n") }], details: { phase: "orthogonal" } });
       } : undefined;
       try {
         const result = await runCheckOrthogonal(
@@ -3672,8 +3678,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const repoRoot = resolveRepoRoot(workDir);
       const config = resolveConfig(readConfigJson(workDir));
       const rpc = new RpcClient(pi.events);
+      const _progressLines: string[] = [];
       const onProgress = onUpdate ? (msg: string) => {
-        onUpdate({ content: [{ type: "text", text: msg }], details: { phase: "spacesearch" } });
+        _progressLines.push(msg);
+        onUpdate({ content: [{ type: "text", text: _progressLines.join("\n") }], details: { phase: "spacesearch" } });
       } : undefined;
       const sctx = { rpc, exec: execAsParallel, runCmd: runBashForParallel, repoRoot, workDir, config, onProgress };
       const sopts = {
