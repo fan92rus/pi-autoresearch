@@ -1,10 +1,10 @@
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import { hasAutoresearchConfigHeader } from "./jsonl.ts";
 import { hookScriptPath, globalHookPath } from "./paths.ts";
+import { runObserver } from "./observer.ts";
 
 const TIMEOUT_MS = 30_000;
 const STDOUT_MAX_BYTES = 8 * 1024;
@@ -202,49 +202,50 @@ function collectHookDir(dirPath: string): string[] {
 }
 
 /**
- * Run hooks in order: bundled observer → global user → project-local → project-local .d/.
- * The observer is extension code (always runs, managed by git).
- * User hooks add behavior on top — they never replace the observer.
+ * Run hooks: built-in TypeScript observer FIRST, then user bash hooks in parallel.
+ * The observer is extension code (in-process, no spawn overhead).
+ * User hooks (global + project-local + .d/) run in addition to the observer.
  */
 export async function runHook(payload: HookPayload): Promise<HookResult> {
-  const observerScript = bundledHookPath(payload.event);
+  if (payload.event !== "before") {
+    // For after.sh: no built-in observer, just run user hooks.
+    const globalScript = globalHookPath(payload.event);
+    const globalDir = path.join(path.dirname(globalScript), `${payload.event}.d`);
+    const localScript = hookScriptPath(payload.cwd, payload.event);
+    const localDir = path.join(path.dirname(localScript), `${payload.event}.d`);
+
+    const tasks: Promise<HookResult>[] = [];
+    if (isExecutableFile(globalScript)) tasks.push(runSingleScript(globalScript, payload));
+    for (const script of collectHookDir(globalDir)) tasks.push(runSingleScript(script, payload));
+    if (localScript !== globalScript && isExecutableFile(localScript)) tasks.push(runSingleScript(localScript, payload));
+    for (const script of collectHookDir(localDir)) tasks.push(runSingleScript(script, payload));
+
+    if (tasks.length === 0) return notFired;
+    const results = await Promise.all(tasks);
+    return results.reduce(mergeResults);
+  }
+
+  // before.sh: run built-in observer (TypeScript, in-process) first.
+  const observerResult = runBundledObserver(payload);
+
+  // Collect user bash hooks.
   const globalScript = globalHookPath(payload.event);
   const globalDir = path.join(path.dirname(globalScript), `${payload.event}.d`);
   const localScript = hookScriptPath(payload.cwd, payload.event);
   const localDir = path.join(path.dirname(localScript), `${payload.event}.d`);
 
   const tasks: Promise<HookResult>[] = [];
+  if (isExecutableFile(globalScript)) tasks.push(runSingleScript(globalScript, payload));
+  for (const script of collectHookDir(globalDir)) tasks.push(runSingleScript(script, payload));
+  if (localScript !== globalScript && isExecutableFile(localScript)) tasks.push(runSingleScript(localScript, payload));
+  for (const script of collectHookDir(localDir)) tasks.push(runSingleScript(script, payload));
 
-  // 1. Bundled observer hook (extension code, managed by git).
-  if (isExecutableFile(observerScript)) {
-    tasks.push(runSingleScript(observerScript, payload));
-  }
+  if (tasks.length === 0) return observerResult;
 
-  // 2. Global user hook (~/.pi/agent/autoresearch/hooks/before.sh).
-  //    The migration in index.ts removes old managed copies; any file here
-  //    now is genuinely user-owned.
-  if (isExecutableFile(globalScript)) {
-    tasks.push(runSingleScript(globalScript, payload));
-  }
-
-  // 3. Global user hooks dir (~/.pi/agent/autoresearch/hooks/before.d/*.sh).
-  for (const script of collectHookDir(globalDir)) {
-    tasks.push(runSingleScript(script, payload));
-  }
-
-  // 4. Project-local hook (.auto/hooks/before.sh).
-  if (localScript !== globalScript && isExecutableFile(localScript)) {
-    tasks.push(runSingleScript(localScript, payload));
-  }
-
-  // 5. Project-local hooks dir (.auto/hooks/before.d/*.sh).
-  for (const script of collectHookDir(localDir)) {
-    tasks.push(runSingleScript(script, payload));
-  }
-
-  if (tasks.length === 0) return notFired;
-  const results = await Promise.all(tasks);
-  return results.reduce(mergeResults);
+  // Merge observer output with user hook outputs.
+  const userResults = await Promise.all(tasks);
+  const userMerged = userResults.reduce(mergeResults);
+  return mergeResults(observerResult, userMerged);
 }
 
 export function steerMessageFor(stage: HookStage, result: HookResult): string | null {
@@ -297,30 +298,52 @@ export function appendHookLogEntryIfConfigured(
   }
 }
 
-// ─── Bundled observer hook path ─────────────────────────────────────────────
-// The observer ships inside the extension package (not in user space).
-const EXTENSION_DIR = path.dirname(fileURLToPath(import.meta.url));
+// ─── Bundled observer (TypeScript, in-process) ───────────────────────────────
+// The observer is now native extension code (observer.ts), not a bash script.
+// It runs in-process (no spawn overhead) and provides stagnation/floor/noise/finalize triggers.
 
-/** Path to the bundled observer hook inside the extension directory. */
-export function bundledHookPath(stage: HookStage): string {
-  return path.join(EXTENSION_DIR, "observer", `${stage}.sh`);
-}
-
-const OBSERVER_VERSION_RE = /^#\s*OBSERVER_VERSION=(\d+)/m;
-
-/** Returns true if a file contains the OBSERVER_VERSION marker (our managed hook). */
-function isManagedHook(filePath: string): boolean {
+/** Run the built-in TypeScript observer and wrap its output as a HookResult. */
+function runBundledObserver(payload: HookPayload): HookResult {
+  const t0 = Date.now();
   try {
-    return OBSERVER_VERSION_RE.test(fs.readFileSync(filePath, "utf-8"));
-  } catch {
-    return false;
+    const steer = runObserver({
+      cwd: payload.cwd,
+      direction: payload.session.direction,
+      metricName: payload.session.metric_name,
+      metricUnit: payload.session.metric_unit,
+      baselineMetric: payload.session.baseline_metric,
+      bestMetric: payload.session.best_metric,
+      runCount: payload.session.run_count,
+      goal: payload.session.goal,
+    });
+    return {
+      fired: steer !== null,
+      stdout: steer ?? "",
+      stderr: "",
+      exitCode: 0,
+      timedOut: false,
+      durationMs: Date.now() - t0,
+    };
+  } catch (e) {
+    return {
+      fired: false,
+      stdout: "",
+      stderr: `observer error: ${e instanceof Error ? e.message : String(e)}`,
+      exitCode: 0,
+      timedOut: false,
+      durationMs: Date.now() - t0,
+    };
   }
 }
+
+// ─── Migration (remove old auto-installed hook) ─────────────────────────────
+
+const OBSERVER_VERSION_RE = /^#\s*OBSERVER_VERSION=(\d+)/m;
 
 /**
  * One-time migration: remove the old auto-installed hook from user space.
  * Previous versions auto-installed the observer to ~/.pi/agent/autoresearch/hooks/before.sh.
- * Now the observer runs from the extension dir. If the old file still exists, we
+ * Now the observer is TypeScript extension code. If the old file still exists, we
  * remove it — whether it has the OBSERVER_VERSION marker or not — because it's
  * superseded by the bundled observer and would cause duplicate steers.
  * Exception: if the file is NOT recognizable as our observer (no v3/v4 header),
@@ -331,7 +354,6 @@ export function migrateAutoInstalledHook(): { removed: boolean; reason?: string 
   if (!fs.existsSync(globalPath)) return { removed: false, reason: "not_found" };
   try {
     const content = fs.readFileSync(globalPath, "utf-8");
-    // Our managed hook always has either OBSERVER_VERSION or the v3 header banner.
     const isOurs = OBSERVER_VERSION_RE.test(content) || /GLOBAL AUTORESEARCH OBSERVER/.test(content);
     if (!isOurs) return { removed: false, reason: "user_customized" };
     fs.unlinkSync(globalPath);
