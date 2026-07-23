@@ -73,13 +73,18 @@ export function buildWorkerTask(opts: {
   sessionName: string;
   budgetSeconds: number;
   benchMode: BenchMode;
+  workerTimeoutMs: number;
   repeats: number;
 }): string {
-  const { hypothesis, wtPath, baselineSha, metricName, direction, metricUnit, sessionName, budgetSeconds, benchMode, repeats } = opts;
+  const { hypothesis, wtPath, baselineSha, metricName, direction, metricUnit, sessionName, budgetSeconds, benchMode, repeats, workerTimeoutMs } = opts;
+  const wallMin = Math.max(1, Math.round(workerTimeoutMs / 60000));
   return [
     `Работай в worktree: ${wtPath}. Baseline commit: ${baselineSha}.`,
     `Гипотеза (реализуй её в коде): ${hypothesis}`,
     `Целевая метрика: ${metricName} (${direction}). Единица: ${metricUnit || "(без единицы)"}.`,
+    ``,
+    `⏱ ВРЕМЕННОЙ БЮДЖЕТ: ~${wallMin} мин на ВСЮ работу. Проверяй время: \`date +%s\`.`,
+    `   Если осталось мало — быстрее к шагу 3 (run_experiment). Результат важнее идеального кода.`,
     ``,
     `ШАГИ:`,
     `1. init_experiment(name="${sessionName}", metric_name="${metricName}", metric_unit="${metricUnit || ""}", direction="${direction}") — включает autoresearchMode и открывает run_experiment.`,
@@ -123,6 +128,7 @@ export function readWorkerResult(wtPath: string): WorkerResult {
 /**
  * Await a worker's completion by polling for worker-result.json, with an overall
  * timeout. On timeout, interrupt the run and return a worker_timeout result.
+ * Always records elapsedMs in the result.
  */
 export async function collectWorker(
   ctx: OrchestratorContext,
@@ -132,20 +138,56 @@ export async function collectWorker(
   pollIntervalMs = 2000,
 ): Promise<WorkerResult> {
   const resultFile = path.join(wt.path, ".auto", "worker-result.json");
-  const deadline = Date.now() + workerTimeoutMs;
+  const startTime = Date.now();
+  const deadline = startTime + workerTimeoutMs;
+
   while (Date.now() < deadline) {
     if (fs.existsSync(resultFile)) {
-      return readWorkerResult(wt.path);
+      const result = readWorkerResult(wt.path);
+      result.elapsedMs = Date.now() - startTime;
+      return result;
     }
     await sleep(pollIntervalMs);
   }
-  // Timed out — interrupt and mark.
+
+  // Timed out — soft interrupt + short grace, then hard stop.
+  const elapsedMs = Date.now() - startTime;
   await ctx.rpc.interrupt(spawned.runId).catch(() => {});
-  return { diff: "", metric: null, metrics: [], status: "worker_timeout", error: `worker ${spawned.runId} exceeded ${workerTimeoutMs}ms` };
+
+  // Grace period: 10s for the worker to finish writing its result
+  const graceDeadline = Date.now() + 10_000;
+  while (Date.now() < graceDeadline) {
+    if (fs.existsSync(resultFile)) {
+      const result = readWorkerResult(wt.path);
+      result.elapsedMs = Date.now() - startTime;
+      return result;
+    }
+    await sleep(2000);
+  }
+
+  // Hard stop
+  const stopped = await ctx.rpc.stop(spawned.runId).catch(() => false);
+
+  return {
+    diff: "",
+    metric: null,
+    metrics: [],
+    status: "worker_timeout",
+    error: `ran ${formatDuration(elapsedMs)}, stop=${stopped ? "ok" : "failed"}`,
+    elapsedMs,
+  };
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function formatDuration(ms: number): string {
+  const s = Math.round(ms / 1000);
+  if (s < 60) return s + "s";
+  const m = Math.floor(s / 60);
+  const rs = s % 60;
+  return rs ? m + "m" + rs + "s" : m + "m";
 }
 
 /** Run an async mapper over items with a concurrency cap. */
@@ -245,6 +287,7 @@ export async function runBestOfN(ctx: OrchestratorContext, opts: BestOfNOptions)
           metricName: opts.metricName, direction: opts.direction, metricUnit: opts.metricUnit ?? "",
           sessionName: opts.sessionName ?? "parallel-bestofn",
           budgetSeconds, benchMode: config.workerBenchMode, repeats,
+          workerTimeoutMs,
         });
         const spawned = await rpc.spawn({
           agent: opts.agent ?? "worker",
@@ -262,9 +305,11 @@ export async function runBestOfN(ctx: OrchestratorContext, opts: BestOfNOptions)
           const pct = opts.direction === "lower"
             ? ((baselineMetric - result.metric) / baselineMetric * 100).toFixed(1)
             : ((result.metric - baselineMetric) / baselineMetric * 100).toFixed(1);
-          progress(`Worker ${label}: ${result.metric}${opts.metricUnit ?? ""} (${pct}%) — ok`);
+          const el = result.elapsedMs ? ` [${formatDuration(result.elapsedMs)}]` : "";
+          progress(`Worker ${label}: ${result.metric}${opts.metricUnit ?? ""} (${pct}%) — ok${el}`);
         } else {
-          progress(`Worker ${label}: ${result.status}${result.error ? " — " + result.error.slice(0, 80) : ""}`);
+          const el = result.elapsedMs ? ` [${formatDuration(result.elapsedMs)}]` : "";
+          progress(`Worker ${label}: ${result.status}${el}${result.error ? " — " + result.error.slice(0, 80) : ""}`);
         }
       };
       await mapWithConcurrency(pending, concurrency, roundFn);

@@ -215,4 +215,18 @@ export class RpcClient {
     const env = reply as RpcReplyEnvelope;
     return env.success ? env.data : null;
   }
+
+  /** Force-stop a run (harder than interrupt). Returns true if the run was stopped. */
+  async stop(runId: string, timeoutMs = 5000): Promise<boolean> {
+    const request = buildRequest("stop", { runId });
+    const replyP = onceEvent(this.events, replyEventFor(request.requestId), (d) => {
+      const e = d as { requestId?: string };
+      return e?.requestId === request.requestId;
+    }, timeoutMs).catch(() => null);
+    this.events.emit(SUBAGENT_RPC_REQUEST_EVENT, request);
+    const reply = await replyP;
+    if (!reply) return false;
+    const env = reply as RpcReplyEnvelope;
+    return env.success;
+  }
 }

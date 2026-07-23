@@ -144,6 +144,7 @@ export async function runCheckOrthogonal(ctx: OrthogonalContext, opts: Orthogona
         metricName: opts.metricName, direction: opts.direction, metricUnit: opts.metricUnit ?? "",
         sessionName: opts.sessionName ?? "parallel-orthogonal",
         budgetSeconds, benchMode, repeats: 1,
+        workerTimeoutMs: config.complexityMap[config.defaultComplexity].workerTimeoutMs,
       });
       const spawned: SpawnedWorker = await rpc.spawn({ agent: opts.agent ?? "worker", task, cwd: wt.path, model, output: path.join(wt.path, ".auto", "worker-result.json"), outputMode: "file-only", context: "fresh" });
       results[index] = await collectWorker(ctx, spawned, wt, config.complexityMap[config.defaultComplexity].workerTimeoutMs);

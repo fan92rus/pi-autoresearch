@@ -161,6 +161,7 @@ export async function stepBeam(ctx: SpaceSearchContext, opts: SpaceSearchOptions
             metricName: beam.metricName, direction: beam.direction, metricUnit: opts.metricUnit ?? "",
             sessionName: opts.sessionName ?? "parallel-spacesearch",
             budgetSeconds, benchMode, repeats: 1,
+            workerTimeoutMs: config.complexityMap[config.defaultComplexity].workerTimeoutMs,
           });
           const spawned: SpawnedWorker = await rpc.spawn({ agent: opts.agent ?? "worker", task, cwd: wt.path, model, output: path.join(wt.path, ".auto", "worker-result.json"), outputMode: "file-only", context: "fresh" });
           const result = await collectWorker(ctx, spawned, wt, config.complexityMap[config.defaultComplexity].workerTimeoutMs);

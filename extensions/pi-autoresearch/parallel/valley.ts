@@ -93,6 +93,7 @@ export async function runValleyProbe(ctx: ValleyProbeContext, opts: ValleyProbeO
         metricName: opts.metricName, direction: opts.direction, metricUnit: opts.metricUnit ?? "",
         sessionName: opts.sessionName ?? "parallel-valley",
         budgetSeconds, benchMode, repeats: 1,
+        workerTimeoutMs: config.complexityMap[config.defaultComplexity].workerTimeoutMs,
       });
       const spawned: SpawnedWorker = await rpc.spawn({ agent: opts.agent ?? "worker", task, cwd: wt.path, model, output: path.join(wt.path, ".auto", "worker-result.json"), outputMode: "file-only", context: "fresh" });
       progress(`Valley worker ${index + 1}/${opts.strategies.length}: spawned (model=${model})...`);
