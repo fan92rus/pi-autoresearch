@@ -157,7 +157,15 @@ export async function stepBeam(ctx: SpaceSearchContext, opts: SpaceSearchOptions
           });
           const spawned: SpawnedWorker = await rpc.spawn({ agent: opts.agent ?? "worker", task, cwd: wt.path, model, output: path.join(wt.path, ".auto", "worker-result.json"), outputMode: "file-only", context: "fresh" });
           const result = await collectWorker(ctx, spawned, wt, config.complexityMap[config.defaultComplexity].workerTimeoutMs);
-          // The worker's worktree HEAD advanced to its edits; capture that commit.
+          // Worker doesn't call log_experiment (no git commit). We commit its
+          // changes in the worktree so HEAD advances and finishBeam can
+          // cherry-pick the chain onto main.
+          await exec("git", ["add", "-A"], { cwd: wt.path, timeout: 10000 }).catch(() => {});
+          const diffCheck = await exec("git", ["diff", "--cached", "--quiet"], { cwd: wt.path, timeout: 5000 });
+          if (diffCheck.code !== 0) {
+            // There are staged changes — commit them so HEAD advances
+            await exec("git", ["commit", "-m", `spacesearch-step: ${hint.slice(0, 60)}`], { cwd: wt.path, timeout: 10000 }).catch(() => {});
+          }
           const newHead = (await exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: wt.path, timeout: 5000 })).stdout.trim();
           if (result.status === "ok" && result.metric !== null && newHead) {
             const regressed = !isBetter(result.metric, state.metric, beam.direction);
