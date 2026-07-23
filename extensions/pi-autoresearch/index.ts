@@ -1747,6 +1747,33 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\n     ⛔ NEVER skip this step. Every run_experiment MUST be logged." +
       "\n  7. NEXT — Updated hypothesis based on what you learned." +
       "\n     If stuck (3+ non-improving runs) → check .auto/ideas.md for alternative directions." +
+      "\n\n## Parallel Toolkit (USE PROACTIVELY — don't wait for stagnation!)" +
+      "\nYou have parallel tools that test N hypotheses SIMULTANEOUSLY in isolated worktrees." +
+      "\nGoing parallel is almost always better than sequential trial-and-error when you have multiple ideas." +
+      "\n" +
+      "\nWHEN TO GO PARALLEL:" +
+      "\n  • 2+ hypotheses in .auto/ideas.md → BestOfN (test all at once, keep the best)" +
+      "\n  • 3+ sequential discards → BestOfN (try 3 different approaches in parallel)" +
+      "\n  • Optimization requires getting WORSE first (refactor, algorithm swap) → startPhase" +
+      "\n  • Stuck in a local optimum during a phase → valleyProbe (parallel escape attempts)" +
+      "\n  • Multimodal landscape (many strategies to try) → SpaceSearch beam search" +
+      "\n  • 2+ independent file-scoped optimizations → CheckOrthogonal (stack them)" +
+      "\n" +
+      "\nQUICK START — BestOfN with 3 hypotheses:" +
+      "\n  BestOfN({ candidates: [" +
+      "\n    {hypothesis:\"idea 1...\", complexity:\"simple\"}," +
+      "\n    {hypothesis:\"idea 2...\", complexity:\"simple\"}," +
+      "\n    {hypothesis:\"idea 3...\", complexity:\"simple\"}," +
+      "\n  ], metric_name:\"<your_metric>\", direction:\"lower\" })" +
+      "\n" +
+      "\nBestOfN handles everything: spawns workers, measures in isolated worktrees," +
+      "\nre-measures top candidates to eliminate selection bias, and returns keep/discard." +
+      "\nYou just call log_experiment with the result." +
+      "\n\n## Finalization" +
+      "\nIf you have PROVEN that further optimization is impossible or not worth the cost" +
+      "\n(mathematical floor, structural limit, noise floor reached, search space exhausted):" +
+      "\n  → Call finalize_research({ reason: \"...\", evidence: \"...\", confidence: 0.8 })" +
+      "\nThe observer will then recommend /autoresearch off. Do NOT grind indefinitely." +
       "\n\n## Observer Hooks" +
       "\nIf you receive a 🔄 STAGNATION steer — STOP experimenting and REFLECT on the pattern." +
       "\nIf you receive a 🎯 MILESTONE steer — Consider strategic alternatives and orthogonal directions." +
