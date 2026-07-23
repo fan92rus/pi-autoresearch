@@ -286,6 +286,125 @@ async function configureBudget(ctx: ConfigCtx, workDir: string): Promise<boolean
   return true;
 }
 
+// ─── Observer settings ─────────────────────────────────────────────────────
+
+function readObserverSection(workDir: string): Record<string, unknown> {
+  const raw = readConfig(workDir);
+  const obs = (raw as Record<string, unknown>).observer;
+  return (typeof obs === "object" && obs !== null ? obs : {}) as Record<string, unknown>;
+}
+
+function writeObserverField(workDir: string, key: string, value: number): void {
+  const raw = readConfig(workDir);
+  if (!(raw as Record<string, unknown>).observer) {
+    (raw as Record<string, unknown>).observer = {};
+  }
+  ((raw as Record<string, unknown>).observer as Record<string, unknown>)[key] = value;
+  writeConfig(workDir, raw);
+}
+
+function resetObserverConfig(ctx: ConfigCtx, workDir: string): void {
+  const raw = readConfig(workDir);
+  delete (raw as Record<string, unknown>).observer;
+  writeConfig(workDir, raw);
+  ctx.ui.notify("Observer settings reset to defaults", "info");
+}
+
+interface ObserverField {
+  key: string;
+  label: string;
+  description: string;
+  default: number;
+  min: number;
+  max: number;
+}
+
+const OBSERVER_FIELDS: ObserverField[] = [
+  {
+    key: "finalize_strong_threshold",
+    label: "Finalize: strong confidence",
+    description: "Agent confidence above this → strong /autoresearch off recommendation.",
+    default: 0.8, min: 0.5, max: 1.0,
+  },
+  {
+    key: "finalize_advisory_threshold",
+    label: "Finalize: advisory confidence",
+    description: "Agent confidence above this → advisory finalize steer.",
+    default: 0.5, min: 0.0, max: 0.8,
+  },
+  {
+    key: "floor_streak_threshold",
+    label: "Floor: min streak",
+    description: "Non-improving runs before floor detection can trigger.",
+    default: 15, min: 3, max: 50,
+  },
+  {
+    key: "floor_cv_threshold",
+    label: "Floor: variance threshold (CV)",
+    description: "Coefficient of variation below which metric is considered plateaued.",
+    default: 0.15, min: 0.01, max: 0.5,
+  },
+  {
+    key: "noise_gate_margin",
+    label: "Noise gate: margin",
+    description: "System noise must exceed best metric × this factor to warn.",
+    default: 1.10, min: 1.0, max: 2.0,
+  },
+  {
+    key: "stagnation_threshold",
+    label: "Stagnation: interval",
+    description: "Non-improving runs between each stagnation escalation steer.",
+    default: 5, min: 3, max: 20,
+  },
+];
+
+async function configureObserver(ctx: ConfigCtx, workDir: string): Promise<boolean> {
+  const obsConfig = readObserverSection(workDir);
+
+  const options = OBSERVER_FIELDS.map(function (f) {
+    const current = typeof obsConfig[f.key] === "number" ? obsConfig[f.key] as number : f.default;
+    return f.label + " (current: " + current + ")";
+  }).concat(["♻️ Reset to defaults", "↩️ Back"]);
+
+  const choice = await ctx.ui.select("Observer Settings — what to configure?", options);
+
+  if (!choice || choice === "↩️ Back") return false;
+
+  if (choice === "♻️ Reset to defaults") {
+    const confirmed = await ctx.ui.confirm("Reset observer", "Reset all observer thresholds to defaults?");
+    if (confirmed) resetObserverConfig(ctx, workDir);
+    return true;
+  }
+
+  const field = OBSERVER_FIELDS.find(function (f) { return choice.startsWith(f.label); });
+  if (!field) return false;
+
+  const currentValue = typeof obsConfig[field.key] === "number" ? obsConfig[field.key] as number : field.default;
+
+  const title = [
+    field.label + " (current: " + currentValue + ")",
+    "",
+    field.description,
+    "",
+    "Range: " + field.min + " - " + field.max + "  |  Default: " + field.default,
+    "",
+    "Enter new value:",
+  ].join("\n");
+
+  const input = await ctx.ui.input(title, String(currentValue));
+  if (!input || !input.trim()) return false;
+
+  const n = parseFloat(input.trim());
+  if (isNaN(n) || n < field.min || n > field.max) {
+    ctx.ui.notify("Invalid value (range: " + field.min + " - " + field.max + ")", "error");
+    return false;
+  }
+
+  writeObserverField(workDir, field.key, n);
+  ctx.ui.notify(field.label + " → " + n, "info");
+  return true;
+}
+
 // ─── Main entry point ────────────────────────────────────────────────────────
 
 /**
@@ -308,6 +427,7 @@ export async function interactiveParallelConfig(ctx: ConfigCtx, workDir: string)
       "🔧 Models (individual)...",
       "⚡ Concurrency...",
       "⏱️  Budget...",
+      "📊 Observer settings...",
       "✅ Done",
     ]);
 
@@ -326,6 +446,9 @@ export async function interactiveParallelConfig(ctx: ConfigCtx, workDir: string)
           break;
         case "⏱️  Budget...":
           await configureBudget(ctx, workDir);
+          break;
+        case "📊 Observer settings...":
+          await configureObserver(ctx, workDir);
           break;
       }
     } catch (e) {

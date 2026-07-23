@@ -17,12 +17,54 @@ import { parseJsonlEntry, reconstructJsonlState, type ReconstructedRun } from ".
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-const STAGNATION_THRESHOLD = 5;
-const PROGRESS_MILESTONE = 5;
-const FLOOR_STREAK_THRESHOLD = 15;
-const FLOOR_CV_THRESHOLD = 0.15;
-const NOISE_GATE_MARGIN = 1.10;
-const NOISE_SAMPLES = 3;
+export interface ObserverConfig {
+  /** Confidence for strong finalize recommendation. Default: 0.8 */
+  finalizeStrongThreshold: number;
+  /** Confidence for advisory finalize steer. Default: 0.5 */
+  finalizeAdvisoryThreshold: number;
+  /** Streak needed before floor detection kicks in. Default: 15 */
+  floorStreakThreshold: number;
+  /** Coefficient of variation below which metric is considered plateaued. Default: 0.15 */
+  floorCvThreshold: number;
+  /** Noise gate: noise must exceed best * margin to trigger. Default: 1.10 */
+  noiseGateMargin: number;
+  /** Number of bash samples for noise estimation. Default: 3 */
+  noiseSamples: number;
+  /** Non-improving runs per stagnation cycle. Default: 5 */
+  stagnationThreshold: number;
+  /** Improvements per progress milestone. Default: 5 */
+  progressMilestone: number;
+}
+
+export const DEFAULT_OBSERVER_CONFIG: ObserverConfig = {
+  finalizeStrongThreshold: 0.8,
+  finalizeAdvisoryThreshold: 0.5,
+  floorStreakThreshold: 15,
+  floorCvThreshold: 0.15,
+  noiseGateMargin: 1.10,
+  noiseSamples: 3,
+  stagnationThreshold: 5,
+  progressMilestone: 5,
+};
+
+function readObserverConfig(cwd: string): ObserverConfig {
+  try {
+    const configPath = path.join(cwd, ".auto", "config.json");
+    if (!fs.existsSync(configPath)) return { ...DEFAULT_OBSERVER_CONFIG };
+    const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    const obs = (config.observer ?? config) as Record<string, unknown>;
+    const cfg = { ...DEFAULT_OBSERVER_CONFIG };
+    if (typeof obs.finalize_strong_threshold === "number") cfg.finalizeStrongThreshold = obs.finalize_strong_threshold;
+    if (typeof obs.finalize_advisory_threshold === "number") cfg.finalizeAdvisoryThreshold = obs.finalize_advisory_threshold;
+    if (typeof obs.floor_streak_threshold === "number") cfg.floorStreakThreshold = obs.floor_streak_threshold;
+    if (typeof obs.floor_cv_threshold === "number") cfg.floorCvThreshold = obs.floor_cv_threshold;
+    if (typeof obs.noise_gate_margin === "number") cfg.noiseGateMargin = obs.noise_gate_margin;
+    if (typeof obs.stagnation_threshold === "number") cfg.stagnationThreshold = obs.stagnation_threshold;
+    return cfg;
+  } catch {
+    return { ...DEFAULT_OBSERVER_CONFIG };
+  }
+}
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -145,7 +187,7 @@ function coefficientOfVariation(values: number[]): { cv: number; mean: number; s
 
 // ─── Trigger: Finalize ───────────────────────────────────────────────────────
 
-function checkFinalize(allEntries: Record<string, unknown>[]): string | null {
+function checkFinalize(allEntries: Record<string, unknown>[], oc: ObserverConfig): string | null {
   const finalizeEntries = allEntries.filter((e) => e.type === "finalize");
   if (finalizeEntries.length === 0) return null;
 
@@ -154,16 +196,16 @@ function checkFinalize(allEntries: Record<string, unknown>[]): string | null {
   const reason = typeof last.reason === "string" ? last.reason : "no reason given";
   const confPct = Math.round(confidence * 100);
 
-  if (confidence > 0.8) {
+  if (confidence > oc.finalizeStrongThreshold) {
     return `🏁 FINALIZE SIGNAL (confidence ${confPct}%): Agent signaled optimization is complete.
    Reason: ${reason}
 
    The agent has explicitly recorded a finalize entry with high confidence.
    Strongly recommended: run /autoresearch off to finalize this session.
-   To override: delete the finalize entry from .auto/log.jsonl or set confidence < 0.8.`;
+   To override: delete the finalize entry from .auto/log.jsonl or lower the threshold in /autoresearch config.`;
   }
 
-  if (confidence > 0.5) {
+  if (confidence > oc.finalizeAdvisoryThreshold) {
     return `🏁 FINALIZE SIGNAL (confidence ${confPct}%): Agent signaled possible completion.
    Reason: ${reason}
 
@@ -176,7 +218,7 @@ function checkFinalize(allEntries: Record<string, unknown>[]): string | null {
 
 // ─── Trigger: Noise gate ─────────────────────────────────────────────────────
 
-function checkNoiseGate(payload: ObserverPayload, cwd: string): string | null {
+function checkNoiseGate(payload: ObserverPayload, cwd: string, oc: ObserverConfig): string | null {
   if (!payload.bestMetric || payload.direction !== "lower") return null;
   if (!fs.existsSync(path.join(cwd, ".auto", "measure.sh"))) return null;
 
@@ -192,9 +234,9 @@ function checkNoiseGate(payload: ObserverPayload, cwd: string): string | null {
 
   if (noiseMode === "off") return null;
 
-  // Time 3 minimal bash invocations to estimate system noise floor
+  // Time minimal bash invocations to estimate system noise floor
   const samples: number[] = [];
-  for (let i = 0; i < NOISE_SAMPLES; i++) {
+  for (let i = 0; i < oc.noiseSamples; i++) {
     try {
       const t0 = performance.now();
       execSync("true", { shell: true, timeout: 5000, stdio: "ignore" });
@@ -207,7 +249,7 @@ function checkNoiseGate(payload: ObserverPayload, cwd: string): string | null {
   const noiseMin = Math.min(...samples);
 
   if (noiseMin <= 0) return null;
-  if (noiseMin <= payload.bestMetric * NOISE_GATE_MARGIN) return null;
+  if (noiseMin <= payload.bestMetric * oc.noiseGateMargin) return null;
 
   const deltaPct = ((noiseMin - payload.bestMetric) / payload.bestMetric * 100).toFixed(1);
   const unit = payload.metricUnit;
@@ -236,8 +278,9 @@ function checkFloor(
   asi: AsiFlags,
   payload: ObserverPayload,
   cwd: string,
+  oc: ObserverConfig,
 ): string | null {
-  if (state.streak < FLOOR_STREAK_THRESHOLD) return null;
+  if (state.streak < oc.floorStreakThreshold) return null;
 
   const recent = state.recentMetrics.slice(-10).filter((v) => v !== 0);
   const stats = coefficientOfVariation(recent);
@@ -252,7 +295,7 @@ function checkFloor(
     }
   } catch { /* ignore */ }
 
-  const isFloor = !floorOverride && stats !== null && stats.cv < FLOOR_CV_THRESHOLD;
+  const isFloor = !floorOverride && stats !== null && stats.cv < oc.floorCvThreshold;
   const asiProvesFloor = state.streak >= 20 && asi.floor;
 
   if (!isFloor && !asiProvesFloor) return null;
@@ -307,17 +350,18 @@ function checkStagnation(
   asi: AsiFlags,
   payload: ObserverPayload,
   cwd: string,
+  oc: ObserverConfig,
 ): string | null {
-  if (state.streak < STAGNATION_THRESHOLD) return null;
-  if (state.streak % STAGNATION_THRESHOLD !== 0) return null;
+  if (state.streak < oc.stagnationThreshold) return null;
+  if (state.streak % oc.stagnationThreshold !== 0) return null;
 
-  const level = Math.floor(state.streak / STAGNATION_THRESHOLD);
+  const level = Math.floor(state.streak / oc.stagnationThreshold);
   const unit = payload.metricUnit;
   const bestStr = state.best !== null ? `${state.best}${unit}` : `?${unit}`;
   const ideasPath = path.join(cwd, ".auto", "ideas.md");
 
   // Status pattern detection
-  const recentRuns = state.recent.slice(-STAGNATION_THRESHOLD);
+  const recentRuns = state.recent.slice(-oc.stagnationThreshold);
   const statuses = recentRuns.map((r) => r.status);
   const crashCount = statuses.filter((s) => s === "crash" || s === "checks_failed").length;
   const discardCount = statuses.filter((s) => s === "discard").length;
@@ -429,10 +473,10 @@ ${reflectQuestions}`;
 
 // ─── Trigger: Progress milestone ─────────────────────────────────────────────
 
-function checkProgress(state: ObserverState, payload: ObserverPayload, cwd: string): string | null {
+function checkProgress(state: ObserverState, payload: ObserverPayload, cwd: string, oc: ObserverConfig): string | null {
   if (state.streak !== 0) return null;
   if (state.improvements <= 0) return null;
-  if (state.improvements % PROGRESS_MILESTONE !== 0) return null;
+  if (state.improvements % oc.progressMilestone !== 0) return null;
 
   const unit = payload.metricUnit;
   const progression = state.impHistory.join(" → ");
@@ -482,6 +526,9 @@ Write your strategic assessment to ${ideasPath}.`;
 export function runObserver(payload: ObserverPayload): string | null {
   const { cwd, direction } = payload;
 
+  // Read observer config from .auto/config.json (project-level)
+  const oc = readObserverConfig(cwd);
+
   // Resolve log file
   const jsonlPath = path.join(cwd, ".auto", "log.jsonl");
   const legacyPath = path.join(cwd, "autoresearch.jsonl");
@@ -504,11 +551,11 @@ export function runObserver(payload: ObserverPayload): string | null {
   }
 
   // Parse all raw entries (for finalize detection)
-  const finalizeSteer = checkFinalize(allEntries);
+  const finalizeSteer = checkFinalize(allEntries, oc);
   if (finalizeSteer) return finalizeSteer;
 
   // Noise gate (can run independently of log state)
-  const noiseSteer = checkNoiseGate(payload, cwd);
+  const noiseSteer = checkNoiseGate(payload, cwd, oc);
   if (noiseSteer) return noiseSteer;
 
   // Reconstruct state from log.jsonl
@@ -520,15 +567,15 @@ export function runObserver(payload: ObserverPayload): string | null {
   const asi = parseAsiFlags(segRuns, ideasPath);
 
   // Floor detection
-  const floorSteer = checkFloor(state, asi, payload, cwd);
+  const floorSteer = checkFloor(state, asi, payload, cwd, oc);
   if (floorSteer) return floorSteer;
 
   // Stagnation
-  const stagnationSteer = checkStagnation(state, asi, payload, cwd);
+  const stagnationSteer = checkStagnation(state, asi, payload, cwd, oc);
   if (stagnationSteer) return stagnationSteer;
 
   // Progress milestone
-  const progressSteer = checkProgress(state, payload, cwd);
+  const progressSteer = checkProgress(state, payload, cwd, oc);
   if (progressSteer) return progressSteer;
 
   return null;
