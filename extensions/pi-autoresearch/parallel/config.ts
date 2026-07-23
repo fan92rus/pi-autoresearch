@@ -55,7 +55,17 @@ export function resolveConfig(raw: unknown): ParallelConfig {
   if (!raw || typeof raw !== "object") return { ...DEFAULT_CONFIG };
   const obj = raw as Record<string, unknown>;
   const parallel = (obj.parallel ?? {}) as Record<string, unknown>;
-  const tiers = { ...DEFAULT_CONFIG.tiers, ...((parallel.tiers ?? {}) as Partial<Record<Tier, string>>) };
+  // Normalize tiers: accept both {fast:"model"} and {fast:{model:"model"}} shapes
+  const rawTiers = (parallel.tiers ?? {}) as Record<string, unknown>;
+  const tiers = { ...DEFAULT_CONFIG.tiers };
+  for (const key of Object.keys(rawTiers)) {
+    const val = rawTiers[key];
+    if (typeof val === "string") {
+      (tiers as Record<string, string>)[key] = val;
+    } else if (val && typeof val === "object" && typeof (val as Record<string, unknown>).model === "string") {
+      (tiers as Record<string, string>)[key] = (val as Record<string, string>).model;
+    }
+  }
   const complexityMap = {
     ...DEFAULT_CONFIG.complexityMap,
     ...((parallel.complexityMap ?? {}) as Partial<Record<Complexity, ComplexityConfig>>),

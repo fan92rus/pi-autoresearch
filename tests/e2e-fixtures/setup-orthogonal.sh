@@ -126,9 +126,9 @@ cat > "$DEST/.auto/config.json" << 'JSONEOF'
     "budgetSeconds": 60,
     "cascade": true,
     "tiers": {
-      "fast": { "model": "opencode-go/deepseek-v4-flash" },
-      "mid": { "model": "opencode-go/deepseek-v4-flash" },
-      "strong": { "model": "zai-glm/glm-5.2" }
+      "fast": "opencode-go/deepseek-v4-flash",
+      "mid": "opencode-go/deepseek-v4-flash",
+      "strong": "zai-glm/glm-5.2"
     }
   }
 }
