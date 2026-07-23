@@ -3325,7 +3325,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "Проверяет N гипотез параллельно: каждый worker реализует гипотезу в изолированном worktree и измеряет (BENCH_MODE=quick). Инструмент ранжирует по медиане, cascade-re-measure топ-кандидатов в их worktree'ах (BENCH_MODE=full, против selection-bias) и возвращает keep/discard. Parent — единственный писатель git/лога. Требует включённого autoresearch-режима и установленного pi-subagents.",
     promptSnippet: "Run N hypothesis candidates in parallel and pick the best (re-measured)",
     parameters: BestOfNParams,
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       const runtime = getRuntime(ctx);
       if (!runtime.autoresearchMode) {
         return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF. Run /autoresearch on first." }], details: {} };
@@ -3338,9 +3338,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (!ready) {
         return { content: [{ type: "text", text: "❌ pi-subagents RPC bridge not ready. Убедитесь, что расширение pi-subagents установлено и активно." }], details: {} };
       }
+      const onProgress = onUpdate ? (msg: string) => {
+        onUpdate({ content: [{ type: "text", text: msg }], details: { phase: "bestofn" } });
+      } : undefined;
       try {
         const result = await runBestOfN(
-          { rpc, exec: execAsParallel, runCmd: runBashForParallel, repoRoot, workDir, config },
+          { rpc, exec: execAsParallel, runCmd: runBashForParallel, repoRoot, workDir, config, onProgress },
           {
             candidates: params.candidates.map((c: { hypothesis: string; label?: string; complexity?: string }) => ({
               hypothesis: c.hypothesis,
@@ -3472,7 +3475,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       budget_seconds: Type.Optional(Type.Number()),
       concurrency: Type.Optional(Type.Number()),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       const runtime = getRuntime(ctx);
       if (!runtime.autoresearchMode) return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF." }], details: {} };
       const workDir = resolveWorkDir(ctx.cwd);
@@ -3486,9 +3489,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (!fromCommit || baselineMetric === null || baselineMetric === undefined) {
         return { content: [{ type: "text", text: "❌ Need from_commit + baseline_metric (or an active phase with a checkpoint)." }], details: {} };
       }
+      const onProgress = onUpdate ? (msg: string) => {
+        onUpdate({ content: [{ type: "text", text: msg }], details: { phase: "valley" } });
+      } : undefined;
       try {
         const probe = await runValleyProbe(
-          { rpc, exec: execAsParallel, runCmd: runBashForParallel, repoRoot, workDir, config },
+          { rpc, exec: execAsParallel, runCmd: runBashForParallel, repoRoot, workDir, config, onProgress },
           {
             fromCommit, baselineMetric, strategies: params.strategies,
             metricName: params.metric_name ?? runtime.state.metricName,
@@ -3552,7 +3558,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       budget_seconds: Type.Optional(Type.Number()),
       concurrency: Type.Optional(Type.Number()),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       const runtime = getRuntime(ctx);
       if (!runtime.autoresearchMode) return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF." }], details: {} };
       const workDir = resolveWorkDir(ctx.cwd);
@@ -3560,9 +3566,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const config = resolveConfig(readConfigJson(workDir));
       const rpc = new RpcClient(pi.events);
       if (!await rpc.ping()) return { content: [{ type: "text", text: "❌ pi-subagents RPC bridge not ready." }], details: {} };
+      const onProgress = onUpdate ? (msg: string) => {
+        onUpdate({ content: [{ type: "text", text: msg }], details: { phase: "orthogonal" } });
+      } : undefined;
       try {
         const result = await runCheckOrthogonal(
-          { rpc, exec: execAsParallel, runCmd: runBashForParallel, repoRoot, workDir, config },
+          { rpc, exec: execAsParallel, runCmd: runBashForParallel, repoRoot, workDir, config, onProgress },
           {
             patches: params.patches.map((p: { name: string; hypothesis: string; file_scope?: string[] }) => ({ name: p.name, hypothesis: p.hypothesis, fileScope: p.file_scope })),
             metricName: params.metric_name,
@@ -3608,14 +3617,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       budget_seconds: Type.Optional(Type.Number()),
       allowed_regression_steps: Type.Optional(Type.Number()),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
       const runtime = getRuntime(ctx);
       if (!runtime.autoresearchMode) return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF." }], details: {} };
       const workDir = resolveWorkDir(ctx.cwd);
       const repoRoot = resolveRepoRoot(workDir);
       const config = resolveConfig(readConfigJson(workDir));
       const rpc = new RpcClient(pi.events);
-      const sctx = { rpc, exec: execAsParallel, runCmd: runBashForParallel, repoRoot, workDir, config };
+      const onProgress = onUpdate ? (msg: string) => {
+        onUpdate({ content: [{ type: "text", text: msg }], details: { phase: "spacesearch" } });
+      } : undefined;
+      const sctx = { rpc, exec: execAsParallel, runCmd: runBashForParallel, repoRoot, workDir, config, onProgress };
       const sopts = {
         beamWidth: params.beam_width, candidatesPerState: params.candidates_per_state, diversityHints: params.diversity_hints,
         metricName: params.metric_name ?? runtime.state.metricName, direction: (params.direction as Direction) ?? runtime.state.bestDirection,

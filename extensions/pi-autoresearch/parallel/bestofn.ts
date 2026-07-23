@@ -46,6 +46,8 @@ export interface BestOfNOptions {
 }
 
 /** Context the orchestrator needs from the extension (injected, not imported). */
+export type ProgressFn = (msg: string) => void;
+
 export interface OrchestratorContext {
   rpc: RpcClient;
   exec: ExecFn;
@@ -54,6 +56,8 @@ export interface OrchestratorContext {
   repoRoot: string;
   workDir: string;
   config: ParallelConfig;
+  /** Optional progress reporter for UI feedback. */
+  onProgress?: ProgressFn;
 }
 
 const ESCALATION_ORDER: Tier[] = ["fast", "mid", "strong"];
@@ -170,10 +174,12 @@ export async function runBestOfN(ctx: OrchestratorContext, opts: BestOfNOptions)
   const { rpc, exec, runCmd, repoRoot, workDir, config } = ctx;
   const budgetSeconds = opts.budgetSeconds ?? config.budgetSeconds;
   const cascade = opts.cascade ?? config.cascade;
+  const progress = ctx.onProgress ?? (() => {});
 
   // 0. pre-flight baseline measure (BENCH_MODE=quick) must fit the budget.
   // Sample CPU load concurrently to calibrate concurrency.
   const baselineSha = await currentHead(exec, repoRoot);
+  progress(`Baseline measure (BENCH_MODE=quick, budget=${budgetSeconds}s)...`);
   const cpuSampleP = sampleCpuLoad(exec, 500);
   const pre = await runMeasure(exec, workDir, opts.metricName, "quick", budgetSeconds, runCmd);
   const cpuSample = await cpuSampleP.catch(() => null);
@@ -188,6 +194,7 @@ export async function runBestOfN(ctx: OrchestratorContext, opts: BestOfNOptions)
     };
   }
   const baselineMetric = pre.metric;
+  progress(`Baseline: ${baselineMetric}${opts.metricUnit ?? ""}`);
 
   // Calibrate concurrency against measured CPU load.
   const requestedConcurrency = opts.concurrency ?? config.concurrency ?? defaultConcurrency();
@@ -199,6 +206,7 @@ export async function runBestOfN(ctx: OrchestratorContext, opts: BestOfNOptions)
   await cleanupAllWorktrees(exec, repoRoot).catch(() => {});
 
   // 1. provision worktrees
+  progress(`Provisioning ${opts.candidates.length} worktrees...`);
   const wts: WorktreeHandle[] = [];
   try {
     for (let i = 0; i < opts.candidates.length; i++) {
@@ -217,6 +225,9 @@ export async function runBestOfN(ctx: OrchestratorContext, opts: BestOfNOptions)
     const finalResults: WorkerResult[] = new Array(opts.candidates.length);
 
     for (let tierRound = 0; tierRound < ESCALATION_ORDER.length && pending.length > 0; tierRound++) {
+      if (tierRound > 0) progress(`Cascade round ${tierRound + 1}/${ESCALATION_ORDER.length}: retrying ${pending.length} failed candidates on higher tier...`);
+      else progress(`Tier round 1: spawning ${pending.length} workers (concurrency=${concurrency})...`);
+
       // Determine which tier this round uses. With cascade, each candidate has
       // its own tier list; we process the round-th tier of each pending candidate.
       const roundFn = async (item: { candidate: Candidate; index: number }): Promise<void> => {
@@ -242,9 +253,19 @@ export async function runBestOfN(ctx: OrchestratorContext, opts: BestOfNOptions)
           outputMode: "file-only",
           context: "fresh",
         }, Math.max(30_000, workerTimeoutMs + 60_000));
+        const label = item.candidate.label ?? `#${item.index + 1}`;
+        progress(`Worker ${label}: spawned (tier=${tierName}, model=${model}, timeout=${Math.round(workerTimeoutMs / 60000)}min)...`);
         const result = await collectWorker(ctx, spawned, wt, workerTimeoutMs);
         result.tier = tierName;
         finalResults[item.index] = result;
+        if (result.status === "ok" && result.metric !== null) {
+          const pct = opts.direction === "lower"
+            ? ((baselineMetric - result.metric) / baselineMetric * 100).toFixed(1)
+            : ((result.metric - baselineMetric) / baselineMetric * 100).toFixed(1);
+          progress(`Worker ${label}: ${result.metric}${opts.metricUnit ?? ""} (${pct}%) — ok`);
+        } else {
+          progress(`Worker ${label}: ${result.status}${result.error ? " — " + result.error.slice(0, 80) : ""}`);
+        }
       };
       await mapWithConcurrency(pending, concurrency, roundFn);
 
@@ -263,6 +284,7 @@ export async function runBestOfN(ctx: OrchestratorContext, opts: BestOfNOptions)
     }
 
     // 4. aggregate
+    progress(`Ranking ${finalResults.length} candidates (noise floor: ${computeNoiseFloor(finalResults).toFixed(2)})...`);
     const noiseFloor = computeNoiseFloor(finalResults);
     const labels = opts.candidates.map((c, i) => c.label ?? `Hypothesis #${i + 1}`);
     const { ranked, winnerIndex } = rankCandidates(baselineMetric, opts.direction, finalResults, noiseFloor, labels);
@@ -276,6 +298,7 @@ export async function runBestOfN(ctx: OrchestratorContext, opts: BestOfNOptions)
     //    Re-measure candidates best-first IN THEIR WORKTREES; the FIRST that
     //    confirms a genuine improvement (above noise floor) wins. Main workdir
     //    is never touched during measurement. If #1 fails, try #2, #3...
+    progress(`Cascade re-measure (BENCH_MODE=full): testing top ${ranked.length} candidates in worktrees...`);
     const remeasureCandidates: ReMeasureCandidate[] = ranked.map((c) => ({
       key: c.index,
       quickMetric: c.medianMetric,
@@ -296,6 +319,12 @@ export async function runBestOfN(ctx: OrchestratorContext, opts: BestOfNOptions)
     let confirmedIndex: number | null = remeasureResult.confirmedKey as number | null;
     let confirmedMetric = remeasureResult.confirmedMetric;
     let confirmedSummary: string | undefined;
+
+    if (confirmedIndex !== null) {
+      progress(`Winner confirmed: #${confirmedIndex + 1} at ${confirmedMetric}${opts.metricUnit ?? ""} — applying diff to main...`);
+    } else {
+      progress(`No candidate survived re-measure cascade — discarding.`);
+    }
 
     // If a winner was confirmed in a worktree, apply its diff to main now.
     if (confirmedIndex !== null) {

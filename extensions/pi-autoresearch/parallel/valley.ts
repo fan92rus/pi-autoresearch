@@ -29,6 +29,8 @@ export interface ValleyProbeContext {
   repoRoot: string;
   workDir: string;
   config: ParallelConfig;
+  /** Optional progress reporter for UI feedback. */
+  onProgress?: (msg: string) => void;
 }
 
 export interface ValleyProbeOptions {
@@ -70,6 +72,7 @@ export interface ValleyProbeResult {
  */
 export async function runValleyProbe(ctx: ValleyProbeContext, opts: ValleyProbeOptions): Promise<ValleyProbeResult> {
   const { rpc, exec, repoRoot, config, runCmd } = ctx;
+  const progress = ctx.onProgress ?? (() => {});
   const budgetSeconds = opts.budgetSeconds ?? config.budgetSeconds;
   const benchMode: BenchMode = config.workerBenchMode;
   const concurrency = opts.concurrency ?? config.concurrency ?? defaultConcurrency();
@@ -79,6 +82,7 @@ export async function runValleyProbe(ctx: ValleyProbeContext, opts: ValleyProbeO
     for (let i = 0; i < opts.strategies.length; i++) {
       wts.push(await provisionWorktree(exec, repoRoot, i + 1, opts.fromCommit));
     }
+    progress(`Valley probe: spawning ${opts.strategies.length} workers (concurrency=${concurrency})...`);
     let cursor = 0;
     const runOne = async (strategy: string, index: number): Promise<void> => {
       const wt = wts[index]!;
@@ -91,7 +95,13 @@ export async function runValleyProbe(ctx: ValleyProbeContext, opts: ValleyProbeO
         budgetSeconds, benchMode, repeats: 1,
       });
       const spawned: SpawnedWorker = await rpc.spawn({ agent: opts.agent ?? "worker", task, cwd: wt.path, model, output: path.join(wt.path, ".auto", "worker-result.json"), outputMode: "file-only", context: "fresh" });
+      progress(`Valley worker ${index + 1}/${opts.strategies.length}: spawned (model=${model})...`);
       results[index] = await collectWorker(ctx, spawned, wt, config.complexityMap[config.defaultComplexity].workerTimeoutMs);
+      if (results[index].status === "ok" && results[index].metric !== null) {
+        progress(`Valley worker ${index + 1}: ${results[index].metric}${opts.metricUnit ?? ""} — ok`);
+      } else {
+        progress(`Valley worker ${index + 1}: ${results[index].status}`);
+      }
     };
     const workers: Promise<void>[] = [];
     const n = Math.max(1, Math.min(concurrency, opts.strategies.length));

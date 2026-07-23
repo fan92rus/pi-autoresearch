@@ -54,6 +54,8 @@ export interface SpaceSearchContext {
   repoRoot: string;
   workDir: string;
   config: ParallelConfig;
+  /** Optional progress reporter for UI feedback. */
+  onProgress?: (msg: string) => void;
 }
 
 export interface SpaceSearchOptions {
@@ -123,6 +125,7 @@ export async function initBeam(ctx: SpaceSearchContext, opts: SpaceSearchOptions
 /** Advance the beam one step: spawn M×K candidates, prune to top-K with lookahead. */
 export async function stepBeam(ctx: SpaceSearchContext, opts: SpaceSearchOptions): Promise<{ ok: true; beam: Beam; improved: boolean; converged: boolean } | { ok: false; error: string }> {
   const { rpc, exec, repoRoot, workDir, config } = ctx;
+  const progress = ctx.onProgress ?? (() => {});
   const beam = loadBeam(workDir);
   if (!beam) return { ok: false, error: "No beam. Call action=init first." };
 
@@ -141,6 +144,7 @@ export async function stepBeam(ctx: SpaceSearchContext, opts: SpaceSearchOptions
   try {
     // clear leftovers from a crashed previous run (wt-* names are reused)
     await cleanupAllWorktrees(exec, repoRoot).catch(() => {});
+    progress(`Step ${beam.step + 1}: spawning ${beam.states.length * M} workers (${beam.states.length} states × ${M} candidates, concurrency=${config.concurrency ?? defaultConcurrency()})...`);
     const tasks: Array<Promise<void>> = [];
     for (const state of beam.states) {
       for (let j = 0; j < M; j++) {
@@ -226,6 +230,7 @@ export async function stepBeam(ctx: SpaceSearchContext, opts: SpaceSearchOptions
 /** Finish: re-measure best states in their worktrees (full), cascade to next if not confirmed, cherry-pick winner onto main. */
 export async function finishBeam(ctx: SpaceSearchContext, opts: SpaceSearchOptions): Promise<{ finalMetric: number | null; decision: "keep" | "discard"; reason?: string }> {
   const { exec, runCmd, workDir, config, repoRoot } = ctx;
+  const progress = ctx.onProgress ?? (() => {});
   const beam = loadBeam(workDir);
   if (!beam) return { finalMetric: null, decision: "discard", reason: "no_beam" };
   const budgetSeconds = opts.budgetSeconds ?? config.budgetSeconds;
@@ -241,8 +246,11 @@ export async function finishBeam(ctx: SpaceSearchContext, opts: SpaceSearchOptio
 
   if (sortedStates.length === 0) {
     clearBeam(workDir);
+    progress(`Finish: no state better than baseline — discarding.`);
     return { finalMetric: null, decision: "discard", reason: "no_state_better_than_baseline" };
   }
+
+  progress(`Finish: cascade re-measure of ${sortedStates.length} candidates (BENCH_MODE=full)...`);
 
   const noiseFloor = 0; // TODO: compute from beam history if available
   const tempWorktrees: WorktreeHandle[] = [];
