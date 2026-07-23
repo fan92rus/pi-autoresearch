@@ -180,7 +180,6 @@ export async function stepBeam(ctx: SpaceSearchContext, opts: SpaceSearchOptions
             // Candidate failed — cleanup its worktree immediately
             await cleanupWorktree(exec, repoRoot, wt).catch(() => {});
           }
-          }
         })());
       }
     }
