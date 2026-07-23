@@ -62,7 +62,7 @@ import { runValleyProbe } from "./parallel/valley.ts";
 import { reMeasureWinner, applyDiff } from "./parallel/remeasure.ts";
 import { computeNoiseFloor } from "./parallel/aggregate.ts";
 import { resolveConfig, defaultConcurrency } from "./parallel/config.ts";
-import { interactiveParallelConfig } from "./parallel/config-ui.ts";
+import { interactiveParallelConfig, filterSubcommands } from "./parallel/config-ui.ts";
 import { resolveRepoRoot, cleanupAllWorktrees } from "./parallel/worktree.ts";
 import { newPhaseStore, startPhase, recordExploreStep, endPhaseDecision, clearPhase, markBestCheckpoint, persistPhase, clearPersistedPhase, commitPhaseGit, abortPhaseGit } from "./parallel/phases.ts";
 import type { Direction } from "./parallel/types.ts";
@@ -3726,7 +3726,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // -----------------------------------------------------------------------
 
   pi.registerCommand("autoresearch", {
-    description: "Start, stop, clear, or resume autoresearch mode",
+    description: "Start, stop, clear, configure, or resume autoresearch mode",
+    getArgumentCompletions: (argumentPrefix: string) => {
+      return filterSubcommands(argumentPrefix).map(function (s) {
+        return { value: s.value, label: s.label, description: s.description };
+      });
+    },
     handler: async (args, ctx) => {
       const runtime = getRuntime(ctx);
       const trimmedArgs = (args ?? "").trim();
