@@ -18,6 +18,7 @@ import type { RpcClient, SpawnedWorker } from "./rpc.ts";
 import type { ExecFn } from "./worktree.ts";
 import { provisionWorktree, cleanupWorktree, cleanupAllWorktrees, currentHead, type WorktreeHandle } from "./worktree.ts";
 import { runMeasure } from "./remeasure.ts";
+import { cascadeReMeasure, type ReMeasureCandidate } from "./remeasure.ts";
 import { isBetter } from "./aggregate.ts";
 import type { ParallelConfig } from "./config.ts";
 import { defaultConcurrency } from "./config.ts";
@@ -245,44 +246,41 @@ export async function finishBeam(ctx: SpaceSearchContext, opts: SpaceSearchOptio
   }
 
   const noiseFloor = 0; // TODO: compute from beam history if available
-  let confirmed: BeamState | null = null;
-  let confirmedMetric: number | null = null;
   const tempWorktrees: WorktreeHandle[] = [];
 
   try {
+    // Resolve worktreePaths for each state (provision fresh if stale).
+    const remeasureCandidates: ReMeasureCandidate[] = [];
     for (const state of sortedStates) {
-      // Determine where to measure: reuse the state's worktree if it exists,
-      // otherwise provision a fresh one from the state's commit.
-      let wtPath: string | null = null;
-      let needsCleanup = false;
-      if (state.worktreePath && fs.existsSync(state.worktreePath)) {
-        wtPath = state.worktreePath;
-      } else {
-        // Worktree was cleaned up by a subsequent step — provision a fresh one.
-        const wt = await provisionWorktree(exec, repoRoot, 99, state.commit);
+      let wtPath = state.worktreePath;
+      if (!wtPath || !fs.existsSync(wtPath)) {
+        const wt = await provisionWorktree(exec, repoRoot, 99 + remeasureCandidates.length, state.commit);
         tempWorktrees.push(wt);
         wtPath = wt.path;
-        needsCleanup = true;
       }
-      const m = await runMeasure(exec, wtPath, beam.metricName, "full", budgetSeconds, runCmd);
-      if (m.metric === null || m.timedOut) continue;
-      const better = beam.direction === "lower" ? m.metric < baselineMetric : m.metric > baselineMetric;
-      const beyondNoise = Math.abs(m.metric - baselineMetric) > noiseFloor;
-      if (better && beyondNoise) {
-        confirmed = state;
-        confirmedMetric = m.metric;
-        break;
-      }
+      remeasureCandidates.push({ key: state.commit, quickMetric: state.metric, status: "ok", worktreePath: wtPath, diff: "" });
     }
 
-    if (!confirmed) {
+    const cascade = await cascadeReMeasure(exec, runCmd, {
+      candidates: remeasureCandidates,
+      metricName: beam.metricName,
+      direction: beam.direction,
+      baselineMetric,
+      noiseFloor,
+      budgetSeconds,
+    });
+
+    if (cascade.confirmedKey === null) {
       clearBeam(workDir);
       return { finalMetric: null, decision: "discard", reason: "none_confirmed_on_remeasure" };
     }
 
     // Cherry-pick the confirmed winner's commit chain onto main.
+    const confirmedCommit = cascade.confirmedKey as string;
+    const confirmedMetric = cascade.confirmedMetric;
+    const confirmedState = sortedStates.find((s) => s.commit === confirmedCommit)!;
     const chain: string[] = [];
-    let cur: BeamState | null = confirmed;
+    let cur: BeamState | null = confirmedState;
     const byCommit = new Map(beam.states.map((s) => [s.commit, s] as const));
     while (cur && cur.parentCommit) {
       chain.unshift(cur.commit);

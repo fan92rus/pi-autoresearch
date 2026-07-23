@@ -22,7 +22,7 @@ import type { RpcClient, SpawnedWorker } from "./rpc.ts";
 import type { ExecFn } from "./worktree.ts";
 import { provisionWorktree, cleanupWorktree, cleanupAllWorktrees, currentHead, resolveRepoRoot, type WorktreeHandle } from "./worktree.ts";
 import { median, computeNoiseFloor, rankCandidates, isBetter } from "./aggregate.ts";
-import { runMeasure, applyDiff, parseMetricLines } from "./remeasure.ts";
+import { runMeasure, applyDiff, parseMetricLines, cascadeReMeasure, type ReMeasureCandidate } from "./remeasure.ts";
 import { sampleCpuLoad, calibrateConcurrency } from "./cpu.ts";
 import type { ParallelConfig } from "./config.ts";
 import { resolveTier, defaultConcurrency } from "./config.ts";
@@ -276,47 +276,31 @@ export async function runBestOfN(ctx: OrchestratorContext, opts: BestOfNOptions)
     //    Re-measure candidates best-first IN THEIR WORKTREES; the FIRST that
     //    confirms a genuine improvement (above noise floor) wins. Main workdir
     //    is never touched during measurement. If #1 fails, try #2, #3...
-    const remeasure: Array<{ index: number; decision: "keep" | "discard" | "skip"; finalMetric: number | null; reason?: string }> = [];
-    let confirmedIndex: number | null = null;
-    let confirmedMetric: number | null = null;
+    const remeasureCandidates: ReMeasureCandidate[] = ranked.map((c) => ({
+      key: c.index,
+      quickMetric: c.medianMetric,
+      status: c.status,
+      worktreePath: wts[c.index]?.path ?? "",
+      diff: finalResults[c.index]?.diff ?? "",
+    }));
+    const cascade = await cascadeReMeasure(exec, runCmd, {
+      candidates: remeasureCandidates,
+      metricName: opts.metricName,
+      direction: opts.direction,
+      baselineMetric,
+      noiseFloor,
+      budgetSeconds,
+      requireDiff: true,
+    });
+    const remeasure = cascade.attempts.map((a) => ({ index: a.key as number, decision: a.decision, finalMetric: a.finalMetric, reason: a.reason }));
+    let confirmedIndex: number | null = cascade.confirmedKey as number | null;
+    let confirmedMetric = cascade.confirmedMetric;
     let confirmedSummary: string | undefined;
-    for (const candidate of ranked) {
-      const result = finalResults[candidate.index]!;
-      if (candidate.status !== "ok" || !result.diff.trim()) {
-        remeasure.push({ index: candidate.index, decision: "skip", finalMetric: null, reason: "no_valid_diff" });
-        continue;
-      }
-      // Skip candidates whose quick metric is not better than baseline.
-      if (candidate.medianMetric !== null && !isBetter(candidate.medianMetric, baselineMetric, opts.direction)) {
-        remeasure.push({ index: candidate.index, decision: "skip", finalMetric: null, reason: "not_better_than_baseline" });
-        continue;
-      }
-      const wt = wts[candidate.index];
-      if (!wt) {
-        remeasure.push({ index: candidate.index, decision: "skip", finalMetric: null, reason: "worktree_gone" });
-        continue;
-      }
-      // Re-measure in the worktree (full mode) — main workdir stays clean.
-      const m = await runMeasure(exec, wt.path, opts.metricName, "full", budgetSeconds, runCmd);
-      if (m.metric === null || m.timedOut) {
-        remeasure.push({ index: candidate.index, decision: "discard", finalMetric: null, reason: "measure_failed" });
-        continue;
-      }
-      const better = opts.direction === "lower" ? m.metric < baselineMetric : m.metric > baselineMetric;
-      const beyondNoise = Math.abs(m.metric - baselineMetric) > noiseFloor;
-      if (better && beyondNoise) {
-        confirmedIndex = candidate.index;
-        confirmedMetric = m.metric;
-        confirmedSummary = truncateDiffSummary(result.diff);
-        remeasure.push({ index: candidate.index, decision: "keep", finalMetric: m.metric });
-        break; // first survivor wins — stop testing further candidates
-      }
-      remeasure.push({ index: candidate.index, decision: "discard", finalMetric: m.metric, reason: beyondNoise ? "regression" : "within_noise" });
-    }
 
     // If a winner was confirmed in a worktree, apply its diff to main now.
     if (confirmedIndex !== null) {
       const winnerResult = finalResults[confirmedIndex]!;
+      confirmedSummary = truncateDiffSummary(winnerResult.diff);
       try {
         await applyDiff(exec, workDir, winnerResult.diff);
       } catch {

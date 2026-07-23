@@ -19,7 +19,7 @@ import { readWorkerResult, collectWorker } from "./bestofn.ts";
 import type { ParallelConfig } from "./config.ts";
 import { defaultConcurrency } from "./config.ts";
 import { buildWorkerTask } from "./bestofn.ts";
-import { runMeasure } from "./remeasure.ts";
+import { cascadeReMeasure, type ReMeasureCandidate } from "./remeasure.ts";
 import type { BenchMode, Direction, RankedCandidate, WorkerResult } from "./types.ts";
 
 export interface ValleyProbeContext {
@@ -107,22 +107,23 @@ export async function runValleyProbe(ctx: ValleyProbeContext, opts: ValleyProbeO
     // Cascade re-measurement: try each ranked candidate in its worktree (full mode).
     // First one that beats baseline beyond noise → confirmed winner. Main workdir
     // is never touched — no applyDiff/revertWorkdir needed.
-    let confirmed: RankedCandidate | null = null;
-    let confirmedMetric: number | null = null;
-    for (const candidate of ranked) {
-      if (candidate.status !== "ok" || candidate.medianMetric === null) continue;
-      const wt = wts[candidate.index];
-      if (!wt) continue;
-      const m = await runMeasure(exec, wt.path, opts.metricName, "full", budgetSeconds, runCmd);
-      if (m.metric === null || m.timedOut) continue;
-      const better = opts.direction === "lower" ? m.metric < opts.baselineMetric : m.metric > opts.baselineMetric;
-      const beyondNoise = Math.abs(m.metric - opts.baselineMetric) > noiseFloor;
-      if (better && beyondNoise) {
-        confirmed = candidate;
-        confirmedMetric = m.metric;
-        break;
-      }
-    }
+    const remeasureCandidates: ReMeasureCandidate[] = ranked.map((c) => ({
+      key: c.index,
+      quickMetric: c.medianMetric,
+      status: c.status,
+      worktreePath: wts[c.index]?.path ?? "",
+      diff: results[c.index]?.diff ?? "",
+    }));
+    const cascade = await cascadeReMeasure(exec, runCmd, {
+      candidates: remeasureCandidates,
+      metricName: opts.metricName,
+      direction: opts.direction,
+      baselineMetric: opts.baselineMetric,
+      noiseFloor,
+      budgetSeconds,
+    });
+    const confirmed = cascade.confirmedKey !== null ? ranked.find((r) => r.index === cascade.confirmedKey) ?? null : null;
+    const confirmedMetric = cascade.confirmedMetric;
 
     const winnerResult = confirmed ? results[confirmed.index] : null;
     return {
