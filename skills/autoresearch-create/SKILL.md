@@ -149,6 +149,23 @@ pnpm typecheck 2>&1 | grep -i error || true
 
 **NEVER STOP.** The user may be away for hours. Keep going until interrupted.
 
+## When to go parallel
+
+A sequential `edit → measure → keep/revert` loop is the default. Switch to parallel modes when you hit these triggers:
+
+| Trigger | Mode | Why |
+|---------|------|-----|
+| **2+ distinct hypotheses** to try | Best-of-N | Test all at once instead of sequentially |
+| **Stuck** — 5+ discards in a row, same approach | Best-of-N | Break out of the local optimum with diverse ideas |
+| **Must get worse before better** (refactor, algorithm swap) | Phases | Disable auto-revert; validate only the final metric |
+| **Phase stuck in a valley** (maxSteps hit) | valleyProbe | Spawn diverse continuations from best checkpoint |
+| **Multimodal landscape** — many local optima | SpaceSearch | Beam search maintains K diverse states |
+| **Independent file-scoped optimizations** | CheckOrthogonal | Stack patches that don't overlap |
+
+See `skill://autoresearch-parallel` for detailed flows and tool usage.
+
+**Rule of thumb**: if you're about to try 3+ variations of the same idea, use Best-of-N instead of sequential runs. It's cheaper (flash-model workers) and faster (parallel worktrees).
+
 ## Ideas Backlog
 
 When you discover complex but promising optimizations that you won't pursue right now, **append them as bullets to `.auto/ideas.md`**. Don't let good ideas get lost.
