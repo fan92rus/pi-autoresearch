@@ -220,8 +220,10 @@ export async function runHook(payload: HookPayload): Promise<HookResult> {
     tasks.push(runSingleScript(observerScript, payload));
   }
 
-  // 2. Global user hook (~/.pi/agent/autoresearch/hooks/before.sh) — only if NOT a managed leftover.
-  if (isExecutableFile(globalScript) && !isManagedHook(globalScript)) {
+  // 2. Global user hook (~/.pi/agent/autoresearch/hooks/before.sh).
+  //    The migration in index.ts removes old managed copies; any file here
+  //    now is genuinely user-owned.
+  if (isExecutableFile(globalScript)) {
     tasks.push(runSingleScript(globalScript, payload));
   }
 
@@ -236,7 +238,7 @@ export async function runHook(payload: HookPayload): Promise<HookResult> {
   }
 
   // 5. Project-local hooks dir (.auto/hooks/before.d/*.sh).
-  for (script of collectHookDir(localDir)) {
+  for (const script of collectHookDir(localDir)) {
     tasks.push(runSingleScript(script, payload));
   }
 
@@ -318,18 +320,23 @@ function isManagedHook(filePath: string): boolean {
 /**
  * One-time migration: remove the old auto-installed hook from user space.
  * Previous versions auto-installed the observer to ~/.pi/agent/autoresearch/hooks/before.sh.
- * Now the observer runs from the extension dir. If the old file still has our
- * OBSERVER_VERSION marker, it's a leftover — delete it so it doesn't run twice.
- * If it has no marker (user customized it), leave it — it runs as a user hook.
+ * Now the observer runs from the extension dir. If the old file still exists, we
+ * remove it — whether it has the OBSERVER_VERSION marker or not — because it's
+ * superseded by the bundled observer and would cause duplicate steers.
+ * Exception: if the file is NOT recognizable as our observer (no v3/v4 header),
+ * it's a user customization and we leave it.
  */
 export function migrateAutoInstalledHook(): { removed: boolean; reason?: string } {
   const globalPath = globalHookPath("before");
   if (!fs.existsSync(globalPath)) return { removed: false, reason: "not_found" };
-  if (!isManagedHook(globalPath)) return { removed: false, reason: "user_customized" };
   try {
+    const content = fs.readFileSync(globalPath, "utf-8");
+    // Our managed hook always has either OBSERVER_VERSION or the v3 header banner.
+    const isOurs = OBSERVER_VERSION_RE.test(content) || /GLOBAL AUTORESEARCH OBSERVER/.test(content);
+    if (!isOurs) return { removed: false, reason: "user_customized" };
     fs.unlinkSync(globalPath);
     return { removed: true };
-  } catch (e) {
+  } catch {
     return { removed: false, reason: "delete_failed" };
   }
 }
