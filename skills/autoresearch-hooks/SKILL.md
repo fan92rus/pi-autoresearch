@@ -5,142 +5,225 @@ description: Author pre/post-iteration hooks for an autoresearch session. Use wh
 
 # autoresearch-hooks
 
-Optional bash scripts that run at iteration boundaries in an autoresearch session. They're transparent to the loop-running agent — their effect is a file on disk or a steer message.
+Create bash scripts that run at iteration boundaries in an autoresearch session — side effects like notifications, logging, research, or intervention.
 
-## What runs automatically (you don't need to build these)
+## What runs automatically (don't rebuild these)
 
-The extension includes a **built-in TypeScript observer** that runs in-process before each iteration. It provides five triggers automatically:
+The extension includes a **built-in TypeScript observer** (in-process, zero overhead) with five triggers:
 
-| Trigger | Condition | Behavior |
-|---------|-----------|----------|
-| 🔊 **Noise Gate** | System noise > best + 10% | Warns the run will likely discard. `"noise_gate": "hard"` in `.auto/config.json` to skip. |
-| 🔬 **Floor Detection** | Streak ≥ 15 + low variance (CV < 0.15) | Recommends finalize — metric plateaued. Override: `"auto_floor_override": true`. |
-| 🏁 **Finalize Signal** | Agent called `finalize_research()` at confidence > 0.5 | Recommends `/autoresearch off`. |
-| 🔄 **Stagnation** | Streak ≥ 5 (every 5) | L1→BestOfN hint, L2→SpaceSearch hint, L3→valleyProbe hint. ASI-aware. |
-| 🎯 **Progress** | Every 5 improvements | Trend analysis (linear/diminishing/erratic). |
+| Trigger | What it does |
+|---------|-------------|
+| 🔊 Noise Gate | Warns if system noise > best metric |
+| 🔬 Floor Detection | Recommends finalize if metric plateaued (CV < 0.15) |
+| 🏁 Finalize Signal | Detects `finalize_research()` calls |
+| 🔄 Stagnation | Escalating hints at 5/10/15/20+ non-improving runs |
+| 🎯 Progress | Trend analysis every 5 improvements |
 
-You **cannot** remove or edit these — they're extension code. User hooks add behavior on top.
-
----
-
-## User hooks
-
-User hooks are **bash scripts** in user space that run **in addition to** the built-in observer:
-
-| Source | Path | Scope |
-|--------|------|-------|
-| **Global hook** | `~/.pi/agent/autoresearch/hooks/before.sh` | All projects |
-| **Global .d/** | `~/.pi/agent/autoresearch/hooks/before.d/*.sh` | All projects (alphabetical) |
-| **Project hook** | `.auto/hooks/before.sh` | One project |
-| **Project .d/** | `.auto/hooks/before.d/*.sh` | One project (alphabetical) |
-
-Same layout for `after.sh` / `after.d/`.
-
-### Execution order
-
-```
-1. Built-in observer (TypeScript, in-process)   ← stagnation/floor/noise/finalize
-2. Global user hook                              ← ~/.pi/agent/autoresearch/hooks/
-3. Global .d/*.sh                                ← alphabetical
-4. Project-local hook                            ← .auto/hooks/
-5. Project-local .d/*.sh                         ← alphabetical
-```
-
-All hooks run independently; stdout is concatenated with `---` separators. A failing user hook **never blocks** the observer.
-
-### Single file or `.d/` directory?
-
-| Need | Use |
-|------|-----|
-| One hook for this project | `.auto/hooks/before.sh` |
-| Multiple independent hooks | `.auto/hooks/before.d/01-notify.sh`, `02-log.sh`, ... |
-| One hook for ALL projects | `~/.pi/agent/autoresearch/hooks/before.sh` |
-| Multiple hooks for ALL projects | `~/.pi/agent/autoresearch/hooks/before.d/*.sh` |
+**Don't reimplement these.** Build hooks for things the observer doesn't do.
 
 ---
 
-## Contract
+## Step 1: Classify the request
 
-### Stdin
+Ask: **what should the hook DO, and WHEN?**
 
-One JSON line. Parse with `jq`:
+| User says... | Stage | Category |
+|--------------|-------|----------|
+| "notify me on wins" | `after` | Notification |
+| "notify on crashes" | `after` | Notification |
+| "log every result" | `after` | Journal |
+| "tag winning commits" | `after` | Git automation |
+| "search the web before each run" | `before` | Research |
+| "prevent thrashing" | `before` | Intervention |
+| "rotate ideas from backlog" | `before` | Idea management |
+| "if 3 discards, suggest pause" | `before` | Intervention |
+| "send Slack update" | `after` | Notification |
+
+**Rule: `before` = prospective (intervene, prepare), `after` = retrospective (react, log, notify).**
+
+If the request is both retrospective + prospective → two hooks (one `before`, one `after`), not one overloaded script.
+
+## Step 2: Choose placement
+
+| Scope | Path | When to use |
+|-------|------|-------------|
+| One project | `.auto/hooks/before.sh` | Default — project-specific logic |
+| One project, multiple concerns | `.auto/hooks/before.d/01-X.sh`, `02-Y.sh` | Independent scripts run in parallel |
+| All projects | `~/.pi/agent/autoresearch/hooks/before.sh` | Global customization (e.g., Slack webhook) |
+
+**Default: project-local `.auto/hooks/`.** Only go global if the user explicitly wants it for all projects.
+
+## Step 3: Write the hook
+
+### Template (copy this)
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+input="$(cat)"
+
+# ── Extract fields ──
+cwd="$(jq -r '.cwd' <<<"$input")"
+status="$(jq -r '.last_run.status // .run_entry.status // empty' <<<"$input")"
+metric="$(jq -r '.last_run.metric // .run_entry.metric // empty' <<<"$input")"
+best="$(jq -r '.session.best_metric // empty' <<<"$input")"
+run_count="$(jq -r '.session.run_count // 0' <<<"$input")"
+
+# ── Guard clause (early exit) ──
+[ -z "$metric" ] && exit 0
+
+# ── Your logic ──
+# (write your side effect here)
+
+# ── Output (optional steer message) ──
+echo "Your steer message for the agent"
+```
+
+### Stdin contract
+
+One JSON line. For `before.sh`:
 
 ```json
 {
   "event": "before",
-  "cwd": "/path/to/workdir",
+  "cwd": "/path",
   "next_run": 6,
-  "last_run": {
-    "run": 5,
-    "status": "discard",
-    "metric": 42.1,
-    "description": "tried X",
-    "asi": { "hypothesis": "tested Y" }
-  },
-  "session": {
-    "metric_name": "total_ms",
-    "metric_unit": "ms",
-    "direction": "lower",
-    "baseline_metric": 40.7,
-    "best_metric": 33.5,
-    "run_count": 5,
-    "goal": "optimize sort speed"
-  }
+  "last_run": { "run": 5, "status": "discard", "metric": 42.1, "description": "...", "asi": { "hypothesis": "..." } },
+  "session": { "metric_name": "ms", "metric_unit": "ms", "direction": "lower", "baseline_metric": 40.7, "best_metric": 33.5, "run_count": 5, "goal": "..." }
 }
 ```
 
-For `after.sh`, `last_run` is replaced by `run_entry` (the run just logged).
+For `after.sh`, `last_run` → `run_entry` (the run just logged).
 
-### Output
+### Output contract
 
-- **Stdout** (up to 8 KB) — delivered to the agent as a steer message. Empty = silent.
-- **Stderr + non-zero exit** — surfaced as an error steer.
-- **Timeout** — 30 s hard kill.
+- **Stdout** (up to 8 KB) → steer message. Empty = silent.
+- **Non-zero exit** → error steer (visible to agent, non-blocking).
+- **Timeout** → 30 s hard kill.
+
+## Step 4: Test
+
+**Always test before relying on the hook:**
+
+```bash
+# before.sh test
+echo '{"event":"before","cwd":".","next_run":4,"last_run":{"run":3,"status":"discard","metric":50},"session":{"metric_name":"ms","metric_unit":"ms","direction":"lower","baseline_metric":45,"best_metric":40,"run_count":3,"goal":"test"}}' \
+  | .auto/hooks/before.sh
+
+# after.sh test (note: run_entry instead of last_run)
+echo '{"event":"after","cwd":".","run_entry":{"run":4,"status":"keep","metric":38},"session":{"metric_name":"ms","metric_unit":"ms","direction":"lower","baseline_metric":45,"best_metric":38,"run_count":4,"goal":"test"}}' \
+  | .auto/hooks/after.sh
+```
+
+If output is empty when it shouldn't be → check `set -euo pipefail` isn't killing the script on a failed `jq` extraction. Use `// empty` or `// 0` defaults in jq.
+
+## Step 5: Commit
+
+`.auto/**` survives auto-revert. Commit alongside measure.sh and prompt.md:
+
+```bash
+chmod +x .auto/hooks/before.sh
+git add .auto/hooks/
+git commit -m "chore: add stagnation alert hook"
+```
 
 ---
 
-## Creating a user hook
+## Patterns
 
-1. **Read `.auto/prompt.md`** for the objective. Your hook should complement the loop.
-
-2. **Create the script**:
+### Notification (after.sh)
 
 ```bash
-mkdir -p .auto/hooks
-cat > .auto/hooks/before.sh << 'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 input="$(cat)"
-next_run="$(echo "$input" | jq -r '.next_run // 0')"
-[ "$next_run" -lt 4 ] && exit 0
-echo "⚠️ Consider a different approach after $next_run runs"
-EOF
-chmod +x .auto/hooks/before.sh
+status="$(jq -r '.run_entry.status // empty' <<<"$input")"
+[ "$status" != "keep" ] && exit 0
+
+metric="$(jq -r '.run_entry.metric' <<<"$input")"
+best="$(jq -r '.session.best_metric' <<<"$input")"
+
+# Slack webhook example
+# curl -s -X POST -H 'Content-type: application/json' \
+#   --data "{\"text\":\"🎉 New best: $metric\"}" \
+#   https://hooks.slack.com/services/XXX
+
+echo "🎉 New best: $metric (was $best)"
 ```
 
-3. **Test with a mock payload**:
+### Anti-thrash intervention (before.sh)
 
 ```bash
-echo '{"event":"before","cwd":".","next_run":4,"last_run":null,"session":{"metric_name":"x","metric_unit":"ms","direction":"lower","baseline_metric":null,"best_metric":null,"run_count":3,"goal":"test"}}' \
-  | .auto/hooks/before.sh
+#!/usr/bin/env bash
+set -euo pipefail
+input="$(cat)"
+next_run="$(jq -r '.next_run // 0' <<<"$input")"
+last_status="$(jq -r '.last_run.status // empty' <<<"$input")"
+
+# Only intervene after 3+ runs
+[ "$next_run" -lt 4 ] && exit 0
+[ "$last_status" != "discard" ] && exit 0
+
+echo "⚠️ Thrash detected ($(($next_run - 1)) runs, no improvement). Consider: re-read .auto/prompt.md, check noise floor, try a fundamentally different approach."
 ```
 
-4. **Commit** alongside other session files.
+### Learnings journal (after.sh)
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+input="$(cat)"
+cwd="$(jq -r '.cwd' <<<"$input")"
+status="$(jq -r '.run_entry.status // empty' <<<"$input")"
+metric="$(jq -r '.run_entry.metric // "?"' <<<"$input")"
+desc="$(jq -r '.run_entry.description // "?"' <<<"$input")"
+learned="$(jq -r '.run_entry.asi.learned // empty' <<<"$input")"
+
+journal="$cwd/.auto/learnings.md"
+{
+  echo "- [$status] $metric: $desc"
+  [ -n "$learned" ] && echo "  Learned: $learned"
+} >> "$journal"
+```
+
+### Idea rotator (before.sh)
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+input="$(cat)"
+cwd="$(jq -r '.cwd' <<<"$input")"
+streak="$(jq -r '.session.run_count // 0' <<<"$input")"
+
+# Rotate an idea from the backlog every 3 runs
+[ $((streak % 3)) -ne 0 ] && exit 0
+
+ideas="$cwd/.auto/ideas.md"
+[ ! -f "$ideas" ] && exit 0
+
+# Pick the first unchecked idea
+idea=$(grep -m1 '^- \[ \]' "$ideas" 2>/dev/null | sed 's/^- \[ \] //')
+[ -z "$idea" ] && exit 0
+
+# Mark it as tried
+sed -i "0,/- \[ \] $idea/s//- [x] $idea/" "$ideas"
+echo "🔄 Rotating idea from backlog: $idea"
+```
 
 ---
 
-## Rules of thumb
+## Rules
 
-- **Silent is the default.** Empty stdout = no steer. Only print when you have something useful.
-- **Guard with early exits.** `[ -z "$metric" ] && exit 0`.
-- **One concern per script.** Want notifications + learnings? Use `before.d/01-notify.sh` and `after.d/01-learnings.sh`.
-- **No environment variables.** Everything is on stdin; extract with `jq`.
-
----
+1. **Silent by default.** Only print to stdout when you have something useful. Empty = no steer.
+2. **One concern per script.** Use `.d/` for multiple independent hooks.
+3. **Guard with early exits.** `[ -z "$x" ] && exit 0`.
+4. **No env vars.** Everything on stdin via `jq`.
+5. **Always `chmod +x`.** Files without the executable bit are silently ignored.
+6. **Use `jq -r` with defaults** (`// empty`, `// 0`) to avoid pipeline failures.
+7. **Don't reimplement the observer.** Stagnation, floor, noise, finalize are already handled.
 
 ## Examples
 
-Runnable reference scripts live in `examples/`:
-
+Complete reference scripts in `examples/`:
 - `examples/before/` — anti-thrash, external search, idea rotator, hypothesis reflection, context rotation
 - `examples/after/` — learnings journal, notification on new best, auto-tag winning commits
