@@ -2,7 +2,7 @@
 
 **Дата:** 2026-07-23
 **Источник:** 64-iteration E2E test (`_parallel_e2e/app.sh` latency optimization)
-**Статус:** Draft — awaiting review
+**Статус:** ✅ Implemented (commit 7d0c779, merged to master 7d7cc1d)
 
 ---
 
