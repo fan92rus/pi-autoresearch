@@ -70,6 +70,8 @@ export interface OrthogonalContext {
   repoRoot: string;
   workDir: string;
   config: ParallelConfig;
+  /** Optional progress reporter for UI feedback. */
+  onProgress?: (msg: string) => void;
 }
 
 /** Compute the file list touched by a diff (actual scope, not declared). Pure. */
@@ -109,16 +111,19 @@ export function findScopeConflicts(
 /** Execute the orthogonal-stack flow. Mutates git on main only in phase 2. */
 export async function runCheckOrthogonal(ctx: OrthogonalContext, opts: OrthogonalOptions): Promise<OrthogonalResult> {
   const { rpc, exec, runCmd, repoRoot, workDir, config } = ctx;
+  const progress = ctx.onProgress ?? (() => {});
   const budgetSeconds = opts.budgetSeconds ?? config.budgetSeconds;
   const concurrency = opts.concurrency ?? config.concurrency ?? defaultConcurrency();
   const benchMode: BenchMode = config.workerBenchMode;
 
   const baselineSha = await currentHead(exec, repoRoot);
+  progress(`Baseline measure (BENCH_MODE=quick)...`);
   const pre = await runMeasure(exec, workDir, opts.metricName, "quick", budgetSeconds, runCmd);
   if (pre.timedOut || pre.metric === null) {
     return { baselineMetric: NaN, perPatch: [], independence: { orthogonal: false, conflicts: [] }, stackedMetric: null, applied: [], rejected: [], decision: "discard", reason: "baseline_over_budget" };
   }
   const baselineMetric = pre.metric;
+  progress(`Baseline: ${baselineMetric}${opts.metricUnit ?? ""}`);
 
   // Phase 1 — parallel measurement + actual scope capture.
   const wts: WorktreeHandle[] = [];
@@ -129,6 +134,7 @@ export async function runCheckOrthogonal(ctx: OrthogonalContext, opts: Orthogona
     for (let i = 0; i < opts.patches.length; i++) {
       wts.push(await provisionWorktree(exec, repoRoot, i + 1, baselineSha));
     }
+    progress(`Phase 1: measuring ${opts.patches.length} patches in parallel worktrees...`);
     let cursor = 0;
     const runOne = async (patch: OrthogonalPatch, index: number): Promise<void> => {
       const wt = wts[index]!;
