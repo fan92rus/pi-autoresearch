@@ -50,6 +50,8 @@ export interface WorkerResult {
   error?: string;
   /** Which tier/model produced this result (for cascade logging). */
   tier?: string;
+  /** Actual wall-clock time the worker ran (ms), set by collectWorker. */
+  elapsedMs?: number;
 }
 
 /** A candidate + its measured result, after aggregation. */
