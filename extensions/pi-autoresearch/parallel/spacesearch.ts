@@ -32,6 +32,8 @@ export interface BeamState {
   depth: number;
   /** Consecutive regression steps without improvement (for lookahead pruning). */
   regressionStreak: number;
+  /** Path to the worktree where this state was created (for finishBeam re-measure). */
+  worktreePath?: string;
 }
 
 export interface Beam {
@@ -171,8 +173,12 @@ export async function stepBeam(ctx: SpaceSearchContext, opts: SpaceSearchOptions
             const regressed = !isBetter(result.metric, state.metric, beam.direction);
             candidates.push({
               parent: state,
-              state: { commit: newHead, metric: result.metric, parentCommit: state.commit, hypothesis: hint, depth: state.depth + 1, regressionStreak: regressed ? state.regressionStreak + 1 : 0 },
+              state: { commit: newHead, metric: result.metric, parentCommit: state.commit, hypothesis: hint, depth: state.depth + 1, regressionStreak: regressed ? state.regressionStreak + 1 : 0, worktreePath: wt.path },
             });
+          } else {
+            // Candidate failed — cleanup its worktree immediately
+            await cleanupWorktree(exec, repoRoot, wt).catch(() => {});
+          }
           }
         })());
       }
@@ -202,56 +208,101 @@ export async function stepBeam(ctx: SpaceSearchContext, opts: SpaceSearchOptions
     beam.step += 1;
     saveBeam(workDir, beam);
 
+    // Cleanup worktrees for candidates that didn't make it into the beam.
+    // Worktrees for surviving states are kept for finishBeam re-measurement.
+    const survivorPaths = new Set(beam.states.map((s) => s.worktreePath).filter((p): p is string => !!p));
+    await Promise.all(wts.filter(Boolean).filter((wt) => !survivorPaths.has(wt.path)).map((wt) => cleanupWorktree(exec, repoRoot, wt).catch(() => {})));
+
     const bestAfter = beam.states.reduce((acc, s) => (isBetter(s.metric, acc, beam.direction) ? s.metric : acc), beam.states[0]!.metric);
     const improved = isBetter(bestAfter, bestBefore, beam.direction);
     return { ok: true, beam, improved, converged: !improved };
-  } finally {
+  } catch (e) {
+    // On error, cleanup ALL worktrees
     await Promise.all(wts.filter(Boolean).map((wt) => cleanupWorktree(exec, repoRoot, wt).catch(() => {})));
+    throw e;
   }
 }
 
-/** Finish: cherry-pick the best state's chain into main, re-measure in full. */
+/** Finish: re-measure best states in their worktrees (full), cascade to next if not confirmed, cherry-pick winner onto main. */
 export async function finishBeam(ctx: SpaceSearchContext, opts: SpaceSearchOptions): Promise<{ finalMetric: number | null; decision: "keep" | "discard"; reason?: string }> {
-  const { exec, runCmd, workDir, config } = ctx;
+  const { exec, runCmd, workDir, config, repoRoot } = ctx;
   const beam = loadBeam(workDir);
   if (!beam) return { finalMetric: null, decision: "discard", reason: "no_beam" };
   const budgetSeconds = opts.budgetSeconds ?? config.budgetSeconds;
 
-  const best = beam.states.reduce((acc, s) => (acc === null || isBetter(s.metric, acc.metric, beam.direction) ? s : acc), null as BeamState | null);
-  if (!best) return { finalMetric: null, decision: "discard", reason: "empty_beam" };
+  // Baseline metric from the baseline state (depth 0).
+  const baselineState = beam.states.find((s) => s.depth === 0) ?? beam.states[0]!;
+  const baselineMetric = baselineState?.metric ?? Infinity;
 
-  // Reconstruct the commit chain best -> ... -> baseline by following parentCommit.
-  const chain: string[] = [];
-  let cur: BeamState | null = best;
-  const byCommit = new Map(beam.states.map((s) => [s.commit, s] as const));
-  // The chain may reference commits not in the current beam (pruned ancestors);
-  // fall back to cherry-picking just the best commit if reconstruction is partial.
-  while (cur && cur.parentCommit) {
-    chain.unshift(cur.commit);
-    cur = byCommit.get(cur.parentCommit) ?? null;
+  // Sort states best-first; skip states not better than baseline.
+  const sortedStates = [...beam.states]
+    .filter((s) => s.depth > 0 && isBetter(s.metric, baselineMetric, beam.direction))
+    .sort((a, b) => (beam.direction === "lower" ? a.metric - b.metric : b.metric - a.metric));
+
+  if (sortedStates.length === 0) {
+    clearBeam(workDir);
+    return { finalMetric: null, decision: "discard", reason: "no_state_better_than_baseline" };
   }
-  // Apply the chain: cherry-pick each onto main.
+
+  const noiseFloor = 0; // TODO: compute from beam history if available
+  let confirmed: BeamState | null = null;
+  let confirmedMetric: number | null = null;
+  const tempWorktrees: WorktreeHandle[] = [];
+
   try {
+    for (const state of sortedStates) {
+      // Determine where to measure: reuse the state's worktree if it exists,
+      // otherwise provision a fresh one from the state's commit.
+      let wtPath: string | null = null;
+      let needsCleanup = false;
+      if (state.worktreePath && fs.existsSync(state.worktreePath)) {
+        wtPath = state.worktreePath;
+      } else {
+        // Worktree was cleaned up by a subsequent step — provision a fresh one.
+        const wt = await provisionWorktree(exec, repoRoot, 99, state.commit);
+        tempWorktrees.push(wt);
+        wtPath = wt.path;
+        needsCleanup = true;
+      }
+      const m = await runMeasure(exec, wtPath, beam.metricName, "full", budgetSeconds, runCmd);
+      if (m.metric === null || m.timedOut) continue;
+      const better = beam.direction === "lower" ? m.metric < baselineMetric : m.metric > baselineMetric;
+      const beyondNoise = Math.abs(m.metric - baselineMetric) > noiseFloor;
+      if (better && beyondNoise) {
+        confirmed = state;
+        confirmedMetric = m.metric;
+        break;
+      }
+    }
+
+    if (!confirmed) {
+      clearBeam(workDir);
+      return { finalMetric: null, decision: "discard", reason: "none_confirmed_on_remeasure" };
+    }
+
+    // Cherry-pick the confirmed winner's commit chain onto main.
+    const chain: string[] = [];
+    let cur: BeamState | null = confirmed;
+    const byCommit = new Map(beam.states.map((s) => [s.commit, s] as const));
+    while (cur && cur.parentCommit) {
+      chain.unshift(cur.commit);
+      cur = byCommit.get(cur.parentCommit) ?? null;
+    }
     for (const sha of chain) {
       const r = await exec("git", ["cherry-pick", sha], { cwd: workDir, timeout: 15000 });
       if (r.code !== 0) {
-        // abort the cherry-pick and fall back
         await exec("git", ["cherry-pick", "--abort"], { cwd: workDir, timeout: 5000 }).catch(() => {});
+        clearBeam(workDir);
         return { finalMetric: null, decision: "discard", reason: `cherry_pick_failed: ${sha}` };
       }
     }
-  } catch (e) {
-    return { finalMetric: null, decision: "discard", reason: `cherry_pick_error: ${e instanceof Error ? e.message : String(e)}` };
+    clearBeam(workDir);
+    return { finalMetric: confirmedMetric, decision: "keep" };
+  } finally {
+    // Cleanup all temporary worktrees (surviving worktrees from stepBeam are also cleaned here).
+    await Promise.all(tempWorktrees.map((wt) => cleanupWorktree(exec, repoRoot, wt).catch(() => {})));
+    await cleanupAllWorktrees(exec, repoRoot).catch(() => {});
   }
-  const m = await runMeasure(exec, workDir, beam.metricName, "full", budgetSeconds, runCmd);
-  clearBeam(workDir);
-  if (m.metric === null || m.timedOut) {
-    await revertWorkdir(exec, workDir);
-    return { finalMetric: null, decision: "discard", reason: "remeasure_failed" };
-  }
-  const baselineMetric = (await initBeam(ctx, opts).catch(() => null)) && null; // not used; baseline stored at step 0
-  void baselineMetric;
-  return { finalMetric: m.metric, decision: "keep" };
 }
 
 export function statusBeam(workDir: string): { step: number; states: BeamState[]; beamWidth: number } | null {
