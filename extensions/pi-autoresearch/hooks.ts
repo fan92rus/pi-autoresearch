@@ -118,12 +118,8 @@ const notFired: HookResult = {
   durationMs: 0,
 };
 
-export async function runHook(payload: HookPayload): Promise<HookResult> {
-  // Project-local hook takes precedence; global hook is a fallback.
-  const localScript = hookScriptPath(payload.cwd, payload.event);
-  const script = isExecutableFile(localScript) ? localScript : globalHookPath(payload.event);
-  if (!isExecutableFile(script)) return notFired;
-
+/** Run a single hook script, capturing stdout/stderr with truncation. */
+async function runSingleScript(script: string, payload: HookPayload): Promise<HookResult> {
   const t0 = Date.now();
   return new Promise<HookResult>((resolve) => {
     const child = spawn(getBashForSpawn(), [script], { cwd: payload.cwd, timeout: TIMEOUT_MS, windowsHide: true });
@@ -168,6 +164,52 @@ export async function runHook(payload: HookPayload): Promise<HookResult> {
     child.stdin.write(JSON.stringify(payload));
     child.stdin.end();
   });
+}
+
+/** Merge two hook results: concatenate stdout, aggregate errors. */
+function mergeResults(global: HookResult, local: HookResult): HookResult {
+  if (!global.fired) return local;
+  if (!local.fired) return global;
+  // Both fired — concatenate stdout with separator if both have output.
+  const g = global.stdout.trim();
+  const l = local.stdout.trim();
+  const stdout = g && l ? `${g}\n---\n${l}` : (g || l);
+  return {
+    fired: true,
+    stdout,
+    stderr: [global.stderr, local.stderr].filter(Boolean).join("\n"),
+    // Non-zero from either = non-zero merged (local failures don't block global steers)
+    exitCode: (global.exitCode !== 0 || local.exitCode !== 0) ? (local.exitCode ?? global.exitCode) : 0,
+    timedOut: global.timedOut || local.timedOut,
+    durationMs: global.durationMs + local.durationMs,
+  };
+}
+
+/**
+ * Run hooks: global observer FIRST, then project-local hook.
+ * Both hooks run independently — the observer always fires (stagnation/floor/noise
+ * triggers), and the local hook adds project-specific behavior on top.
+ * If both produce stdout, outputs are concatenated with a '---' separator.
+ */
+export async function runHook(payload: HookPayload): Promise<HookResult> {
+  const globalScript = globalHookPath(payload.event);
+  const localScript = hookScriptPath(payload.cwd, payload.event);
+
+  const tasks: Promise<HookResult>[] = [];
+
+  // Global observer hook (always runs if executable).
+  if (isExecutableFile(globalScript)) {
+    tasks.push(runSingleScript(globalScript, payload));
+  }
+
+  // Project-local hook (runs IN ADDITION to global, not instead of).
+  if (localScript !== globalScript && isExecutableFile(localScript)) {
+    tasks.push(runSingleScript(localScript, payload));
+  }
+
+  if (tasks.length === 0) return notFired;
+  const results = await Promise.all(tasks);
+  return results.reduce(mergeResults);
 }
 
 export function steerMessageFor(stage: HookStage, result: HookResult): string | null {

@@ -5,13 +5,24 @@ description: Author pre/post-iteration hooks for an autoresearch session. Use wh
 
 # autoresearch-hooks
 
-Optional scripts that run at iteration boundaries in an autoresearch session. Two hooks, both transparent to the loop-running agent — their effect is a file on disk or a steer message.
+Optional scripts that run at iteration boundaries in an autoresearch session. Both hooks, transparent to the loop-running agent — their effect is a file on disk or a steer message.
 
 ```
 .auto/hooks/
   before.sh    # fires before each iteration (prospective)
   after.sh     # fires after each log_experiment (retrospective)
 ```
+
+## Both run: global observer + project-local
+
+The **global observer** (`~/.pi/agent/autoresearch/hooks/before.sh`, auto-installed by the extension) **always runs** — providing stagnation, floor, noise, and finalize triggers. A **project-local** hook (`.auto/hooks/before.sh`) runs **in addition**, not instead of.
+
+| Scenario | What runs |
+|----------|----------|
+| No local hook | Global observer only |
+| Local hook exists | **Both**: global observer first, then local hook. Outputs concatenated with `---` separator. |
+
+This means you can add a project-local hook (e.g., Slack notification) without losing the observer's stagnation/floor/noise triggers.
 
 Both files are optional. Files without the executable bit are silently ignored.
 
