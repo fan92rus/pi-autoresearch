@@ -22,7 +22,7 @@ All session files live in a single `.auto/` subfolder at the working directory r
 | `.auto/prompt.md` | Experiment prompt / playbook (heart of the session) |
 | `.auto/measure.sh` | Benchmark script — emits `METRIC name=value` lines |
 | `.auto/log.jsonl` | Append-only result log (written by the tools) |
-| `.auto/ideas.md` | Ideas backlog (optional) |
+| `.auto/ideas/` | Ideas backlog — one `.md` file per idea (optional) |
 | `.auto/checks.sh` | Correctness checks (optional) |
 | `.auto/config.json` | Session config (optional) |
 | `.auto/hooks/{before,after}.sh` | Lifecycle hooks (optional) |
@@ -102,7 +102,7 @@ Use `log_experiment`'s `asi` parameter to annotate each run with **whatever woul
 JSON config file that lives in `.auto/` under the pi session's working directory (`ctx.cwd`). Supported fields:
 
 - **`maxIterations`** (number) — maximum experiments before auto-stopping.
-- **`workingDir`** (string) — override the directory for all autoresearch operations: file I/O (`.auto/log.jsonl`, `.auto/prompt.md`, `.auto/measure.sh`, `.auto/checks.sh`, `.auto/ideas.md`), command execution, and git operations. Supports absolute paths or relative paths (resolved against `ctx.cwd`). The config file itself always stays under `ctx.cwd`. Fails if the directory doesn't exist.
+- **`workingDir`** (string) — override the directory for all autoresearch operations: file I/O (`.auto/log.jsonl`, `.auto/prompt.md`, `.auto/measure.sh`, `.auto/checks.sh`, `.auto/ideas/`), command execution, and git operations. Supports absolute paths or relative paths (resolved against `ctx.cwd`). The config file itself always stays under `ctx.cwd`. Fails if the directory doesn't exist.
 
 ```json
 {
@@ -168,9 +168,9 @@ See `skill://autoresearch-parallel` for detailed flows and tool usage.
 
 ## Ideas Backlog
 
-When you discover complex but promising optimizations that you won't pursue right now, **append them as bullets to `.auto/ideas.md`**. Don't let good ideas get lost.
+When you discover complex but promising optimizations that you won't pursue right now, **write them as individual `.md` files in `.auto/ideas/`** (e.g. `.auto/ideas/cache-ast.md`). Don't let good ideas get lost.
 
-On resume (context limit, crash), check `.auto/ideas.md` — prune stale/tried entries, experiment with the rest. When all paths are exhausted, delete the file and write a final summary.
+On resume (context limit, crash), check `.auto/ideas/` — remove tried files, experiment with the rest. When all paths are exhausted, write a final summary.
 
 ## User Messages During Experiments
 

@@ -20,7 +20,7 @@ For the hook contract (stdin schemas, stdout handling, timeouts, observability),
 | [`external-search.sh`](before/external-search.sh) | Mine agent notes for a query and fetch external material via your search tool of choice. |
 | [`qmd-search.sh`](before/qmd-search.sh) | Same shape, but targets a local [`qmd`](https://www.npmjs.com/package/qmd) BM25 / vector / rerank index over your project's markdown. |
 | [`anti-thrash.sh`](before/anti-thrash.sh) | After N consecutive discards, emit a steer suggesting a structural rethink. |
-| [`idea-rotator.sh`](before/idea-rotator.sh) | Surface the next unchecked bullet from `.auto/ideas.md` as a steer nudge. |
+| [`idea-rotator.sh`](before/idea-rotator.sh) | Surface the next idea from `.auto/ideas/` as a steer nudge. (Legacy: reads `.auto/ideas.md`) |
 | [`hypothesis-reflection.sh`](before/hypothesis-reflection.sh) | On a discard, ask a cheap model to critique the failed hypothesis and propose adjacent directions. |
 | [`context-rotation.sh`](before/context-rotation.sh) | Trim an oversized `.auto/prompt.md`, archiving the tail. |
 

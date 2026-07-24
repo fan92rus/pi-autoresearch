@@ -30,6 +30,7 @@ import { fileURLToPath } from "node:url";
 import { createServer, type Server, type ServerResponse } from "node:http";
 
 import { spawn } from "node:child_process";
+import { markIdeaTried } from "./observer.ts";
 import { createWriteStream } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -1727,7 +1728,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\nYou are in autoresearch mode. Optimize the primary metric through an autonomous experiment loop." +
       "\nUse init_experiment, run_experiment, and log_experiment tools. NEVER STOP until interrupted." +
       `\nExperiment rules: ${mdPath} — read this file at the start of every session and after compaction.` +
-      "\nWrite promising but deferred optimizations as bullet points to .auto/ideas.md — don't let good ideas get lost." +
+      "\nWrite promising but deferred optimizations as files in .auto/ideas/ (one .md per idea) — don't let good ideas get lost." +
       `\n${BENCHMARK_GUARDRAIL}` +
       "\nIf the user sends a follow-on message while an experiment is running, finish the current run_experiment + log_experiment cycle first, then address their message in the next iteration." +
       "\n\n## Experiment Protocol (MANDATORY — follow for EVERY iteration)" +
@@ -1746,13 +1747,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\n  6. LOG — log_experiment with status: keep/discard/crash." +
       "\n     ⛔ NEVER skip this step. Every run_experiment MUST be logged." +
       "\n  7. NEXT — Updated hypothesis based on what you learned." +
-      "\n     If stuck (3+ non-improving runs) → check .auto/ideas.md for alternative directions." +
+      "\n     If stuck (3+ non-improving runs) → check .auto/ideas/ for alternative directions." +
       "\n\n## Parallel Toolkit (USE PROACTIVELY — don't wait for stagnation!)" +
       "\nYou have parallel tools that test N hypotheses SIMULTANEOUSLY in isolated worktrees." +
       "\nGoing parallel is almost always better than sequential trial-and-error when you have multiple ideas." +
       "\n" +
       "\nWHEN TO GO PARALLEL:" +
-      "\n  • 2+ hypotheses in .auto/ideas.md → BestOfN (test all at once, keep the best)" +
+      "\n  • 2+ ideas in .auto/ideas/ → BestOfN (test all at once, keep the best)" +
       "\n  • 3+ sequential discards → BestOfN (try 3 different approaches in parallel)" +
       "\n  • Optimization requires getting WORSE first (refactor, algorithm swap) → startPhase" +
       "\n  • Stuck in a local optimum during a phase → valleyProbe (parallel escape attempts)" +
@@ -1790,7 +1791,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\n⛔ NEVER call run_experiment without a stated hypothesis." +
       "\n⛔ NEVER skip log_experiment after run_experiment." +
       "\n⛔ NEVER skip the smoke test — broken code wastes experiment time." +
-      "✅ Write promising but untried ideas to .auto/ideas.md.";
+      "✅ Write promising but untried ideas to .auto/ideas/ — one .md file per idea (e.g. cache-ast-nodes.md).\nWhen you try an idea, add \"idea_id\": \"filename\" to the ASI in log_experiment — the file will be auto-removed so the untried count stays accurate.";
 
     if (hasChecks) {
       extra +=
@@ -1856,6 +1857,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Old results remain accessible (filtered by segment in rendering).
       if (isReinit) {
         state.currentSegment++;
+        // Clear stale ideas from previous segment
+        const ideasDir = path.join(resolveWorkDir(ctx.cwd), ".auto", "ideas");
+        try { fs.rmSync(ideasDir, { recursive: true, force: true }); } catch { /* ignore */ }
       }
       state.bestMetric = null;
       state.secondaryMetrics = [];
@@ -2479,7 +2483,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "log_experiment automatically runs git add -A && git commit on 'keep', and auto-reverts code changes on 'discard'/'crash'/'checks_failed' (autoresearch files are preserved). Do NOT commit or revert manually.",
       "Use status 'keep' if the PRIMARY metric improved. 'discard' if worse or unchanged. 'crash' if it failed. Secondary metrics are for monitoring — they almost never affect keep/discard. Only discard a primary improvement if a secondary metric degraded catastrophically, and explain why in the description.",
       "log_experiment reports a confidence score after 3+ runs (best improvement as a multiple of the noise floor). ≥2.0× = likely real, <1.0× = within noise. If confidence is below 1.0×, consider re-running the same experiment to confirm before keeping. The score is advisory — it never auto-discards.",
-      "If you discover complex but promising optimizations you won't pursue immediately, append them as bullet points to .auto/ideas.md. Don't let good ideas get lost.",
+      "If you discover complex but promising optimizations you won't pursue immediately, write them as files in .auto/ideas/ (one .md per idea). Don't let good ideas get lost.",
       "Always include the asi parameter. At minimum: {\"hypothesis\": \"what you tried\"}. On discard/crash, also include rollback_reason and next_action_hint. Add any other key/value pairs that capture what you learned — dead ends, surprising findings, error details, bottlenecks. This is the only structured memory that survives reverts.",
     ],
     parameters: LogParams,
@@ -2768,6 +2772,24 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         broadcastDashboardUpdate(workDir);
       } catch (e) {
         text += `\n⚠️ Failed to write .auto/log.jsonl: ${e instanceof Error ? e.message : String(e)}`;
+      }
+
+      // ── Auto-remove tried idea file from .auto/ideas/ ──
+      // If ASI contains idea_id (string or array), delete the matching file
+      // so countUntriedIdeas stays accurate.
+      if (mergedASI) {
+        const ideasDir = path.join(workDir, ".auto", "ideas");
+        const rawId = (mergedASI as Record<string, unknown>).idea_id;
+        const ids: string[] = [];
+        if (typeof rawId === "string") ids.push(rawId);
+        else if (Array.isArray(rawId)) {
+          for (const x of rawId) if (typeof x === "string") ids.push(x);
+        }
+        for (const id of ids) {
+          if (markIdeaTried(ideasDir, id)) {
+            text += `\n💡 Idea ${id} removed from .auto/ideas/`;
+          }
+        }
       }
 
       if (params.status !== "keep" && params.status !== "budget_exceeded" && params.status !== "explore") {
@@ -3854,6 +3876,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             return;
           }
         }
+
+        // Also clear ideas directory
+        const ideasDir = path.join(workDir, ".auto", "ideas");
+        try { fs.rmSync(ideasDir, { recursive: true, force: true }); } catch { /* ignore */ }
 
         if (deletedPaths.length > 0) {
           ctx.ui.notify(`Deleted ${deletedPaths.join(", ")} and turned autoresearch mode OFF`, "info");

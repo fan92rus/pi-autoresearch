@@ -198,16 +198,18 @@ streak="$(jq -r '.session.run_count // 0' <<<"$input")"
 # Rotate an idea from the backlog every 3 runs
 [ $((streak % 3)) -ne 0 ] && exit 0
 
-ideas="$cwd/.auto/ideas.md"
-[ ! -f "$ideas" ] && exit 0
+ideas_dir="$cwd/.auto/ideas"
+[ ! -d "$ideas_dir" ] && exit 0
 
-# Pick the first unchecked idea
-idea=$(grep -m1 '^- \[ \]' "$ideas" 2>/dev/null | sed 's/^- \[ \] //')
-[ -z "$idea" ] && exit 0
+# Pick the first idea file
+idea_file=$(find "$ideas_dir" -name '*.md' | sort | head -1)
+[ -z "$idea_file" ] && exit 0
 
-# Mark it as tried
-sed -i "0,/- \[ \] $idea/s//- [x] $idea/" "$ideas"
-echo "🔄 Rotating idea from backlog: $idea"
+idea=$(cat "$idea_file")
+
+# Mark it as tried (delete the file)
+rm "$idea_file"
+echo "🔄 Rotating idea from backlog: $(basename "$idea_file")"
 ```
 
 ---

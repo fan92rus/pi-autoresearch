@@ -408,8 +408,22 @@ print_summary() {
   echo "  rm -r .auto    # session folder (current layout)"
   echo "  rm -f autoresearch.jsonl autoresearch.sh autoresearch.md autoresearch.ideas.md    # legacy flat files, if any"
 
+  local ideas_dir=".auto/ideas"
   local ideas_file=""
-  if [ -f ".auto/ideas.md" ]; then
+  if [ -d "$ideas_dir" ]; then
+    local idea_files
+    idea_files=$(find "$ideas_dir" -name '*.md' 2>/dev/null | sort)
+    if [ -n "$idea_files" ]; then
+      echo ""
+      echo "Ideas backlog (from $ideas_dir/):"
+      echo ""
+      for f in $idea_files; do
+        echo "  ### $(basename "$f")"
+        sed 's/^/    /' "$f"
+        echo ""
+      done
+    fi
+  elif [ -f ".auto/ideas.md" ]; then
     ideas_file=".auto/ideas.md"
   elif [ -f "autoresearch.ideas.md" ]; then
     ideas_file="autoresearch.ideas.md"
