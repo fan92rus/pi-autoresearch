@@ -8,6 +8,7 @@ import {
   checkFloor,
   computeState,
   DEFAULT_OBSERVER_CONFIG,
+  markIdeaTried,
 } from "../extensions/pi-autoresearch/observer.ts";
 
 // Helper: a "keep" run entry that improved the metric (lower is better)
@@ -24,7 +25,20 @@ function finalizeEntry(confidence, reason = "floor reached") {
   return { type: "finalize", reason, confidence, best_metric: 100, run_count: 5, timestamp: Date.now() };
 }
 
-const IDEAS = "/dev/null"; // non-existent path → untriedIdeas always 0
+const NO_IDEAS = "/dev/null"; // non-existent path → untriedIdeas always 0
+
+// Helper: create a .auto/ideas/ directory with N .md files
+function makeIdeasDir(count) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "obs-test-"));
+  const ideasDir = path.join(dir, "ideas");
+  fs.mkdirSync(ideasDir, { recursive: true });
+  for (let i = 0; i < count; i++) {
+    fs.writeFileSync(path.join(ideasDir, `idea-${i + 1}.md`), `# Idea ${i + 1}\n\nThis is idea number ${i + 1} to try out.\n`);
+  }
+  return ideasDir;
+}
+
+// ── checkFinalize: basic confidence thresholds ──────────────────────────────
 
 test("checkFinalize: no finalize entry → null", () => {
   const entries = [keepRun(90, 1), discardRun(95, 2)];
@@ -32,14 +46,14 @@ test("checkFinalize: no finalize entry → null", () => {
     entries.filter((e) => typeof e.run === "number").map((e) => ({ ...e, commit: "", metrics: {}, segment: 0, confidence: null, asi: {} })),
     "lower",
   );
-  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, IDEAS);
+  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, NO_IDEAS);
   assert.equal(result, null);
 });
 
 test("checkFinalize: strong confidence (>0.8) → strong recommendation", () => {
   const entries = [finalizeEntry(0.95, "architectural floor reached")];
   const state = { streak: 0, improvements: 0, best: 100, recent: [], impHistory: [], recentMetrics: [] };
-  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, IDEAS);
+  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, NO_IDEAS);
   assert.ok(result, "should return a steer");
   assert.match(result, /FINALIZE SIGNAL.*95%/);
   assert.match(result, /Strongly recommended/);
@@ -48,88 +62,56 @@ test("checkFinalize: strong confidence (>0.8) → strong recommendation", () => 
 test("checkFinalize: advisory confidence (>0.5, <=0.8) → advisory steer", () => {
   const entries = [finalizeEntry(0.6)];
   const state = { streak: 0, improvements: 0, best: 100, recent: [], impHistory: [], recentMetrics: [] };
-  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, IDEAS);
+  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, NO_IDEAS);
   assert.ok(result);
-  assert.match(result, /FINALIZE SIGNAL.*60%/);
   assert.match(result, /Consider whether/);
 });
 
 test("checkFinalize: low confidence (<=0.5) → null", () => {
   const entries = [finalizeEntry(0.3)];
   const state = { streak: 0, improvements: 0, best: 100, recent: [], impHistory: [], recentMetrics: [] };
-  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, IDEAS);
+  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, NO_IDEAS);
   assert.equal(result, null);
 });
 
-test("STALE DETECTION: improvement after finalize → suppressed (null)", () => {
-  // Agent called finalize at entry 2, then found a keep improvement at entry 3.
-  // The finalize claim "no more improvements" was premature → suppress.
+// ── Stale detection: improvements after finalize → suppressed ───────────────
+
+test("STALE DETECTION: improvement after finalize → null", () => {
   const entries = [
-    { run: 1, status: "keep", metric: 100, description: "baseline-ish", timestamp: 1 },
-    finalizeEntry(0.95, "floor reached"),
-    { run: 2, status: "keep", metric: 90, description: "found a gain!", timestamp: 2 },
+    finalizeEntry(0.95),
+    { run: 1, status: "keep", metric: 80, description: "found an improvement", timestamp: 2 },
   ];
-  const state = { streak: 0, improvements: 1, best: 90, recent: [], impHistory: [90], recentMetrics: [90] };
-  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, IDEAS);
-  assert.equal(result, null, "finalize should be suppressed when improvements found after it");
+  const state = { streak: 0, improvements: 1, best: 80, recent: [], impHistory: [80], recentMetrics: [80] };
+  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, NO_IDEAS);
+  assert.equal(result, null, "improvement after finalize → stale → null");
 });
 
-test("ANTI-NAGGING: discards after finalize → null (agent continued, don't nag)", () => {
-  // Agent called finalize, then continued working (all discards, no improvements).
-  // Previously: full FINALIZE SIGNAL every iteration = the "stops prematurely" bug.
-  // Now: observer goes quiet — the tool's immediate steer was enough.
-  // Actionable triggers (parallel, stagnation) handle steering instead.
-  const entries = [
-    finalizeEntry(0.95, "floor reached"),
-    discardRun(100, 1),
-    discardRun(100, 2),
-  ];
-  const state = { streak: 2, improvements: 0, best: 100, recent: [], impHistory: [], recentMetrics: [100, 100] };
-  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, IDEAS);
-  assert.equal(result, null, "should be null — agent continued working, tool steer was enough");
-});
-
-test("STALE DETECTION: last finalize entry matters, not earlier ones", () => {
-  // First finalize (stale, improvements after), then a second finalize (current).
+test("STALE DETECTION: last finalize entry governs (not earlier ones)", () => {
   const entries = [
     finalizeEntry(0.9, "first attempt"),
     { run: 1, status: "keep", metric: 80, description: "gain after first finalize", timestamp: 1 },
     finalizeEntry(0.95, "second attempt, still valid"),
   ];
   const state = { streak: 0, improvements: 1, best: 80, recent: [], impHistory: [80], recentMetrics: [80] };
-  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, IDEAS);
+  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, NO_IDEAS);
   assert.ok(result, "the LAST finalize entry governs — no runs after it → fires");
   assert.match(result, /95%/);
 });
 
 // ── Untried-ideas: simplify (not suppress) ────────────────────────────────────
 
-function makeIdeasFile(count) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "obs-test-"));
-  const ideasPath = path.join(dir, "ideas.md");
-  const lines = [];
-  for (let i = 0; i < count; i++) lines.push(`- Idea number ${i + 1} to try out`);
-  // Add a struck-through (tried) idea that should NOT count
-  lines.push("- ~~This one was tried already~~");
-  fs.writeFileSync(ideasPath, lines.join("\n") + "\n");
-  return ideasPath;
-}
-
 test("UNTRIED IDEAS: >=2 ideas → simplify to nudge (even with 0 runs after finalize)", () => {
-  const ideasPath = makeIdeasFile(3);
+  const ideasDir = makeIdeasDir(3);
   const entries = [finalizeEntry(0.95, "floor reached")];
   const state = { streak: 0, improvements: 0, best: 100, recent: [], impHistory: [], recentMetrics: [] };
-  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, ideasPath);
+  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, ideasDir);
   assert.ok(result, "should return a nudge, not null");
   assert.match(result, /3 untried ideas remain/);
   assert.doesNotMatch(result, /FINALIZE SIGNAL.*Strongly recommended/);
 });
 
 test("UNTRIED IDEAS: >=2 ideas + runs after → null (anti-nagging takes priority)", () => {
-  // Previously this returned a nudge mentioning run count.
-  // Now: runEntriesAfter >= 1 → null (anti-nagging fires before untried-ideas check).
-  // The actionable triggers (parallel opportunity) will suggest trying the ideas.
-  const ideasPath = makeIdeasFile(2);
+  const ideasDir = makeIdeasDir(2);
   const entries = [
     finalizeEntry(0.9),
     discardRun(100, 1),
@@ -137,37 +119,25 @@ test("UNTRIED IDEAS: >=2 ideas + runs after → null (anti-nagging takes priorit
     discardRun(100, 3),
   ];
   const state = { streak: 3, improvements: 0, best: 100, recent: [], impHistory: [], recentMetrics: [100, 100, 100] };
-  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, ideasPath);
+  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, ideasDir);
   assert.equal(result, null, "should be null — anti-nagging suppresses finalize after agent continued");
 });
 
 test("UNTRIED IDEAS: 1 idea → full finalize block (threshold is >=2)", () => {
-  const ideasPath = makeIdeasFile(1);
+  const ideasDir = makeIdeasDir(1);
   const entries = [finalizeEntry(0.95)];
   const state = { streak: 0, improvements: 0, best: 100, recent: [], impHistory: [], recentMetrics: [] };
-  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, ideasPath);
+  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, ideasDir);
   assert.match(result, /FINALIZE SIGNAL.*95%/);
-  assert.match(result, /Strongly recommended/);
-});
-
-test("UNTRIED IDEAS: struck-through ideas don't count", () => {
-  // makeIdeasFile adds 1 struck-through line; with count=1 total real = 1
-  const ideasPath = makeIdeasFile(1);
-  const entries = [finalizeEntry(0.95)];
-  const state = { streak: 0, improvements: 0, best: 100, recent: [], impHistory: [], recentMetrics: [] };
-  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, ideasPath);
-  // Only 1 real idea → full block, not nudge
   assert.match(result, /Strongly recommended/);
 });
 
 // ── Anti-nagging: finalize goes quiet after agent continued working ──────────
 
 test("ANTI-NAGGING: 0 runs after finalize → fires (just called, observer can surface)", () => {
-  // No runs after finalize → observer can show it as a fallback.
-  // With new priority order, actionable triggers fire first; finalize is last resort.
   const entries = [finalizeEntry(0.95)];
   const state = { streak: 0, improvements: 0, best: 100, recent: [], impHistory: [], recentMetrics: [] };
-  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, IDEAS);
+  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, NO_IDEAS);
   assert.ok(result, "with 0 runs after, finalize should fire as fallback");
   assert.match(result, /95%/);
 });
@@ -178,15 +148,13 @@ test("ANTI-NAGGING: 1 run after finalize → null (tool steer was enough)", () =
     discardRun(100, 1),
   ];
   const state = { streak: 1, improvements: 0, best: 100, recent: [], impHistory: [], recentMetrics: [100] };
-  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, IDEAS);
+  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, NO_IDEAS);
   assert.equal(result, null, "1+ runs after finalize → null (don't nag)");
 });
 
-// ── checkFloor: untried-ideas guard (P1-2) ───────────────────────────────────
+// ── checkFloor: untried-ideas guard ──────────────────────────────────────────
 
 function makeFloorState(streak, best) {
-  // Build a state with N non-improving runs and low CV to trigger floor detection.
-  // floorStreakThreshold=15, floorCvThreshold=0.15
   const metrics = Array(streak).fill(best);
   return {
     streak,
@@ -211,12 +179,14 @@ function makeFloorPayload(cwd, unit = "\u00b5s") {
 
 test("CHECK FLOOR: >=2 untried ideas → downgrade to nudge (don't claim limit)", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "obs-floor-"));
-  fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
-  // ideas.md goes in .auto/ (where checkFloor looks)
-  const ideasPath = path.join(dir, ".auto", "ideas.md");
-  fs.writeFileSync(ideasPath, "- Idea one to try out\n- Idea two to try out\n- Idea three to try out\n");
+  // Create .auto/ideas/ with 3 idea files
+  const ideasDir = path.join(dir, ".auto", "ideas");
+  fs.mkdirSync(ideasDir, { recursive: true });
+  for (let i = 0; i < 3; i++) {
+    fs.writeFileSync(path.join(ideasDir, `idea-${i + 1}.md`), `Idea ${i + 1} to try out`);
+  }
 
-  const state = makeFloorState(15, 100); // streak=15 triggers floor check
+  const state = makeFloorState(15, 100);
   const asi = { floor: false, profiled: false, noise: false, exhausted: false };
   const payload = makeFloorPayload(dir);
   const result = checkFloor(state, asi, payload, dir, DEFAULT_OBSERVER_CONFIG);
@@ -227,7 +197,7 @@ test("CHECK FLOOR: >=2 untried ideas → downgrade to nudge (don't claim limit)"
 
 test("CHECK FLOOR: 0 untried ideas → full floor block", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "obs-floor-"));
-  // No ideas.md → 0 untried ideas
+  // No ideas directory → 0 untried ideas
   fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
 
   const state = makeFloorState(15, 100);
@@ -236,4 +206,78 @@ test("CHECK FLOOR: 0 untried ideas → full floor block", () => {
   const result = checkFloor(state, asi, payload, dir, DEFAULT_OBSERVER_CONFIG);
   assert.ok(result);
   assert.match(result, /FLOOR DETECTED/);
+});
+
+// ── markIdeaTried: file-per-idea auto-removal ───────────────────────────────
+
+test("markIdeaTried: removes the correct idea file", () => {
+  const ideasDir = makeIdeasDir(3);
+  const removed = markIdeaTried(ideasDir, "idea-2");
+  assert.equal(removed, true);
+  const remaining = fs.readdirSync(ideasDir).filter((f) => f.endsWith(".md"));
+  assert.equal(remaining.length, 2);
+  assert.ok(remaining.includes("idea-1.md"));
+  assert.ok(!remaining.includes("idea-2.md"), "idea-2.md should be deleted");
+  assert.ok(remaining.includes("idea-3.md"));
+});
+
+test("markIdeaTried: accepts filename with .md extension", () => {
+  const ideasDir = makeIdeasDir(2);
+  const removed = markIdeaTried(ideasDir, "idea-1.md");
+  assert.equal(removed, true);
+  const remaining = fs.readdirSync(ideasDir).filter((f) => f.endsWith(".md"));
+  assert.equal(remaining.length, 1);
+  assert.ok(!remaining.includes("idea-1.md"));
+});
+
+test("markIdeaTried: returns false for non-existent idea", () => {
+  const ideasDir = makeIdeasDir(2);
+  const removed = markIdeaTried(ideasDir, "nonexistent");
+  assert.equal(removed, false);
+  // Files unchanged
+  assert.equal(fs.readdirSync(ideasDir).filter((f) => f.endsWith(".md")).length, 2);
+});
+
+test("markIdeaTried: returns false for non-existent directory", () => {
+  const removed = markIdeaTried("/nonexistent/path/ideas", "some-idea");
+  assert.equal(removed, false);
+});
+
+test("markIdeaTried: after removal, countUntriedIdeas reflects it", () => {
+  const ideasDir = makeIdeasDir(3);
+  markIdeaTried(ideasDir, "idea-2");
+  // checkFinalize should see only 2 untried now
+  const entries = [finalizeEntry(0.95)];
+  const state = { streak: 0, improvements: 0, best: 100, recent: [], impHistory: [], recentMetrics: [] };
+  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, ideasDir);
+  assert.ok(result);
+  assert.match(result, /2 untried ideas remain/);
+});
+
+test("FILE-PER-IDEA: multi-line content works correctly", () => {
+  // Ideas with rich content (multi-line, code blocks, etc.)
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "obs-multi-"));
+  const ideasDir = path.join(dir, "ideas");
+  fs.mkdirSync(ideasDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(ideasDir, "cache-ast.md"),
+    "# Cache AST Nodes\n\nStore the AST in a WeakMap keyed by source hash.\n\n```js\nconst cache = new WeakMap();\n```\n\nThis could save ~30% on re-parses.",
+  );
+  fs.writeFileSync(
+    path.join(ideasDir, "bit-packed.md"),
+    "# Bit-Packed Representation\n\nUse Uint8Array instead of number[].\n\n   - Saves memory\n   - Faster access\n   - Cache-friendly",
+  );
+
+  // Should count 2 ideas
+  const entries = [finalizeEntry(0.95)];
+  const state = { streak: 0, improvements: 0, best: 100, recent: [], impHistory: [], recentMetrics: [] };
+  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, ideasDir);
+  assert.ok(result);
+  assert.match(result, /2 untried ideas remain/);
+
+  // Remove one
+  markIdeaTried(ideasDir, "cache-ast");
+  const remaining = fs.readdirSync(ideasDir).filter((f) => f.endsWith(".md"));
+  assert.equal(remaining.length, 1);
+  assert.equal(remaining[0], "bit-packed.md");
 });

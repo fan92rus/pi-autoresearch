@@ -22,7 +22,7 @@ const LEGACY_HOOKS_DIR = "autoresearch.hooks";
 const SESSION_FILE_NAMES: Record<SessionFileKind, { current: string; legacy: string }> = {
   log:    { current: "log.jsonl",   legacy: "autoresearch.jsonl" },
   prompt: { current: "prompt.md",  legacy: "autoresearch.md" },
-  ideas:  { current: "ideas.md",    legacy: "autoresearch.ideas.md" },
+  ideas:  { current: "ideas",      legacy: "autoresearch.ideas.md" },
   checks: { current: "checks.sh",   legacy: "autoresearch.checks.sh" },
   measure:{ current: "measure.sh",  legacy: "autoresearch.sh" },
   config: { current: "config.json", legacy: "autoresearch.config.json" },

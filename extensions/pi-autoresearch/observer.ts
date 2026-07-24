@@ -119,7 +119,7 @@ const ASI_PATTERNS = {
   exhausted: /exhaust|tried.*all|no.*untried|provably.*complete|optimization.*complete/i,
 };
 
-function parseAsiFlags(runs: ReconstructedRun[], ideasPath: string): AsiFlags {
+function parseAsiFlags(runs: ReconstructedRun[], ideasDir: string): AsiFlags {
   const recent = runs.slice(-5);
   const text = recent
     .map((r) => {
@@ -135,14 +135,17 @@ function parseAsiFlags(runs: ReconstructedRun[], ideasPath: string): AsiFlags {
   const noise = ASI_PATTERNS.noise.test(text);
   let exhausted = ASI_PATTERNS.exhausted.test(text);
 
-  // Fallback: check ideas.md for marker words
-  if (!floor && fs.existsSync(ideasPath)) {
+  // Fallback: scan all idea files in .auto/ideas/ for marker words
+  if ((!floor || !exhausted) && fs.existsSync(ideasDir)) {
     try {
-      const ideas = fs.readFileSync(ideasPath, "utf-8");
-      if (/PROVEN COMPLETE|MATHEMATICALLY IMPOSSIBLE|FLOOR REACHED|PROVABLY/i.test(ideas)) {
+      const files = fs.readdirSync(ideasDir).filter((f) => f.endsWith(".md"));
+      const combined = files.map((f) => {
+        try { return fs.readFileSync(path.join(ideasDir, f), "utf-8"); } catch { return ""; }
+      }).join("\n");
+      if (!floor && /PROVEN COMPLETE|MATHEMATICALLY IMPOSSIBLE|FLOOR REACHED|PROVABLY/i.test(combined)) {
         floor = true;
       }
-      if (/EXHAUST|NO.*UNTRIED/i.test(ideas)) {
+      if (!exhausted && /EXHAUST|NO.*UNTRIED/i.test(combined)) {
         exhausted = true;
       }
     } catch { /* ignore */ }
@@ -200,25 +203,37 @@ function coefficientOfVariation(values: number[]): { cv: number; mean: number; s
   return { cv: std / mean, mean, std, n };
 }
 
-// ─── Helper: count untried ideas in ideas.md ─────────────────────────────────
+// ─── Helper: count untried ideas in .auto/ideas/ ────────────────────────────
 // Shared by checkFinalize and checkFloor.
-// (checkParallelOpportunity has its own reader because it needs idea strings, not just a count.)
-function countUntriedIdeas(ideasPath: string): number {
-  if (!fs.existsSync(ideasPath)) return 0;
+// Each .md file in the ideas directory = one untried idea.
+function countUntriedIdeas(ideasDir: string): number {
+  if (!fs.existsSync(ideasDir)) return 0;
   try {
-    const content = fs.readFileSync(ideasPath, "utf-8");
-    return content
-      .split("\n")
-      .filter((l) => /^[\-*]\s+/.test(l.trim()) && !/~~/.test(l) && l.trim().length > 10)
-      .length;
+    return fs.readdirSync(ideasDir).filter((f) => f.endsWith(".md")).length;
   } catch {
     return 0;
   }
 }
 
+// ─── Helper: mark an idea as tried by removing its file ─────────────────────
+// ideaId can be a filename (with or without .md extension).
+// Returns true if the file was found and deleted.
+export function markIdeaTried(ideasDir: string, ideaId: string): boolean {
+  if (!fs.existsSync(ideasDir)) return false;
+  const filename = ideaId.endsWith(".md") ? ideaId : ideaId + ".md";
+  const filePath = path.join(ideasDir, filename);
+  try {
+    if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+      fs.unlinkSync(filePath);
+      return true;
+    }
+  } catch { /* ignore */ }
+  return false;
+}
+
 // ─── Trigger: Finalize ───────────────────────────────────────────────────────
 
-export function checkFinalize(allEntries: Record<string, unknown>[], oc: ObserverConfig, state: ObserverState, ideasPath: string): string | null {
+export function checkFinalize(allEntries: Record<string, unknown>[], oc: ObserverConfig, state: ObserverState, ideasDir: string): string | null {
   const finalizeEntries = allEntries.filter((e) => e.type === "finalize");
   if (finalizeEntries.length === 0) return null;
 
@@ -250,9 +265,9 @@ export function checkFinalize(allEntries: Record<string, unknown>[], oc: Observe
   // ── Below only fires when runEntriesAfter === 0 (just called, no runs since) ──
 
   // Untried ideas → one-line nudge instead of full block.
-  const untriedIdeas = countUntriedIdeas(ideasPath);
+  const untriedIdeas = countUntriedIdeas(ideasDir);
   if (untriedIdeas >= 2) {
-    return `🏁 Finalize signal (${confPct}%) is pending, but ${untriedIdeas} untried ideas remain in .auto/ideas.md. Try the ideas first, or run /autoresearch off to finalize.`;
+    return `🏁 Finalize signal (${confPct}%) is pending, but ${untriedIdeas} untried ideas remain in .auto/ideas/. Try the ideas first, or run /autoresearch off to finalize.`;
   }
 
   if (confidence > oc.finalizeStrongThreshold) {
@@ -360,16 +375,16 @@ export function checkFloor(
   if (!isFloor && !asiProvesFloor) return null;
 
   // ── Untried-ideas guard: don't claim "floor reached" if ideas remain. ──
-  // Consistent with checkFinalize: if there are ≥2 untried ideas in ideas.md,
+  // Consistent with checkFinalize: if there are ≥2 untried ideas in .auto/ideas/,
   // the search space isn't exhausted. Downgrade to a nudge.
   const triggerReason = isFloor ? "variance" : "asi_proof";
   const unit = payload.metricUnit;
   const bestStr = state.best !== null ? `${state.best}${unit}` : `?${unit}`;
-  const ideasPath = path.join(cwd, ".auto", "ideas.md");
-  const untriedIdeas = countUntriedIdeas(ideasPath);
+  const ideasDir = path.join(cwd, ".auto", "ideas");
+  const untriedIdeas = countUntriedIdeas(ideasDir);
   if (untriedIdeas >= 2) {
     const meanStr = stats ? `~${stats.mean.toFixed(2)}${unit}` : `?${unit}`;
-    return `🔬 Possible floor at ${meanStr}, but ${untriedIdeas} untried ideas remain in .auto/ideas.md. Try them before concluding the limit is structural.`;
+    return `🔬 Possible floor at ${meanStr}, but ${untriedIdeas} untried ideas remain in .auto/ideas/. Try them before concluding the limit is structural.`;
   }
 
   const lines: string[] = [
@@ -379,7 +394,7 @@ export function checkFloor(
   if (triggerReason === "variance" && stats) {
     lines.push(`   Metric stable at ~${stats.mean.toFixed(2)}${unit} ± ${stats.std.toFixed(2)}${unit} (CV=${stats.cv.toFixed(4)}, n=${stats.n}) across ${state.streak} non-improving runs.`);
   } else {
-    lines.push(`   Agent ASI/ideas.md contains proof that further optimization is impossible.`);
+    lines.push(`   Agent ASI/idea files contain proof that further optimization is impossible.`);
   }
 
   if (asi.profiled) {
@@ -395,8 +410,8 @@ export function checkFloor(
     lines.push(`   - Recent median: ${stats.mean.toFixed(2)}${unit} ± ${stats.std.toFixed(2)}${unit}`);
   }
 
-  if (fs.existsSync(ideasPath)) {
-    lines.push(`   - Reflections in ${ideasPath}`);
+  if (fs.existsSync(ideasDir) && countUntriedIdeas(ideasDir) === 0) {
+    lines.push(`   - All ideas in ${ideasDir}/ have been tried`);
   }
 
   lines.push("");
@@ -422,17 +437,15 @@ function checkParallelOpportunity(
   if (state.streak < 3) return null;
   if (state.streak >= oc.stagnationThreshold) return null; // stagnation handles >=5
 
-  const ideasPath = path.join(cwd, ".auto", "ideas.md");
-  if (!fs.existsSync(ideasPath)) return null;
+  const ideasDir = path.join(cwd, ".auto", "ideas");
+  if (!fs.existsSync(ideasDir)) return null;
 
   let ideas: string[];
   try {
-    const content = fs.readFileSync(ideasPath, "utf-8");
-    ideas = content
-      .split("\n")
-      .map(function (l) { return l.trim(); })
-      .filter(function (l) { return /^[\-*]\s+/.test(l) && !/~~/.test(l) && l.length > 10; })
-      .map(function (l) { return l.replace(/^[\-*]\s+/, ""); });
+    const files = fs.readdirSync(ideasDir).filter((f) => f.endsWith(".md"));
+    ideas = files.map((f) => {
+      try { return fs.readFileSync(path.join(ideasDir, f), "utf-8"); } catch { return ""; }
+    }).filter((c) => c.trim().length > 10);
   } catch {
     return null;
   }
@@ -539,7 +552,7 @@ function checkStagnation(
   const level = Math.floor(state.streak / oc.stagnationThreshold);
   const unit = payload.metricUnit;
   const bestStr = state.best !== null ? `${state.best}${unit}` : `?${unit}`;
-  const ideasPath = path.join(cwd, ".auto", "ideas.md");
+  const ideasPath = path.join(cwd, ".auto", "ideas");
 
   // Status pattern detection
   const recentRuns = state.recent.slice(-oc.stagnationThreshold);
@@ -667,7 +680,7 @@ function checkProgress(state: ObserverState, payload: ObserverPayload, cwd: stri
 
   const unit = payload.metricUnit;
   const progression = state.impHistory.join(" → ");
-  const ideasPath = path.join(cwd, ".auto", "ideas.md");
+  const ideasPath = path.join(cwd, ".auto", "ideas");
 
   // Compute trend from deltas
   const deltas: number[] = [];
@@ -741,7 +754,7 @@ export function runObserver(payload: ObserverPayload): string | null {
   const reconstructed = reconstructJsonlState(content);
   const segRuns = reconstructed.results.filter((r) => r.segment === reconstructed.currentSegment);
   const state = computeState(segRuns, direction);
-  const ideasPath = path.join(cwd, ".auto", "ideas.md");
+  const ideasPath = path.join(cwd, ".auto", "ideas");
   const asi = parseAsiFlags(segRuns, ideasPath);
 
   // ── Trigger order: actionable first, finalize as fallback (P0-1) ──

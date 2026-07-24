@@ -150,10 +150,20 @@ function rulesSection(workDir: string, mdPath: string): string {
   return `## Experiment Rules (${readablePath(workDir, mdPath)})\n\n${content}`;
 }
 
-function ideasSection(workDir: string, ideasPath: string): string {
-  const content = readTrimmedFile(ideasPath);
-  if (!content) return "";
-  return `## Ideas Backlog (${readablePath(workDir, ideasPath)})\n\n${content}`;
+function ideasSection(workDir: string, ideasDir: string): string {
+  // Ideas are now stored as individual .md files in a directory.
+  // Concatenate all files for the compaction summary.
+  if (!fs.existsSync(ideasDir)) return "";
+  let combined = "";
+  try {
+    const files = fs.readdirSync(ideasDir).filter((f) => f.endsWith(".md")).sort();
+    for (const f of files) {
+      const content = readTrimmedFile(path.join(ideasDir, f));
+      if (content) combined += `### ${f}\n\n${content}\n\n`;
+    }
+  } catch { /* ignore */ }
+  if (!combined) return "";
+  return `## Ideas Backlog (${readablePath(workDir, ideasDir)}/)\n\n${combined.trim()}`;
 }
 
 function recentRunsSection(state: ReconstructedJsonlState, workDir: string, jsonlPath: string): string {
