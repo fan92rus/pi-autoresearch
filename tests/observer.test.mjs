@@ -1,5 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as os from "node:os";
 import {
   checkFinalize,
   computeState,
@@ -93,4 +96,60 @@ test("STALE DETECTION: last finalize entry matters, not earlier ones", () => {
   const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, IDEAS);
   assert.ok(result, "the LAST finalize entry governs — no runs after it → fires");
   assert.match(result, /95%/);
+});
+
+// ── Untried-ideas: simplify (not suppress) ────────────────────────────────────
+
+function makeIdeasFile(count) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "obs-test-"));
+  const ideasPath = path.join(dir, "ideas.md");
+  const lines = [];
+  for (let i = 0; i < count; i++) lines.push(`- Idea number ${i + 1} to try out`);
+  // Add a struck-through (tried) idea that should NOT count
+  lines.push("- ~~This one was tried already~~");
+  fs.writeFileSync(ideasPath, lines.join("\n") + "\n");
+  return ideasPath;
+}
+
+test("UNTRIED IDEAS: >=2 ideas → simplify to nudge (even with 0 runs after finalize)", () => {
+  const ideasPath = makeIdeasFile(3);
+  const entries = [finalizeEntry(0.95, "floor reached")];
+  const state = { streak: 0, improvements: 0, best: 100, recent: [], impHistory: [], recentMetrics: [] };
+  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, ideasPath);
+  assert.ok(result, "should return a nudge, not null");
+  assert.match(result, /3 untried ideas remain/);
+  assert.doesNotMatch(result, /FINALIZE SIGNAL.*Strongly recommended/);
+});
+
+test("UNTRIED IDEAS: >=2 ideas + runs after → nudge mentions run count", () => {
+  const ideasPath = makeIdeasFile(2);
+  const entries = [
+    finalizeEntry(0.9),
+    discardRun(100, 1),
+    discardRun(100, 2),
+    discardRun(100, 3),
+  ];
+  const state = { streak: 3, improvements: 0, best: 100, recent: [], impHistory: [], recentMetrics: [100, 100, 100] };
+  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, ideasPath);
+  assert.ok(result);
+  assert.match(result, /3 runs attempted since/);
+});
+
+test("UNTRIED IDEAS: 1 idea → full finalize block (threshold is >=2)", () => {
+  const ideasPath = makeIdeasFile(1);
+  const entries = [finalizeEntry(0.95)];
+  const state = { streak: 0, improvements: 0, best: 100, recent: [], impHistory: [], recentMetrics: [] };
+  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, ideasPath);
+  assert.match(result, /FINALIZE SIGNAL.*95%/);
+  assert.match(result, /Strongly recommended/);
+});
+
+test("UNTRIED IDEAS: struck-through ideas don't count", () => {
+  // makeIdeasFile adds 1 struck-through line; with count=1 total real = 1
+  const ideasPath = makeIdeasFile(1);
+  const entries = [finalizeEntry(0.95)];
+  const state = { streak: 0, improvements: 0, best: 100, recent: [], impHistory: [], recentMetrics: [] };
+  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, ideasPath);
+  // Only 1 real idea → full block, not nudge
+  assert.match(result, /Strongly recommended/);
 });

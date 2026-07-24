@@ -236,10 +236,15 @@ export function checkFinalize(allEntries: Record<string, unknown>[], oc: Observe
     } catch { /* ignore */ }
   }
 
-  // If there are untried ideas AND agent continued working (runs after finalize),
-  // downgrade to a one-line nudge instead of a full block.
-  if (untriedIdeas >= 2 && runEntriesAfter.length >= 2) {
-    return `🏁 Finalize signal (${confPct}%) is pending, but ${untriedIdeas} untried ideas remain in .auto/ideas.md and ${runEntriesAfter.length} runs were attempted since. Try the ideas first, or run /autoresearch off to finalize.`;
+  // If there are untried ideas, downgrade to a one-line nudge instead of a full block.
+  // We simplify (not suppress) because the finalize signal may still be valid —
+  // the ideas could be stale/irrelevant. The nudge points the agent at concrete
+  // remaining work without blocking it.
+  if (untriedIdeas >= 2) {
+    const runsNote = runEntriesAfter.length > 0
+      ? ` and ${runEntriesAfter.length} run${runEntriesAfter.length > 1 ? "s" : ""} attempted since`
+      : "";
+    return `🏁 Finalize signal (${confPct}%) is pending, but ${untriedIdeas} untried ideas remain in .auto/ideas.md${runsNote}. Try the ideas first, or run /autoresearch off to finalize.`;
   }
 
   if (confidence > oc.finalizeStrongThreshold) {
