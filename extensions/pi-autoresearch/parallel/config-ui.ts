@@ -68,6 +68,7 @@ const L = {
   concurrency: RU ? "⚡ Конкурентность..." : "⚡ Concurrency...",
   budget: RU ? "⏱️  Бюджет..." : "⏱️  Budget...",
   observer: RU ? "📊 Настройки наблюдателя..." : "📊 Observer settings...",
+  toggles: RU ? "🎚️ Тумблеры (вкл/выкл)..." : "🎚️ Toggles (on/off)...",
   done: RU ? "✅ Готово" : "✅ Done",
   back: RU ? "↩️ Назад" : "↩️ Back",
   reset: RU ? "♻️ Сбросить к дефолтам" : "♻️ Reset to defaults",
@@ -295,7 +296,7 @@ function readObserverSection(workDir: string): Record<string, unknown> {
   return (typeof obs === "object" && obs !== null ? obs : {}) as Record<string, unknown>;
 }
 
-function writeObserverField(workDir: string, key: string, value: number): void {
+function writeObserverField(workDir: string, key: string, value: number | boolean): void {
   const raw = readConfig(workDir);
   if (!(raw as Record<string, unknown>).observer) (raw as Record<string, unknown>).observer = {};
   ((raw as Record<string, unknown>).observer as Record<string, unknown>)[key] = value;
@@ -337,13 +338,66 @@ const OBSERVER_FIELDS: ObserverField[] = [
     default: 5, min: 3, max: 20 },
 ];
 
+interface ObserverToggle {
+  key: string;
+  label: string; labelRu: string;
+  description: string; descriptionRu: string;
+}
+
+const OBSERVER_TOGGLES: ObserverToggle[] = [
+  { key: "finalize_enabled", label: "Finalize trigger", labelRu: "Триггер финализации",
+    description: "Enable the finalize recommendation when the agent calls finalize_research(). Disable if the agent signals completion too eagerly.",
+    descriptionRu: "Включить рекомендацию финализации, когда агент вызывает finalize_research(). Отключите, если агент слишком поспешно сигнализирует о завершении." },
+  { key: "floor_detection_enabled", label: "Floor detection trigger", labelRu: "Триггер обнаружения пола",
+    description: "Enable floor detection (variance plateau + ASI proof). Disable to prevent the observer from claiming the optimization hit a structural limit.",
+    descriptionRu: "Включить обнаружение пола (плато вариативности + ASI-доказательство). Отключите, чтобы наблюдатель не заявлял о структурном пределе." },
+  { key: "stagnation_finalize_enabled", label: "Stagnation finalize hints", labelRu: "Подсказки финализации в стагнации",
+    description: "Enable finalize hints inside stagnation escalations (ASI floor/exhausted, critical level). Disable to keep stagnation advice actionable without stop recommendations.",
+    descriptionRu: "Включить подсказки о финализации внутри эскалаций стагнации (ASI пол/истощение, критический уровень). Отключите, чтобы стагнация давала actionable-советы без рекомендации остановиться." },
+];
+
+async function configureObserverToggles(ctx: ConfigCtx, workDir: string): Promise<boolean> {
+  while (true) {
+    const obsConfig = readObserverSection(workDir);
+    const options = OBSERVER_TOGGLES.map(function (t) {
+      const label = RU ? t.labelRu : t.label;
+      const raw = obsConfig[t.key];
+      const enabled = typeof raw === "boolean" ? raw : true;
+      const state = enabled ? (RU ? "✅ вкл" : "✅ on") : (RU ? "⬛ выкл" : "⬛ off");
+      return label + " — " + state;
+    }).concat([L.back]);
+
+    const choice = await ctx.ui.select(RU ? "Тумблеры наблюдателя — включить/выключить" : "Observer toggles — enable/disable", options);
+    if (!choice || choice === L.back) return true;
+
+    const toggle = OBSERVER_TOGGLES.find(function (t) { const label = RU ? t.labelRu : t.label; return choice.startsWith(label); });
+    if (!toggle) return true;
+
+    const raw = obsConfig[toggle.key];
+    const currentlyEnabled = typeof raw === "boolean" ? raw : true;
+    const desc = RU ? toggle.descriptionRu : toggle.description;
+    const label = RU ? toggle.labelRu : toggle.label;
+
+    const confirmed = await ctx.ui.confirm(
+      label,
+      desc + "\n\n" + (RU
+        ? (currentlyEnabled ? "Сейчас ВКЛ. Выключить?" : "Сейчас ВЫКЛ. Включить?")
+        : (currentlyEnabled ? "Currently ON. Turn OFF?" : "Currently OFF. Turn ON?")),
+    );
+    if (!confirmed) { ctx.ui.notify(L.noChange, "info"); continue; }
+
+    writeObserverField(workDir, toggle.key, !currentlyEnabled);
+    ctx.ui.notify(label + " → " + (!currentlyEnabled ? (RU ? "вкл" : "on") : (RU ? "выкл" : "off")), "info");
+  }
+}
+
 async function configureObserver(ctx: ConfigCtx, workDir: string): Promise<boolean> {
   const obsConfig = readObserverSection(workDir);
   const options = OBSERVER_FIELDS.map(function (f) {
     const label = RU ? f.labelRu : f.label;
     const current = typeof obsConfig[f.key] === "number" ? obsConfig[f.key] as number : f.default;
     return label + " (" + (RU ? "текущий" : "current") + ": " + current + ")";
-  }).concat([L.reset, L.back]);
+  }).concat([L.toggles, L.reset, L.back]);
 
   const choice = await ctx.ui.select(L.observerTitle, options);
   if (!choice || choice === L.back) return false;
@@ -352,6 +406,10 @@ async function configureObserver(ctx: ConfigCtx, workDir: string): Promise<boole
     const confirmed = await ctx.ui.confirm(L.observerResetTitle, L.observerReset);
     if (confirmed) resetObserverConfig(ctx, workDir);
     return true;
+  }
+
+  if (choice === L.toggles) {
+    return configureObserverToggles(ctx, workDir);
   }
 
   const field = OBSERVER_FIELDS.find(function (f) { const label = RU ? f.labelRu : f.label; return choice.startsWith(label); });
