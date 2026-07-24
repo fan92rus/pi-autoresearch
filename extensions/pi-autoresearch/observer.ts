@@ -34,6 +34,14 @@ export interface ObserverConfig {
   stagnationThreshold: number;
   /** Improvements per progress milestone. Default: 5 */
   progressMilestone: number;
+
+  // ── Trigger toggles (all default: true). Disable a whole recommendation mechanism. ──
+  /** Enable the finalize trigger (fires when agent calls finalize_research). Default: true */
+  finalizeEnabled: boolean;
+  /** Enable floor detection trigger (variance plateau + ASI proof). Default: true */
+  floorDetectionEnabled: boolean;
+  /** Enable finalize recommendations inside stagnation (ASI floor/exhausted, critical level). Default: true */
+  stagnationFinalizeEnabled: boolean;
 }
 
 export const DEFAULT_OBSERVER_CONFIG: ObserverConfig = {
@@ -45,6 +53,9 @@ export const DEFAULT_OBSERVER_CONFIG: ObserverConfig = {
   noiseSamples: 3,
   stagnationThreshold: 5,
   progressMilestone: 5,
+  finalizeEnabled: true,
+  floorDetectionEnabled: true,
+  stagnationFinalizeEnabled: true,
 };
 
 function readObserverConfig(cwd: string): ObserverConfig {
@@ -60,6 +71,10 @@ function readObserverConfig(cwd: string): ObserverConfig {
     if (typeof obs.floor_cv_threshold === "number") cfg.floorCvThreshold = obs.floor_cv_threshold;
     if (typeof obs.noise_gate_margin === "number") cfg.noiseGateMargin = obs.noise_gate_margin;
     if (typeof obs.stagnation_threshold === "number") cfg.stagnationThreshold = obs.stagnation_threshold;
+    // Boolean toggles (default true; presence of a boolean value overrides)
+    if (typeof obs.finalize_enabled === "boolean") cfg.finalizeEnabled = obs.finalize_enabled;
+    if (typeof obs.floor_detection_enabled === "boolean") cfg.floorDetectionEnabled = obs.floor_detection_enabled;
+    if (typeof obs.stagnation_finalize_enabled === "boolean") cfg.stagnationFinalizeEnabled = obs.stagnation_finalize_enabled;
     return cfg;
   } catch {
     return { ...DEFAULT_OBSERVER_CONFIG };
@@ -79,7 +94,7 @@ export interface ObserverPayload {
   goal: string;
 }
 
-interface ObserverState {
+export interface ObserverState {
   streak: number;
   improvements: number;
   best: number | null;
@@ -138,7 +153,7 @@ function parseAsiFlags(runs: ReconstructedRun[], ideasPath: string): AsiFlags {
 
 // ─── State computation ───────────────────────────────────────────────────────
 
-function computeState(runs: ReconstructedRun[], direction: "lower" | "higher"): ObserverState {
+export function computeState(runs: ReconstructedRun[], direction: "lower" | "higher"): ObserverState {
   const state: ObserverState = {
     streak: 0,
     improvements: 0,
@@ -187,7 +202,7 @@ function coefficientOfVariation(values: number[]): { cv: number; mean: number; s
 
 // ─── Trigger: Finalize ───────────────────────────────────────────────────────
 
-function checkFinalize(allEntries: Record<string, unknown>[], oc: ObserverConfig): string | null {
+export function checkFinalize(allEntries: Record<string, unknown>[], oc: ObserverConfig, state: ObserverState, ideasPath: string): string | null {
   const finalizeEntries = allEntries.filter((e) => e.type === "finalize");
   if (finalizeEntries.length === 0) return null;
 
@@ -196,13 +211,44 @@ function checkFinalize(allEntries: Record<string, unknown>[], oc: ObserverConfig
   const reason = typeof last.reason === "string" ? last.reason : "no reason given";
   const confPct = Math.round(confidence * 100);
 
+  // ── Stale detection: did the agent find improvements AFTER the finalize entry? ──
+  // If the agent kept working and produced keep runs after claiming "floor reached",
+  // the finalize claim was premature. Suppress the nagging recommendation.
+  const lastIndex = allEntries.lastIndexOf(last);
+  const entriesAfter = allEntries.slice(lastIndex + 1);
+  const runEntriesAfter = entriesAfter.filter((e) => typeof e.run === "number");
+  const improvementsAfter = runEntriesAfter.filter((e) => e.status === "keep" && typeof e.metric === "number" && e.metric !== 0);
+
+  if (improvementsAfter.length > 0) {
+    // Agent proved itself wrong by finding improvements — don't re-fire the finalize signal.
+    return null;
+  }
+
+  // ── Untried ideas check: if ideas.md has non-struck entries, work remains. ──
+  let untriedIdeas = 0;
+  if (fs.existsSync(ideasPath)) {
+    try {
+      const content = fs.readFileSync(ideasPath, "utf-8");
+      untriedIdeas = content
+        .split("\n")
+        .filter((l) => /^[\-*]\s+/.test(l.trim()) && !/~~/.test(l) && l.trim().length > 10)
+        .length;
+    } catch { /* ignore */ }
+  }
+
+  // If there are untried ideas AND agent continued working (runs after finalize),
+  // downgrade to a one-line nudge instead of a full block.
+  if (untriedIdeas >= 2 && runEntriesAfter.length >= 2) {
+    return `🏁 Finalize signal (${confPct}%) is pending, but ${untriedIdeas} untried ideas remain in .auto/ideas.md and ${runEntriesAfter.length} runs were attempted since. Try the ideas first, or run /autoresearch off to finalize.`;
+  }
+
   if (confidence > oc.finalizeStrongThreshold) {
     return `🏁 FINALIZE SIGNAL (confidence ${confPct}%): Agent signaled optimization is complete.
    Reason: ${reason}
 
    The agent has explicitly recorded a finalize entry with high confidence.
    Strongly recommended: run /autoresearch off to finalize this session.
-   To override: delete the finalize entry from .auto/log.jsonl or lower the threshold in /autoresearch config.`;
+   To override: delete the finalize entry from .auto/log.jsonl, set observer.finalize_enabled=false in .auto/config.json, or lower the threshold in /autoresearch config.`;
   }
 
   if (confidence > oc.finalizeAdvisoryThreshold) {
@@ -338,7 +384,7 @@ function checkFloor(
   lines.push(`   → Or call finalize_research(reason="...", confidence=0.9)`);
   lines.push(`   → Or start a fresh segment with a different metric/target`);
   lines.push("");
-  lines.push(`   To override: set "auto_floor_override": true in .auto/config.json`);
+  lines.push(`   To override: set "observer": {"floor_detection_enabled": false} in .auto/config.json, or "auto_floor_override": true (variance only)`);
 
   return lines.join("\n");
 }
@@ -495,7 +541,8 @@ function checkStagnation(
 
   // ASI-aware: if agent proved floor/exhaustion, skip generic advice
   if (asi.floor || asi.exhausted) {
-    return `🔄 STAGNATION: No metric improvement in ${state.streak} runs.
+    if (oc.stagnationFinalizeEnabled) {
+      return `🔄 STAGNATION: No metric improvement in ${state.streak} runs.
 
 ⚠️  ASI CONTEXT: Your recent log entries already contain proof that further
    optimization is impossible or exhausted. The limit appears structural.
@@ -506,6 +553,8 @@ function checkStagnation(
    RECOMMENDED: Call finalize_research() or run /autoresearch off.
    The observer will not ask you to "change direction" again — the evidence
    in your ASI fields shows there is nowhere to change TO.`;
+    }
+    // Finalize recommendation disabled — fall through to actionable stagnation advice.
   }
 
   // Progressive escalation with parallel hints
@@ -544,7 +593,10 @@ Otherwise: ABANDON the current direction entirely. Try a radically different app
     default:
       escalation = `
 
-💀 CRITICAL: ${state.streak} non-improving runs (${level} stagnation cycles). The session appears EXHAUSTED. Consider /autoresearch off and finalize, or call finalize_research() to signal completion.`;
+💀 CRITICAL: ${state.streak} non-improving runs (${level} stagnation cycles). The session appears EXHAUSTED.` +
+        (oc.stagnationFinalizeEnabled
+          ? " Consider /autoresearch off and finalize, or call finalize_research() to signal completion."
+          : " Try a radically different approach, or start a new segment with a different metric/target.");
       break;
   }
 
@@ -554,8 +606,8 @@ Otherwise: ABANDON the current direction entirely. Try a radically different app
     reflectQuestions = `REFLECT:
 1. Your profiling (per ASI) shows where time is spent. Is the bottleneck ADDRESSABLE from the code you're allowed to change?
 2. Are there orthogonal dimensions you haven't explored (memory, I/O, caching, precomputation)?
-3. Would a completely different algorithm or data structure help, even if more complex?
-4. Consider calling finalize_research() if the limit is structural.`;
+3. Would a completely different algorithm or data structure help, even if more complex?` +
+      (oc.stagnationFinalizeEnabled ? "\n4. Consider calling finalize_research() if the limit is structural." : "");
   } else {
     reflectQuestions = `REFLECT:
 1. What PATTERN do these runs share? What common assumption are they all making?
@@ -665,8 +717,15 @@ export function runObserver(payload: ObserverPayload): string | null {
   }
 
   // Parse all raw entries (for finalize detection)
-  const finalizeSteer = checkFinalize(allEntries, oc);
-  if (finalizeSteer) return finalizeSteer;
+  if (oc.finalizeEnabled) {
+    const ideasPathEarly = path.join(cwd, ".auto", "ideas.md");
+    // Need state for stale-detection: reconstruct early from same content.
+    const earlyReconstructed = reconstructJsonlState(content);
+    const earlySegRuns = earlyReconstructed.results.filter((r) => r.segment === earlyReconstructed.currentSegment);
+    const earlyState = computeState(earlySegRuns, direction);
+    const finalizeSteer = checkFinalize(allEntries, oc, earlyState, ideasPathEarly);
+    if (finalizeSteer) return finalizeSteer;
+  }
 
   // Noise gate (can run independently of log state)
   const noiseSteer = checkNoiseGate(payload, cwd, oc);
@@ -681,8 +740,10 @@ export function runObserver(payload: ObserverPayload): string | null {
   const asi = parseAsiFlags(segRuns, ideasPath);
 
   // Floor detection
-  const floorSteer = checkFloor(state, asi, payload, cwd, oc);
-  if (floorSteer) return floorSteer;
+  if (oc.floorDetectionEnabled) {
+    const floorSteer = checkFloor(state, asi, payload, cwd, oc);
+    if (floorSteer) return floorSteer;
+  }
 
   // Parallel opportunity (proactive — fires at streak 3, before stagnation)
   const parallelSteer = checkParallelOpportunity(state, payload, cwd, oc);

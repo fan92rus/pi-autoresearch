@@ -217,6 +217,35 @@ Create `.auto/config.json` in your pi session directory to customize behavior:
 | `workingDir` | string | Override the directory for all autoresearch operations — file I/O, command execution, and git. Supports absolute or relative paths (resolved against the pi session cwd). The config file itself always stays under the session cwd. Fails if the directory doesn't exist. |
 | `maxIterations` | number | Maximum experiments before auto-stopping. The agent is told to stop and won't run more experiments until a new segment is initialized. |
 
+### Observer settings
+
+The built-in observer runs before each iteration and emits **steer messages** (advisory only — it never force-stops the session). Three mechanisms can recommend finalization; each can be toggled on/off in `.auto/config.json` under the `observer` key (all default to `true`):
+
+```json
+{
+  "observer": {
+    "finalize_enabled": true,
+    "floor_detection_enabled": true,
+    "stagnation_finalize_enabled": true,
+    "finalize_strong_threshold": 0.8,
+    "finalize_advisory_threshold": 0.5,
+    "floor_streak_threshold": 15,
+    "floor_cv_threshold": 0.15,
+    "stagnation_threshold": 5
+  }
+}
+```
+
+| Toggle | Default | What it controls |
+|--------|---------|------------------|
+| `finalize_enabled` | `true` | The finalize trigger — fires when the agent calls `finalize_research()`. Disable if the agent signals completion too eagerly. |
+| `floor_detection_enabled` | `true` | Floor detection (variance plateau + ASI proof). Disable to stop the observer from claiming a structural limit was reached. |
+| `stagnation_finalize_enabled` | `true` | Finalize hints inside stagnation escalations (ASI floor/exhausted, critical level). Disable to keep stagnation advice actionable without stop recommendations. |
+
+Numeric thresholds (`finalize_strong_threshold`, `floor_cv_threshold`, `stagnation_threshold`, etc.) can also be tuned interactively via `/autoresearch config` → **Observer settings** → **Toggles**.
+
+**Stale-finalize protection.** If the agent calls `finalize_research()` but then continues working and finds an improvement (a `keep` run after the finalize entry), the observer automatically suppresses the finalize signal — the claim was premature. This prevents the observer from nagging the agent to stop when work is clearly still productive.
+
 ### Long-running loops and context
 
 The loop is designed to run unattended across context limits. When pi's [auto-compaction](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/compaction.md) summarizes the older portion of the conversation, autoresearch detects the resulting idle and re-prompts the agent to re-read `.auto/prompt.md`, the tail of `.auto/log.jsonl`, `.auto/ideas.md`, and `git log` before continuing. All progress is persisted in those files, so the post-summary turn rehydrates from the source of truth instead of relying on whatever survived compaction. No tuning required — if pi's auto-compaction is enabled (the default), this just works.

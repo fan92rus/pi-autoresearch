@@ -1774,6 +1774,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\n(mathematical floor, structural limit, noise floor reached, search space exhausted):" +
       "\n  → Call finalize_research({ reason: \"...\", evidence: \"...\", confidence: 0.8 })" +
       "\nThe observer will then recommend /autoresearch off. Do NOT grind indefinitely." +
+      "\n\n⚠ IMPORTANT: finalize_research is a RECOMMENDATION, not a stop. Only call it when" +
+      "\nyou have concrete PROOF (profiling, variance data, exhausted search space)." +
+      "\nA subjective \"this seems hard\" is NOT proof — try orthogonal approaches and" +
+      "\nparallel tools (BestOfN, SpaceSearch) first. If you finalize prematurely and then" +
+      "\nfind an improvement, the observer will suppress the finalize signal automatically." +
       "\n\n## Observer Hooks" +
       "\nIf you receive a 🔄 STAGNATION steer — STOP experimenting and REFLECT on the pattern." +
       "\nIf you receive a 🎯 MILESTONE steer — Consider strategic alternatives and orthogonal directions." +
