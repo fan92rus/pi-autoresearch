@@ -200,6 +200,22 @@ function coefficientOfVariation(values: number[]): { cv: number; mean: number; s
   return { cv: std / mean, mean, std, n };
 }
 
+// ─── Helper: count untried ideas in ideas.md ─────────────────────────────────
+// Shared by checkFinalize and checkFloor.
+// (checkParallelOpportunity has its own reader because it needs idea strings, not just a count.)
+function countUntriedIdeas(ideasPath: string): number {
+  if (!fs.existsSync(ideasPath)) return 0;
+  try {
+    const content = fs.readFileSync(ideasPath, "utf-8");
+    return content
+      .split("\n")
+      .filter((l) => /^[\-*]\s+/.test(l.trim()) && !/~~/.test(l) && l.trim().length > 10)
+      .length;
+  } catch {
+    return 0;
+  }
+}
+
 // ─── Trigger: Finalize ───────────────────────────────────────────────────────
 
 export function checkFinalize(allEntries: Record<string, unknown>[], oc: ObserverConfig, state: ObserverState, ideasPath: string): string | null {
@@ -212,8 +228,6 @@ export function checkFinalize(allEntries: Record<string, unknown>[], oc: Observe
   const confPct = Math.round(confidence * 100);
 
   // ── Stale detection: did the agent find improvements AFTER the finalize entry? ──
-  // If the agent kept working and produced keep runs after claiming "floor reached",
-  // the finalize claim was premature. Suppress the nagging recommendation.
   const lastIndex = allEntries.lastIndexOf(last);
   const entriesAfter = allEntries.slice(lastIndex + 1);
   const runEntriesAfter = entriesAfter.filter((e) => typeof e.run === "number");
@@ -224,27 +238,21 @@ export function checkFinalize(allEntries: Record<string, unknown>[], oc: Observe
     return null;
   }
 
-  // ── Untried ideas check: if ideas.md has non-struck entries, work remains. ──
-  let untriedIdeas = 0;
-  if (fs.existsSync(ideasPath)) {
-    try {
-      const content = fs.readFileSync(ideasPath, "utf-8");
-      untriedIdeas = content
-        .split("\n")
-        .filter((l) => /^[\-*]\s+/.test(l.trim()) && !/~~/.test(l) && l.trim().length > 10)
-        .length;
-    } catch { /* ignore */ }
+  // ── Anti-nagging: agent continued working without finding improvements. ──
+  // The finalize_research tool already sent an immediate steer when called.
+  // If the agent continued (≥1 run after), it knows about the finalize signal.
+  // Don't nag every iteration — actionable triggers (parallel, stagnation)
+  // take over steering via the new priority order.
+  if (runEntriesAfter.length >= 1) {
+    return null;
   }
 
-  // If there are untried ideas, downgrade to a one-line nudge instead of a full block.
-  // We simplify (not suppress) because the finalize signal may still be valid —
-  // the ideas could be stale/irrelevant. The nudge points the agent at concrete
-  // remaining work without blocking it.
+  // ── Below only fires when runEntriesAfter === 0 (just called, no runs since) ──
+
+  // Untried ideas → one-line nudge instead of full block.
+  const untriedIdeas = countUntriedIdeas(ideasPath);
   if (untriedIdeas >= 2) {
-    const runsNote = runEntriesAfter.length > 0
-      ? ` and ${runEntriesAfter.length} run${runEntriesAfter.length > 1 ? "s" : ""} attempted since`
-      : "";
-    return `🏁 Finalize signal (${confPct}%) is pending, but ${untriedIdeas} untried ideas remain in .auto/ideas.md${runsNote}. Try the ideas first, or run /autoresearch off to finalize.`;
+    return `🏁 Finalize signal (${confPct}%) is pending, but ${untriedIdeas} untried ideas remain in .auto/ideas.md. Try the ideas first, or run /autoresearch off to finalize.`;
   }
 
   if (confidence > oc.finalizeStrongThreshold) {
@@ -324,7 +332,7 @@ function checkNoiseGate(payload: ObserverPayload, cwd: string, oc: ObserverConfi
 
 // ─── Trigger: Floor detection ────────────────────────────────────────────────
 
-function checkFloor(
+export function checkFloor(
   state: ObserverState,
   asi: AsiFlags,
   payload: ObserverPayload,
@@ -351,10 +359,18 @@ function checkFloor(
 
   if (!isFloor && !asiProvesFloor) return null;
 
+  // ── Untried-ideas guard: don't claim "floor reached" if ideas remain. ──
+  // Consistent with checkFinalize: if there are ≥2 untried ideas in ideas.md,
+  // the search space isn't exhausted. Downgrade to a nudge.
   const triggerReason = isFloor ? "variance" : "asi_proof";
   const unit = payload.metricUnit;
   const bestStr = state.best !== null ? `${state.best}${unit}` : `?${unit}`;
   const ideasPath = path.join(cwd, ".auto", "ideas.md");
+  const untriedIdeas = countUntriedIdeas(ideasPath);
+  if (untriedIdeas >= 2) {
+    const meanStr = stats ? `~${stats.mean.toFixed(2)}${unit}` : `?${unit}`;
+    return `🔬 Possible floor at ${meanStr}, but ${untriedIdeas} untried ideas remain in .auto/ideas.md. Try them before concluding the limit is structural.`;
+  }
 
   const lines: string[] = [
     `🔬 FLOOR DETECTED: Optimization has reached its structural limit (trigger: ${triggerReason}).`,
@@ -721,46 +737,45 @@ export function runObserver(payload: ObserverPayload): string | null {
     if (entry) allEntries.push(entry);
   }
 
-  // Parse all raw entries (for finalize detection)
-  if (oc.finalizeEnabled) {
-    const ideasPathEarly = path.join(cwd, ".auto", "ideas.md");
-    // Need state for stale-detection: reconstruct early from same content.
-    const earlyReconstructed = reconstructJsonlState(content);
-    const earlySegRuns = earlyReconstructed.results.filter((r) => r.segment === earlyReconstructed.currentSegment);
-    const earlyState = computeState(earlySegRuns, direction);
-    const finalizeSteer = checkFinalize(allEntries, oc, earlyState, ideasPathEarly);
-    if (finalizeSteer) return finalizeSteer;
-  }
-
-  // Noise gate (can run independently of log state)
-  const noiseSteer = checkNoiseGate(payload, cwd, oc);
-  if (noiseSteer) return noiseSteer;
-
-  // Reconstruct state from log.jsonl
+  // Reconstruct state ONCE from log.jsonl (P1-1: was reconstructed twice before)
   const reconstructed = reconstructJsonlState(content);
   const segRuns = reconstructed.results.filter((r) => r.segment === reconstructed.currentSegment);
-
   const state = computeState(segRuns, direction);
   const ideasPath = path.join(cwd, ".auto", "ideas.md");
   const asi = parseAsiFlags(segRuns, ideasPath);
 
-  // Floor detection
+  // ── Trigger order: actionable first, finalize as fallback (P0-1) ──
+  // Rationale: concrete advice (BestOfN, reflection) is more useful than an
+  // abstract "stop" recommendation. Finalize is the lowest-priority fallback
+  // — it only fires if nothing else has actionable guidance.
+
+  // 1. Noise gate (system noise — continuing is pointless)
+  const noiseSteer = checkNoiseGate(payload, cwd, oc);
+  if (noiseSteer) return noiseSteer;
+
+  // 2. Parallel opportunity (actionable: concrete ideas → BestOfN/SpaceSearch)
+  const parallelSteer = checkParallelOpportunity(state, payload, cwd, oc);
+  if (parallelSteer) return parallelSteer;
+
+  // 3. Stagnation (actionable: reflection + escalation hints)
+  const stagnationSteer = checkStagnation(state, asi, payload, cwd, oc);
+  if (stagnationSteer) return stagnationSteer;
+
+  // 4. Floor detection (objective limit — now checks untried ideas, P1-2)
   if (oc.floorDetectionEnabled) {
     const floorSteer = checkFloor(state, asi, payload, cwd, oc);
     if (floorSteer) return floorSteer;
   }
 
-  // Parallel opportunity (proactive — fires at streak 3, before stagnation)
-  const parallelSteer = checkParallelOpportunity(state, payload, cwd, oc);
-  if (parallelSteer) return parallelSteer;
-
-  // Stagnation
-  const stagnationSteer = checkStagnation(state, asi, payload, cwd, oc);
-  if (stagnationSteer) return stagnationSteer;
-
-  // Progress milestone
+  // 5. Progress milestone (positive reinforcement — always useful)
   const progressSteer = checkProgress(state, payload, cwd, oc);
   if (progressSteer) return progressSteer;
+
+  // 6. Finalize (fallback — lowest priority; agent self-assessment)
+  if (oc.finalizeEnabled) {
+    const finalizeSteer = checkFinalize(allEntries, oc, state, ideasPath);
+    if (finalizeSteer) return finalizeSteer;
+  }
 
   return null;
 }
