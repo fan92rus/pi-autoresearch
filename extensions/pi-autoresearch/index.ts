@@ -1778,7 +1778,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\nyou have concrete PROOF (profiling, variance data, exhausted search space)." +
       "\nA subjective \"this seems hard\" is NOT proof — try orthogonal approaches and" +
       "\nparallel tools (BestOfN, SpaceSearch) first. If you finalize prematurely and then" +
-      "\nfind an improvement, the observer will suppress the finalize signal automatically." +
+      "\nfind an improvement, the observer will suppress the finalize signal automatically."
+    + "\nIf you continue working after finalize, the observer goes quiet — actionable"
+    + "\ntriggers (parallel opportunity, stagnation) will guide you instead."
+    + "\nThe finalize signal is the LOWEST priority steer: it only fires if nothing"
+    + "\nelse has concrete guidance." +
       "\n\n## Observer Hooks" +
       "\nIf you receive a 🔄 STAGNATION steer — STOP experimenting and REFLECT on the pattern." +
       "\nIf you receive a 🎯 MILESTONE steer — Consider strategic alternatives and orthogonal directions." +

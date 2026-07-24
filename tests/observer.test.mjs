@@ -5,6 +5,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import {
   checkFinalize,
+  checkFloor,
   computeState,
   DEFAULT_OBSERVER_CONFIG,
 } from "../extensions/pi-autoresearch/observer.ts";
@@ -73,7 +74,11 @@ test("STALE DETECTION: improvement after finalize → suppressed (null)", () => 
   assert.equal(result, null, "finalize should be suppressed when improvements found after it");
 });
 
-test("STALE DETECTION: only discards after finalize → still fires (claim not yet disproven)", () => {
+test("ANTI-NAGGING: discards after finalize → null (agent continued, don't nag)", () => {
+  // Agent called finalize, then continued working (all discards, no improvements).
+  // Previously: full FINALIZE SIGNAL every iteration = the "stops prematurely" bug.
+  // Now: observer goes quiet — the tool's immediate steer was enough.
+  // Actionable triggers (parallel, stagnation) handle steering instead.
   const entries = [
     finalizeEntry(0.95, "floor reached"),
     discardRun(100, 1),
@@ -81,8 +86,7 @@ test("STALE DETECTION: only discards after finalize → still fires (claim not y
   ];
   const state = { streak: 2, improvements: 0, best: 100, recent: [], impHistory: [], recentMetrics: [100, 100] };
   const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, IDEAS);
-  assert.ok(result, "finalize should fire when no improvements after it");
-  assert.match(result, /FINALIZE SIGNAL.*95%/);
+  assert.equal(result, null, "should be null — agent continued working, tool steer was enough");
 });
 
 test("STALE DETECTION: last finalize entry matters, not earlier ones", () => {
@@ -121,7 +125,10 @@ test("UNTRIED IDEAS: >=2 ideas → simplify to nudge (even with 0 runs after fin
   assert.doesNotMatch(result, /FINALIZE SIGNAL.*Strongly recommended/);
 });
 
-test("UNTRIED IDEAS: >=2 ideas + runs after → nudge mentions run count", () => {
+test("UNTRIED IDEAS: >=2 ideas + runs after → null (anti-nagging takes priority)", () => {
+  // Previously this returned a nudge mentioning run count.
+  // Now: runEntriesAfter >= 1 → null (anti-nagging fires before untried-ideas check).
+  // The actionable triggers (parallel opportunity) will suggest trying the ideas.
   const ideasPath = makeIdeasFile(2);
   const entries = [
     finalizeEntry(0.9),
@@ -131,8 +138,7 @@ test("UNTRIED IDEAS: >=2 ideas + runs after → nudge mentions run count", () =>
   ];
   const state = { streak: 3, improvements: 0, best: 100, recent: [], impHistory: [], recentMetrics: [100, 100, 100] };
   const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, ideasPath);
-  assert.ok(result);
-  assert.match(result, /3 runs attempted since/);
+  assert.equal(result, null, "should be null — anti-nagging suppresses finalize after agent continued");
 });
 
 test("UNTRIED IDEAS: 1 idea → full finalize block (threshold is >=2)", () => {
@@ -152,4 +158,82 @@ test("UNTRIED IDEAS: struck-through ideas don't count", () => {
   const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, ideasPath);
   // Only 1 real idea → full block, not nudge
   assert.match(result, /Strongly recommended/);
+});
+
+// ── Anti-nagging: finalize goes quiet after agent continued working ──────────
+
+test("ANTI-NAGGING: 0 runs after finalize → fires (just called, observer can surface)", () => {
+  // No runs after finalize → observer can show it as a fallback.
+  // With new priority order, actionable triggers fire first; finalize is last resort.
+  const entries = [finalizeEntry(0.95)];
+  const state = { streak: 0, improvements: 0, best: 100, recent: [], impHistory: [], recentMetrics: [] };
+  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, IDEAS);
+  assert.ok(result, "with 0 runs after, finalize should fire as fallback");
+  assert.match(result, /95%/);
+});
+
+test("ANTI-NAGGING: 1 run after finalize → null (tool steer was enough)", () => {
+  const entries = [
+    finalizeEntry(0.95),
+    discardRun(100, 1),
+  ];
+  const state = { streak: 1, improvements: 0, best: 100, recent: [], impHistory: [], recentMetrics: [100] };
+  const result = checkFinalize(entries, DEFAULT_OBSERVER_CONFIG, state, IDEAS);
+  assert.equal(result, null, "1+ runs after finalize → null (don't nag)");
+});
+
+// ── checkFloor: untried-ideas guard (P1-2) ───────────────────────────────────
+
+function makeFloorState(streak, best) {
+  // Build a state with N non-improving runs and low CV to trigger floor detection.
+  // floorStreakThreshold=15, floorCvThreshold=0.15
+  const metrics = Array(streak).fill(best);
+  return {
+    streak,
+    improvements: 0,
+    best,
+    recent: [],
+    impHistory: [],
+    recentMetrics: metrics,
+  };
+}
+
+function makeFloorPayload(cwd, unit = "\u00b5s") {
+  return {
+    workDir: cwd,
+    direction: "lower",
+    metricName: "total_\u00b5s",
+    metricUnit: unit,
+    bestMetric: 100,
+    segment: 0,
+  };
+}
+
+test("CHECK FLOOR: >=2 untried ideas → downgrade to nudge (don't claim limit)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "obs-floor-"));
+  fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
+  // ideas.md goes in .auto/ (where checkFloor looks)
+  const ideasPath = path.join(dir, ".auto", "ideas.md");
+  fs.writeFileSync(ideasPath, "- Idea one to try out\n- Idea two to try out\n- Idea three to try out\n");
+
+  const state = makeFloorState(15, 100); // streak=15 triggers floor check
+  const asi = { floor: false, profiled: false, noise: false, exhausted: false };
+  const payload = makeFloorPayload(dir);
+  const result = checkFloor(state, asi, payload, dir, DEFAULT_OBSERVER_CONFIG);
+  assert.ok(result, "should return a nudge");
+  assert.match(result, /3 untried ideas remain/);
+  assert.doesNotMatch(result, /FLOOR DETECTED/);
+});
+
+test("CHECK FLOOR: 0 untried ideas → full floor block", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "obs-floor-"));
+  // No ideas.md → 0 untried ideas
+  fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
+
+  const state = makeFloorState(15, 100);
+  const asi = { floor: false, profiled: false, noise: false, exhausted: false };
+  const payload = makeFloorPayload(dir);
+  const result = checkFloor(state, asi, payload, dir, DEFAULT_OBSERVER_CONFIG);
+  assert.ok(result);
+  assert.match(result, /FLOOR DETECTED/);
 });
