@@ -181,11 +181,11 @@ const RunParams = Type.Object({
     description:
       "Shell command to run (e.g. 'pnpm test:vitest', 'uv run train.py')",
   }),
-  timeout_seconds: Type.Optional(
-    Type.Number({
-      description: "Kill after this many seconds (default: 600)",
-    })
-  ),
+  timeout_seconds: Type.Number({
+    description:
+      "Hard kill timeout in seconds. REQUIRED — the experiment fails if the command exceeds it. Pick a tight bound (e.g. 60–300) so runaway processes are killed promptly. Must be > 0.",
+    minimum: 1,
+  }),
   checks_timeout_seconds: Type.Optional(
     Type.Number({
       description:
@@ -387,15 +387,41 @@ function getBashSpawnOptions(): { shell: string; spawnArgs: string[]; detached: 
   return { shell: "bash", spawnArgs: ["-c"], detached: true };
 }
 
-/** Kill a process tree (best effort, tries process group first) */
+/**
+ * Kill a process and all its children (cross-platform).
+ * Mirrors pi core's killProcessTree (utils/shell.ts):
+ *   - Windows: taskkill /F /T /PID (kills the entire process tree)
+ *   - Unix:    SIGKILL on the process group (negative PID), then just the PID
+ *
+ * NOTE: The previous Unix-only SIGTERM implementation did NOT kill the tree on
+ * Windows — process.kill(-pid) is unsupported there, and the fallback only
+ * killed the immediate bash child, leaving the benchmark (go test, python, ...)
+ * running as an orphan indefinitely.
+ */
 function killTree(pid: number): void {
-  try {
-    process.kill(-pid, "SIGTERM");
-  } catch {
+  if (process.platform === "win32") {
+    // Use taskkill on Windows to kill the process tree.
+    // /F = force, /T = kill child processes (tree), /PID = target
     try {
-      process.kill(pid, "SIGTERM");
+      spawn("taskkill", ["/F", "/T", "/PID", String(pid)], {
+        stdio: "ignore",
+        detached: true,
+        windowsHide: true,
+      });
     } catch {
-      // Process may have already exited
+      // Ignore errors if taskkill fails
+    }
+  } else {
+    // Unix: SIGKILL the process group (negative PID).
+    // SIGKILL (not SIGTERM) — cannot be caught/ignored, guarantees death.
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // Process already dead
+      }
     }
   }
 }
@@ -1949,9 +1975,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "Run a timed experiment command (captures duration, output, exit code)",
     promptGuidelines: [
       "Use run_experiment instead of bash when running experiment commands — it handles timing and output capture automatically.",
+      "Always pass a tight timeout_seconds (required). A runaway process will be force-killed at the limit and logged as 'crash'.",
       "After run_experiment, always call log_experiment to record the result.",
       "If the benchmark script outputs structured METRIC lines (e.g. 'METRIC total_µs=15200'), run_experiment will parse them automatically and suggest exact values for log_experiment. Use these parsed values directly instead of extracting them manually from the output.",
-
     ],
     parameters: RunParams,
 
@@ -1982,11 +2008,32 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
+      // Hard timeout — required parameter (validated by schema minimum: 1).
       // Budget: a soft kill below the hard timeout. When set and <= timeout,
       // the kill timer uses the budget and the result is flagged budget_exceeded.
-      const hardTimeoutMs = (params.timeout_seconds ?? 600) * 1000;
+      const hardTimeoutSeconds = params.timeout_seconds;
+      const hardTimeoutMs = hardTimeoutSeconds * 1000;
       const budgetMs = params.budget_seconds != null ? params.budget_seconds * 1000 : null;
-      const killedByBudget = budgetMs !== null && budgetMs <= hardTimeoutMs;
+      if (budgetMs !== null && budgetMs > hardTimeoutMs) {
+        return {
+          content: [{ type: "text", text: `❌ budget_seconds (${params.budget_seconds}) must be <= timeout_seconds (${hardTimeoutSeconds}).` }],
+          details: {
+            command: params.command,
+            exitCode: null,
+            durationSeconds: 0,
+            passed: false,
+            crashed: true,
+            timedOut: false,
+            budgetExceeded: false,
+            tailOutput: "",
+            checksPass: null,
+            checksTimedOut: false,
+            checksOutput: "",
+            checksDuration: 0,
+          } as RunDetails,
+        };
+      }
+      const killedByBudget = budgetMs !== null; // safe: validated <= hardTimeoutMs above
       const timeout = killedByBudget ? budgetMs! : hardTimeoutMs;
 
       // Guard: if the benchmark script exists, only allow running it
@@ -2277,7 +2324,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         text += `⏰ BUDGET EXCEEDED after ${durationSeconds.toFixed(1)}s (budget ${params.budget_seconds}s)\n`;
         text += `Log this as 'budget_exceeded'. The experiment is too slow — before continuing, speed up measure.sh (add a BENCH_MODE=quick subset, cache prebuilt artifacts, or cut fixture/iter count) so a single run fits the budget.\n`;
       } else if (details.timedOut) {
-        text += `⏰ TIMEOUT after ${durationSeconds.toFixed(1)}s\n`;
+        text += `⏰ TIMEOUT after ${durationSeconds.toFixed(1)}s (hard limit ${params.timeout_seconds}s)\n`;
+        text += `Log this as 'crash'. The experiment exceeded the hard timeout — reduce the workload (fewer iterations, BENCH_MODE=quick) or raise timeout_seconds if the run genuinely needs more time.\n`;
       } else if (!benchmarkPassed) {
         text += `💥 FAILED (exit code ${exitCode}) in ${durationSeconds.toFixed(1)}s\n`;
       } else if (checksTimedOut) {
