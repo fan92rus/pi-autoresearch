@@ -4276,6 +4276,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   });
 
   // ── tree_status: show tree + UCB1 suggestions ──
+
+  /** Format a node's metric value with unit, for action directive text. */
+  function formatNodeMetric(node: TreeNode | undefined, tree: ExperimentTree): string {
+    if (!node || node.metric == null) return "?";
+    const unit = tree.metricName || "";
+    return `${node.metric}${unit ? " " + unit : ""}`;
+  }
   registerGatedTool({
     name: "tree_status",
     label: "Show experiment tree and UCB1 suggestions",
@@ -4382,6 +4389,36 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       let text = "";
 
+      // ── Action directive at the TOP (most important for the agent) ──
+      const activeNodeHypothesis = activeNode?.hypothesisLabel || activeNode?.hypothesis || "";
+      if (recommendation.action === "explore_from" && recommendation.node_id) {
+        const recNode = tree.nodes[recommendation.node_id];
+        const recHypothesis = recNode?.hypothesisLabel || recNode?.hypothesis || "";
+        text += `▶ NEXT: explore_from("${recommendation.node_id}")\n`;
+        text += `  Reason: ${recommendation.reason}.\n`;
+        if (recHypothesis) text += `  Target: ${recommendation.node_id} — "${recHypothesis}" (${formatNodeMetric(recNode, tree)})\n`;
+        text += `\n`;
+      } else if (recommendation.action === "compose" && composeCandidates.length > 0) {
+        text += `▶ NEXT: compose("${composeCandidates[0][0]}", "${composeCandidates[0][1]}")\n`;
+        text += `  Reason: ${recommendation.reason}. Call compose() to merge orthogonal improvements.\n`;
+        text += `\n`;
+      } else {
+        text += `▶ NEXT: continue experimenting from ${tree.activeNodeId} (${formatNodeMetric(activeNode, tree)}).\n`;
+        text += `  Reason: ${recommendation.reason}.\n`;
+        text += `\n`;
+      }
+
+      // ── Compose candidates (cross-branch pairs — currently invisible to agent without this) ──
+      if (composeCandidates.length > 0) {
+        text += `🔗 COMPOSE CANDIDATES (cross-branch keep-nodes):\n`;
+        for (const [aId, bId] of composeCandidates.slice(0, 3)) {
+          const aNode = tree.nodes[aId];
+          const bNode = tree.nodes[bId];
+          text += `  compose("${aId}", "${bId}") — "${aNode?.hypothesisLabel || aNode?.hypothesis || ""}" + "${bNode?.hypothesisLabel || bNode?.hypothesis || ""}\n`;
+        }
+        text += `\n`;
+      }
+
       if (detailMode === "ucb1") {
         // UCB1 ranking only
         text += `📊 UCB1 Ranking (${nodeCount} nodes)\n`;
@@ -4405,7 +4442,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       } else {
         // Tree + UCB1 (summary or full)
-        text = renderTree(tree);
+        text += renderTree(tree);
 
         // UCB1 suggestions
         if (ranked.length > 0) {
