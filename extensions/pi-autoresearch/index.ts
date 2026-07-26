@@ -13,6 +13,11 @@
  * - Injects .auto/prompt.md into context on every turn via before_agent_start
  */
 
+/** Module-level custom working directory, set by init_experiment(cwd=...).
+ *  When non-null, ALL autoresearch tools resolve against this instead of ctx.cwd.
+ *  Allows testing experiments in a separate project directory. */
+let _customWorkDir: string | null = null;
+
 import type {
   CustomEntry,
   ExtensionAPI,
@@ -253,6 +258,15 @@ const InitParams = Type.Object({
     Type.String({
       description:
         'Whether "lower" or "higher" is better for the primary metric. Default: "lower".',
+    })
+  ),
+  cwd: Type.Optional(
+    Type.String({
+      description:
+        'Override working directory for this experiment session (absolute path). ' +
+        'All autoresearch tools (run_experiment, log_experiment, tree_status, etc.) ' +
+        'will use this directory instead of ctx.cwd. ' +
+        'Use when testing experiments in a separate project. Default: ctx.cwd.',
     })
   ),
 });
@@ -669,6 +683,7 @@ function readMaxExperiments(cwd: string): number | null {
  * Returns ctxCwd if not set. Supports relative (resolved against ctxCwd) and absolute paths.
  */
 function resolveWorkDir(ctxCwd: string): string {
+  if (_customWorkDir) return _customWorkDir;
   const config = readConfig(ctxCwd);
   if (!config.workingDir) return ctxCwd;
   return path.isAbsolute(config.workingDir)
@@ -2012,12 +2027,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const state = runtime.state;
 
       // Validate working directory exists
-      const workDirError = validateWorkDir(ctx.cwd);
+      const effectiveCwd = params.cwd ? path.resolve(params.cwd) : ctx.cwd;
+      const workDirError = validateWorkDir(effectiveCwd);
       if (workDirError) {
         return {
           content: [{ type: "text", text: `❌ ${workDirError}` }],
           details: {},
         };
+      }
+
+      // Set module-level workDir override for ALL tools
+      if (params.cwd) {
+        _customWorkDir = effectiveCwd;
       }
 
       const isReinit = state.results.length > 0;
