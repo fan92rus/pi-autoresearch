@@ -677,6 +677,15 @@ function readMaxExperiments(cwd: string): number | null {
     : null;
 }
 
+/** Write the config file to .auto/config.json (best-effort) */
+function writeConfig(cwd: string, config: AutoresearchConfig): void {
+  try {
+    const configPath = autoresearchConfigPath(cwd);
+    ensureParentDir(configPath);
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+  } catch { /* best-effort */ }
+}
+
 /**
  * Resolve the effective working directory.
  * Reads workingDir from the config file (.auto/config.json) in ctxCwd.
@@ -2039,6 +2048,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Set module-level workDir override for ALL tools
       if (params.cwd) {
         _customWorkDir = effectiveCwd;
+        // Persist to config so it survives pi restart
+        const existingCfg = readConfig(ctx.cwd);
+        writeConfig(ctx.cwd, { ...existingCfg, workingDir: effectiveCwd });
       }
 
       const isReinit = state.results.length > 0;
@@ -2235,35 +2247,65 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const killedByBudget = budgetMs !== null; // safe: validated <= hardTimeoutMs above
       const timeout = killedByBudget ? budgetMs! : hardTimeoutMs;
 
-      // ── Pre-run SimHash repeat detection ──
-      // If the agent passed a `hypothesis`, check if it closely matches an
-      // already-tried sibling (child of the current active node). Advisory only.
+            // ── Pre-run SimHash repeat detection ──
+      // Scans the ENTIRE tree (not just siblings) for close hypothesis matches.
+      // Results weighted by tree distance: closer nodes get stricter thresholds.
       let repeatWarning = "";
       if (params.hypothesis && treeExists(workDir)) {
         try {
           const tree = loadTree(workDir);
           if (tree) {
-            const activeNode = tree.nodes[tree.activeNodeId];
-            if (activeNode && activeNode.children.length > 0) {
-              const newSimhash = computeSimhash(params.hypothesis);
-              const dupes = activeNode.children
-                .map((id) => tree.nodes[id])
-                .filter((child) => child && child.simhashFull)
-                .map((child) => ({
-                  node: child,
-                  distance: hammingDistance(newSimhash, child.simhashFull!),
-                }))
-                .filter((x) => x.distance <= SIMHASH_LIKELY)
-                .sort((a, b) => a.distance - b.distance);
-              if (dupes.length > 0) {
-                const d = dupes[0];
-                const level = classifyDistance(d.distance);
-                repeatWarning =
-                  `\n⚠️ POSSIBLE REPEAT: hypothesis \"${params.hypothesis}\"\n` +
-                  `  matches ${d.node.id} \"${d.node.hypothesisLabel || d.node.hypothesis}\" (${d.node.status})\n` +
-                  `  SimHash distance=${d.distance} (${level}).\n` +
-                  `  If this is a genuinely different idea — proceed. Otherwise consider a new approach.`;
+            const newSimhash = computeSimhash(params.hypothesis);
+            // BFS tree distance between two nodes
+            function treeDist(tree: ExperimentTree, a: string, b: string): number {
+              if (a === b) return 0;
+              const seen = new Set<string>();
+              let qa = [a], qb = [b];
+              for (let d = 0; qa.length && qb.length; d++) {
+                seen.clear();
+                for (const id of qa) seen.add(id);
+                qa = [...new Set(qa.flatMap(id => {
+                  const n = tree.nodes[id];
+                  return n && n.parentId ? [n.parentId] : [];
+                }))];
+                if (qa.some(id => seen.has(id) || qb.includes(id))) return d + 1;
+                seen.clear();
+                for (const id of qb) seen.add(id);
+                qb = [...new Set(qb.flatMap(id => {
+                  const n = tree.nodes[id];
+                  return n && n.parentId ? [n.parentId] : [];
+                }))];
+                if (qb.some(id => seen.has(id) || qa.includes(id))) return d + 1;
               }
+              return Infinity;
+            }
+            const activeId = tree.activeNodeId;
+            // Scan ALL experiment/keep/compose nodes in the tree
+            const allDupes = Object.values(tree.nodes)
+              .filter((n) => n.simhashFull && n.id !== activeId &&
+                (n.nodeType === "experiment" || n.nodeType === "compose"))
+              .map((n) => ({
+                node: n,
+                distance: hammingDistance(newSimhash, n.simhashFull!),
+                td: treeDist(tree, activeId, n.id),
+              }))
+              .filter((x) => {
+                // Siblings (td=2): threshold = SIMHASH_LIKELY (3)
+                // Close (td 4): threshold = SIMHASH_MAYBE (6)
+                // Distant (td 6+): threshold = SIMHASH_LIKELY (3)
+                const th = x.td <= 2 ? SIMHASH_LIKELY : x.td <= 4 ? SIMHASH_MAYBE : SIMHASH_LIKELY;
+                return x.distance <= th;
+              })
+              .sort((a, b) => a.distance - b.distance || a.td - b.td);
+            if (allDupes.length > 0) {
+              const d = allDupes[0];
+              const level = classifyDistance(d.distance);
+              const where = d.td <= 2 ? "sibling" : d.td <= 4 ? "nearby" : "distant";
+              repeatWarning =
+                `\n⚠️ POSSIBLE REPEAT: hypothesis \"${params.hypothesis}\"\n` +
+                `  matches ${d.node.id} \"${d.node.hypothesisLabel || d.node.hypothesis}\" (${d.node.status}, ${where})\n` +
+                `  SimHash distance=${d.distance} (${level}), tree distance=${d.td}.\n` +
+                `  If this is a genuinely different idea — proceed. Otherwise consider a new approach.`;
             }
           }
         } catch {
