@@ -112,26 +112,25 @@ export function findBestNodeId(tree: ExperimentTree): string | null {
  * Render the full tree as ASCII art.
  * Returns a string ready for TUI display.
  */
-export function renderTree(tree: ExperimentTree): string {
+export function renderTree(tree: ExperimentTree, maxLines: number = 60): string {
   const bestId = findBestNodeId(tree);
   const lines: string[] = [];
+  const push = (s: string) => { if (lines.length < maxLines) lines.push(s); };
 
   // Header
   const headerUnit = tree.metricName || "";
   const direction = tree.direction === "lower" ? "lower is better" : "higher is better";
   const nodeCount = Object.keys(tree.nodes).length;
-  lines.push(`🌳 Experiment Tree — "${headerUnit}" (${direction})    [Tab → List view]`);
+  lines.push(`🌳 Experiment Tree — "${headerUnit}" (${direction})    [/tree → List view]`);
   lines.push("━".repeat(80));
   lines.push("");
 
-  // Render tree recursively starting from root
   const root = tree.nodes[tree.rootId];
   if (!root) {
     lines.push("(empty tree)");
     return lines.join("\n");
   }
 
-  // Calculate max depth for tree shape
   let maxDepth = 0;
   for (const node of Object.values(tree.nodes)) {
     if (node.depth > maxDepth) maxDepth = node.depth;
@@ -139,29 +138,76 @@ export function renderTree(tree: ExperimentTree): string {
   lines.push(`Nodes: ${nodeCount}  Depth: ${maxDepth}  Active: ${tree.activeNodeId}`);
   lines.push("");
 
-  function renderNode(node: TreeNode, indent: string, isLast: boolean) {
-    const isActive = node.id === tree.activeNodeId;
-    const isBest = node.id === bestId;
-    lines.push(renderNodeLine(node, tree, indent, isLast, isBest, isActive));
-
-    const children = node.children.map((id) => tree.nodes[id]).filter(Boolean);
-    children.forEach((child, i) => {
-      const childIsLast = i === children.length - 1;
-      const childIndent = indent + (isLast ? SYMBOLS.emptyIndent : SYMBOLS.verticalIndent);
-      renderNode(child, childIndent, childIsLast);
-    });
+  // Consecutive discard count (for collapse heuristic)
+  function countDiscards(tree: ExperimentTree, id: string): number {
+    const n = tree.nodes[id];
+    if (!n) return 0;
+    let c = (n.status === "discard" || n.status === "crash" || n.status === "checks_failed") ? 1 : 0;
+    for (const cid of n.children) c += countDiscards(tree, cid);
+    return c;
   }
 
-  // Root has no tree prefix (it's the top of the tree)
-  const isActiveRoot = root.id === tree.activeNodeId;
-  const isBestRoot = root.id === bestId;
-  lines.push(renderNodeLine(root, tree, "", true, isBestRoot, isActiveRoot, true));
+  // Iterative DFS stack: [nodeId, indent, isLast, isRoot]
+  const stack: Array<[string, string, boolean, boolean]> = [[tree.rootId, "", true, true]];
+  let hiddenCount = 0;
+  let hiddenSubtree = false;
 
-  const rootChildren = root.children.map((id) => tree.nodes[id]).filter(Boolean);
-  rootChildren.forEach((child, i) => {
-    const childIsLast = i === rootChildren.length - 1;
-    renderNode(child, "", childIsLast);
-  });
+  while (stack.length > 0) {
+    const [nodeId, indent, isLast, isRoot] = stack.pop()!;
+    if (hiddenSubtree) { hiddenCount++; continue; }
+
+    const node = tree.nodes[nodeId];
+    if (!node) continue;
+
+    // Collapse chains of 3+ consecutive discard/crash
+    if (!isRoot && (node.status === "discard" || node.status === "crash" || node.status === "checks_failed")) {
+      const totalDiscards = countDiscards(tree, nodeId);
+      if (totalDiscards >= 3) {
+        const remaining = lines.length < maxLines - 1;
+        if (remaining) {
+          const icon = STATUS_ICONS[node.status] || "?";
+          const prefix = indent + (isLast ? SYMBOLS.lastBranch : SYMBOLS.branch);
+          const metric = formatMetric(node.metric, "");
+          push(`${prefix}${node.id}  ${metric.padStart(8)}  ${icon}  (${totalDiscards} collapsed discard nodes)`);
+        }
+        hiddenSubtree = true;
+        continue;
+      }
+    }
+
+    const isActive = node.id === tree.activeNodeId;
+    const isBest = node.id === bestId;
+    const line = renderNodeLine(node, tree, indent, isLast, isBest, isActive, isRoot);
+    push(line);
+
+    // Push children in reverse order for correct visual ordering
+    const children = node.children.map((id) => tree.nodes[id]).filter(Boolean);
+    if (children.length > 0) {
+      const remaining = maxLines - lines.length;
+      if (remaining < 2 && !isRoot) {
+        // Collapse all children
+        let totalKids = 0;
+        const visit = (id: string) => { totalKids++; const n = tree.nodes[id]; if (n) for (const c of n.children) visit(c); };
+        for (const ch of children) visit(ch.id);
+        const childIndent = indent + (isLast ? SYMBOLS.emptyIndent : SYMBOLS.verticalIndent);
+        push(`${childIndent}${SYMBOLS.lastBranch}(${totalKids} more nodes — use tree_detail for full view)`);
+        hiddenSubtree = true;
+      } else {
+        for (let i = children.length - 1; i >= 0; i--) {
+          const childIsLast = i === children.length - 1;
+          const childIndent = indent + (isLast ? SYMBOLS.emptyIndent : SYMBOLS.verticalIndent);
+          stack.push([children[i].id, childIndent, childIsLast, false]);
+        }
+      }
+    }
+  }
+
+  if (hiddenCount > 0) {
+    const warning = hiddenCount > 1
+      ? `  (${hiddenCount} nodes hidden due to collapse)`
+      : `  (1 node hidden due to collapse)`;
+    push(warning);
+  }
 
   // Legend
   lines.push("");
@@ -172,7 +218,7 @@ export function renderTree(tree: ExperimentTree): string {
   return lines.join("\n");
 }
 
-/**
+/**/**
  * Render node detail view (shown when user selects a node).
  */
 export function renderNodeDetail(tree: ExperimentTree, node: TreeNode): string {
