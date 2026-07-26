@@ -883,13 +883,18 @@ async function recordTreeNode(
   const commit = isKeep ? info.experiment.commit || null : null;
 
   const nodeId = nextNodeId(tree);
+  const nodeHypothesis: string =
+    (info.asi && typeof info.asi.hypothesis === "string" && info.asi.hypothesis.length > 0)
+      ? info.asi.hypothesis
+      : info.experiment.description;
+
   const node = createExperimentNode(
     nodeId,
     parentId,
     parent.depth,
     commit,
     info.experiment.metric,
-    info.experiment.description,
+    nodeHypothesis,
     status,
     info.asi ?? null,
     info.runNumber,
