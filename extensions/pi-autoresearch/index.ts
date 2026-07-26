@@ -2424,16 +2424,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
 
-      // ── do_not_retry overlap detection ──
-      const dnriMatch = checkDoNotRetryOverlap(tree, hypothesisText);
-      if (dnriMatch) {
-        warning +=
-          `\n⚠️ CAUTION: This hypothesis resembles ${dnriMatch.nodeId} (discard) which found:\n` +
-          `   "${dnriMatch.doNotRetry.slice(0, 120)}"\n` +
-          `   Shared keywords: ${dnriMatch.sharedKeywords.join(", ")}\n` +
-          `   Are you doing something FUNDAMENTALLY different? If not, skip this.`;
-      }
-
       // ── SimHash duplicate detection ──
       const newSimhash = computeSimhash(hypothesisText);
       const activeId = tree.activeNodeId;
@@ -2450,6 +2440,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       let nodeStatus: "untested" | "duplicate" = "untested";
       let warning = "";
+
+      // ── do_not_retry overlap detection ──
+      const dnriMatch = checkDoNotRetryOverlap(tree, hypothesisText);
+      if (dnriMatch) {
+        warning +=
+          `\n⚠️ CAUTION: This hypothesis resembles ${dnriMatch.nodeId} (discard) which found:\n` +
+          `   "${dnriMatch.doNotRetry.slice(0, 120)}"\n` +
+          `   Shared keywords: ${dnriMatch.sharedKeywords.join(", ")}\n` +
+          `   Are you doing something FUNDAMENTALLY different? If not, skip this.`;
+      }
 
       if (dupes.length > 0) {
         const d = dupes[0];
