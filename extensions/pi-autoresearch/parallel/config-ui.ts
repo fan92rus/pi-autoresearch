@@ -39,6 +39,7 @@ export interface AutocompleteEntry {
 export const AUTORESEARCH_SUBCOMMANDS: AutocompleteEntry[] = [
   { value: "off", label: "off", description: "Turn autoresearch mode off" },
   { value: "clear", label: "clear", description: "Delete session log and reset state" },
+  { value: "tree", label: "tree", description: "Toggle tree/list view in dashboard widget" },
   { value: "config", label: "config", description: "Interactive parallel mode configuration (models, concurrency, budget)" },
   { value: "export", label: "export", description: "Open live dashboard in browser" },
   { value: "parallel-best-of-n", label: "parallel-best-of-n", description: "Try N hypotheses at once, keep the best" },
