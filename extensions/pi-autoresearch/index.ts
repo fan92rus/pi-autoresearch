@@ -67,6 +67,25 @@ import { interactiveParallelConfig, filterSubcommands } from "./parallel/config-
 import { resolveRepoRoot, cleanupAllWorktrees } from "./parallel/worktree.ts";
 import { newPhaseStore, startPhase, recordExploreStep, endPhaseDecision, clearPhase, markBestCheckpoint, persistPhase, clearPersistedPhase, commitPhaseGit, abortPhaseGit } from "./parallel/phases.ts";
 import type { Direction } from "./parallel/types.ts";
+import {
+  treeExists,
+  loadTree,
+  saveTree,
+  treeFilePath,
+  createRootNode,
+  createExperimentNode,
+  appendChild,
+  nextNodeId,
+  getPath,
+  getChildren,
+  checkExhausted,
+  type ExperimentTree,
+  type TreeNode,
+} from "./parallel/tree.ts";
+import { computeSimhash, hammingDistance, classifyDistance, SIMHASH_LIKELY } from "./parallel/simhash.ts";
+import { rankNodes, isExpandable, getUcb1C, type RankedNode } from "./parallel/ucb1.ts";
+import { composeDiffs, checkFileScopeConflict, extractChangedFiles, findLCA } from "./parallel/compose.ts";
+import { renderTree, renderNodeDetail, findBestNodeId } from "./parallel/treeview.ts";
 
 // ---------------------------------------------------------------------------
 // Experiment output limits (sent to LLM — keep small to save context)
@@ -170,6 +189,8 @@ interface AutoresearchRuntime {
   pendingResumeMessage: string | null;
   /** Active phase state for valley-crossing multi-step optimizations (ТЗ §11.5). */
   phaseStore: ReturnType<typeof newPhaseStore>;
+  /** TUI view mode: 'list' (dashboard table) or 'tree' (experiment tree). Toggle with Tab. */
+  treeViewMode: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +223,14 @@ const RunParams = Type.Object({
     Type.String({
       description:
         'Sets the BENCH_MODE env var for the command (e.g. "quick", "full", "smoke"). measure.sh convention: parallel workers measure with BENCH_MODE=quick (a fast subset), the parent re-measures the winner with BENCH_MODE=full. Default: unset.',
+    })
+  ),
+  hypothesis: Type.Optional(
+    Type.String({
+      description:
+        "Brief hypothesis description (1-2 sentences). Used for pre-run repeat detection via SimHash. " +
+        "Strongly recommended — without it the system cannot warn about duplicate hypotheses. " +
+        "Example: 'Replace switch/case dispatch with lookup table for O(1) access'",
     })
   ),
 });
@@ -777,6 +806,109 @@ const autoresearchChecksPath = (dir: string) => sessionFilePath(dir, "checks");
 const autoresearchScriptPath = (dir: string) => sessionFilePath(dir, "measure");
 const autoresearchConfigPath = (dir: string) => sessionFilePath(dir, "config");
 
+// -----------------------------------------------------------------------
+// Experiment tree integration helper
+// -----------------------------------------------------------------------
+
+/** Type for the exec function (matches pi.exec shape). */
+type ExecFn = (
+  cmd: string,
+  args: string[],
+  opts?: { cwd?: string; timeout?: number },
+) => Promise<{ stdout: string; stderr: string; code: number }>;
+
+/**
+ * Record an experiment as a child node in the experiment tree.
+ *
+ * This is a best-effort overlay on top of log.jsonl. If tree.json does not
+ * exist or the operation fails, returns null (no warning appended to output).
+ * On success, returns null (silent) or a warning string if something notable
+ * happened (e.g. exhausted branch detected).
+ *
+ * For keep-status nodes:
+ *  - activeNodeId advances to the new node
+ *  - a git ref refs/exp/<id> is created to protect the commit from GC
+ * For discard/crash/checks_failed: the node is a "ghost" (commit=null) but its
+ * hypothesis + simhash are preserved for repeat detection.
+ */
+async function recordTreeNode(
+  execFn: ExecFn,
+  workDir: string,
+  info: { experiment: ExperimentResult; asi: ASI | null; runNumber: number },
+): Promise<string | null> {
+  if (!treeExists(workDir)) return null;
+
+  const tree = loadTree(workDir);
+  if (!tree) return null;
+
+  const parentId = tree.activeNodeId;
+  const parent = tree.nodes[parentId];
+  if (!parent) {
+    return `\n⚠️ tree.json: active node ${parentId} not found, skipping tree update`;
+  }
+
+  // Map ExperimentResult.status → TreeNodeStatus.
+  // budget_exceeded behaves like crash (code reverted, no commit).
+  // explore is handled earlier in log_experiment and never reaches here.
+  const rawStatus = info.experiment.status;
+  const status: TreeNode["status"] =
+    rawStatus === "keep" ? "keep" :
+    rawStatus === "discard" ? "discard" :
+    rawStatus === "crash" ? "crash" :
+    "checks_failed"; // budget_exceeded, checks_failed → checks_failed (ghost node)
+  const isKeep = status === "keep";
+  const commit = isKeep ? info.experiment.commit || null : null;
+
+  const nodeId = nextNodeId(tree);
+  const node = createExperimentNode(
+    nodeId,
+    parentId,
+    parent.depth,
+    commit,
+    info.experiment.metric,
+    info.experiment.description,
+    status,
+    info.asi ?? null,
+    info.runNumber,
+  );
+
+  // If ASI indicates this is a compose node, set nodeType + composedFrom
+  if (info.asi && Array.isArray(info.asi.composed_from)) {
+    node.nodeType = "compose";
+    node.composedFrom = (info.asi.composed_from as string[]).filter(
+      (id): id is string => typeof id === "string",
+    );
+  }
+
+  appendChild(tree, parentId, node);
+
+  // For keep: advance active node and protect the commit with a git ref.
+  if (isKeep && commit) {
+    tree.activeNodeId = nodeId;
+    // Update baselineMetric if this is the first real result (root had 0).
+    if (tree.baselineMetric === 0 && parent.nodeType === "baseline") {
+      tree.baselineMetric = info.experiment.metric;
+    }
+    try {
+      await execFn("git", ["update-ref", `refs/exp/${nodeId}`, commit], {
+        cwd: workDir,
+        timeout: 5000,
+      });
+    } catch {
+      // GC protection is best-effort.
+    }
+  }
+
+  // Detect exhausted branch (≥3 consecutive discards among siblings).
+  let warning: string | null = null;
+  if (checkExhausted(tree, parentId)) {
+    warning = `\n🌲 tree: branch at ${parentId} marked exhausted (3 consecutive discards) — consider explore_from to backtrack.`;
+  }
+
+  saveTree(workDir, tree);
+  return warning;
+}
+
 function findBaselineRunNumber(results: ExperimentResult[], segment: number): number | null {
   const index = results.findIndex((result) => result.segment === segment);
   return index >= 0 ? index + 1 : null;
@@ -906,6 +1038,7 @@ function createSessionRuntime(): AutoresearchRuntime {
     pendingResumeTimer: null,
     pendingResumeMessage: null,
     phaseStore: newPhaseStore(),
+    treeViewMode: false,
   };
 }
 
@@ -1651,6 +1784,21 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     ctx.ui.setWidget("autoresearch", (tui, theme) => ({
         render(width: number): string[] {
           const safeWidth = Math.max(1, width || getTuiSize(tui).width);
+
+          // Tree view mode: render ASCII tree instead of dashboard table
+          if (runtime.treeViewMode) {
+            const workDir = resolveWorkDir(ctx.cwd);
+            if (!treeExists(workDir)) {
+              return [theme.fg("dim", "🌳 No experiment tree yet — call init_experiment")];
+            }
+            const tree = loadTree(workDir);
+            if (!tree) {
+              return [theme.fg("dim", "🌳 Failed to load tree")];
+            }
+            const treeStr = renderTree(tree);
+            return treeStr.split("\n").map((line) => truncateToWidth(line, safeWidth, "…", true));
+          }
+
           const title = truncateDisplayText(
             `🔬 autoresearch${state.name ? `: ${state.name}` : ""}`,
             Math.max(0, safeWidth - 5)
@@ -1814,10 +1962,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\nIf you receive a 🔄 STAGNATION steer — STOP experimenting and REFLECT on the pattern." +
       "\nIf you receive a 🎯 MILESTONE steer — Consider strategic alternatives and orthogonal directions." +
       "\n\n## Rules" +
-      "\n⛔ NEVER call run_experiment without a stated hypothesis." +
+      "\n⛔ NEVER call run_experiment without a stated hypothesis (pass the `hypothesis` parameter for repeat detection)." +
       "\n⛔ NEVER skip log_experiment after run_experiment." +
       "\n⛔ NEVER skip the smoke test — broken code wastes experiment time." +
-      "✅ Write promising but untried ideas to .auto/ideas/ — one .md file per idea (e.g. cache-ast-nodes.md).\nWhen you try an idea, add \"idea_id\": \"filename\" to the ASI in log_experiment — the file will be auto-removed so the untried count stays accurate.";
+      "✅ Write promising but untried ideas to .auto/ideas/ — one .md file per idea (e.g. cache-ast-nodes.md).\nWhen you try an idea, add \"idea_id\": \"filename\" to the ASI in log_experiment — the file will be auto-removed so the untried count stays accurate." +
+      "\n\n## Experiment Tree" +
+      "\nEach experiment is recorded as a node in .auto/tree.json. Available tools: tree_status(), explore_from(), restore_main(), compose(). When you see \"branch exhausted\" or stagnation, call tree_status() for UCB1 suggestions and use explore_from() to backtrack. Pass a hypothesis parameter to run_experiment for pre-run repeat detection.";
 
     if (hasChecks) {
       extra +=
@@ -1920,6 +2070,35 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           }],
           details: {},
         };
+      }
+
+      // ── Experiment tree: create root node ──
+      // The tree is an optional overlay on top of log.jsonl. On init (or
+      // re-init) we (re)create the tree with a fresh root. The baseline metric
+      // is not yet known — it will be set by the first keep-logged experiment.
+      try {
+        const headRes = await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: workDir, timeout: 5000 });
+        const baselineCommit = (headRes.stdout || "").trim() || "unknown";
+        const tree: ExperimentTree = {
+          version: 1,
+          rootId: "n0",
+          activeNodeId: "n0",
+          nextId: 1,
+          baselineMetric: 0,
+          direction: state.bestDirection,
+          metricName: state.metricName,
+          nodes: { n0: createRootNode("n0", baselineCommit, 0) },
+          savedBranch: null,
+        };
+        saveTree(workDir, tree);
+        // Protect the baseline commit from GC
+        try {
+          await pi.exec("git", ["update-ref", "refs/exp/n0", baselineCommit], { cwd: workDir, timeout: 5000 });
+        } catch { /* best-effort — GC protection is not critical */ }
+      } catch (e) {
+        // Tree creation is best-effort; the session works without it.
+        const msg = e instanceof Error ? e.message : String(e);
+        console.warn(`[autoresearch] tree.json creation failed (non-fatal): ${msg}`);
       }
 
       const wasInactive = !runtime.autoresearchMode;
@@ -2035,6 +2214,42 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
       const killedByBudget = budgetMs !== null; // safe: validated <= hardTimeoutMs above
       const timeout = killedByBudget ? budgetMs! : hardTimeoutMs;
+
+      // ── Pre-run SimHash repeat detection ──
+      // If the agent passed a `hypothesis`, check if it closely matches an
+      // already-tried sibling (child of the current active node). Advisory only.
+      let repeatWarning = "";
+      if (params.hypothesis && treeExists(workDir)) {
+        try {
+          const tree = loadTree(workDir);
+          if (tree) {
+            const activeNode = tree.nodes[tree.activeNodeId];
+            if (activeNode && activeNode.children.length > 0) {
+              const newSimhash = computeSimhash(params.hypothesis);
+              const dupes = activeNode.children
+                .map((id) => tree.nodes[id])
+                .filter((child) => child && child.simhashFull)
+                .map((child) => ({
+                  node: child,
+                  distance: hammingDistance(newSimhash, child.simhashFull!),
+                }))
+                .filter((x) => x.distance <= SIMHASH_LIKELY)
+                .sort((a, b) => a.distance - b.distance);
+              if (dupes.length > 0) {
+                const d = dupes[0];
+                const level = classifyDistance(d.distance);
+                repeatWarning =
+                  `\n⚠️ POSSIBLE REPEAT: hypothesis \"${params.hypothesis}\"\n` +
+                  `  matches ${d.node.id} \"${d.node.hypothesisLabel || d.node.hypothesis}\" (${d.node.status})\n` +
+                  `  SimHash distance=${d.distance} (${level}).\n` +
+                  `  If this is a genuinely different idea — proceed. Otherwise consider a new approach.`;
+              }
+            }
+          }
+        } catch {
+          // Repeat detection is best-effort.
+        }
+      }
 
       // Guard: if the benchmark script exists, only allow running it
       const autoresearchShPath = autoresearchScriptPath(workDir);
@@ -2383,6 +2598,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       if (checksPass === false) {
         text += `\n\n── Checks output (last 80 lines) ──\n${details.checksOutput}`;
+      }
+
+      // Append pre-run SimHash repeat warning (if any)
+      if (repeatWarning) {
+        text += repeatWarning;
       }
 
       return {
@@ -2821,6 +3041,21 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       } catch (e) {
         text += `\n⚠️ Failed to write .auto/log.jsonl: ${e instanceof Error ? e.message : String(e)}`;
       }
+
+      // ── Experiment tree: append child node ──
+      // The tree is an optional overlay. If tree.json exists, record this
+      // experiment as a child of the active node. keep-nodes get a git ref
+      // (refs/exp/<id>) to protect the commit from GC and enable explore_from.
+      const treeWarn = await recordTreeNode(
+        (cmd, args, opts) => pi.exec(cmd, args, opts),
+        workDir,
+        {
+          experiment,
+          asi: mergedASI ?? null,
+          runNumber: state.results.length,
+        },
+      );
+      if (treeWarn) text += treeWarn;
 
       // ── Auto-remove tried idea file from .auto/ideas/ ──
       // If ASI contains idea_id (string or array), delete the matching file
@@ -3782,6 +4017,524 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     },
   });
 
+  // ═══════════════════════════════════════════════════════════════════
+  // Experiment Tree tools (Phase 1.1–1.3)
+  // ═════════════════════════════════════════════════════════════════
+
+  // ── explore_from: backtrack to any tree node ──
+  registerGatedTool({
+    name: "explore_from",
+    label: "Backtrack to a tree node and explore from there",
+    description:
+      "Backtrack to any node in the experiment tree. Checks out the node's commit (detached HEAD) " +
+      "and sets it as the new active point for future experiments. " +
+      "Use when the current branch is exhausted (3+ discards) or when tree_status suggests a more promising node. " +
+      "After exploring, call restore_main() to return to the main branch.",
+    promptSnippet: 'Backtrack to a different part of the experiment tree',
+    promptGuidelines: [
+      "Use explore_from when the current branch is exhausted or tree_status suggests a better starting point.",
+      "explore_from creates a detached HEAD — always call restore_main() when done exploring that branch.",
+      "Ghost nodes (discard/crash) cannot be explored from — they have no commit.",
+    ],
+    parameters: {
+      type: "object",
+      properties: {
+        node_id: {
+          type: "string",
+          description: 'ID of the tree node to explore from (e.g. "n2", "n6"). Use tree_status to see available nodes.',
+        },
+      },
+      required: ["node_id"],
+    } as any,
+    async execute(_toolCallId: string, params: { node_id: string }, _signal, _onUpdate, ctx: ExtensionContext) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
+      const workDir = resolveWorkDir(ctx.cwd);
+
+      if (!treeExists(workDir)) {
+        return {
+          content: [{ type: "text", text: "❌ No experiment tree found. Call init_experiment first." }],
+          details: {},
+        };
+      }
+
+      const tree = loadTree(workDir);
+      if (!tree) {
+        return {
+          content: [{ type: "text", text: "❌ Failed to load experiment tree." }],
+          details: {},
+        };
+      }
+
+      const node = tree.nodes[params.node_id];
+      if (!node) {
+        return {
+          content: [{ type: "text", text: `❌ Node ${params.node_id} not found in tree. Call tree_status() to see available nodes.` }],
+          details: {},
+        };
+      }
+
+      if (!node.commit) {
+        return {
+          content: [{ type: "text", text: `❌ Node ${params.node_id} is a ghost node (status: ${node.status}). No commit to checkout.` }],
+          details: { node },
+        };
+      }
+
+      // Verify commit is accessible
+      try {
+        const catFile = await pi.exec("git", ["cat-file", "-e", node.commit], { cwd: workDir, timeout: 5000 });
+        if (catFile.code !== 0) {
+          return {
+            content: [{ type: "text", text: `❌ Commit ${node.commit} for node ${params.node_id} is not accessible (may have been GC'd).` }],
+            details: { node },
+          };
+        }
+      } catch {
+        return {
+          content: [{ type: "text", text: `❌ Could not verify commit ${node.commit}. Is git available?` }],
+          details: { node },
+        };
+      }
+
+      // Save current branch for restore_main()
+      try {
+        const branchRes = await pi.exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: workDir, timeout: 5000 });
+        const currentBranch = (branchRes.stdout || "").trim();
+        if (currentBranch && currentBranch !== "HEAD") {
+          tree.savedBranch = currentBranch;
+        } else if (!tree.savedBranch) {
+          // Already detached — save main as fallback
+          tree.savedBranch = "main";
+        }
+      } catch {
+        // best-effort
+      }
+
+      // Checkout the node's commit (detached HEAD)
+      try {
+        const checkoutRes = await pi.exec("git", ["checkout", "--detach", node.commit], { cwd: workDir, timeout: 30000 });
+        if (checkoutRes.code !== 0) {
+          return {
+            content: [{ type: "text", text: `❌ git checkout failed: ${checkoutRes.stderr || checkoutRes.stdout}` }],
+            details: { node },
+          };
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return {
+          content: [{ type: "text", text: `❌ git checkout error: ${msg}` }],
+          details: { node },
+        };
+      }
+
+      // Update active node
+      tree.activeNodeId = params.node_id;
+      saveTree(workDir, tree);
+
+      // Build response
+      const path = getPath(tree, params.node_id);
+      const children = getChildren(tree, params.node_id);
+      const pathStr = path.join(" → ");
+
+      let text = `📍 explore_from(${params.node_id})\n`;
+      text += `Moved to node ${params.node_id} (metric: ${node.metric}, "${node.hypothesisLabel || node.hypothesis}").\n`;
+      text += `Path: ${pathStr}\n`;
+
+      if (children.length > 0) {
+        text += `\nChildren (already tried from here):\n`;
+        for (const c of children) {
+          text += `  ${c.id}  "${c.hypothesisLabel || c.hypothesis}"  ${c.status}\n`;
+        }
+      } else {
+        text += `\nNo children — this node is unexplored. Good starting point.\n`;
+      }
+
+      if (node.exhausted) {
+        text += `\n⚠️ This branch was marked exhausted, but you can still explore from here.\n`;
+      }
+
+      text += `\n⚠️ Detached HEAD. Call restore_main() to return to the main branch.\n`;
+      text += `Now experiment from here. Check tree_status() for UCB1 suggestions.\n`;
+
+      return {
+        content: [{ type: "text", text }],
+        details: { node, path, children, warning: "Detached HEAD — call restore_main() to return." },
+      };
+    },
+
+    renderCall(args, theme) {
+      let text = theme.fg("toolTitle", theme.bold("explore_from "));
+      text += theme.fg("info", args.node_id || "?");
+      return new Text(text, 0, 0);
+    },
+
+    renderResult(result, theme) {
+      const t = result.content[0];
+      return new Text(t?.type === "text" ? t.text : "", 0, 0);
+    },
+  });
+
+  // ── restore_main: return from detached HEAD to main branch ──
+  registerGatedTool({
+    name: "restore_main",
+    label: "Return to main branch from explore_from",
+    description:
+      "Return from a detached HEAD (created by explore_from) to the main branch. " +
+      "Sets the active node to the last keep-node on main. " +
+      "Always call this after explore_from when you're done exploring that branch.",
+    promptSnippet: "Return to main branch after explore_from",
+    promptGuidelines: [
+      "Always call restore_main() after explore_from when you're done exploring.",
+    ],
+    parameters: {
+      type: "object",
+      properties: {},
+    } as any,
+    async execute(_toolCallId: string, _params: Record<string, never>, _signal, _onUpdate, ctx: ExtensionContext) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
+      const workDir = resolveWorkDir(ctx.cwd);
+
+      if (!treeExists(workDir)) {
+        return {
+          content: [{ type: "text", text: "❌ No experiment tree found." }],
+          details: {},
+        };
+      }
+
+      const tree = loadTree(workDir);
+      if (!tree) {
+        return {
+          content: [{ type: "text", text: "❌ Failed to load experiment tree." }],
+          details: {},
+        };
+      }
+
+      if (!tree.savedBranch) {
+        return {
+          content: [{ type: "text", text: "ℹ️ No saved branch — already on main?" }],
+          details: { activeNodeId: tree.activeNodeId },
+        };
+      }
+
+      // Checkout the saved branch
+      try {
+        const checkoutRes = await pi.exec("git", ["checkout", tree.savedBranch], { cwd: workDir, timeout: 30000 });
+        if (checkoutRes.code !== 0) {
+          return {
+            content: [{ type: "text", text: `❌ git checkout failed: ${checkoutRes.stderr || checkoutRes.stdout}` }],
+            details: {},
+          };
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return {
+          content: [{ type: "text", text: `❌ git checkout error: ${msg}` }],
+          details: {},
+        };
+      }
+
+      // Find the last keep-node on the main branch (the one whose commit == HEAD)
+      let activeNodeId = tree.rootId;
+      try {
+        const headRes = await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: workDir, timeout: 5000 });
+        const headSha = (headRes.stdout || "").trim();
+        for (const [id, n] of Object.entries(tree.nodes)) {
+          if (n.commit === headSha && n.status === "keep") {
+            activeNodeId = id;
+            break;
+          }
+        }
+      } catch {
+        // best-effort — keep rootId
+      }
+
+      tree.activeNodeId = activeNodeId;
+      const restoredBranch = tree.savedBranch;
+      tree.savedBranch = null;
+      saveTree(workDir, tree);
+
+      const activeNode = tree.nodes[activeNodeId];
+      let text = `✅ restore_main() — returned to ${restoredBranch || "main"}\n`;
+      text += `Active node: ${activeNodeId} (metric: ${activeNode?.metric ?? "?"}, "${activeNode?.hypothesisLabel || activeNode?.hypothesis || ""}")\n`;
+      text += `Ready to continue experimenting on the main branch.`;
+
+      return {
+        content: [{ type: "text", text }],
+        details: { activeNodeId, activeNode },
+      };
+    },
+
+    renderCall(_args, theme) {
+      return new Text(theme.fg("toolTitle", theme.bold("restore_main")), 0, 0);
+    },
+
+    renderResult(result, theme) {
+      const t = result.content[0];
+      return new Text(t?.type === "text" ? t.text : "", 0, 0);
+    },
+  });
+
+  // ── tree_status: show tree + UCB1 suggestions ──
+  registerGatedTool({
+    name: "tree_status",
+    label: "Show experiment tree and UCB1 suggestions",
+    description:
+      "Display the experiment tree as an ASCII diagram with UCB1 ranking of expandable nodes. " +
+      "Use this to see the full exploration map, find dead ends, and decide where to explore next. " +
+      "Modes: 'summary' (tree + UCB1), 'full' (tree + all node details), 'ucb1' (UCB1 ranking only).",
+    promptSnippet: "View experiment tree and get exploration suggestions",
+    promptGuidelines: [
+      "Call tree_status() when you're stuck, before backtracking, or after every 3-4 experiments to see the big picture.",
+      "tree_status 'ucb1' shows which nodes are most promising (balance of exploitation + exploration).",
+      "When tree_status shows an exhausted branch, call explore_from() to backtrack to a promising node.",
+    ],
+    parameters: {
+      type: "object",
+      properties: {
+        detail: {
+          type: "string",
+          enum: ["summary", "full", "ucb1"],
+          description: "Level of detail: 'summary' (default, tree + UCB1), 'full' (all node details), 'ucb1' (UCB1 ranking only).",
+        },
+      },
+    } as any,
+    async execute(_toolCallId: string, params: { detail?: string }, _signal, _onUpdate, ctx: ExtensionContext) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
+      const workDir = resolveWorkDir(ctx.cwd);
+
+      if (!treeExists(workDir)) {
+        return {
+          content: [{ type: "text", text: "ℹ️ No experiment tree yet. Call init_experiment to create one." }],
+          details: {},
+        };
+      }
+
+      const tree = loadTree(workDir);
+      if (!tree) {
+        return {
+          content: [{ type: "text", text: "❌ Failed to load experiment tree." }],
+          details: {},
+        };
+      }
+
+      const detailMode = params.detail || "summary";
+      const activeNode = tree.nodes[tree.activeNodeId];
+      const ranked = rankNodes(tree);
+      const bestId = findBestNodeId(tree);
+      const nodeCount = Object.keys(tree.nodes).length;
+
+      let text = "";
+
+      if (detailMode === "ucb1") {
+        // UCB1 ranking only
+        text += `📊 UCB1 Ranking (${nodeCount} nodes)\n`;
+        text += "═".repeat(60) + "\n";
+        if (ranked.length === 0) {
+          text += "No expandable nodes yet.\n";
+        } else {
+          for (let i = 0; i < Math.min(ranked.length, 10); i++) {
+            const r = ranked[i];
+            const n = tree.nodes[r.nodeId];
+            text += `  #${i + 1}  ${r.nodeId}  UCB1=${r.ucb1.toFixed(2)}  (${n.children.length} children, ${r.reason})\n`;
+            if (i < 3) {
+              text += `       → explore_from("${r.nodeId}")\n`;
+            }
+          }
+        }
+        // Mark exhausted nodes
+        const exhausted = Object.values(tree.nodes).filter((n) => n.exhausted);
+        if (exhausted.length > 0) {
+          text += `\n❌ EXHAUSTED: ${exhausted.map((n) => n.id).join(", ")}\n`;
+        }
+      } else {
+        // Tree + UCB1 (summary or full)
+        text = renderTree(tree);
+
+        // UCB1 suggestions
+        if (ranked.length > 0) {
+          text += `\nUCB1 Suggestions (expandable nodes):\n`;
+          for (let i = 0; i < Math.min(ranked.length, 5); i++) {
+            const r = ranked[i];
+            const n = tree.nodes[r.nodeId];
+            text += `  #${i + 1}  ${r.nodeId}  UCB1=${r.ucb1.toFixed(2)}  (${n.children.length} children) — ${r.reason}\n`;
+            if (i === 0) {
+              text += `       💡 Suggestion: explore_from("${r.nodeId}")\n`;
+            }
+          }
+        }
+
+        // Mark exhausted nodes
+        const exhausted = Object.values(tree.nodes).filter((n) => n.exhausted);
+        if (exhausted.length > 0) {
+          text += `\n❌ EXHAUSTED: ${exhausted.map((n) => `${n.id} ("${n.hypothesisLabel || n.hypothesis}")`).join(", ")}\n`;
+        }
+
+        // Full detail mode: append all node details
+        if (detailMode === "full") {
+          text += `\n${"═".repeat(80)}\n`;
+          text += `Node Details:\n\n`;
+          for (const node of Object.values(tree.nodes)) {
+            text += renderNodeDetail(tree, node) + "\n";
+          }
+        }
+      }
+
+      return {
+        content: [{ type: "text", text }],
+        details: {
+          nodeCount,
+          activeNodeId: tree.activeNodeId,
+          bestNodeId: bestId,
+          rankedNodes: ranked.slice(0, 5),
+          exhaustedNodes: Object.values(tree.nodes).filter((n) => n.exhausted).map((n) => n.id),
+        },
+      };
+    },
+
+    renderCall(args, theme) {
+      let text = theme.fg("toolTitle", theme.bold("tree_status"));
+      if (args.detail) {
+        text += theme.fg("dim", ` (${args.detail})`);
+      }
+      return new Text(text, 0, 0);
+    },
+
+    renderResult(result, theme) {
+      const t = result.content[0];
+      return new Text(t?.type === "text" ? t.text : "", 0, 0);
+    },
+  });
+
+  // ── compose: merge orthogonal improvements from two branches ──
+  registerGatedTool({
+    name: "compose",
+    label: "Merge orthogonal improvements from two tree branches",
+    description:
+      "Combine changes from two different tree branches by applying their diffs at the merge-base. " +
+      "Phase 1: only orthogonal changes (different files) are supported. " +
+      "Use compose when tree_status shows two promising branches that touch different files. " +
+      "After compose, benchmark and log_experiment(status='keep') to record the composed result.",
+    promptSnippet: "Combine orthogonal improvements from different branches",
+    promptGuidelines: [
+      "compose(node_a, node_b) merges diffs from two branches. Only works for orthogonal changes (different files).",
+      "Use compose when two branches show independent improvements — e.g., one optimizes parsing, another optimizes dispatch.",
+      "compose does NOT benchmark — you need to run_experiment and log_experiment after composing.",
+    ],
+    parameters: {
+      type: "object",
+      properties: {
+        node_a: { type: "string", description: 'First node ID (e.g. "n1")' },
+        node_b: { type: "string", description: 'Second node ID (e.g. "n7")' },
+      },
+      required: ["node_a", "node_b"],
+    } as any,
+    async execute(_toolCallId: string, params: { node_a: string; node_b: string }, _signal, _onUpdate, ctx: ExtensionContext) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
+      const workDir = resolveWorkDir(ctx.cwd);
+
+      if (!treeExists(workDir)) {
+        return {
+          content: [{ type: "text", text: "❌ No experiment tree found." }],
+          details: {},
+        };
+      }
+
+      const tree = loadTree(workDir);
+      if (!tree) {
+        return {
+          content: [{ type: "text", text: "❌ Failed to load experiment tree." }],
+          details: {},
+        };
+      }
+
+      const nodeA = tree.nodes[params.node_a];
+      const nodeB = tree.nodes[params.node_b];
+
+      if (!nodeA || !nodeB) {
+        const missing = !nodeA ? params.node_a : params.node_b;
+        return {
+          content: [{ type: "text", text: `❌ Node ${missing} not found in tree.` }],
+          details: {},
+        };
+      }
+
+      if (!nodeA.commit || !nodeB.commit) {
+        const ghost = !nodeA.commit ? params.node_a : params.node_b;
+        return {
+          content: [{ type: "text", text: `❌ Node ${ghost} is a ghost (no commit). Cannot compose ghost nodes.` }],
+          details: {},
+        };
+      }
+
+      if (params.node_a === params.node_b) {
+        return {
+          content: [{ type: "text", text: `❌ Cannot compose a node with itself.` }],
+          details: {},
+        };
+      }
+
+      // Execute compose
+      const execFn = (cmd: string, args: string[], opts?: { cwd?: string; timeout?: number }) =>
+        pi.exec(cmd, args, opts);
+
+      const result = await composeDiffs(execFn, workDir, workDir, tree, nodeA, nodeB);
+
+      let text = `🔗 compose(${params.node_a}, ${params.node_b})\n`;
+      text += `  ${params.node_a}  "${nodeA.hypothesisLabel || nodeA.hypothesis}"\n`;
+      text += `  ${params.node_b}  "${nodeB.hypothesisLabel || nodeB.hypothesis}"\n`;
+
+      if (result.lcaCommit) {
+        text += `  LCA: ${result.lcaCommit}\n`;
+      }
+
+      if (result.conflict) {
+        text += `  ❌ CONFLICT: both nodes modify: ${result.sharedFiles.join(", ")}\n`;
+        text += `  Phase 1 only supports orthogonal composition (different files).\n`;
+        return {
+          content: [{ type: "text", text }],
+          details: { conflict: true, sharedFiles: result.sharedFiles, applied: false },
+        };
+      }
+
+      if (!result.success) {
+        text += `  ❌ FAILED: ${result.error}\n`;
+        return {
+          content: [{ type: "text", text }],
+          details: { conflict: false, applied: false, error: result.error },
+        };
+      }
+
+      text += `  ✅ Diffs applied successfully.\n`;
+      text += `  Now run_experiment to benchmark.\n`;
+      text += `  Then log_experiment(status='keep', asi={composed_from: ["${params.node_a}", "${params.node_b}"]}) to record as a compose node.`;
+
+      return {
+        content: [{ type: "text", text }],
+        details: {
+          conflict: false,
+          applied: true,
+          lcaCommit: result.lcaCommit,
+          composedFrom: [params.node_a, params.node_b],
+        },
+      };
+    },
+
+    renderCall(args, theme) {
+      let text = theme.fg("toolTitle", theme.bold("compose "));
+      text += theme.fg("info", `${args.node_a || "?"} + ${args.node_b || "?"}`);
+      return new Text(text, 0, 0);
+    },
+
+    renderResult(result, theme) {
+      const t = result.content[0];
+      return new Text(t?.type === "text" ? t.text : "", 0, 0);
+    },
+  });
+
   // T4: finalize_research — agent-driven completion signal
   // Records a finalize entry in log.jsonl and sends a completion steer.
   // The agent retains control — this does NOT force-stop the session.
@@ -3934,6 +4687,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         } else {
           ctx.ui.notify("No session log found. Autoresearch mode OFF", "info");
         }
+        return;
+      }
+
+      // ===== tree subcommand: toggle tree/list view in dashboard widget =====
+      if (command === "tree" || command === "tree-view") {
+        runtime.treeViewMode = !runtime.treeViewMode;
+        updateWidget(ctx);
+        ctx.ui.notify(
+          runtime.treeViewMode
+            ? "🌳 Tree view ON — experiment tree shown in dashboard"
+            : "📋 List view ON — dashboard table restored",
+          "info",
+        );
         return;
       }
 

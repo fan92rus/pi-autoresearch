@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added — Experiment Tree
+
+- **Experiment tree** (`.auto/tree.json`): every experiment is now recorded as a node in a parent→child tree of hypotheses, giving the agent a structured map of its exploration.
+- **`tree_status()`** tool: renders the tree as ASCII art with UCB1 ranking of expandable nodes, exhaustion markers, and best-path highlighting.
+- **`explore_from(node_id)`** tool: backtrack to any keep-node in the tree (creates detached HEAD). The agent can jump to a different branch when the current one is exhausted.
+- **`restore_main()`** tool: return to the main branch after `explore_from`.
+- **`compose(node_a, node_b)`** tool: merge orthogonal improvements from two different tree branches (Phase 1: different files only).
+- **Pre-run SimHash repeat detection**: pass a `hypothesis` parameter to `run_experiment` to get a warning if a similar hypothesis was already tried at the current tree position.
+- **UCB1 node ranking**: balances exploitation (proven improvements) and exploration (underexplored nodes) to suggest where to expand next.
+- **Tree-aware observer**: stagnation steers now include tree status + UCB1 backtrack suggestions; new composition-opportunity trigger detects when two branches could be merged.
+- **`/autoresearch tree`** command: toggle between list view and tree view in the dashboard widget.
+- **Tree TUI widget**: the dashboard widget can render the ASCII tree view in real-time.
+- **Compose node type**: experiments created after `compose()` are tagged with `nodeType: "compose"` and `composedFrom` metadata.
+- **`refs/exp/*` git refs**: each keep-node's commit is protected from GC, enabling backtracking to any past experiment.
+- Documentation: [Agent Guide](docs/AGENT-GUIDE.md) and [User Guide](docs/USER-GUIDE.md).
+
+### Changed
+
+- `init_experiment` now creates the tree root node (n0) + `refs/exp/n0`.
+- `log_experiment` now creates tree child nodes automatically (keep → child + ref, discard/crash → ghost node with hypothesis preserved).
+- The system prompt now includes experiment tree guidance.
+- The observer trigger order now includes composition opportunity (priority 2, before parallel opportunity).
+
+### Fixed
+
+- `killTree` now works on Windows (uses `taskkill /F /T /PID` instead of Unix-only process-group kill).
+- `timeout_seconds` is now a **required** parameter (minimum: 1) — the agent can no longer accidentally run 30-minute experiments.
+- `budget_seconds > timeout_seconds` now returns an explicit error instead of being silently ignored.
+
 ## [1.6.1] - 2026-07-02
 
 ### Fixed

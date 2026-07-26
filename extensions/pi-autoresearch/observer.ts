@@ -14,6 +14,8 @@ import { execSync } from "node:child_process";
 import { performance } from "node:perf_hooks";
 
 import { parseJsonlEntry, reconstructJsonlState, type ReconstructedRun } from "./jsonl.ts";
+import { treeExists, loadTree } from "./parallel/tree.ts";
+import { rankNodes } from "./parallel/ucb1.ts";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -425,6 +427,57 @@ export function checkFloor(
   return lines.join("\n");
 }
 
+// ─── Trigger: Composition opportunity (tree-aware) ─────────────────────────
+
+function checkCompositionOpportunity(
+  state: ObserverState,
+  payload: ObserverPayload,
+  cwd: string,
+  oc: ObserverConfig,
+): string | null {
+  // Fire at streak 3+ (same as parallel opportunity) but only when tree exists
+  // and there are 2+ keep-nodes on different branches
+  if (state.streak < 3) return null;
+  if (state.streak >= oc.stagnationThreshold) return null;
+
+  try {
+    if (!treeExists(cwd)) return null;
+    const tree = loadTree(cwd);
+    if (!tree) return null;
+
+    // Find keep-nodes with commits on different branches (different parents)
+    const keepNodes = Object.values(tree.nodes).filter(
+      (n) => n.status === "keep" && n.commit && n.nodeType === "experiment",
+    );
+    if (keepNodes.length < 2) return null;
+
+    // Find pairs with different immediate parents (different branches)
+    const pairs: Array<{ a: typeof keepNodes[0]; b: typeof keepNodes[0] }> = [];
+    for (let i = 0; i < keepNodes.length; i++) {
+      for (let j = i + 1; j < keepNodes.length; j++) {
+        if (keepNodes[i].parentId !== keepNodes[j].parentId) {
+          pairs.push({ a: keepNodes[i], b: keepNodes[j] });
+        }
+      }
+    }
+    if (pairs.length === 0) return null;
+
+    const unit = payload.metricUnit;
+    const bestPair = pairs[0];
+    return `🔗 COMPOSITION OPPORTUNITY: Tree has ${keepNodes.length} keep-nodes on different branches.
+
+💡 Try combining orthogonal improvements:
+   compose("${bestPair.a.id}", "${bestPair.b.id}")
+   ${bestPair.a.id}: "${bestPair.a.hypothesisLabel || bestPair.a.hypothesis}" (${bestPair.a.metric}${unit})
+   ${bestPair.b.id}: "${bestPair.b.hypothesisLabel || bestPair.b.hypothesis}" (${bestPair.b.metric}${unit})
+
+   If the changes touch different files, compose() will merge them — stacking improvements.
+   Call tree_status() to see the full tree and find the best pair.`;
+  } catch {
+    return null;
+  }
+}
+
 // ─── Trigger: Parallel opportunity (proactive, before stagnation) ───────────
 
 function checkParallelOpportunity(
@@ -661,6 +714,39 @@ Write your analysis to ${ideasPath}, then try the most fundamentally different a
     })
     .join("\n");
 
+  // Tree-aware stagnation: suggest backtrack if tree exists
+  let treeHint = "";
+  try {
+    if (treeExists(cwd)) {
+      const tree = loadTree(cwd);
+      if (tree) {
+        const activeNode = tree.nodes[tree.activeNodeId];
+        const ranked = rankNodes(tree);
+        const exhausted = Object.values(tree.nodes).filter(n => n.exhausted);
+        
+        if (activeNode?.exhausted || exhausted.length > 0) {
+          const exhaustedIds = exhausted.map(n => n.id).join(", ");
+          treeHint = `\n🌳 TREE STATUS: Current branch is EXHAUSTED.\n`;
+          treeHint += `   Exhausted nodes: ${exhaustedIds}\n`;
+          if (ranked.length > 0) {
+            const top = ranked[0];
+            treeHint += `   UCB1 suggests: explore_from("${top.nodeId}") (UCB1=${top.ucb1.toFixed(2)}, ${top.reason})\n`;
+            treeHint += `   Call tree_status() for full map, or explore_from("${top.nodeId}") to backtrack.`;
+          } else {
+            treeHint += `   Call tree_status() to see the exploration map.`;
+          }
+        } else if (ranked.length > 0 && ranked[0].ucb1 > 0.5) {
+          const top = ranked[0];
+          treeHint = `\n🌳 TREE STATUS: UCB1 suggests a more promising node.\n`;
+          treeHint += `   explore_from("${top.nodeId}") (UCB1=${top.ucb1.toFixed(2)}, ${top.reason})\n`;
+          treeHint += `   Call tree_status() for full map.`;
+        }
+      }
+    }
+  } catch {
+    // Tree hint is best-effort
+  }
+
   return `🔄 STAGNATION: No metric improvement in ${state.streak} runs.
 
 ${patternHint}
@@ -668,6 +754,7 @@ ${patternHint}
 Recent runs (none beat best ${bestStr}):
 ${recentFormatted}
 ${escalation}
+${treeHint}
 ${reflectQuestions}`;
 }
 
@@ -766,25 +853,29 @@ export function runObserver(payload: ObserverPayload): string | null {
   const noiseSteer = checkNoiseGate(payload, cwd, oc);
   if (noiseSteer) return noiseSteer;
 
-  // 2. Parallel opportunity (actionable: concrete ideas → BestOfN/SpaceSearch)
+  // 2. Composition opportunity (tree-aware: compose hint)
+  const compositionSteer = checkCompositionOpportunity(state, payload, cwd, oc);
+  if (compositionSteer) return compositionSteer;
+
+  // 3. Parallel opportunity (actionable: concrete ideas → BestOfN/SpaceSearch)
   const parallelSteer = checkParallelOpportunity(state, payload, cwd, oc);
   if (parallelSteer) return parallelSteer;
 
-  // 3. Stagnation (actionable: reflection + escalation hints)
+  // 4. Stagnation (actionable: reflection + escalation hints)
   const stagnationSteer = checkStagnation(state, asi, payload, cwd, oc);
   if (stagnationSteer) return stagnationSteer;
 
-  // 4. Floor detection (objective limit — now checks untried ideas, P1-2)
+  // 5. Floor detection (objective limit — now checks untried ideas, P1-2)
   if (oc.floorDetectionEnabled) {
     const floorSteer = checkFloor(state, asi, payload, cwd, oc);
     if (floorSteer) return floorSteer;
   }
 
-  // 5. Progress milestone (positive reinforcement — always useful)
+  // 6. Progress milestone (positive reinforcement — always useful)
   const progressSteer = checkProgress(state, payload, cwd, oc);
   if (progressSteer) return progressSteer;
 
-  // 6. Finalize (fallback — lowest priority; agent self-assessment)
+  // 7. Finalize (fallback — lowest priority; agent self-assessment)
   if (oc.finalizeEnabled) {
     const finalizeSteer = checkFinalize(allEntries, oc, state, ideasPath);
     if (finalizeSteer) return finalizeSteer;

@@ -39,6 +39,10 @@ pi install npm:pi-autoresearch
 | `init_experiment` | One-time session config — name, metric, unit, direction |
 | `run_experiment` | Runs any command, times wall-clock duration, captures output |
 | `log_experiment` | Records result, auto-commits, updates widget and dashboard |
+| `tree_status` | Show experiment tree + UCB1 suggestions for exploration |
+| `explore_from` | Backtrack to any tree node and explore from there |
+| `restore_main` | Return to main branch after `explore_from` |
+| `compose` | Merge orthogonal improvements from two different branches |
 
 ### `/autoresearch` command
 
@@ -47,6 +51,7 @@ pi install npm:pi-autoresearch
 | `/autoresearch <text>` | Enter autoresearch mode. If `.auto/prompt.md` exists, resumes the loop with `<text>` as context. Otherwise, sets up a new session. |
 | `/autoresearch off` | Leave autoresearch mode. Stops auto-resume and clears runtime state but keeps `.auto/log.jsonl` intact. |
 | `/autoresearch clear` | Delete `.auto/log.jsonl`, reset all state, and turn autoresearch mode off. Use this for a clean start. |
+| `/autoresearch tree` | Toggle between list view and experiment tree view in the dashboard widget. |
 | `/autoresearch export` | Open a live dashboard in your browser. Auto-updates as experiments run. |
 
 **Examples:**
@@ -194,10 +199,32 @@ Two files keep the session alive across restarts and context resets:
 
 ```
 .auto/log.jsonl   — append-only log of every run (metric, status, commit, description)
+.auto/tree.json   — experiment tree (parent→child structure, SimHash, UCB1 rankings)
 .auto/prompt.md   — living document: objective, what's been tried, dead ends, key wins
 ```
 
-A fresh agent with no memory can read these two files and continue exactly where the previous session left off.
+A fresh agent with no memory can read these files and continue exactly where the previous session left off.
+
+### Experiment tree
+
+Since v1.7, autoresearch maintains an **experiment tree** — a parent→child hierarchy of every hypothesis tried. This gives the agent (and you) a map of the exploration:
+
+```
+n0  100µs  baseline
+├── n1  92µs  ●  "AST cache"        keep   -8µs
+│    └── n2  88µs  ●  "LRU eviction" keep   -4µs
+└── n3  81µs  ●  "lookup table"     keep  -19µs ★ BEST
+```
+
+**Key capabilities:**
+- **Backtracking** — when a branch is exhausted, the agent can `explore_from("n3")` to jump to a different part of the tree
+- **Repeat detection** — before running an experiment, SimHash checks if a similar hypothesis was already tried
+- **Composition** — merge orthogonal improvements from different branches with `compose("n1", "n3")`
+- **UCB1 ranking** — the agent sees which nodes are most promising to expand (balance of exploitation + exploration)
+
+The tree is **enabled by default** and stored in `.auto/tree.json`. Toggle the tree view in the dashboard with `/autoresearch tree`.
+
+📚 **Full documentation:** [Agent Guide](docs/AGENT-GUIDE.md) · [User Guide](docs/USER-GUIDE.md)
 
 ---
 
@@ -216,6 +243,7 @@ Create `.auto/config.json` in your pi session directory to customize behavior:
 |-------|------|-------------|
 | `workingDir` | string | Override the directory for all autoresearch operations — file I/O, command execution, and git. Supports absolute or relative paths (resolved against the pi session cwd). The config file itself always stays under the session cwd. Fails if the directory doesn't exist. |
 | `maxIterations` | number | Maximum experiments before auto-stopping. The agent is told to stop and won't run more experiments until a new segment is initialized. |
+| `parallel.ucb1C` | number | UCB1 exploration constant for tree node ranking (default: 0.5). Higher = more exploration (favor unexplored nodes); lower = more exploitation (favor proven territory). |
 
 ### Observer settings
 
