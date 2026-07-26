@@ -30,6 +30,9 @@ const STATUS_ICONS: Record<string, string> = {
   crash: "✕",
   checks_failed: "⚠",
   compose: "◆",
+  untested: "◇",
+  running: "◎",
+  duplicate: "⊘",
 };
 
 /**
@@ -78,7 +81,9 @@ function renderNodeLine(
   isRoot: boolean = false,
 ): string {
   const prefix = isRoot ? "" : indent + (isLast ? SYMBOLS.lastBranch : SYMBOLS.branch);
-  const icon = node.nodeType === "compose" ? STATUS_ICONS.compose : (STATUS_ICONS[node.status] || "?");
+  const icon = node.nodeType === "compose" ? STATUS_ICONS.compose
+    : node.nodeType === "hypothesis" ? (STATUS_ICONS[node.status] || "◇")
+    : (STATUS_ICONS[node.status] || "?");
   const metric = formatMetric(node.metric, tree.metricName?.replace("time_", "").replace("_us", "µs") || "");
   const label = node.nodeType === "baseline" ? "baseline" : `"${truncateLabel(node.hypothesisLabel || node.hypothesis)}"`;
   const status = node.status;
@@ -212,7 +217,7 @@ export function renderTree(tree: ExperimentTree, maxLines: number = 60): string 
   // Legend
   lines.push("");
   lines.push("─".repeat(80));
-  lines.push(" ● keep   ○ discard   ✕ crash   ◆ compose   ★ best   ← active   ☒ exhausted");
+  lines.push(" ● keep   ○ discard   ✕ crash   ◆ compose   ◇ untested   ◎ running   ⊘ duplicate   ★ best   ← active   ☒ exhausted");
   lines.push("─".repeat(80));
 
   return lines.join("\n");

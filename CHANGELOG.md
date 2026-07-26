@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added — Hypothesis-First Workflow
+
+- **propose_hypothesis** tool: register hypotheses in the tree BEFORE running experiments. SimHash duplicate detection at registration time.
+- **hypothesis_id** parameter in run_experiment and log_experiment: links experiments to pre-registered hypothesis nodes.
+- New node statuses: `untested`, `running`, `duplicate` for hypothesis lifecycle.
+- New node type: `hypothesis` (transitions to `experiment` on first log).
+- `.auto/ideas/<nodeId>.md` files: persistent hypothesis descriptions with YAML frontmatter.
+- Baseline exception: first experiment after init_experiment may omit hypothesis_id.
+
+### Changed
+
+- SimHash repeat detection moved from run_experiment to propose_hypothesis (registration time).
+- `finalizeExistingNode()` replaces `recordTreeNode` for hypothesis-linked experiments.
+- `treeDist()` and `simhashThreshold()` extracted to tree.ts (shared between tools).
+- System prompt updated with Hypothesis-First Workflow instructions.
+
+### Breaking
+
+- **BestOfN/SpaceSearch/valleyProbe workers**: run_experiment now requires hypothesis_id for non-baseline runs. Workers that call run_experiment without hypothesis_id will get an error after the baseline run. Phase 2 will integrate parallel tools with propose_hypothesis.
+
 ## [1.7.0] - 2026-07-26
 
 ### Added — Experiment Tree
