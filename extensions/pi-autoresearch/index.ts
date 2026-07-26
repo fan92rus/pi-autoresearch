@@ -2256,33 +2256,33 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Scans the ENTIRE tree (not just siblings) for close hypothesis matches.
       // Results weighted by tree distance: closer nodes get stricter thresholds.
       let repeatWarning = "";
-      if (params.hypothesis && treeExists(workDir)) {
+      if (params.hypothesis && params.hypothesis.trim().length > 0 && treeExists(workDir)) {
         try {
           const tree = loadTree(workDir);
           if (tree) {
             const newSimhash = computeSimhash(params.hypothesis);
-            // BFS tree distance between two nodes
+            // LCA-based tree distance: walk up to root and find first common ancestor
+            // Distance = depth(a) + depth(b) - 2*depth(LCA)
             function treeDist(tree: ExperimentTree, a: string, b: string): number {
               if (a === b) return 0;
-              const seen = new Set<string>();
-              let qa = [a], qb = [b];
-              for (let d = 0; qa.length && qb.length; d++) {
-                seen.clear();
-                for (const id of qa) seen.add(id);
-                qa = [...new Set(qa.flatMap(id => {
-                  const n = tree.nodes[id];
-                  return n && n.parentId ? [n.parentId] : [];
-                }))];
-                if (qa.some(id => seen.has(id) || qb.includes(id))) return d + 1;
-                seen.clear();
-                for (const id of qb) seen.add(id);
-                qb = [...new Set(qb.flatMap(id => {
-                  const n = tree.nodes[id];
-                  return n && n.parentId ? [n.parentId] : [];
-                }))];
-                if (qb.some(id => seen.has(id) || qa.includes(id))) return d + 1;
+              // Walk from a up to root, collecting ancestor set
+              const ancestors = new Set<string>();
+              let cur: string | null = a;
+              while (cur) {
+                ancestors.add(cur);
+                const n = tree.nodes[cur];
+                cur = n && n.parentId ? n.parentId : null;
               }
-              return Infinity;
+              // Walk from b up until we find a common ancestor (the LCA)
+              cur = b;
+              while (cur) {
+                if (ancestors.has(cur)) {
+                  return tree.nodes[a].depth + tree.nodes[b].depth - 2 * tree.nodes[cur].depth;
+                }
+                const n = tree.nodes[cur];
+                cur = n && n.parentId ? n.parentId : null;
+              }
+              return Infinity; // disconnected (shouldn't happen in a valid tree)
             }
             const activeId = tree.activeNodeId;
             // Scan ALL experiment/keep/compose nodes in the tree
