@@ -44,6 +44,8 @@ export interface ObserverConfig {
   floorDetectionEnabled: boolean;
   /** Enable finalize recommendations inside stagnation (ASI floor/exhausted, critical level). Default: true */
   stagnationFinalizeEnabled: boolean;
+  /** Enable parallel tool suggestions (BestOfN, CheckOrthogonal, SpaceSearch). Default: false (tools disabled) */
+  parallelEnabled: boolean;
 }
 
 export const DEFAULT_OBSERVER_CONFIG: ObserverConfig = {
@@ -58,6 +60,7 @@ export const DEFAULT_OBSERVER_CONFIG: ObserverConfig = {
   finalizeEnabled: true,
   floorDetectionEnabled: true,
   stagnationFinalizeEnabled: true,
+  parallelEnabled: false,
 };
 
 function readObserverConfig(cwd: string): ObserverConfig {
@@ -77,6 +80,7 @@ function readObserverConfig(cwd: string): ObserverConfig {
     if (typeof obs.finalize_enabled === "boolean") cfg.finalizeEnabled = obs.finalize_enabled;
     if (typeof obs.floor_detection_enabled === "boolean") cfg.floorDetectionEnabled = obs.floor_detection_enabled;
     if (typeof obs.stagnation_finalize_enabled === "boolean") cfg.stagnationFinalizeEnabled = obs.stagnation_finalize_enabled;
+    if (typeof obs.parallel_enabled === "boolean") cfg.parallelEnabled = obs.parallel_enabled;
     return cfg;
   } catch {
     return { ...DEFAULT_OBSERVER_CONFIG };
@@ -503,6 +507,8 @@ function checkParallelOpportunity(
   cwd: string,
   oc: ObserverConfig,
 ): string | null {
+  // Skip if parallel tools are disabled
+  if (!oc.parallelEnabled) return null;
   // Fire at streak 3 (before stagnation threshold of 5) — early nudge
   if (state.streak < 3) return null;
   if (state.streak >= oc.stagnationThreshold) return null; // stagnation handles >=5
@@ -667,14 +673,16 @@ function checkStagnation(
   let escalation: string;
   switch (level) {
     case 1:
-      escalation = `
+      escalation = oc.parallelEnabled ? `
 
 💡 PARALLEL HINT: Stuck on the same approach? Try BestOfN with 3 different hypotheses:
    BestOfN({ candidates: [{hypothesis:"...",complexity:"medium"}, ...], metric_name:"...", direction:"..." })
-   Workers run in isolated worktrees (cheap flash model), winner is re-measured in full.`;
+   Workers run in isolated worktrees (cheap flash model), winner is re-measured in full.` : `
+
+💡 TREE HINT: Stuck on the same approach? Call tree_status() and explore_from() to a different branch.`;
       break;
     case 2:
-      escalation = `
+      escalation = oc.parallelEnabled ? `
 
 ⚠️  SECOND STAGNATION CYCLE. Your first reflection didn't break through.
 
@@ -683,10 +691,14 @@ function checkStagnation(
    Then step() to explore, finish() to re-measure the winner. Beam maintains K diverse states to avoid local optima.
 
 Or if you need to get worse before better (refactor, algorithm swap), use phases:
-   startPhase({ name:"refactor", max_steps:5, hard_floor_pct:40 })`;
+   startPhase({ name:"refactor", max_steps:5, hard_floor_pct:40 })` : `
+
+⚠️  SECOND STAGNATION CYCLE. Your first reflection didn't break through.
+
+💡 Call tree_status() for the full experiment tree. Consider explore_from() to revisit a different branch and try a fundamentally different optimization direction.`;
       break;
     case 3:
-      escalation = `
+      escalation = oc.parallelEnabled ? `
 
 🚨 THIRD STAGNATION CYCLE. Two reflections, zero progress.
 
@@ -694,7 +706,11 @@ Or if you need to get worse before better (refactor, algorithm swap), use phases
    valleyProbe({ strategies:["strategy1","strategy2","strategy3"], baseline_metric:..., metric_name:"...", direction:"..." })
    Workers branch from the best checkpoint with different strategies.
 
-Otherwise: ABANDON the current direction entirely. Try a radically different approach.`;
+Otherwise: ABANDON the current direction entirely. Try a radically different approach.` : `
+
+🚨 THIRD STAGNATION CYCLE. Two reflections, zero progress.
+
+💡 ABANDON the current branch entirely. Call explore_from() to backtrack, or restore_main() and try a radically different optimization category.`;
       break;
     default:
       escalation = `

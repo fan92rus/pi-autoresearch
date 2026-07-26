@@ -435,3 +435,59 @@ export function nextNodeId(tree: ExperimentTree): string {
   tree.nextId++;
   return id;
 }
+
+// ─── do_not_retry overlap detection ──────────────────────────────────────────
+
+const STOPWORDS = new Set([
+  "the", "a", "an", "with", "for", "in", "on", "to", "is", "are", "was", "were",
+  "and", "or", "not", "but", "than", "this", "that", "from", "by", "at", "it", "as",
+  "be", "of", "via", "using", "use", "used", "into", "all", "each", "per",
+]);
+
+function extractKeywords(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((w) => w.length >= 4 && !STOPWORDS.has(w))
+    .map((w) => w.slice(0, 6)) // crude stem: "comparison"/"compare" → "compa"
+    .filter((w, i, arr) => arr.indexOf(w) === i); // dedupe
+}
+
+export interface DoNotRetryMatch {
+  nodeId: string;
+  doNotRetry: string;
+  overlap: number;
+  sharedKeywords: string[];
+}
+
+/**
+ * Check if a new hypothesis text overlaps with any discard/crash node's
+ * do_not_retry ASI field. Returns the best match if overlap >= 3 keywords.
+ */
+export function checkDoNotRetryOverlap(
+  tree: ExperimentTree,
+  hypothesisText: string,
+): DoNotRetryMatch | null {
+  const newKeywords = extractKeywords(hypothesisText);
+  if (newKeywords.length === 0) return null;
+
+  let best: DoNotRetryMatch | null = null;
+
+  for (const [nodeId, node] of Object.entries(tree.nodes)) {
+    if (node.status !== "discard" && node.status !== "crash") continue;
+    const doNotRetry = node.asi?.do_not_retry;
+    if (typeof doNotRetry !== "string" || doNotRetry.length < 5) continue;
+
+    const oldKeywords = extractKeywords(doNotRetry);
+    if (oldKeywords.length === 0) continue;
+
+    const shared = newKeywords.filter((k) => oldKeywords.includes(k));
+    if (shared.length >= 2) {
+      if (!best || shared.length > best.overlap) {
+        best = { nodeId, doNotRetry, overlap: shared.length, sharedKeywords: shared };
+      }
+    }
+  }
+
+  return best;
+}

@@ -90,6 +90,7 @@ import {
   treeDist,
   simhashThreshold,
   extractLabel,
+  checkDoNotRetryOverlap,
   type ExperimentTree,
   type TreeNode,
 } from "./parallel/tree.ts";
@@ -2106,10 +2107,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\n\n## Experiment Tree" +
       "\nEach experiment is recorded as a node in .auto/tree.json." +
       "\n\n### Hypothesis-First Workflow (REQUIRED)" +
-      "\n1. propose_hypothesis(description=\"...\") returns node_id. SimHash at registration." +
-      "\n2. EDIT THE CODE — implement the hypothesis in source files." +
-      "\n3. run_experiment(hypothesis_id=\"n6\", command=\"...\") runs the benchmark." +
-      "\n4. log_experiment(hypothesis_id=\"n6\", metric=..., status=\"keep\") records result." +
+      "\n1. PROFILE FIRST \u2014 use node --prof, console.time/timeEnd, or node --allow-natives-syntax --trace-deopt to find WHERE time is actually spent. Record findings in the hypothesis description. Do NOT guess.\n2. propose_hypothesis(description=\"...\") returns node_id. SimHash + do_not_retry check at registration." +
+      "\n3. EDIT THE CODE — implement the hypothesis in source files." +
+      "\n4. run_experiment(hypothesis_id=\"n6\", command=\"...\") runs the benchmark." +
+      "\n5. log_experiment(hypothesis_id=\"n6\", metric=..., status=\"keep\") records result." +
       "\nIn log_experiment, description is a RESULT SUMMARY (what happened, what you learned). Do NOT repeat the hypothesis — it is already stored." +
       "\nhypothesis_id is REQUIRED for all non-baseline experiments." +
       "\n\n### Tree Tools" +
@@ -2398,6 +2399,39 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           content: [{ type: "text", text: `❌ Active node ${parentId} not found in tree.` }],
           details: {},
         };
+      }
+
+      // ── HARD BLOCK: branch exhausted — agent must backtrack ──
+      if (checkExhausted(tree, parentId)) {
+        // Find UCB1 top suggestion for the backtrack message
+        let suggestion = "";
+        try {
+          const ranked = rankNodes(tree);
+          if (ranked.length > 0 && ranked[0].nodeId !== parentId) {
+            suggestion = `\n   💡 UCB1 suggests: explore_from("${ranked[0].nodeId}") (UCB1=${ranked[0].ucb1.toFixed(2)})`;
+          }
+        } catch { /* best-effort */ }
+        return {
+          content: [{ type: "text", text:
+            `⛔ Branch at ${parentId} is EXHAUSTED (3 consecutive discards).\n` +
+            `   You MUST either:\n` +
+            `   • explore_from("<nodeId>") to backtrack to a different branch\n` +
+            `   • restore_main() to return to main branch\n` +
+            `   Do not create more children on exhausted nodes.` +
+            suggestion,
+          }],
+          details: { exhausted: true, node_id: parentId },
+        };
+      }
+
+      // ── do_not_retry overlap detection ──
+      const dnriMatch = checkDoNotRetryOverlap(tree, hypothesisText);
+      if (dnriMatch) {
+        warning +=
+          `\n⚠️ CAUTION: This hypothesis resembles ${dnriMatch.nodeId} (discard) which found:\n` +
+          `   "${dnriMatch.doNotRetry.slice(0, 120)}"\n` +
+          `   Shared keywords: ${dnriMatch.sharedKeywords.join(", ")}\n` +
+          `   Are you doing something FUNDAMENTALLY different? If not, skip this.`;
       }
 
       // ── SimHash duplicate detection ──
