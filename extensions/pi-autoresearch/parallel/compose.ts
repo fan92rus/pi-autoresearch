@@ -35,29 +35,6 @@ export interface ComposeResult {
 }
 
 /**
- * Extract the files changed by a node's commit relative to its parent.
- */
-export async function extractChangedFiles(
-  exec: ExecFn,
-  workDir: string,
-  tree: ExperimentTree,
-  node: TreeNode,
-): Promise<string[]> {
-  if (!node.commit || !node.parentId) return [];
-  const parent = tree.nodes[node.parentId];
-  if (!parent || !parent.commit) return [];
-
-  const r = await exec("git", ["diff", "--name-only", parent.commit, node.commit], {
-    cwd: workDir,
-    timeout: 10000,
-  });
-  return r.stdout
-    .trim()
-    .split("\n")
-    .filter(Boolean);
-}
-
-/**
  * Check if two file sets are orthogonal (no shared files).
  */
 export function checkFileScopeConflict(filesA: string[], filesB: string[]): FileScopeCheck {
@@ -93,16 +70,16 @@ export async function findLCA(
 }
 
 /**
- * Apply two orthogonal diffs onto a worktree at the LCA commit.
+ * Apply two orthogonal diffs onto the working directory.
  *
  * Steps:
- *  1. Find LCA of nodeA.commit and nodeB.commit
- *  2. Generate diff from LCA→A and LCA→B
- *  3. Check file-scope orthogonality
- *  4. Apply patch A, then patch B
- *  5. Return the worktree path + success status (caller benchmarks + commits)
+ *  1. Find LCA (merge-base) of nodeA.commit and nodeB.commit
+ *  2. Extract changed files for each node relative to LCA
+ *  3. Check file-scope orthogonality (fail on overlap)
+ *  4. For each file: git checkout <commit> -- <file> (file-level merge)
+ *  5. Return success — caller benchmarks + commits
  *
- * Returns the worktree path on success, or an error result.
+ * Returns ComposeResult. On conflict, lists shared files.
  */
 export async function composeDiffs(
   exec: ExecFn,

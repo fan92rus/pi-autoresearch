@@ -70,6 +70,8 @@ function totalExperiments(tree: ExperimentTree): number {
  * maxChildren prevents infinite branching from a single node.
  */
 export function isExpandable(node: TreeNode, maxChildren = 5): boolean {
+  // Ghost nodes (discard/crash) have no commit — cannot explore_from them
+  if (!node.commit) return false;
   return !node.exhausted && node.children.length < maxChildren;
 }
 

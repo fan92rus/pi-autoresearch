@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [1.7.0] - 2026-07-26
 
 ### Added — Experiment Tree
 
@@ -32,6 +32,7 @@ All notable changes to this project will be documented in this file.
 - `killTree` now works on Windows (uses `taskkill /F /T /PID` instead of Unix-only process-group kill).
 - `timeout_seconds` is now a **required** parameter (minimum: 1) — the agent can no longer accidentally run 30-minute experiments.
 - `budget_seconds > timeout_seconds` now returns an explicit error instead of being silently ignored.
+- Removed unused exports (`extractChangedFiles`) and imports (`findLCA`, `checkFileScopeConflict`, `treeFilePath`, `isExpandable`, `getUcb1C`) from index.ts — dead code cleanup.
 
 ## [1.6.1] - 2026-07-02
 

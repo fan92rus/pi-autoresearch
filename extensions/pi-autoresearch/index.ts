@@ -71,7 +71,6 @@ import {
   treeExists,
   loadTree,
   saveTree,
-  treeFilePath,
   createRootNode,
   createExperimentNode,
   appendChild,
@@ -83,8 +82,8 @@ import {
   type TreeNode,
 } from "./parallel/tree.ts";
 import { computeSimhash, hammingDistance, classifyDistance, SIMHASH_LIKELY } from "./parallel/simhash.ts";
-import { rankNodes, isExpandable, getUcb1C, type RankedNode } from "./parallel/ucb1.ts";
-import { composeDiffs, checkFileScopeConflict, extractChangedFiles, findLCA } from "./parallel/compose.ts";
+import { rankNodes, type RankedNode } from "./parallel/ucb1.ts";
+import { composeDiffs } from "./parallel/compose.ts";
 import { renderTree, renderNodeDetail, findBestNodeId } from "./parallel/treeview.ts";
 
 // ---------------------------------------------------------------------------
@@ -4325,6 +4324,61 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const ranked = rankNodes(tree);
       const bestId = findBestNodeId(tree);
       const nodeCount = Object.keys(tree.nodes).length;
+      const exhaustedList = Object.values(tree.nodes).filter((n) => n.exhausted);
+
+      // ── Build structured recommendation for the agent (machine-parseable) ──
+      // The agent uses this to decide its next action without parsing ASCII art.
+      const isExhaustedHere = exhaustedList.some((n) => n.id === tree.activeNodeId);
+      const topRanked = ranked.length > 0 ? ranked[0] : null;
+
+      // Find compose candidates: cross-branch keep-node pairs (different paths from root)
+      const keepNodes = Object.values(tree.nodes).filter(
+        (n) => n.status === "keep" && n.commit && n.id !== tree.rootId,
+      );
+      const composeCandidates: Array<[string, string]> = [];
+      for (let i = 0; i < keepNodes.length; i++) {
+        for (let j = i + 1; j < keepNodes.length; j++) {
+          const a = keepNodes[i];
+          const b = keepNodes[j];
+          // Different branches = neither is in the other's ancestor path
+          const pathA = getPath(tree, a.id).map((n) => n.id);
+          const pathB = getPath(tree, b.id).map((n) => n.id);
+          if (!pathA.includes(b.id) && !pathB.includes(a.id)) {
+            composeCandidates.push([a.id, b.id]);
+          }
+        }
+      }
+
+      // Determine recommended action
+      let recAction: string;
+      let recNodeId: string | null = null;
+      let recReason: string;
+      if (isExhaustedHere && topRanked) {
+        recAction = "explore_from";
+        recNodeId = topRanked.nodeId;
+        recReason = `branch exhausted, ${topRanked.reason} (UCB1=${topRanked.ucb1.toFixed(2)})`;
+      } else if (topRanked && topRanked.ucb1 > 0.5) {
+        recAction = "explore_from";
+        recNodeId = topRanked.nodeId;
+        recReason = `${topRanked.reason} (UCB1=${topRanked.ucb1.toFixed(2)})`;
+      } else if (composeCandidates.length > 0) {
+        recAction = "compose";
+        recReason = `${composeCandidates.length} cross-branch pair(s) available`;
+      } else {
+        recAction = "continue";
+        recReason = "current branch is productive";
+      }
+
+      const recommendation = {
+        action: recAction,
+        node_id: recNodeId,
+        reason: recReason,
+        alternatives: ranked.slice(1, 4).map((r) => ({
+          node_id: r.nodeId,
+          ucb1: Number(r.ucb1.toFixed(2)),
+          reason: r.reason,
+        })),
+      };
 
       let text = "";
 
@@ -4367,9 +4421,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
 
         // Mark exhausted nodes
-        const exhausted = Object.values(tree.nodes).filter((n) => n.exhausted);
-        if (exhausted.length > 0) {
-          text += `\n❌ EXHAUSTED: ${exhausted.map((n) => `${n.id} ("${n.hypothesisLabel || n.hypothesis}")`).join(", ")}\n`;
+        if (exhaustedList.length > 0) {
+          text += `\n❌ EXHAUSTED: ${exhaustedList.map((n) => `${n.id} ("${n.hypothesisLabel || n.hypothesis}")`).join(", ")}\n`;
         }
 
         // Full detail mode: append all node details
@@ -4388,8 +4441,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           nodeCount,
           activeNodeId: tree.activeNodeId,
           bestNodeId: bestId,
+          recommendation,
+          exhaustedBranches: exhaustedList.map((n) => n.id),
+          composeCandidates: composeCandidates.slice(0, 5),
           rankedNodes: ranked.slice(0, 5),
-          exhaustedNodes: Object.values(tree.nodes).filter((n) => n.exhausted).map((n) => n.id),
         },
       };
     },
