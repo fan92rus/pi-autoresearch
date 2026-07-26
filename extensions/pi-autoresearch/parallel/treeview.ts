@@ -218,7 +218,7 @@ export function renderTree(tree: ExperimentTree, maxLines: number = 60): string 
   return lines.join("\n");
 }
 
-/**/**
+/**
  * Render node detail view (shown when user selects a node).
  */
 export function renderNodeDetail(tree: ExperimentTree, node: TreeNode): string {
