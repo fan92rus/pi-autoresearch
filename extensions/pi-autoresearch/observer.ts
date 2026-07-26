@@ -208,10 +208,25 @@ function coefficientOfVariation(values: number[]): { cv: number; mean: number; s
 // ─── Helper: count untried ideas in .auto/ideas/ ────────────────────────────
 // Shared by checkFinalize and checkFloor.
 // Each .md file in the ideas directory = one untried idea.
+// EXCLUDES hypothesis registration files (created by propose_hypothesis) which
+// have YAML frontmatter (---\nid: ...\nstatus: ...\n---) — those are tracked
+// in tree.json, not manual optimization ideas.
+function isHypothesisFile(filePath: string): boolean {
+  try {
+    const content = fs.readFileSync(filePath, "utf-8");
+    return content.startsWith("---\n") && /^id:\s*n\d+/m.test(content);
+  } catch {
+    return false;
+  }
+}
+
 function countUntriedIdeas(ideasDir: string): number {
   if (!fs.existsSync(ideasDir)) return 0;
   try {
-    return fs.readdirSync(ideasDir).filter((f) => f.endsWith(".md")).length;
+    return fs.readdirSync(ideasDir)
+      .filter((f) => f.endsWith(".md"))
+      .filter((f) => !isHypothesisFile(path.join(ideasDir, f)))
+      .length;
   } catch {
     return 0;
   }
@@ -497,7 +512,9 @@ function checkParallelOpportunity(
 
   let ideas: string[];
   try {
-    const files = fs.readdirSync(ideasDir).filter((f) => f.endsWith(".md"));
+    const files = fs.readdirSync(ideasDir)
+      .filter((f) => f.endsWith(".md"))
+      .filter((f) => !isHypothesisFile(path.join(ideasDir, f)));
     ideas = files.map((f) => {
       try { return fs.readFileSync(path.join(ideasDir, f), "utf-8"); } catch { return ""; }
     }).filter((c) => c.trim().length > 10);

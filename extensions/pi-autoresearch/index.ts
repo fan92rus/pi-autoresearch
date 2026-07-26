@@ -1036,6 +1036,12 @@ async function finalizeExistingNode(
     warning = `\n🌲 tree: branch at ${node.parentId} marked exhausted (3 consecutive discards) — consider explore_from to backtrack.`;
   }
 
+  // Clean up hypothesis file from .auto/ideas/ (no longer untried).
+  try {
+    const hypoFile = hypothesisNodeFilePath(workDir, nodeId);
+    if (fs.existsSync(hypoFile)) fs.unlinkSync(hypoFile);
+  } catch { /* best-effort */ }
+
   saveTree(workDir, tree);
   return warning;
 }
@@ -2443,30 +2449,33 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       appendChild(tree, parentId, hypothesisNode);
       saveTree(workDir, tree);
 
-      // ── Write hypothesis file ──
-      const filePath = hypothesisNodeFilePath(workDir, nodeId);
-      const ideasDir = path.dirname(filePath);
-      fs.mkdirSync(ideasDir, { recursive: true });
+      // ── Write hypothesis file (only for untested, not duplicates) ──
+      if (nodeStatus !== "duplicate") {
+        const filePath = hypothesisNodeFilePath(workDir, nodeId);
+        const ideasDir = path.dirname(filePath);
+        fs.mkdirSync(ideasDir, { recursive: true });
 
-      const frontmatter = [
-        "---",
-        `id: ${nodeId}`,
-        `status: ${nodeStatus}`,
-        `created_at: ${new Date().toISOString()}`,
-        "---",
-      ].join("\n");
-      fs.writeFileSync(filePath, frontmatter + "\n\n" + hypothesisText + "\n", "utf8");
+        const frontmatter = [
+          "---",
+          `id: ${nodeId}`,
+          `status: ${nodeStatus}`,
+          `created_at: ${new Date().toISOString()}`,
+          "---",
+        ].join("\n");
+        fs.writeFileSync(filePath, frontmatter + "\n\n" + hypothesisText + "\n", "utf8");
+      }
 
       // ── Build response ──
+      const filePath = nodeStatus !== "duplicate" ? hypothesisNodeFilePath(workDir, nodeId) : "(not created for duplicates)";
       const text =
         `🧪 Hypothesis registered: ${nodeId}\n` +
         `  Status: ${nodeStatus}\n` +
-        `  File: ${filePath}` +
+        (nodeStatus !== "duplicate" ? `  File: ${filePath}` : "") +
         warning;
 
       return {
         content: [{ type: "text", text }],
-        details: { node_id: nodeId, file_path: filePath, status: nodeStatus },
+        details: { node_id: nodeId, status: nodeStatus },
       };
     },
 
