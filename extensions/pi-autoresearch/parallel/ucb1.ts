@@ -66,13 +66,13 @@ function totalExperiments(tree: ExperimentTree): number {
 }
 
 /**
- * A node is expandable if it's not exhausted and has room for more children.
+ * A node is expandable if it has a commit and room for more children.
  * maxChildren prevents infinite branching from a single node.
  */
 export function isExpandable(node: TreeNode, maxChildren = 5): boolean {
   // Ghost nodes (discard/crash) have no commit — cannot explore_from them
   if (!node.commit) return false;
-  return !node.exhausted && node.children.length < maxChildren;
+  return node.children.length < maxChildren;
 }
 
 /**
