@@ -993,22 +993,23 @@ async function finalizeExistingNode(
   const isKeep = finalStatus === "keep";
   const commit = isKeep ? experiment.commit || null : null;
 
-  // Use hypothesis from ASI or experiment.description for label update.
-  const nodeHypothesis: string =
-    (asi && typeof asi.hypothesis === "string" && asi.hypothesis.length > 0)
-      ? asi.hypothesis
-      : experiment.description;
-
   // Finalize the node (updates status, metric, commit, asi, nodeType)
   finalizeHypothesisNode(tree, nodeId, finalStatus, experiment.metric, commit, asi ?? null);
 
-  // Update hypothesis text if ASI provides a better one
-  if (nodeHypothesis && nodeHypothesis !== node.hypothesis) {
-    node.hypothesis = nodeHypothesis;
-    const label = extractLabel(nodeHypothesis);
-    node.hypothesisLabel = label;
-    if (label) node.simhashLabel = computeSimhash(label);
-    node.simhashFull = computeSimhash(nodeHypothesis);
+  // Only set hypothesis if the node doesn't have one yet (e.g. baseline path).
+  // For hypothesis-first flow, propose_hypothesis already set it — DON'T overwrite.
+  if (!node.hypothesis || node.hypothesis.length === 0) {
+    const fallback: string =
+      (asi && typeof asi.hypothesis === "string" && asi.hypothesis.length > 0)
+        ? asi.hypothesis
+        : experiment.description;
+    if (fallback) {
+      node.hypothesis = fallback;
+      const label = extractLabel(fallback);
+      node.hypothesisLabel = label;
+      if (label) node.simhashLabel = computeSimhash(label);
+      node.simhashFull = computeSimhash(fallback);
+    }
   }
 
   // For keep: advance active node and protect the commit with a git ref.

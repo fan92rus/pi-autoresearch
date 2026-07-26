@@ -98,13 +98,12 @@ export function computeSimhash(text: string): string {
  * the number of differing bits.
  */
 export function hammingDistance(hexA: string, hexB: string): number {
-  const a = parseInt(hexA, 16) >>> 0;
-  const b = parseInt(hexB, 16) >>> 0;
-  // Brian Kernighan's bit-count trick
+  const a = parseInt(hexA, 16);
+  const b = parseInt(hexB, 16);
   let x = (a ^ b) >>> 0;
   let count = 0;
   while (x > 0) {
-    x &= (x - 1) >>> 0;
+    x = (x & (x - 1)) >>> 0; // >>> 0 on the AND result, not just (x-1)
     count++;
   }
   return count;
