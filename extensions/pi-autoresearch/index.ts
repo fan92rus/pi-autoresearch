@@ -2294,10 +2294,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
                 td: treeDist(tree, activeId, n.id),
               }))
               .filter((x) => {
-                // td <= 2 (same node, siblings): threshold = SIMHASH_LIKELY
-                // td <= 4 (close cousins): threshold = SIMHASH_MAYBE
-                // td > 4 (distant): threshold = SIMHASH_LIKELY
-                const th = x.td <= 2 ? SIMHASH_LIKELY : x.td <= 4 ? SIMHASH_MAYBE : SIMHASH_LIKELY;
+                // td=0 (active node): only exact match (distance=0).
+                // Agent builds on the current idea — vocabulary overlap is expected.
+                // td > 0: threshold grows monotonically with code divergence.
+                // More changes to the codebase = more tolerance for repeated hypotheses
+                // (same idea on different code may yield different results).
+                const th = x.td === 0 ? 0 :
+                  x.td <= 2 ? SIMHASH_LIKELY :
+                  SIMHASH_MAYBE;
                 return x.distance <= th;
               })
               .sort((a, b) => a.distance - b.distance || a.td - b.td);
