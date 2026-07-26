@@ -20,7 +20,6 @@ const SYMBOLS = {
   emptyIndent: "    ",
   active: " ← HERE",
   best: " ★ BEST",
-  exhausted: " ☒",
 } as const;
 
 const STATUS_ICONS: Record<string, string> = {
@@ -91,7 +90,6 @@ function renderNodeLine(
 
   let line = `${prefix}${node.id}  ${metric.padStart(8)}  ${icon}  ${label.padEnd(32)} ${status.padEnd(8)}`;
   if (delta) line += ` ${delta}`;
-  if (node.exhausted) line += SYMBOLS.exhausted;
   if (isActive) line += SYMBOLS.active;
   if (isBest) line += SYMBOLS.best;
 
@@ -217,7 +215,7 @@ export function renderTree(tree: ExperimentTree, maxLines: number = 60): string 
   // Legend
   lines.push("");
   lines.push("─".repeat(80));
-  lines.push(" ● keep   ○ discard   ✕ crash   ◆ compose   ◇ untested   ◎ running   ⊘ duplicate   ★ best   ← active   ☒ exhausted");
+  lines.push(" ● keep   ○ discard   ✕ crash   ◆ compose   ◇ untested   ◎ running   ⊘ duplicate   ★ best   ← active");
   lines.push("─".repeat(80));
 
   return lines.join("\n");

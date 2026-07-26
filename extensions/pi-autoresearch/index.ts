@@ -82,7 +82,8 @@ import {
   nextNodeId,
   getPath,
   getChildren,
-  checkExhausted,
+  countFailedChildren,
+  getFailedChildren,
   findRunningNode,
   hypothesisNodeFilePath,
   createHypothesisNode,
@@ -869,7 +870,7 @@ type ExecFn = (
  * This is a best-effort overlay on top of log.jsonl. If tree.json does not
  * exist or the operation fails, returns null (no warning appended to output).
  * On success, returns null (silent) or a warning string if something notable
- * happened (e.g. exhausted branch detected).
+ * happened (e.g. many failed attempts on a branch).
  *
  * For keep-status nodes:
  *  - activeNodeId advances to the new node
@@ -950,10 +951,11 @@ async function recordTreeNode(
     }
   }
 
-  // Detect exhausted branch (≥3 consecutive discards among siblings).
+  // Informational warning: many failed attempts on parent.
   let warning: string | null = null;
-  if (checkExhausted(tree, parentId)) {
-    warning = `\n🌲 tree: branch at ${parentId} marked exhausted (3 consecutive discards) — consider explore_from to backtrack.`;
+  const failCount = countFailedChildren(tree, parentId);
+  if (failCount >= 6) {
+    warning = `\n⚠️ tree: ${failCount} failed attempts at ${parentId} — consider tree_status() for alternatives.`;
   }
 
   saveTree(workDir, tree);
@@ -965,7 +967,7 @@ async function recordTreeNode(
  * Used by log_experiment when hypothesis_id is provided.
  * Updates status, metric, commit, asi, nodeType (hypothesis→experiment).
  * Advances activeNode for keep. Creates git ref for keep.
- * Returns a warning string (e.g. exhausted branch), or null.
+ * Returns a warning string (e.g. many failed attempts), or null.
  */
 async function finalizeExistingNode(
   execFn: ExecFn,
@@ -1031,10 +1033,13 @@ async function finalizeExistingNode(
     }
   }
 
-  // Detect exhausted branch (≥3 consecutive discards among siblings).
+  // Informational warning: many failed attempts on parent.
   let warning: string | null = null;
-  if (node.parentId && checkExhausted(tree, node.parentId)) {
-    warning = `\n🌲 tree: branch at ${node.parentId} marked exhausted (3 consecutive discards) — consider explore_from to backtrack.`;
+  if (node.parentId) {
+    const failCount = countFailedChildren(tree, node.parentId);
+    if (failCount >= 6) {
+      warning = `\n⚠️ tree: ${failCount} failed attempts at ${node.parentId} — consider tree_status() for alternatives.`;
+    }
   }
 
   // Clean up hypothesis file from .auto/ideas/ (no longer untried).
@@ -2118,7 +2123,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\nexplore_from(node_id) - backtrack. Always call restore_main() after." +
       "\nrestore_main() - return to main branch after explore_from." +
       "\ncompose(node_a, node_b) - merge orthogonal diffs from different branches." +
-      "\nWhen you see branch exhausted or stagnation, call tree_status() for suggestions.";
+      "\nWhen you see many failures or stagnation, call tree_status() for suggestions.";
 
     if (hasChecks) {
       extra +=
@@ -2401,27 +2406,30 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
 
-      // ── HARD BLOCK: branch exhausted — agent must backtrack ──
-      if (checkExhausted(tree, parentId)) {
-        // Find UCB1 top suggestion for the backtrack message
-        let suggestion = "";
+      // ── Soft warning: many failed attempts on this node (after 6) ──
+      let warning = "";
+      const failedCount = countFailedChildren(tree, parentId);
+      if (failedCount >= 6) {
+        const failedNodes = getFailedChildren(tree, parentId);
+        warning +=
+          `\n⚠️ ${failedCount} failed attempts on this node (${parentId}).\n` +
+          `   All failures:\n`;
+        for (const f of failedNodes) {
+          const fLabel = (f.hypothesisLabel || f.hypothesis || "").slice(0, 60);
+          const fMetric = f.metric ? `${f.metric.toFixed(0)}µs` : "no metric";
+          warning += `   • ${f.id}: "${fLabel}" → ${f.status} (${fMetric})`;
+          if (f.asi?.do_not_retry) warning += ` [do_not_retry: ${String(f.asi.do_not_retry).slice(0, 80)}]`;
+          if (f.asi?.finding) warning += ` [finding: ${String(f.asi.finding).slice(0, 80)}]`;
+          warning += `\n`;
+        }
+        // UCB1 top alternative
         try {
           const ranked = rankNodes(tree);
           if (ranked.length > 0 && ranked[0].nodeId !== parentId) {
-            suggestion = `\n   💡 UCB1 suggests: explore_from("${ranked[0].nodeId}") (UCB1=${ranked[0].ucb1.toFixed(2)})`;
+            warning += `   💡 UCB1 suggests: explore_from("${ranked[0].nodeId}") (UCB1=${ranked[0].ucb1.toFixed(2)})\n`;
           }
         } catch { /* best-effort */ }
-        return {
-          content: [{ type: "text", text:
-            `⛔ Branch at ${parentId} is EXHAUSTED (3 consecutive discards).\n` +
-            `   You MUST either:\n` +
-            `   • explore_from("<nodeId>") to backtrack to a different branch\n` +
-            `   • restore_main() to return to main branch\n` +
-            `   Do not create more children on exhausted nodes.` +
-            suggestion,
-          }],
-          details: { exhausted: true, node_id: parentId },
-        };
+        warning += `   You can proceed — but is your approach FUNDAMENTALLY different?`;
       }
 
       // ── SimHash duplicate detection ──
@@ -2439,7 +2447,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         .sort((a, b) => a.distance - b.distance || a.td - b.td);
 
       let nodeStatus: "untested" | "duplicate" = "untested";
-      let warning = "";
 
       // ── do_not_retry overlap detection ──
       const dnriMatch = checkDoNotRetryOverlap(tree, hypothesisText);
@@ -4475,11 +4482,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     description:
       "Backtrack to any node in the experiment tree. Checks out the node's commit (detached HEAD) " +
       "and sets it as the new active point for future experiments. " +
-      "Use when the current branch is exhausted (3+ discards) or when tree_status suggests a more promising node. " +
+      "Use when the current branch has many failures (6+) or when tree_status suggests a more promising node. " +
       "After exploring, call restore_main() to return to the main branch.",
     promptSnippet: 'Backtrack to a different part of the experiment tree',
     promptGuidelines: [
-      "Use explore_from when the current branch is exhausted or tree_status suggests a better starting point.",
+      "Use explore_from when the current branch has many failures or tree_status suggests a better starting point.",
       "explore_from creates a detached HEAD — always call restore_main() when done exploring that branch.",
       "Ghost nodes (discard/crash) cannot be explored from — they have no commit.",
     ],
@@ -4597,8 +4604,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         text += `\nNo children — this node is unexplored. Good starting point.\n`;
       }
 
-      if (node.exhausted) {
-        text += `\n⚠️ This branch was marked exhausted, but you can still explore from here.\n`;
+      const fCount = countFailedChildren(tree, params.node_id);
+      if (fCount >= 6) {
+        text += `\n⚠️ ${fCount} failed attempts were tried from this node. You can still explore from here.\n`;
       }
 
       text += `\n⚠️ Detached HEAD. Call restore_main() to return to the main branch.\n`;
@@ -4742,7 +4750,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     promptGuidelines: [
       "Call tree_status() when you're stuck, before backtracking, or after every 3-4 experiments to see the big picture.",
       "tree_status 'ucb1' shows which nodes are most promising (balance of exploitation + exploration).",
-      "When tree_status shows an exhausted branch, call explore_from() to backtrack to a promising node.",
+      "When tree_status shows a node with many failures, call explore_from() to backtrack to a promising node.",
     ],
     parameters: {
       type: "object",
@@ -4779,11 +4787,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const ranked = rankNodes(tree);
       const bestId = findBestNodeId(tree);
       const nodeCount = Object.keys(tree.nodes).length;
-      const exhaustedList = Object.values(tree.nodes).filter((n) => n.exhausted);
 
       // ── Build structured recommendation for the agent (machine-parseable) ──
       // The agent uses this to decide its next action without parsing ASCII art.
-      const isExhaustedHere = exhaustedList.some((n) => n.id === tree.activeNodeId);
+      const activeFailCount = countFailedChildren(tree, tree.activeNodeId);
+      const isStrugglingHere = activeFailCount >= 6;
       const topRanked = ranked.length > 0 ? ranked[0] : null;
 
       // Find compose candidates: cross-branch keep-node pairs (different paths from root)
@@ -4808,10 +4816,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       let recAction: string;
       let recNodeId: string | null = null;
       let recReason: string;
-      if (isExhaustedHere && topRanked) {
+      if (isStrugglingHere && topRanked) {
         recAction = "explore_from";
         recNodeId = topRanked.nodeId;
-        recReason = `branch exhausted, ${topRanked.reason} (UCB1=${topRanked.ucb1.toFixed(2)})`;
+        recReason = `${activeFailCount} failed attempts here, ${topRanked.reason} (UCB1=${topRanked.ucb1.toFixed(2)})`;
       } else if (topRanked && topRanked.ucb1 > 0.5) {
         recAction = "explore_from";
         recNodeId = topRanked.nodeId;
@@ -4883,10 +4891,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             }
           }
         }
-        // Mark exhausted nodes
-        const exhausted = Object.values(tree.nodes).filter((n) => n.exhausted);
-        if (exhausted.length > 0) {
-          text += `\n❌ EXHAUSTED: ${exhausted.map((n) => n.id).join(", ")}\n`;
+        // Show nodes with many failures
+        const struggling = Object.values(tree.nodes).filter(
+          (n) => countFailedChildren(tree, n.id) >= 6,
+        );
+        if (struggling.length > 0) {
+          text += `\n⚠️ HIGH FAILURE COUNT: ${struggling.map((n) => `${n.id} (${countFailedChildren(tree, n.id)})`).join(", ")}\n`;
         }
       } else {
         // Tree + UCB1 (summary or full)
@@ -4905,9 +4915,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           }
         }
 
-        // Mark exhausted nodes
-        if (exhaustedList.length > 0) {
-          text += `\n❌ EXHAUSTED: ${exhaustedList.map((n) => `${n.id} ("${n.hypothesisLabel || n.hypothesis}")`).join(", ")}\n`;
+        // Show nodes with many failures
+        const strugglingList = Object.values(tree.nodes).filter(
+          (n) => countFailedChildren(tree, n.id) >= 6,
+        );
+        if (strugglingList.length > 0) {
+          text += `\n⚠️ HIGH FAILURE COUNT: ${strugglingList.map((n) => `${n.id} (${countFailedChildren(tree, n.id)} failures)`).join(", ")}\n`;
         }
 
         // Full detail mode: append all node details
@@ -4927,7 +4940,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           activeNodeId: tree.activeNodeId,
           bestNodeId: bestId,
           recommendation,
-          exhaustedBranches: exhaustedList.map((n) => n.id),
+          strugglingBranches: Object.values(tree.nodes)
+            .filter((n) => countFailedChildren(tree, n.id) >= 6)
+            .map((n) => n.id),
           composeCandidates: composeCandidates.slice(0, 5),
           rankedNodes: ranked.slice(0, 5),
         },

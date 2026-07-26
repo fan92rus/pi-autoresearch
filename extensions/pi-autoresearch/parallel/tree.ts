@@ -389,27 +389,24 @@ export function findBestNode(tree: ExperimentTree): TreeNode | null {
 }
 
 /**
- * Check if a node's children indicate an exhausted branch:
- * the last 3 children are all discard/crash/checks_failed.
- * Mutates node.exhausted in place if exhausted.
+ * Count failed children (discard/crash/checks_failed) of a node.
+ * Used for informational warnings — does NOT block hypothesis creation.
  */
-export function checkExhausted(tree: ExperimentTree, nodeId: string): boolean {
-  const node = tree.nodes[nodeId];
-  if (!node) return false;
-  if (node.exhausted) return true;
-
+export function countFailedChildren(tree: ExperimentTree, nodeId: string): number {
   const children = getChildren(tree, nodeId);
-  if (children.length < 3) return false;
+  return children.filter(
+    (c) => c.status === "discard" || c.status === "crash" || c.status === "checks_failed",
+  ).length;
+}
 
-  const recent = children.slice(-3);
-  const allBad = recent.every(
+/**
+ * Get all failed children (discard/crash/checks_failed) of a node.
+ */
+export function getFailedChildren(tree: ExperimentTree, nodeId: string): TreeNode[] {
+  const children = getChildren(tree, nodeId);
+  return children.filter(
     (c) => c.status === "discard" || c.status === "crash" || c.status === "checks_failed",
   );
-  if (allBad) {
-    node.exhausted = true;
-    return true;
-  }
-  return false;
 }
 
 /**

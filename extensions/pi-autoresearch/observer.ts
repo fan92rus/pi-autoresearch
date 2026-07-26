@@ -14,7 +14,7 @@ import { execSync } from "node:child_process";
 import { performance } from "node:perf_hooks";
 
 import { parseJsonlEntry, reconstructJsonlState, type ReconstructedRun } from "./jsonl.ts";
-import { treeExists, loadTree, getPath } from "./parallel/tree.ts";
+import { treeExists, loadTree, getPath, countFailedChildren } from "./parallel/tree.ts";
 import { rankNodes } from "./parallel/ucb1.ts";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -757,12 +757,10 @@ Write your analysis to ${ideasPath}, then try the most fundamentally different a
       if (tree) {
         const activeNode = tree.nodes[tree.activeNodeId];
         const ranked = rankNodes(tree);
-        const exhausted = Object.values(tree.nodes).filter(n => n.exhausted);
+        const activeFailCount = activeNode ? countFailedChildren(tree, activeNode.id) : 0;
         
-        if (activeNode?.exhausted || exhausted.length > 0) {
-          const exhaustedIds = exhausted.map(n => n.id).join(", ");
-          treeHint = `\n🌳 TREE STATUS: Current branch is EXHAUSTED.\n`;
-          treeHint += `   Exhausted nodes: ${exhaustedIds}\n`;
+        if (activeFailCount >= 6) {
+          treeHint = `\n🌳 TREE STATUS: ${activeFailCount} failed attempts on current branch (${activeNode.id}).\n`;
           if (ranked.length > 0) {
             const top = ranked[0];
             treeHint += `   UCB1 suggests: explore_from("${top.nodeId}") (UCB1=${top.ucb1.toFixed(2)}, ${top.reason})\n`;
