@@ -83,10 +83,17 @@ import {
   getPath,
   getChildren,
   checkExhausted,
+  findRunningNode,
+  hypothesisNodeFilePath,
+  createHypothesisNode,
+  finalizeHypothesisNode,
+  treeDist,
+  simhashThreshold,
+  extractLabel,
   type ExperimentTree,
   type TreeNode,
 } from "./parallel/tree.ts";
-import { computeSimhash, hammingDistance, classifyDistance, SIMHASH_LIKELY } from "./parallel/simhash.ts";
+import { computeSimhash, hammingDistance, classifyDistance } from "./parallel/simhash.ts";
 import { rankNodes, type RankedNode } from "./parallel/ucb1.ts";
 import { composeDiffs } from "./parallel/compose.ts";
 import { renderTree, renderNodeDetail, findBestNodeId } from "./parallel/treeview.ts";
@@ -237,6 +244,14 @@ const RunParams = Type.Object({
         "Example: 'Replace switch/case dispatch with lookup table for O(1) access'",
     })
   ),
+  hypothesis_id: Type.Optional(
+    Type.String({
+      description:
+        "Node ID from propose_hypothesis (e.g. \"n6\"). REQUIRED for all non-baseline experiments. " +
+        "Links this run to a pre-registered hypothesis in the tree. " +
+        "Exception: the baseline run (first experiment after init_experiment) may omit this.",
+    })
+  ),
 });
 
 const InitParams = Type.Object({
@@ -281,6 +296,13 @@ export const LogParams = Type.Object({
   description: Type.String({
     description: "Short description of what this experiment tried",
   }),
+  hypothesis_id: Type.Optional(
+    Type.String({
+      description:
+        "Node ID from propose_hypothesis. Links this log entry to the pre-registered hypothesis. " +
+        "If omitted, falls back to last run_experiment's hypothesis_id (baseline path).",
+    })
+  ),
   metrics: Type.Optional(
     Type.Object({}, {
       additionalProperties: Type.Number(),
@@ -931,6 +953,86 @@ async function recordTreeNode(
   let warning: string | null = null;
   if (checkExhausted(tree, parentId)) {
     warning = `\n🌲 tree: branch at ${parentId} marked exhausted (3 consecutive discards) — consider explore_from to backtrack.`;
+  }
+
+  saveTree(workDir, tree);
+  return warning;
+}
+
+/**
+ * Finalize an existing hypothesis node: transition from "running" to a terminal status.
+ * Used by log_experiment when hypothesis_id is provided.
+ * Updates status, metric, commit, asi, nodeType (hypothesis→experiment).
+ * Advances activeNode for keep. Creates git ref for keep.
+ * Returns a warning string (e.g. exhausted branch), or null.
+ */
+async function finalizeExistingNode(
+  execFn: ExecFn,
+  workDir: string,
+  nodeId: string,
+  experiment: ExperimentResult,
+  asi: ASI | null,
+): Promise<string | null> {
+  if (!treeExists(workDir)) return null;
+
+  const tree = loadTree(workDir);
+  if (!tree) return null;
+
+  const node = tree.nodes[nodeId];
+  if (!node) {
+    return `\n⚠️ tree.json: hypothesis node ${nodeId} not found, falling back to no tree update`;
+  }
+
+  // Map ExperimentResult.status → TreeNodeStatus.
+  const rawStatus = experiment.status;
+  const finalStatus: "keep" | "discard" | "crash" | "checks_failed" =
+    rawStatus === "keep" ? "keep" :
+    rawStatus === "discard" ? "discard" :
+    rawStatus === "crash" ? "crash" :
+    "checks_failed";
+  const isKeep = finalStatus === "keep";
+  const commit = isKeep ? experiment.commit || null : null;
+
+  // Use hypothesis from ASI or experiment.description for label update.
+  const nodeHypothesis: string =
+    (asi && typeof asi.hypothesis === "string" && asi.hypothesis.length > 0)
+      ? asi.hypothesis
+      : experiment.description;
+
+  // Finalize the node (updates status, metric, commit, asi, nodeType)
+  finalizeHypothesisNode(tree, nodeId, finalStatus, experiment.metric, commit, asi ?? null);
+
+  // Update hypothesis text if ASI provides a better one
+  if (nodeHypothesis && nodeHypothesis !== node.hypothesis) {
+    node.hypothesis = nodeHypothesis;
+    const label = extractLabel(nodeHypothesis);
+    node.hypothesisLabel = label;
+    if (label) node.simhashLabel = computeSimhash(label);
+    node.simhashFull = computeSimhash(nodeHypothesis);
+  }
+
+  // For keep: advance active node and protect the commit with a git ref.
+  if (isKeep && commit) {
+    tree.activeNodeId = nodeId;
+    // Update baselineMetric if this is the first real result (root had 0).
+    const parent = tree.nodes[node.parentId!] ?? null;
+    if (tree.baselineMetric === 0 && parent && parent.nodeType === "baseline") {
+      tree.baselineMetric = experiment.metric;
+    }
+    try {
+      await execFn("git", ["update-ref", `refs/exp/${nodeId}`, commit], {
+        cwd: workDir,
+        timeout: 5000,
+      });
+    } catch {
+      // GC protection is best-effort.
+    }
+  }
+
+  // Detect exhausted branch (≥3 consecutive discards among siblings).
+  let warning: string | null = null;
+  if (node.parentId && checkExhausted(tree, node.parentId)) {
+    warning = `\n🌲 tree: branch at ${node.parentId} marked exhausted (3 consecutive discards) — consider explore_from to backtrack.`;
   }
 
   saveTree(workDir, tree);
@@ -1990,12 +2092,23 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\nIf you receive a 🔄 STAGNATION steer — STOP experimenting and REFLECT on the pattern." +
       "\nIf you receive a 🎯 MILESTONE steer — Consider strategic alternatives and orthogonal directions." +
       "\n\n## Rules" +
-      "\n⛔ NEVER call run_experiment without a stated hypothesis (pass the `hypothesis` parameter for repeat detection)." +
+      "\n⛔ NEVER call run_experiment without registering a hypothesis first (propose_hypothesis then hypothesis_id)." +
       "\n⛔ NEVER skip log_experiment after run_experiment." +
       "\n⛔ NEVER skip the smoke test — broken code wastes experiment time." +
       "✅ Write promising but untried ideas to .auto/ideas/ — one .md file per idea (e.g. cache-ast-nodes.md).\nWhen you try an idea, add \"idea_id\": \"filename\" to the ASI in log_experiment — the file will be auto-removed so the untried count stays accurate." +
       "\n\n## Experiment Tree" +
-      "\nEach experiment is recorded as a node in .auto/tree.json. Available tools: tree_status(), explore_from(), restore_main(), compose(). When you see \"branch exhausted\" or stagnation, call tree_status() for UCB1 suggestions and use explore_from() to backtrack. Pass a hypothesis parameter to run_experiment for pre-run repeat detection.";
+      "\nEach experiment is recorded as a node in .auto/tree.json." +
+      "\n\n### Hypothesis-First Workflow (REQUIRED)" +
+      "\n1. propose_hypothesis(description=\"...\") returns node_id. SimHash at registration." +
+      "\n2. run_experiment(hypothesis_id=\"n6\", command=\"...\") runs the experiment." +
+      "\n3. log_experiment(hypothesis_id=\"n6\", metric=..., status=\"keep\") records result." +
+      "\nhypothesis_id is REQUIRED for all non-baseline experiments." +
+      "\n\n### Tree Tools" +
+      "\ntree_status() - view tree with UCB1 suggestions and NEXT ACTION." +
+      "\nexplore_from(node_id) - backtrack. Always call restore_main() after." +
+      "\nrestore_main() - return to main branch after explore_from." +
+      "\ncompose(node_a, node_b) - merge orthogonal diffs from different branches." +
+      "\nWhen you see branch exhausted or stagnation, call tree_status() for suggestions.";
 
     if (hasChecks) {
       extra +=
@@ -2179,6 +2292,193 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   });
 
   // -----------------------------------------------------------------------
+  // propose_hypothesis tool
+  // -----------------------------------------------------------------------
+
+  const ProposeHypothesisParams = Type.Object({
+    description: Type.Optional(Type.String({
+      description: "Hypothesis description text. Mutually exclusive with path.",
+    })),
+    path: Type.Optional(Type.String({
+      description: "Path to existing file with hypothesis description. Mutually exclusive with description.",
+    })),
+    force: Type.Optional(Type.Boolean({
+      description: "Register even if SimHash detects a possible duplicate.",
+    })),
+  });
+
+  registerGatedTool({
+    name: "propose_hypothesis",
+    label: "Propose Hypothesis",
+    description:
+      "Register a hypothesis in the experiment tree BEFORE calling run_experiment. " +
+      "Takes either a description string (saved to .auto/ideas/<nodeId>.md) or a path to an existing file. " +
+      "SimHash checks against all existing nodes; duplicates get status=duplicate unless force=true. " +
+      "Returns the node_id to pass to run_experiment(hypothesis_id).",
+    promptSnippet: "Register a hypothesis in the tree before run_experiment",
+    promptGuidelines: [
+      "ALWAYS call propose_hypothesis BEFORE run_experiment to register the idea.",
+      "SimHash duplicate detection runs at registration time, not at run time.",
+      "Use the returned node_id in run_experiment(hypothesis_id: \"nX\").",
+      "Use force=true to override SimHash duplicate detection if the idea is genuinely different.",
+    ],
+    parameters: ProposeHypothesisParams,
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
+
+      // ── Read hypothesis text ──
+      let hypothesisText: string;
+
+      if (params.description && params.path) {
+        return {
+          content: [{ type: "text", text: "❌ Provide either description OR path, not both." }],
+          details: {},
+        };
+      }
+
+      if (params.path) {
+        const resolvedPath = path.resolve(params.path);
+        try {
+          hypothesisText = fs.readFileSync(resolvedPath, "utf8").trim();
+        } catch (e) {
+          return {
+            content: [{ type: "text", text: `❌ Cannot read file: ${resolvedPath} — ${e instanceof Error ? e.message : String(e)}` }],
+            details: {},
+          };
+        }
+      } else if (params.description) {
+        hypothesisText = params.description.trim();
+      } else {
+        return {
+          content: [{ type: "text", text: "❌ Provide either description (text) or path (file)." }],
+          details: {},
+        };
+      }
+
+      if (!hypothesisText) {
+        return {
+          content: [{ type: "text", text: "❌ Hypothesis text is empty." }],
+          details: {},
+        };
+      }
+
+      const workDir = resolveWorkDir(ctx.cwd);
+
+      // ── Load tree ──
+      if (!treeExists(workDir)) {
+        return {
+          content: [{ type: "text", text: "❌ No experiment tree found. Call init_experiment first." }],
+          details: {},
+        };
+      }
+
+      const tree = loadTree(workDir);
+      if (!tree) {
+        return {
+          content: [{ type: "text", text: "❌ Failed to load experiment tree." }],
+          details: {},
+        };
+      }
+
+      const parentId = tree.activeNodeId;
+      const parent = tree.nodes[parentId];
+      if (!parent) {
+        return {
+          content: [{ type: "text", text: `❌ Active node ${parentId} not found in tree.` }],
+          details: {},
+        };
+      }
+
+      // ── SimHash duplicate detection ──
+      const newSimhash = computeSimhash(hypothesisText);
+      const activeId = tree.activeNodeId;
+      const dupes = Object.values(tree.nodes)
+        .filter((n) => n.simhashFull &&
+          (n.nodeType === "experiment" || n.nodeType === "compose" || n.nodeType === "hypothesis"))
+        .map((n) => ({
+          node: n,
+          distance: hammingDistance(newSimhash, n.simhashFull!),
+          td: treeDist(tree, activeId, n.id),
+        }))
+        .filter((x) => x.distance <= simhashThreshold(x.td))
+        .sort((a, b) => a.distance - b.distance || a.td - b.td);
+
+      let nodeStatus: "untested" | "duplicate" = "untested";
+      let warning = "";
+
+      if (dupes.length > 0) {
+        const d = dupes[0];
+        const where = d.td === 0 ? "active" : d.td <= 2 ? "sibling" : "distant";
+        const level = classifyDistance(d.distance);
+
+        if (!params.force) {
+          nodeStatus = "duplicate";
+          warning =
+            `\n⚠️ DUPLICATE HYPOTHESIS: \"${hypothesisText.slice(0, 80)}\"\n` +
+            `  matches ${d.node.id} \"${d.node.hypothesisLabel || d.node.hypothesis}\" (${d.node.status}, ${where})\n` +
+            `  SimHash distance=${d.distance} (${level}), tree distance=${d.td}.\n` +
+            `  Registered as status=duplicate. Use force=true to override.`;
+        } else {
+          warning =
+            `\n⚠️ Possible duplicate (force=true): matches ${d.node.id} \"${d.node.hypothesisLabel || d.node.hypothesis}\"\n` +
+            `  SimHash distance=${d.distance} (${level}), tree distance=${d.td}.`;
+        }
+      }
+
+      // ── Create tree node ──
+      const nodeId = nextNodeId(tree);
+      const hypothesisNode = createHypothesisNode(
+        nodeId,
+        parentId,
+        parent.depth,
+        hypothesisText,
+        nodeStatus,
+        null,
+      );
+      appendChild(tree, parentId, hypothesisNode);
+      saveTree(workDir, tree);
+
+      // ── Write hypothesis file ──
+      const filePath = hypothesisNodeFilePath(workDir, nodeId);
+      const ideasDir = path.dirname(filePath);
+      fs.mkdirSync(ideasDir, { recursive: true });
+
+      const frontmatter = [
+        "---",
+        `id: ${nodeId}`,
+        `status: ${nodeStatus}`,
+        `created_at: ${new Date().toISOString()}`,
+        "---",
+      ].join("\n");
+      fs.writeFileSync(filePath, frontmatter + "\n\n" + hypothesisText + "\n", "utf8");
+
+      // ── Build response ──
+      const text =
+        `🧪 Hypothesis registered: ${nodeId}\n` +
+        `  Status: ${nodeStatus}\n` +
+        `  File: ${filePath}` +
+        warning;
+
+      return {
+        content: [{ type: "text", text }],
+        details: { node_id: nodeId, file_path: filePath, status: nodeStatus },
+      };
+    },
+
+    renderCall(args, theme) {
+      const desc = args.description || args.path || "";
+      return new Text(theme.fg("toolTitle", theme.bold("propose_hypothesis ")) + theme.fg("accent", desc.slice(0, 60)), 0, 0);
+    },
+
+    renderResult(result, _options, _theme) {
+      const t = result.content[0];
+      return new Text(t?.type === "text" ? t.text : "", 0, 0);
+    },
+  });
+
+  // -----------------------------------------------------------------------
   // run_experiment tool
   // -----------------------------------------------------------------------
 
@@ -2193,6 +2493,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "Use run_experiment instead of bash when running experiment commands — it handles timing and output capture automatically.",
       "Always pass a tight timeout_seconds (required). A runaway process will be force-killed at the limit and logged as 'crash'.",
       "After run_experiment, always call log_experiment to record the result.",
+      "ALWAYS call propose_hypothesis BEFORE run_experiment to get a hypothesis_id. Pass hypothesis_id to both run_experiment and log_experiment.",
+      "Exception: the baseline run (first after init_experiment) does NOT need hypothesis_id.",
       "If the benchmark script outputs structured METRIC lines (e.g. 'METRIC total_µs=15200'), run_experiment will parse them automatically and suggest exact values for log_experiment. Use these parsed values directly instead of extracting them manually from the output.",
     ],
     parameters: RunParams,
@@ -2252,72 +2554,74 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const killedByBudget = budgetMs !== null; // safe: validated <= hardTimeoutMs above
       const timeout = killedByBudget ? budgetMs! : hardTimeoutMs;
 
-            // ── Pre-run SimHash repeat detection ──
-      // Scans the ENTIRE tree (not just siblings) for close hypothesis matches.
-      // Results weighted by tree distance: closer nodes get stricter thresholds.
+      // ── Hypothesis validation ──
+      // hypothesis_id links this run to a pre-registered hypothesis node.
+      // Required for all non-baseline experiments. Baseline exception: when
+      // the tree root has no experiment/hypothesis children yet (first run).
       let repeatWarning = "";
-      if (params.hypothesis && params.hypothesis.trim().length > 0 && treeExists(workDir)) {
-        try {
+      let runningNodeId: string | null = null;
+
+      if (params.hypothesis_id) {
+        // ── New flow: validate pre-registered hypothesis node ──
+        if (!treeExists(workDir)) {
+          return {
+            content: [{ type: "text", text: `❌ hypothesis_id="${params.hypothesis_id}" but no tree exists. Call init_experiment first.` }],
+            details: {},
+          };
+        }
+        const tree = loadTree(workDir);
+        if (!tree) {
+          return {
+            content: [{ type: "text", text: `❌ Failed to load tree.json for hypothesis_id="${params.hypothesis_id}".` }],
+            details: {},
+          };
+        }
+        const node = tree.nodes[params.hypothesis_id];
+        if (!node) {
+          return {
+            content: [{ type: "text", text: `❌ hypothesis_id="${params.hypothesis_id}" not found in tree. Call propose_hypothesis first.` }],
+            details: {},
+          };
+        }
+        if (node.status === "duplicate") {
+          return {
+            content: [{ type: "text", text: `❌ hypothesis_id="${params.hypothesis_id}" is a duplicate. Re-propose with force=true if genuinely different.` }],
+            details: {},
+          };
+        }
+        if (node.status !== "untested") {
+          return {
+            content: [{ type: "text", text: `❌ hypothesis_id="${params.hypothesis_id}" has status="${node.status}". Only untested hypotheses can be run.` }],
+            details: {},
+          };
+        }
+        // Warn if hypothesis was proposed under a different branch (code diverged)
+        const td = treeDist(tree, tree.activeNodeId, node.id);
+        if (td > 2) {
+          const parent_1 = tree.nodes[node.parentId!]?.id ?? "?";
+          repeatWarning =
+            `\n⚠️ DIVERGED BRANCH: ${node.id} was proposed under ${parent_1} (td=${td} from active ${tree.activeNodeId}).\n` +
+            `  Code has changed since registration — results may differ from expectations.`;
+        }
+        // Transition to running
+        node.status = "running";
+        saveTree(workDir, tree);
+        runningNodeId = node.id;
+      } else {
+        // ── No hypothesis_id: check baseline exception ──
+        if (treeExists(workDir)) {
           const tree = loadTree(workDir);
           if (tree) {
-            const newSimhash = computeSimhash(params.hypothesis);
-            // LCA-based tree distance: walk up to root and find first common ancestor
-            // Distance = depth(a) + depth(b) - 2*depth(LCA)
-            function treeDist(tree: ExperimentTree, a: string, b: string): number {
-              if (a === b) return 0;
-              // Walk from a up to root, collecting ancestor set
-              const ancestors = new Set<string>();
-              let cur: string | null = a;
-              while (cur) {
-                ancestors.add(cur);
-                const n = tree.nodes[cur];
-                cur = n && n.parentId ? n.parentId : null;
-              }
-              // Walk from b up until we find a common ancestor (the LCA)
-              cur = b;
-              while (cur) {
-                if (ancestors.has(cur)) {
-                  return tree.nodes[a].depth + tree.nodes[b].depth - 2 * tree.nodes[cur].depth;
-                }
-                const n = tree.nodes[cur];
-                cur = n && n.parentId ? n.parentId : null;
-              }
-              return Infinity; // disconnected (shouldn't happen in a valid tree)
+            const root = tree.nodes[tree.rootId];
+            const hasChildren = root && root.children.length > 0;
+            if (hasChildren) {
+              return {
+                content: [{ type: "text", text: `❌ hypothesis_id is required for non-baseline experiments.\n  Call propose_hypothesis first, then run_experiment(hypothesis_id: \"nX\").` }],
+                details: {},
+              };
             }
-            const activeId = tree.activeNodeId;
-            // Scan ALL experiment/keep/compose nodes in the tree
-            const allDupes = Object.values(tree.nodes)
-              .filter((n) => n.simhashFull && (n.nodeType === "experiment" || n.nodeType === "compose"))
-              .map((n) => ({
-                node: n,
-                distance: hammingDistance(newSimhash, n.simhashFull!),
-                td: treeDist(tree, activeId, n.id),
-              }))
-              .filter((x) => {
-                // td=0 (active node): only exact match (distance=0).
-                // Agent builds on the current idea — vocabulary overlap is expected.
-                // td > 0: threshold grows monotonically with code divergence.
-                // More changes to the codebase = more tolerance for repeated hypotheses
-                // (same idea on different code may yield different results).
-                const th = x.td === 0 ? 0 :
-                  x.td <= 2 ? SIMHASH_LIKELY :
-                  SIMHASH_MAYBE;
-                return x.distance <= th;
-              })
-              .sort((a, b) => a.distance - b.distance || a.td - b.td);
-            if (allDupes.length > 0) {
-              const d = allDupes[0];
-              const level = classifyDistance(d.distance);
-              const where = d.td === 0 ? "active" : d.td <= 2 ? "sibling" : d.td <= 4 ? "nearby" : "distant";
-              repeatWarning =
-                `\n⚠️ POSSIBLE REPEAT: hypothesis \"${params.hypothesis}\"\n` +
-                `  matches ${d.node.id} \"${d.node.hypothesisLabel || d.node.hypothesis}\" (${d.node.status}, ${where})\n` +
-                `  SimHash distance=${d.distance} (${level}), tree distance=${d.td}.\n` +
-                `  If this is a genuinely different idea — proceed. Otherwise consider a new approach.`;
-            }
+            // Baseline context: root has no children yet. Allowed.
           }
-        } catch {
-          // Repeat detection is best-effort.
         }
       }
 
@@ -2670,9 +2974,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         text += `\n\n── Checks output (last 80 lines) ──\n${details.checksOutput}`;
       }
 
-      // Append pre-run SimHash repeat warning (if any)
+      // Append pre-run warnings (diverged branch, etc.)
       if (repeatWarning) {
         text += repeatWarning;
+      }
+
+      // Include hypothesis node info
+      if (runningNodeId) {
+        text += `\n🧪 Hypothesis node: ${runningNodeId} (status=running). Pass to log_experiment(hypothesis_id: "${runningNodeId}") after.`;
       }
 
       return {
@@ -3112,20 +3421,42 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         text += `\n⚠️ Failed to write .auto/log.jsonl: ${e instanceof Error ? e.message : String(e)}`;
       }
 
-      // ── Experiment tree: append child node ──
-      // The tree is an optional overlay. If tree.json exists, record this
-      // experiment as a child of the active node. keep-nodes get a git ref
-      // (refs/exp/<id>) to protect the commit from GC and enable explore_from.
-      const treeWarn = await recordTreeNode(
-        (cmd, args, opts) => pi.exec(cmd, args, opts),
-        workDir,
-        {
+      // ── Experiment tree: update or create node ──
+      // New flow: if hypothesis_id is provided, or a running node exists in tree,
+      // finalize the existing hypothesis node. Old flow: for baseline runs
+      // without hypothesis_id and no running node, fall back to recordTreeNode.
+      const execFn = (cmd: string, args: string[], opts?: Record<string, unknown>) =>
+        pi.exec(cmd, args, opts);
+
+      // Resolve which node to finalize: explicit hypothesis_id, or last running node.
+      let resolveNodeId: string | null = params.hypothesis_id ?? null;
+      if (!resolveNodeId && treeExists(workDir)) {
+        const tree = loadTree(workDir);
+        if (tree) {
+          const running = findRunningNode(tree);
+          if (running) resolveNodeId = running.id;
+        }
+      }
+
+      if (resolveNodeId) {
+        // ── New flow: finalize existing hypothesis node ──
+        const treeWarn = await finalizeExistingNode(
+          execFn,
+          workDir,
+          resolveNodeId,
           experiment,
-          asi: mergedASI ?? null,
-          runNumber: state.results.length,
-        },
-      );
-      if (treeWarn) text += treeWarn;
+          mergedASI ?? null,
+        );
+        if (treeWarn) text += treeWarn;
+      } else {
+        // ── Old flow: baseline or no hypothesis (create new node) ──
+        const treeWarn = await recordTreeNode(
+          execFn,
+          workDir,
+          { experiment, asi: mergedASI ?? null, runNumber: state.results.length },
+        );
+        if (treeWarn) text += treeWarn;
+      }
 
       // ── Auto-remove tried idea file from .auto/ideas/ ──
       // If ASI contains idea_id (string or array), delete the matching file

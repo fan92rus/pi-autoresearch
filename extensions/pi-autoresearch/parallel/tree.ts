@@ -17,7 +17,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Direction } from "./types.ts";
-import { computeSimhash } from "./simhash.ts";
+import { computeSimhash, SIMHASH_EXACT, SIMHASH_LIKELY, SIMHASH_MAYBE } from "./simhash.ts";
 
 // ── Path ───────────────────────────────────────────────────────────────────
 
@@ -33,11 +33,16 @@ export function treeExists(workDir: string): boolean {
   return fs.existsSync(treeFilePath(workDir));
 }
 
+/** Resolve the .auto/ideas/<nodeId>.md path for hypothesis files. */
+export function hypothesisNodeFilePath(workDir: string, nodeId: string): string {
+  return path.join(workDir, ".auto", "ideas", `${nodeId}.md`);
+}
+
 // ── Types ──────────────────────────────────────────────────────────────────
 
-export type TreeNodeStatus = "baseline" | "keep" | "discard" | "crash" | "checks_failed";
+export type TreeNodeStatus = "baseline" | "keep" | "discard" | "crash" | "checks_failed" | "untested" | "running" | "duplicate";
 
-export type TreeNodeType = "baseline" | "experiment" | "compose";
+export type TreeNodeType = "baseline" | "experiment" | "compose" | "hypothesis";
 
 export interface TreeNode {
   /** Unique node ID (e.g. "n0", "n1", ...). */
@@ -213,6 +218,129 @@ export function createExperimentNode(
     nodeType: "experiment",
     runRef,
   };
+}
+
+/**
+ * Create a hypothesis node (untested idea).
+ * Does NOT advance activeNode — it's a proposal, not a result.
+ */
+export function createHypothesisNode(
+  nodeId: string,
+  parentId: string,
+  parentDepth: number,
+  hypothesis: string,
+  status: "untested" | "duplicate",
+  asi: Record<string, unknown> | null,
+): TreeNode {
+  const label = extractLabel(hypothesis);
+  const ideaId = asi && typeof asi.idea_id === "string" ? asi.idea_id : null;
+
+  return {
+    id: nodeId,
+    parentId,
+    children: [],
+    commit: null,
+    metric: 0,
+    hypothesis,
+    hypothesisLabel: label,
+    status,
+    asi,
+    simhashLabel: label ? computeSimhash(label) : null,
+    simhashFull: computeSimhash(hypothesis),
+    ideaId,
+    depth: parentDepth + 1,
+    createdAt: Date.now(),
+    exhausted: false,
+    nodeType: "hypothesis",
+  };
+}
+
+/**
+ * Find the last node (by createdAt) with "running" status in the tree.
+ * Used by log_experiment to link back to the hypothesis node.
+ */
+export function findRunningNode(tree: ExperimentTree): TreeNode | null {
+  const running = Object.values(tree.nodes)
+    .filter((n) => n.status === "running")
+    .sort((a, b) => b.createdAt - a.createdAt);
+  return running.length > 0 ? running[0] : null;
+}
+
+/**
+ * Finalize a hypothesis node: transition from "running" to a terminal status.
+ * Updates status, metric, commit, asi, and nodeType (hypothesis → experiment).
+ * Returns the updated node, or null if the node is not found.
+ * Does NOT save to disk — caller must saveTree().
+ */
+export function finalizeHypothesisNode(
+  tree: ExperimentTree,
+  nodeId: string,
+  status: "keep" | "discard" | "crash" | "checks_failed",
+  metric: number,
+  commit: string | null,
+  asi: Record<string, unknown> | null,
+): TreeNode | null {
+  const node = tree.nodes[nodeId];
+  if (!node) return null;
+
+  node.status = status;
+  node.metric = metric;
+  node.commit = commit;
+  node.asi = asi;
+  // Transition from hypothesis to experiment node type now that it has a result.
+  if (node.nodeType === "hypothesis") {
+    node.nodeType = "experiment";
+  }
+  // If ASI indicates compose, override nodeType.
+  if (asi && Array.isArray(asi.composed_from)) {
+    node.nodeType = "compose";
+    node.composedFrom = (asi.composed_from as string[]).filter(
+      (id): id is string => typeof id === "string",
+    );
+  }
+  // Update ideaId if present in ASI.
+  if (asi && typeof asi.idea_id === "string") {
+    node.ideaId = asi.idea_id;
+  }
+  return node;
+}
+
+// ── SimHash repeat detection ──────────────────────────────────────────
+
+/**
+ * LCA-based tree distance: walk up to root and find first common ancestor.
+ * Distance = depth(a) + depth(b) - 2*depth(LCA)
+ */
+export function treeDist(tree: ExperimentTree, a: string, b: string): number {
+  if (a === b) return 0;
+  const ancestors = new Set<string>();
+  let cur: string | null = a;
+  while (cur) {
+    ancestors.add(cur);
+    const n = tree.nodes[cur];
+    cur = n && n.parentId ? n.parentId : null;
+  }
+  cur = b;
+  while (cur) {
+    if (ancestors.has(cur)) {
+      return tree.nodes[a].depth + tree.nodes[b].depth - 2 * tree.nodes[cur].depth;
+    }
+    const n = tree.nodes[cur];
+    cur = n && n.parentId ? n.parentId : null;
+  }
+  return Infinity;
+}
+
+/**
+ * Threshold for SimHash-based repeat detection.
+ * td=0 (active node): only exact match.
+ * td=1-2 (siblings): SIMHASH_LIKELY.
+ * td>2 (distant): SIMHASH_MAYBE — code diverged, more tolerance.
+ */
+export function simhashThreshold(td: number): number {
+  return td === 0 ? SIMHASH_EXACT :
+    td <= 2 ? SIMHASH_LIKELY :
+    SIMHASH_MAYBE;
 }
 
 // ── Tree traversal helpers ─────────────────────────────────────────────────
