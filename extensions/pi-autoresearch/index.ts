@@ -2287,17 +2287,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             const activeId = tree.activeNodeId;
             // Scan ALL experiment/keep/compose nodes in the tree
             const allDupes = Object.values(tree.nodes)
-              .filter((n) => n.simhashFull && n.id !== activeId &&
-                (n.nodeType === "experiment" || n.nodeType === "compose"))
+              .filter((n) => n.simhashFull && (n.nodeType === "experiment" || n.nodeType === "compose"))
               .map((n) => ({
                 node: n,
                 distance: hammingDistance(newSimhash, n.simhashFull!),
                 td: treeDist(tree, activeId, n.id),
               }))
               .filter((x) => {
-                // Siblings (td=2): threshold = SIMHASH_LIKELY (3)
-                // Close (td 4): threshold = SIMHASH_MAYBE (6)
-                // Distant (td 6+): threshold = SIMHASH_LIKELY (3)
+                // td <= 2 (same node, siblings): threshold = SIMHASH_LIKELY
+                // td <= 4 (close cousins): threshold = SIMHASH_MAYBE
+                // td > 4 (distant): threshold = SIMHASH_LIKELY
                 const th = x.td <= 2 ? SIMHASH_LIKELY : x.td <= 4 ? SIMHASH_MAYBE : SIMHASH_LIKELY;
                 return x.distance <= th;
               })
@@ -2305,7 +2304,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             if (allDupes.length > 0) {
               const d = allDupes[0];
               const level = classifyDistance(d.distance);
-              const where = d.td <= 2 ? "sibling" : d.td <= 4 ? "nearby" : "distant";
+              const where = d.td === 0 ? "active" : d.td <= 2 ? "sibling" : d.td <= 4 ? "nearby" : "distant";
               repeatWarning =
                 `\n⚠️ POSSIBLE REPEAT: hypothesis \"${params.hypothesis}\"\n` +
                 `  matches ${d.node.id} \"${d.node.hypothesisLabel || d.node.hypothesis}\" (${d.node.status}, ${where})\n` +
