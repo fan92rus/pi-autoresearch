@@ -2053,7 +2053,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\n     ⛔ NEVER skip this step. Every run_experiment MUST be logged." +
       "\n  7. NEXT — Updated hypothesis based on what you learned." +
       "\n     If stuck (3+ non-improving runs) → check .auto/ideas/ for alternative directions." +
-      "\n\n## Parallel Toolkit (USE PROACTIVELY — don't wait for stagnation!)" +
+      "\n\n## Parallel Toolkit (CURRENTLY DISABLED — will be re-enabled in a future version)" +
       "\nYou have parallel tools that test N hypotheses SIMULTANEOUSLY in isolated worktrees." +
       "\nGoing parallel is almost always better than sequential trial-and-error when you have multiple ideas." +
       "\n" +
@@ -2082,8 +2082,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\nThe observer will then recommend /autoresearch off. Do NOT grind indefinitely." +
       "\n\n⚠ IMPORTANT: finalize_research is a RECOMMENDATION, not a stop. Only call it when" +
       "\nyou have concrete PROOF (profiling, variance data, exhausted search space)." +
-      "\nA subjective \"this seems hard\" is NOT proof — try orthogonal approaches and" +
-      "\nparallel tools (BestOfN, SpaceSearch) first. If you finalize prematurely and then" +
+      "\nA subjective \"this seems hard\" is NOT proof — try orthogonal approaches first." +
+      "\nIf you finalize prematurely and then" +
       "\nfind an improvement, the observer will suppress the finalize signal automatically."
     + "\nIf you continue working after finalize, the observer goes quiet — actionable"
     + "\ntriggers (parallel opportunity, stagnation) will guide you instead."
@@ -2101,8 +2101,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\nEach experiment is recorded as a node in .auto/tree.json." +
       "\n\n### Hypothesis-First Workflow (REQUIRED)" +
       "\n1. propose_hypothesis(description=\"...\") returns node_id. SimHash at registration." +
-      "\n2. run_experiment(hypothesis_id=\"n6\", command=\"...\") runs the experiment." +
-      "\n3. log_experiment(hypothesis_id=\"n6\", metric=..., status=\"keep\") records result." +
+      "\n2. EDIT THE CODE — implement the hypothesis in source files." +
+      "\n3. run_experiment(hypothesis_id=\"n6\", command=\"...\") runs the benchmark." +
+      "\n4. log_experiment(hypothesis_id=\"n6\", metric=..., status=\"keep\") records result." +
+      "\nIn log_experiment, description is a RESULT SUMMARY (what happened, what you learned). Do NOT repeat the hypothesis — it is already stored." +
       "\nhypothesis_id is REQUIRED for all non-baseline experiments." +
       "\n\n### Tree Tools" +
       "\ntree_status() - view tree with UCB1 suggestions and NEXT ACTION." +
