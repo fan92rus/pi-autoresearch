@@ -14,7 +14,7 @@ import { execSync } from "node:child_process";
 import { performance } from "node:perf_hooks";
 
 import { parseJsonlEntry, reconstructJsonlState, type ReconstructedRun } from "./jsonl.ts";
-import { treeExists, loadTree } from "./parallel/tree.ts";
+import { treeExists, loadTree, getPath } from "./parallel/tree.ts";
 import { rankNodes } from "./parallel/ucb1.ts";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -451,11 +451,13 @@ function checkCompositionOpportunity(
     );
     if (keepNodes.length < 2) return null;
 
-    // Find pairs with different immediate parents (different branches)
+    // Find keep-nodes with commits on different branches (neither is ancestor of the other)
     const pairs: Array<{ a: typeof keepNodes[0]; b: typeof keepNodes[0] }> = [];
     for (let i = 0; i < keepNodes.length; i++) {
       for (let j = i + 1; j < keepNodes.length; j++) {
-        if (keepNodes[i].parentId !== keepNodes[j].parentId) {
+        const pathA = getPath(tree, keepNodes[i].id);
+        const pathB = getPath(tree, keepNodes[j].id);
+        if (!pathA.includes(keepNodes[j].id) && !pathB.includes(keepNodes[i].id)) {
           pairs.push({ a: keepNodes[i], b: keepNodes[j] });
         }
       }

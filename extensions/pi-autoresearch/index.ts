@@ -4369,8 +4369,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           const a = keepNodes[i];
           const b = keepNodes[j];
           // Different branches = neither is in the other's ancestor path
-          const pathA = getPath(tree, a.id).map((n) => n.id);
-          const pathB = getPath(tree, b.id).map((n) => n.id);
+          const pathA = getPath(tree, a.id);
+          const pathB = getPath(tree, b.id);
           if (!pathA.includes(b.id) && !pathB.includes(a.id)) {
             composeCandidates.push([a.id, b.id]);
           }
