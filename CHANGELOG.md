@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added — Observer Intelligence & Persistence
+
+- **Pattern classification in stagnation**: replaces generic "change direction" with domain-agnostic result-pattern detection (convergence, repetition, no-info, divergence) based on ASI findings and metric variance.
+- **Profiling gate**: warns when recent experiments have no profiling data in ASI (optimizing blind).
+- **Noise floor calibration**: auto-runs measure.sh once after baseline to measure variance; warns when keep improvements are within noise floor.
+- **Cross-session dead-end memory**: saves do_not_retry entries to `.auto/dead-ends.json` on `/autoresearch off`; loads and displays at `init_experiment` with 30-day expiry.
+- **`finalize_recommendations` config setting**: master switch (default: true) to disable ALL finalize/floor recommendations. When false, agent keeps trying without stop suggestions.
+
+### Changed
+
+- **Two-signal floor detection**: floor now requires BOTH consecutive discard streak AND no best improvement in N total experiments (default 12). Prevents false floor on productive branches.
+- **Floor streak threshold**: lowered from 15 to 8 based on real-world testing.
+- **Removed hard block on exhausted branches**: `propose_hypothesis` no longer blocks when a branch has 6+ failures. Instead shows informational warning with all failed children, their do_not_retry findings, and UCB1 alternatives.
+- **Removed `exhausted` node field usage**: `isExpandable` in ucb1.ts no longer checks `node.exhausted`. Treeview no longer shows ☒ marker.
+- **`checkExhausted`** replaced by `countFailedChildren`/`getFailedChildren` in tree.ts.
+
 ### Added — Hypothesis-First Workflow
 
 - **propose_hypothesis** tool: register hypotheses in the tree BEFORE running experiments. SimHash duplicate detection at registration time.

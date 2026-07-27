@@ -711,6 +711,109 @@ function writeConfig(cwd: string, config: AutoresearchConfig): void {
 }
 
 /**
+ * Save cross-session dead-ends to .auto/dead-ends.json.
+ * Called on /autoresearch off to persist do_not_retry knowledge.
+ */
+function saveDeadEnds(workDir: string): void {
+  if (!treeExists(workDir)) return;
+  const tree = loadTree(workDir);
+  if (!tree) return;
+
+  const deadEnds = Object.values(tree.nodes)
+    .filter((n) => {
+      const asi = n.asi as Record<string, string> | undefined;
+      return asi?.do_not_retry && (n.status === "discard" || n.status === "crash" || n.status === "checks_failed");
+    })
+    .map((n) => ({
+      nodeId: n.id,
+      hypothesis: n.hypothesisLabel || n.hypothesis,
+      do_not_retry: (n.asi as Record<string, string>)?.do_not_retry,
+      finding: (n.asi as Record<string, string>)?.finding,
+      commit: n.commit,
+      savedAt: new Date().toISOString(),
+    }));
+
+  if (deadEnds.length === 0) return;
+
+  const deadEndsPath = path.join(workDir, ".auto", "dead-ends.json");
+  ensureParentDir(deadEndsPath);
+  fs.writeFileSync(deadEndsPath, JSON.stringify(deadEnds, null, 2), "utf8");
+}
+
+/**
+ * Load cross-session dead-ends from .auto/dead-ends.json.
+ * Returns formatted warning string, or null if none/expired.
+ */
+function loadDeadEnds(workDir: string): string | null {
+  const deadEndsPath = path.join(workDir, ".auto", "dead-ends.json");
+  if (!fs.existsSync(deadEndsPath)) return null;
+
+  try {
+    const deadEnds = JSON.parse(fs.readFileSync(deadEndsPath, "utf-8")) as Array<{
+      nodeId: string; hypothesis: string; do_not_retry: string;
+      finding?: string; commit: string | null; savedAt: string;
+    }>;
+    if (!Array.isArray(deadEnds) || deadEnds.length === 0) return null;
+
+    // Expire entries older than 30 days
+    const maxAge = 30 * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    const fresh = deadEnds.filter((d) => {
+      try { return now - new Date(d.savedAt).getTime() < maxAge; } catch { return false; }
+    });
+    if (fresh.length === 0) return null;
+
+    const lines = fresh.map((d) =>
+      `  • "${(d.hypothesis || "").slice(0, 60)}" — ${(d.do_not_retry || "").slice(0, 80)}`,
+    );
+    return `KNOWN DEAD-ENDS from previous sessions (${fresh.length}):
+${lines.join("\n")}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Calibrate noise floor by running measure.sh once more after baseline.
+ * Returns noise floor as a fraction (e.g., 0.04 = ±4%).
+ */
+async function calibrateNoiseFloor(
+  execFn: ExecFn,
+  workDir: string,
+  baselineMetric: number,
+): Promise<number | null> {
+  const measureScript = findMeasureScript(workDir);
+  if (!measureScript) return null;
+
+  try {
+    const result = await execFn(measureScript, [], {
+      cwd: workDir,
+      timeout: 30_000,
+      window: false,
+    } as any);
+    const stdout = typeof result === "string" ? result : (result as any)?.stdout || "";
+    const match = stdout.match(/METRIC\s+\S+=(\d+(?:\.\d+)?)/);
+    if (!match) return null;
+    const noopMetric = parseFloat(match[1]);
+    if (baselineMetric <= 0) return null;
+    return Math.abs(noopMetric - baselineMetric) / baselineMetric;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Find the measure script path in the working directory.
+ */
+function findMeasureScript(workDir: string): string | null {
+  const candidates = [".auto/measure.sh", "./.auto/measure.sh"];
+  for (const c of candidates) {
+    if (fs.existsSync(path.join(workDir, c.replace(/^\.\//, "")))) return c;
+  }
+  return null;
+}
+
+/**
  * Resolve the effective working directory.
  * Reads workingDir from the config file (.auto/config.json) in ctxCwd.
  * Returns ctxCwd if not set. Supports relative (resolved against ctxCwd) and absolute paths.
@@ -940,6 +1043,15 @@ async function recordTreeNode(
     // Update baselineMetric if this is the first real result (root had 0).
     if (tree.baselineMetric === 0 && parent.nodeType === "baseline") {
       tree.baselineMetric = info.experiment.metric;
+      // Calibrate noise floor by running measure.sh once more (no code changes)
+      try {
+        const nf = await calibrateNoiseFloor(execFn, workDir, info.experiment.metric);
+        if (nf !== null && nf > 0) {
+          const cfg = readConfig(workDir);
+          writeConfig(workDir, { ...cfg, noiseFloor: nf });
+          console.warn(`[autoresearch] noise floor calibrated: ±${(nf * 100).toFixed(1)}%`);
+        }
+      } catch { /* best-effort */ }
     }
     try {
       await execFn("git", ["update-ref", `refs/exp/${nodeId}`, commit], {
@@ -2285,10 +2397,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const reinitNote = isReinit ? " (re-initialized — previous results archived, new baseline needed)" : "";
       const limitNote = state.maxExperiments !== null ? `\nMax iterations: ${state.maxExperiments} (from .auto/config.json)` : "";
       const workDirNote = workDir !== ctx.cwd ? `\nWorking directory: ${workDir}` : "";
+
+      // Load cross-session dead-ends warning
+      let deadEndsNote = "";
+      try {
+        const deadEnds = loadDeadEnds(workDir);
+        if (deadEnds) deadEndsNote = `\n\n⚠️ ${deadEnds}`;
+      } catch { /* best-effort */ }
+
       return {
         content: [{
           type: "text",
-          text: `✅ Experiment initialized: "${state.name}"${reinitNote}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)${limitNote}${workDirNote}\nConfig written to .auto/log.jsonl. Now run the baseline with run_experiment.`,
+          text: `✅ Experiment initialized: "${state.name}"${reinitNote}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)${limitNote}${workDirNote}${deadEndsNote}\nConfig written to .auto/log.jsonl. Now run the baseline with run_experiment.`,
         }],
         details: { state: cloneExperimentState(state) },
       };
@@ -3378,6 +3498,31 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const isKeep = params.status === "keep";
         // Find the run number where the current best was set
         const bestRunNum = findBestRunNumber(state.results, state.currentSegment, state.bestDirection);
+
+        // Noise floor warning for keep: check if improvement is within calibrated noise
+        if (isKeep) {
+          try {
+            const workDirNf = resolveWorkDir(ctx.cwd);
+            const nfCfg = readConfig(workDirNf);
+            const nf = (nfCfg as Record<string, unknown>).noiseFloor;
+            if (typeof nf === "number" && nf > 0 && state.results.length >= 2) {
+              const prevBest = state.results
+                .filter((r) => r.segment === state.currentSegment && r.status === "keep" && r.runNumber !== experiment.runNumber)
+                .reduce((best, r) => {
+                  if (state.bestDirection === "lower") return best === null || r.metric < best ? r.metric : best;
+                  return best === null || r.metric > best ? r.metric : best;
+                }, null as number | null);
+              if (prevBest !== null) {
+                const improvement = state.bestDirection === "lower"
+                  ? (prevBest - params.metric) / prevBest
+                  : (params.metric - prevBest) / prevBest;
+                if (improvement > 0 && improvement < nf) {
+                  text += `\n⚠️ NOISE FLOOR: Improvement (${(improvement * 100).toFixed(1)}%) is WITHIN noise floor (±${(nf * 100).toFixed(1)}%). Likely not real.`;
+                }
+              }
+            }
+          } catch { /* best-effort */ }
+        }
 
         if (isKeep) {
           // This run IS the improvement — confidence refers to THIS run
@@ -5179,6 +5324,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (command === "off") {
         const wasRunning = !ctx.isIdle();
         const workDir = resolveWorkDir(ctx.cwd);
+
+        // Save cross-session dead-ends before turning off
+        try {
+          saveDeadEnds(workDir);
+        } catch { /* best-effort */ }
 
         recordAutoresearchActivation(workDir, false);
         setAutoresearchMode(ctx, false);

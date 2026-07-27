@@ -24,8 +24,10 @@ export interface ObserverConfig {
   finalizeStrongThreshold: number;
   /** Confidence for advisory finalize steer. Default: 0.5 */
   finalizeAdvisoryThreshold: number;
-  /** Streak needed before floor detection kicks in. Default: 15 */
+  /** Streak needed before floor detection kicks in. Default: 8 */
   floorStreakThreshold: number;
+  /** Total experiments without best improvement for floor detection. Default: 12 */
+  floorNoImproveThreshold: number;
   /** Coefficient of variation below which metric is considered plateaued. Default: 0.15 */
   floorCvThreshold: number;
   /** Noise gate: noise must exceed best * margin to trigger. Default: 1.10 */
@@ -42,6 +44,8 @@ export interface ObserverConfig {
   finalizeEnabled: boolean;
   /** Enable floor detection trigger (variance plateau + ASI proof). Default: true */
   floorDetectionEnabled: boolean;
+  /** Enable ALL finalize/floor recommendations. When false, agent keeps trying without stop suggestions. Default: true */
+  finalizeRecommendations: boolean;
   /** Enable finalize recommendations inside stagnation (ASI floor/exhausted, critical level). Default: true */
   stagnationFinalizeEnabled: boolean;
   /** Enable parallel tool suggestions (BestOfN, CheckOrthogonal, SpaceSearch). Default: false (tools disabled) */
@@ -51,7 +55,8 @@ export interface ObserverConfig {
 export const DEFAULT_OBSERVER_CONFIG: ObserverConfig = {
   finalizeStrongThreshold: 0.8,
   finalizeAdvisoryThreshold: 0.5,
-  floorStreakThreshold: 15,
+  floorStreakThreshold: 8,
+  floorNoImproveThreshold: 12,
   floorCvThreshold: 0.15,
   noiseGateMargin: 1.10,
   noiseSamples: 3,
@@ -59,6 +64,7 @@ export const DEFAULT_OBSERVER_CONFIG: ObserverConfig = {
   progressMilestone: 5,
   finalizeEnabled: true,
   floorDetectionEnabled: true,
+  finalizeRecommendations: true,
   stagnationFinalizeEnabled: true,
   parallelEnabled: false,
 };
@@ -73,12 +79,14 @@ function readObserverConfig(cwd: string): ObserverConfig {
     if (typeof obs.finalize_strong_threshold === "number") cfg.finalizeStrongThreshold = obs.finalize_strong_threshold;
     if (typeof obs.finalize_advisory_threshold === "number") cfg.finalizeAdvisoryThreshold = obs.finalize_advisory_threshold;
     if (typeof obs.floor_streak_threshold === "number") cfg.floorStreakThreshold = obs.floor_streak_threshold;
+    if (typeof obs.floor_no_improve_threshold === "number") cfg.floorNoImproveThreshold = obs.floor_no_improve_threshold;
     if (typeof obs.floor_cv_threshold === "number") cfg.floorCvThreshold = obs.floor_cv_threshold;
     if (typeof obs.noise_gate_margin === "number") cfg.noiseGateMargin = obs.noise_gate_margin;
     if (typeof obs.stagnation_threshold === "number") cfg.stagnationThreshold = obs.stagnation_threshold;
     // Boolean toggles (default true; presence of a boolean value overrides)
     if (typeof obs.finalize_enabled === "boolean") cfg.finalizeEnabled = obs.finalize_enabled;
     if (typeof obs.floor_detection_enabled === "boolean") cfg.floorDetectionEnabled = obs.floor_detection_enabled;
+    if (typeof obs.finalize_recommendations === "boolean") cfg.finalizeRecommendations = obs.finalize_recommendations;
     if (typeof obs.stagnation_finalize_enabled === "boolean") cfg.stagnationFinalizeEnabled = obs.stagnation_finalize_enabled;
     if (typeof obs.parallel_enabled === "boolean") cfg.parallelEnabled = obs.parallel_enabled;
     return cfg;
@@ -107,6 +115,8 @@ export interface ObserverState {
   recent: ReconstructedRun[];
   impHistory: number[];
   recentMetrics: number[];
+  /** Total experiments (keep+discard) since best metric last improved. */
+  runsSinceBestImprovement: number;
 }
 
 interface AsiFlags {
@@ -170,6 +180,7 @@ export function computeState(runs: ReconstructedRun[], direction: "lower" | "hig
     recent: [],
     impHistory: [],
     recentMetrics: [],
+    runsSinceBestImprovement: 0,
   };
 
   for (const r of runs) {
@@ -187,8 +198,10 @@ export function computeState(runs: ReconstructedRun[], direction: "lower" | "hig
       state.impHistory.push(r.metric);
       state.recentMetrics.push(r.metric);
       state.recent = [];
+      state.runsSinceBestImprovement = 0;
     } else {
       state.streak++;
+      state.runsSinceBestImprovement++;
       state.recent.push(r);
       if (r.metric !== 0) state.recentMetrics.push(r.metric);
     }
@@ -377,6 +390,14 @@ export function checkFloor(
 ): string | null {
   if (state.streak < oc.floorStreakThreshold) return null;
 
+  // Two-signal floor: need BOTH consecutive discards AND no best improvement recently
+  // This prevents false floor when agent is trying wrong hypotheses on a productive branch
+  const asiProvesFloor = state.streak >= 20 && asi.floor;
+  if (!asiProvesFloor && state.runsSinceBestImprovement < oc.floorNoImproveThreshold) {
+    // Streak of bad luck, but best is still improving — don't claim floor yet
+    return null;
+  }
+
   const recent = state.recentMetrics.slice(-10).filter((v) => v !== 0);
   const stats = coefficientOfVariation(recent);
 
@@ -391,7 +412,6 @@ export function checkFloor(
   } catch { /* ignore */ }
 
   const isFloor = !floorOverride && stats !== null && stats.cv < oc.floorCvThreshold;
-  const asiProvesFloor = state.streak >= 20 && asi.floor;
 
   if (!isFloor && !asiProvesFloor) return null;
 
@@ -615,6 +635,70 @@ function checkParallelOpportunity(
   ].join("\n");
 }
 
+
+/**
+ * Classify the pattern of recent discard results.
+ * Domain-agnostic: uses RESULT patterns (convergence, repetition, no-info, divergence),
+ * not hypothesis keywords.
+ */
+function classifyStagnationPattern(state: ObserverState): { category: string; hint: string } {
+  const recent = state.recent.slice(-5);
+  if (recent.length < 3) return { category: "insufficient", hint: "" };
+
+  // no-info: discards without ASI findings
+  const noInfoCount = recent.filter((r) => {
+    const a = r.asi as Record<string, string | undefined> | undefined;
+    return !a?.finding && !a?.do_not_retry && !a?.learned;
+  }).length;
+  if (noInfoCount >= 3) {
+    return {
+      category: "no_info",
+      hint: "NO LEARNING: Recent discards have NO findings/do_not_retry in ASI. Each discard without a finding is a WASTED experiment. Record what you learned.",
+    };
+  }
+
+  // repetition: overlapping do_not_retry entries
+  const doNotRetryTexts = recent
+    .map((r) => { const a = r.asi as Record<string, string | undefined> | undefined; return a?.do_not_retry || ""; })
+    .filter((t) => t.length > 0);
+  if (doNotRetryTexts.length >= 3) {
+    const allWords = doNotRetryTexts.flatMap((t) => t.toLowerCase().split(/\W+/).filter((w) => w.length > 4));
+    const wordCounts = new Map<string, number>();
+    for (const w of allWords) wordCounts.set(w, (wordCounts.get(w) || 0) + 1);
+    const repeatedWords = [...wordCounts.entries()].filter(([_, c]) => c >= 3).map(([w]) => w);
+    if (repeatedWords.length >= 2) {
+      return {
+        category: "repetition",
+        hint: "REPETITION: Recent discards share do_not_retry themes: " + repeatedWords.slice(0, 5).join(", ") + ". You have learned this lesson already. Try FUNDAMENTALLY different.",
+      };
+    }
+  }
+
+  // convergence/divergence: metric variance patterns
+  const metrics = recent.map((r) => r.metric).filter((m) => m > 0);
+  if (metrics.length >= 4) {
+    const cv = coefficientOfVariation(metrics);
+    if (cv && cv.cv < 0.05) {
+      return { category: "convergence", hint: "CONVERGENCE: Metrics tightly clustered (CV=" + cv.cv.toFixed(3) + "). Performance floor for this approach." };
+    }
+    if (cv && cv.cv > 0.5) {
+      return { category: "divergence", hint: "ERRATIC: High variance (CV=" + cv.cv.toFixed(3) + "). Benchmark noisy - verify with multiple runs." };
+    }
+  }
+
+  return { category: "mixed", hint: "" };
+}
+
+
+/**
+ * Profiling gate: warn when recent experiments have no profiling data.
+ */
+function checkProfilingGate(state: ObserverState, asi: AsiFlags): string | null {
+  if (asi.profiled) return null;
+  if (state.streak < 3 || state.streak % 3 !== 0) return null;
+  return "PROFILING GATE: No profiling data in recent experiments. You are optimizing BLIND. Profile first (node --prof, console.time, cProfile, pprof), record findings in hypothesis.";
+}
+
 // ─── Trigger: Stagnation ───────────────────────────────────────────────────────
 
 function checkStagnation(
@@ -644,7 +728,9 @@ function checkStagnation(
   if (total > 0 && crashCount === total) {
     patternHint = "🔧 TECHNICAL: All recent runs CRASHED. Your code is breaking — fix stability before optimizing further.";
   } else if (total > 0 && discardCount === total) {
-    patternHint = "📉 DIRECTION: All recent runs DISCARDED. Your optimization approaches aren't working — change direction entirely.";
+    // Use result-pattern classification instead of generic "change direction"
+    const pattern = classifyStagnationPattern(state);
+    patternHint = pattern.hint || "DIRECTION: All recent runs DISCARDED. Change direction entirely.";
   } else if (total > 0 && keepCount === total) {
     patternHint = "⚠️  SELECTIVITY: All recent runs KEPT but none improved the metric. You may be accepting changes that don't help — be more selective.";
   } else {
@@ -653,7 +739,7 @@ function checkStagnation(
 
   // ASI-aware: if agent proved floor/exhaustion, skip generic advice
   if (asi.floor || asi.exhausted) {
-    if (oc.stagnationFinalizeEnabled) {
+    if (oc.stagnationFinalizeEnabled && oc.finalizeRecommendations) {
       return `🔄 STAGNATION: No metric improvement in ${state.streak} runs.
 
 ⚠️  ASI CONTEXT: Your recent log entries already contain proof that further
@@ -894,12 +980,16 @@ export function runObserver(payload: ObserverPayload): string | null {
   const parallelSteer = checkParallelOpportunity(state, payload, cwd, oc);
   if (parallelSteer) return parallelSteer;
 
+  // 3b. Profiling gate (warn when optimizing blind)
+  const profilingSteer = checkProfilingGate(state, asi);
+  if (profilingSteer) return profilingSteer;
+
   // 4. Stagnation (actionable: reflection + escalation hints)
   const stagnationSteer = checkStagnation(state, asi, payload, cwd, oc);
   if (stagnationSteer) return stagnationSteer;
 
   // 5. Floor detection (objective limit — now checks untried ideas, P1-2)
-  if (oc.floorDetectionEnabled) {
+  if (oc.floorDetectionEnabled && oc.finalizeRecommendations) {
     const floorSteer = checkFloor(state, asi, payload, cwd, oc);
     if (floorSteer) return floorSteer;
   }
@@ -909,7 +999,7 @@ export function runObserver(payload: ObserverPayload): string | null {
   if (progressSteer) return progressSteer;
 
   // 7. Finalize (fallback — lowest priority; agent self-assessment)
-  if (oc.finalizeEnabled) {
+  if (oc.finalizeEnabled && oc.finalizeRecommendations) {
     const finalizeSteer = checkFinalize(allEntries, oc, state, ideasPath);
     if (finalizeSteer) return finalizeSteer;
   }
