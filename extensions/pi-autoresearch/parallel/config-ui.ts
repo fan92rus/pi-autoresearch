@@ -355,6 +355,9 @@ const OBSERVER_TOGGLES: ObserverToggle[] = [
   { key: "stagnation_finalize_enabled", label: "Stagnation finalize hints", labelRu: "Подсказки финализации в стагнации",
     description: "Enable finalize hints inside stagnation escalations (ASI floor/exhausted, critical level). Disable to keep stagnation advice actionable without stop recommendations.",
     descriptionRu: "Включить подсказки о финализации внутри эскалаций стагнации (ASI пол/истощение, критический уровень). Отключите, чтобы стагнация давала actionable-советы без рекомендации остановиться." },
+  { key: "finalize_recommendations", label: "Finalize recommendations (master switch)", labelRu: "Рекомендации финализации (общий выключатель)",
+    description: "Master switch for ALL finalize/floor recommendations. When off, agent keeps trying variants without stop suggestions. Useful for exhaustive exploration.",
+    descriptionRu: "Общий выключатель для ВСЕХ рекомендаций финализации/пола. Когда выключено, агент продолжает пробовать варианты без предложений остановиться. Полезно для исчерпывающего исследования." },
 ];
 
 async function configureObserverToggles(ctx: ConfigCtx, workDir: string): Promise<boolean> {
