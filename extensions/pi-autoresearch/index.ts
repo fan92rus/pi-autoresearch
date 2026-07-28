@@ -2050,7 +2050,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             if (!tree) {
               return [theme.fg("dim", "🌳 Failed to load tree")];
             }
-            const treeStr = renderTree(tree);
+            const treeStr = renderTree(tree, 60, 3, 7);
             return treeStr.split("\n").map((line) => truncateToWidth(line, safeWidth, "…", true));
           }
 
@@ -5045,7 +5045,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       } else {
         // Tree + UCB1 (summary or full)
-        text += renderTree(tree);
+        text += renderTree(tree, 60, 3, 7);
 
         // UCB1 suggestions
         if (ranked.length > 0) {

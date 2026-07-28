@@ -35,6 +35,30 @@ const STATUS_ICONS: Record<string, string> = {
 };
 
 /**
+ * Get recent-subtree view: last N branches from root, at most M nodes per branch.
+ * Returns { rootChildren (filtered), hiddenBranches, nodesPerBranchLimit }.
+ */
+function getRecentView(
+  tree: ExperimentTree,
+  maxBranches: number,
+  nodesPerBranch: number,
+): { rootChildren: string[]; hiddenBranches: number; nodeLimit: number } {
+  const root = tree.nodes[tree.rootId];
+  if (!root) return { rootChildren: [], hiddenBranches: 0, nodeLimit: nodesPerBranch };
+
+  const allChildren = root.children;
+  if (allChildren.length <= maxBranches) {
+    return { rootChildren: allChildren, hiddenBranches: 0, nodeLimit: nodesPerBranch };
+  }
+
+  return {
+    rootChildren: allChildren.slice(-maxBranches),
+    hiddenBranches: allChildren.length - maxBranches,
+    nodeLimit: nodesPerBranch,
+  };
+}
+
+/**
  * Format a metric value for display.
  */
 function formatMetric(value: number, unit: string): string {
@@ -115,7 +139,12 @@ export function findBestNodeId(tree: ExperimentTree): string | null {
  * Render the full tree as ASCII art.
  * Returns a string ready for TUI display.
  */
-export function renderTree(tree: ExperimentTree, maxLines: number = 60): string {
+export function renderTree(
+  tree: ExperimentTree,
+  maxLines: number = 60,
+  maxBranches?: number,
+  nodesPerBranch?: number,
+): string {
   const bestId = findBestNodeId(tree);
   const lines: string[] = [];
   const push = (s: string) => { if (lines.length < maxLines) lines.push(s); };
@@ -138,7 +167,21 @@ export function renderTree(tree: ExperimentTree, maxLines: number = 60): string 
   for (const node of Object.values(tree.nodes)) {
     if (node.depth > maxDepth) maxDepth = node.depth;
   }
-  lines.push(`Nodes: ${nodeCount}  Depth: ${maxDepth}  Active: ${tree.activeNodeId}`);
+
+  // Compute branch truncation when tree is large
+  const effMaxBranches = maxBranches && maxBranches > 0 ? maxBranches : 0;
+  const effNodesPerBranch = nodesPerBranch && nodesPerBranch > 0 ? nodesPerBranch : 0;
+  const truncateBranches = effMaxBranches > 0 && root.children.length > effMaxBranches;
+  const truncateDepth = effNodesPerBranch > 0;
+  const recentView = truncateBranches
+    ? getRecentView(tree, effMaxBranches, effNodesPerBranch)
+    : null;
+
+  if (recentView) {
+    lines.push(`Nodes: ${nodeCount}  Depth: ${maxDepth}  Active: ${tree.activeNodeId}  (showing last ${root.children.slice(-effMaxBranches).length} of ${root.children.length} branches)`);
+  } else {
+    lines.push(`Nodes: ${nodeCount}  Depth: ${maxDepth}  Active: ${tree.activeNodeId}`);
+  }
   lines.push("");
 
   // Consecutive discard count (for collapse heuristic)
@@ -150,13 +193,15 @@ export function renderTree(tree: ExperimentTree, maxLines: number = 60): string 
     return c;
   }
 
-  // Iterative DFS stack: [nodeId, indent, isLast, isRoot]
-  const stack: Array<[string, string, boolean, boolean]> = [[tree.rootId, "", true, true]];
+  // Iterative DFS stack: [nodeId, indent, isLast, isRoot, depthFromBranch]
+  const stack: Array<[string, string, boolean, boolean, number]> = [[tree.rootId, "", true, true, 0]];
   let hiddenCount = 0;
   let hiddenSubtree = false;
+  let hiddenBranchesLines = 0;
+  let hiddenNodesInBranch = 0;
 
   while (stack.length > 0) {
-    const [nodeId, indent, isLast, isRoot] = stack.pop()!;
+    const [nodeId, indent, isLast, isRoot, depthFromBranch] = stack.pop()!;
     if (hiddenSubtree) { hiddenCount++; continue; }
 
     const node = tree.nodes[nodeId];
@@ -183,10 +228,38 @@ export function renderTree(tree: ExperimentTree, maxLines: number = 60): string 
     const line = renderNodeLine(node, tree, indent, isLast, isBest, isActive, isRoot);
     push(line);
 
-    // Push children in reverse order for correct visual ordering
-    const children = node.children.map((id) => tree.nodes[id]).filter(Boolean);
+    // Determine children to show: root-level truncation via recentView
+    let children: TreeNode[];
+    if (isRoot && recentView) {
+      children = recentView.rootChildren.map((id) => tree.nodes[id]).filter(Boolean) as TreeNode[];
+    } else {
+      children = node.children.map((id) => tree.nodes[id]).filter(Boolean) as TreeNode[];
+    }
+
     if (children.length > 0) {
       const remaining = maxLines - lines.length;
+
+      // Nodes-per-branch limit: if root node and recentView, compute hidden sibling branches
+      if (isRoot && recentView && recentView.hiddenBranches > 0) {
+        const childIndent = indent + SYMBOLS.emptyIndent;
+        if (remaining >= 2) {
+          push(`${childIndent}${SYMBOLS.branch}(… ${recentView.hiddenBranches} older branches hidden)`);
+          hiddenBranchesLines++;
+        }
+      }
+
+      // Apply nodesPerBranch limit at each branch level
+      if (truncateDepth && !isRoot && depthFromBranch >= effNodesPerBranch) {
+        // Count how many nodes in this subtree are being hidden
+        let hiddenSub = 0;
+        const countSub = (id: string) => { hiddenSub++; const n = tree.nodes[id]; if (n) for (const c of n.children) countSub(c); };
+        for (const ch of children) countSub(ch.id);
+        hiddenNodesInBranch += hiddenSub;
+        const prefix = indent + (isLast ? SYMBOLS.emptyIndent : SYMBOLS.verticalIndent);
+        push(`${prefix}${SYMBOLS.lastBranch}(… ${hiddenSub} deeper nodes in this branch)`);
+        continue; // don't push children
+      }
+
       if (remaining < 2 && !isRoot) {
         // Collapse all children
         let totalKids = 0;
@@ -199,17 +272,28 @@ export function renderTree(tree: ExperimentTree, maxLines: number = 60): string 
         for (let i = children.length - 1; i >= 0; i--) {
           const childIsLast = i === children.length - 1;
           const childIndent = indent + (isLast ? SYMBOLS.emptyIndent : SYMBOLS.verticalIndent);
-          stack.push([children[i].id, childIndent, childIsLast, false]);
+          const childDepth = isRoot ? 1 : depthFromBranch + 1;
+          stack.push([children[i].id, childIndent, childIsLast, false, childDepth]);
         }
       }
     }
   }
 
+  // Footer: show collapse/truncation summary
+  const footNotes: string[] = [];
   if (hiddenCount > 0) {
-    const warning = hiddenCount > 1
-      ? `  (${hiddenCount} nodes hidden due to collapse)`
-      : `  (1 node hidden due to collapse)`;
-    push(warning);
+    footNotes.push(hiddenCount > 1
+      ? `${hiddenCount} nodes hidden (collapse)`
+      : `1 node hidden (collapse)`);
+  }
+  if (hiddenBranchesLines > 0) {
+    footNotes.push(`${hiddenBranchesLines} branch${hiddenBranchesLines > 1 ? "es" : ""} hidden`);
+  }
+  if (hiddenNodesInBranch > 0) {
+    footNotes.push(`${hiddenNodesInBranch} nodes hidden (depth limit)`);
+  }
+  if (footNotes.length > 0) {
+    push(`  (${footNotes.join("; ")})`);
   }
 
   // Legend
