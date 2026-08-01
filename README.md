@@ -401,6 +401,14 @@ Autoresearch loops run autonomously and can burn through tokens. Two ways to cap
    }
    ```
 
+## Development
+
+Run the test suite with:
+
+```bash
+npm test
+```
+
 ## License
 
 MIT
