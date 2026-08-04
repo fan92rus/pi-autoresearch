@@ -3,3 +3,6 @@
 .dolt/
 *.db
 .beads-credential-key
+.agile/
+.pi-subagents/
+node_modules/

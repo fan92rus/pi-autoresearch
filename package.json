@@ -45,6 +45,8 @@
     "package.json"
   ],
   "scripts": {
-    "test": "node --experimental-strip-types --test tests/*.test.mjs"
+    "test": "node --experimental-strip-types --test tests/*.test.mjs",
+    "test:core": "node --experimental-strip-types --test tests/aggregate.test.mjs tests/cpu.test.mjs tests/observer.test.mjs tests/orthogonal.test.mjs tests/phases.test.mjs tests/rpc.test.mjs",
+    "test:ext": "node --experimental-strip-types --experimental-loader ./tests/redirect-loader.mjs --test tests/smoke.test.mjs tests/pbt.test.mjs"
   }
 }

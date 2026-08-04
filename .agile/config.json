@@ -3,5 +3,5 @@
     "worker": "opencode-go/deepseek-v4-flash"
   },
   "observer_enabled": true,
-  "agile_mode": true
+  "agile_mode": false
 }
