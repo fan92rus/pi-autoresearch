@@ -1,0 +1,17 @@
+{
+  "name": "pi-extension-testkit",
+  "version": "0.1.0",
+  "description": "Shared test infrastructure for pi extensions: PBT harness, fake-pi skeleton, typebox stubs, redirect loader.",
+  "type": "module",
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./pbt": "./src/pbt.mjs",
+    "./typebox-stub": "./src/typebox-stub.mjs",
+    "./event-bus": "./src/event-bus.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}
