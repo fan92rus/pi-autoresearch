@@ -374,6 +374,19 @@ async function test(name, fn) {
   }
 }
 
+/**
+ * forAll swallows per-seed failures (it prints ❌ and returns a summary) —
+ * without a check the whole scenario would be a FALSE GREEN. This wrapper
+ * turns any failing seed into a thrown error so the suite actually fails.
+ */
+async function runPbt(opts) {
+  const res = await forAll(opts);
+  if (res.pbtFail > 0) {
+    throw new Error(`PBT ${opts.name}: ${res.pbtFail} failing seed(s) of ${opts.seeds ?? 25}`);
+  }
+  return res;
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // PBT scenarios
 // ──────────────────────────────────────────────────────────────────────
@@ -406,7 +419,7 @@ function pickAction(rng) {
 console.log("## PBT: state machine — core actions");
 
 await test("PBT init→propose→run→log preserves invariants", async () => {
-  await forAll({
+  await runPbt({
     seeds: 20,
     maxActions: 30,
     name: "core-lifecycle",
@@ -437,7 +450,7 @@ await test("PBT init→propose→run→log preserves invariants", async () => {
 console.log("\n## PBT: corruption resilience");
 
 await test("PBT corrupt log/tree doesn't crash next tool call", async () => {
-  await forAll({
+  await runPbt({
     seeds: 10,
     maxActions: 15,
     name: "corruption",
@@ -481,7 +494,7 @@ await test("PBT corrupt log/tree doesn't crash next tool call", async () => {
 console.log("\n## PBT: hooks");
 
 await test("PBT before_agent_start + agent_end don't crash under random sequences", async () => {
-  await forAll({
+  await runPbt({
     seeds: 10,
     maxActions: 20,
     name: "hooks",
@@ -514,7 +527,7 @@ await test("PBT before_agent_start + agent_end don't crash under random sequence
 console.log("\n## PBT: propose sequences");
 
 await test("PBT multiple proposals maintain tree consistency", async () => {
-  await forAll({
+  await runPbt({
     seeds: 15,
     maxActions: 25,
     name: "multi-propose",
@@ -548,7 +561,7 @@ await test("PBT multiple proposals maintain tree consistency", async () => {
 console.log("\n## PBT: re-init sequences");
 
 await test("PBT re-init resets tree but preserves invariants", async () => {
-  await forAll({
+  await runPbt({
     seeds: 10,
     maxActions: 20,
     name: "re-init",
@@ -584,7 +597,7 @@ await test("PBT re-init resets tree but preserves invariants", async () => {
 console.log("\n## PBT: finalize sequences");
 
 await test("PBT finalize doesn't break subsequent operations", async () => {
-  await forAll({
+  await runPbt({
     seeds: 10,
     maxActions: 15,
     name: "finalize",
