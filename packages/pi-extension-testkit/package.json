@@ -8,7 +8,8 @@
     ".": "./src/index.mjs",
     "./pbt": "./src/pbt.mjs",
     "./typebox-stub": "./src/typebox-stub.mjs",
-    "./event-bus": "./src/event-bus.mjs"
+    "./event-bus": "./src/event-bus.mjs",
+    "./loader": "./src/loader.mjs"
   },
   "engines": {
     "node": ">=22"
