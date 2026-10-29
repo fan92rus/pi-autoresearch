@@ -253,7 +253,10 @@ export function makeCtx(dir, sessionId, piRef) {
     cwd: dir,
     sessionManager,
     ui: {
-      notify() {},
+      // Route to pi.notifications so tests can assert user-facing notifies.
+      notify(text, type) {
+        piRef?.notifications.push({ text, type });
+      },
       setWidget() {},
       input: async () => "",
       select: async () => "",

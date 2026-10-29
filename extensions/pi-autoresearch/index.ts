@@ -223,6 +223,8 @@ interface LogDetails {
   experiment: ExperimentResult;
   state: ExperimentState;
   wallClockSeconds: number | null;
+  /** "measured" | "wallclock" | "manual" | "unmeasured" — how params.metric relates to the last run_experiment measurement. */
+  metricProvenance?: string;
 }
 
 interface AutoresearchRuntime {
@@ -241,6 +243,12 @@ interface AutoresearchRuntime {
   phaseStore: ReturnType<typeof newPhaseStore>;
   /** TUI view mode: 'list' (dashboard table) or 'tree' (experiment tree). Toggle with Tab. */
   treeViewMode: boolean;
+  /** True when the current turn used a loop tool (run_experiment/log_experiment/propose_hypothesis/parallel tools). Reset in before_agent_start; read by agent_end drift policy. */
+  lastTurnUsedExperimentTools: boolean;
+  /** Consecutive settled turns that did no loop work and were nudged. After MAX_CONSECUTIVE_DRIFT_RESUMES the loop stops instead of nudging again (anti chat-loop bound, goal-x pattern). Reset whenever a loop tool fires. */
+  consecutiveDriftResumes: number;
+  /** What run_experiment actually measured last: parsed primary metric (or null if no METRIC line) + wall-clock fallback. Reset to null on init/compact. Read by log_experiment to flag agent-claimed metrics. */
+  lastMeasurement: { primary: number | null; wallClockSeconds: number } | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1331,6 +1339,9 @@ function createSessionRuntime(): AutoresearchRuntime {
     pendingResumeMessage: null,
     phaseStore: newPhaseStore(),
     treeViewMode: false,
+    lastTurnUsedExperimentTools: false,
+    consecutiveDriftResumes: 0,
+    lastMeasurement: null,
   };
 }
 
@@ -1664,6 +1675,12 @@ function renderDashboardLines(
 
 export default function autoresearchExtension(pi: ExtensionAPI) {
   const MAX_AUTORESUME_TURNS = 300;
+  // Parallel in-process tools (BestOfN, phases, valleyProbe, CheckOrthogonal,
+  // SpaceSearch) are disabled for now — the owner doesn't use them. Flip to
+  // true to re-register them; also re-add their names to EXPERIMENT_LOOP_TOOLS
+  // and to the smoke EXPECTED_TOOLS list.
+  const PARALLEL_TOOLS_ENABLED = false;
+
   const BENCHMARK_GUARDRAIL =
     "Be careful not to overfit to the benchmarks and do not cheat on the benchmarks.";
 
@@ -1679,6 +1696,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // Outlasts pi's internal retry (setTimeout 0) and compaction-continue
   // (setTimeout 100); see badlogic/pi-mono#2023, #2110.
   const SETTLED_WINDOW_MS = 800;
+  /** Bounded drift-resume (goal-x anti-chat-loop pattern): after this many consecutive no-loop-work turns the loop stops and the user is notified instead of nudged again. */
+  const MAX_CONSECUTIVE_DRIFT_RESUMES = 2;
   const shortcuts = resolveAutoresearchShortcuts();
 
   // The widget shows the first hint that fits its width, so a configured
@@ -1805,6 +1824,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   // Why the experiment gate: a chat-only turn would otherwise loop forever,
   // because every agent_end would re-prompt the agent, which would chat again.
+  // The unbounded-chat case is now handled by the bounded drift-resume policy
+  // in agent_end (MAX_CONSECUTIVE_DRIFT_RESUMES), not by silence.
   const shouldAutoResumeAfterTurn = (runtime: AutoresearchRuntime): boolean =>
     runtime.autoresearchMode && hasRunExperimentsThisSession(runtime);
 
@@ -1819,6 +1840,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return [
       "Run the next iteration now.",
       "Use the persisted autoresearch state as needed, pick the most promising hypothesis, then call run_experiment + log_experiment.",
+      BENCHMARK_GUARDRAIL,
+    ].join(" ");
+  };
+
+  /** Corrective resume for a settled turn that did no loop work (bounded — see MAX_CONSECUTIVE_DRIFT_RESUMES). */
+  const composeDriftResumeMessage = (): string => {
+    return [
+      "⚠ Last turn used no experiment tools (chat/reads don't advance the loop).",
+      "Resume the cycle now: propose_hypothesis → run_experiment → log_experiment.",
       BENCHMARK_GUARDRAIL,
     ].join(" ");
   };
@@ -1958,6 +1988,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     runtime.runningExperiment = null;
     runtime.experimentsThisSession = 0;
     runtime.autoResumeTurns = 0;
+    runtime.lastMeasurement = null;
     runtime.state = createExperimentState();
 
     let state = runtime.state;
@@ -2053,7 +2084,25 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     if (state.results.length === 0) {
       if (!runtime.runningExperiment) {
-        ctx.ui.setWidget("autoresearch", undefined);
+        // Mode is active but nothing logged yet: show a starter widget instead of
+        // clearing, so the user can SEE that autoresearch is on (adopted from
+        // pi-goal-x: the widget is the always-visible sign of a live extension).
+        ctx.ui.setWidget("autoresearch", (tui, theme) => ({
+          render(width: number): string[] {
+            const safeWidth = Math.max(1, width || getTuiSize(tui).width);
+            const line = joinPartsToWidth(
+              [
+                theme.fg("accent", "🔬"),
+                state.name ? theme.fg("dim", ` │ ${state.name}`) : "",
+                theme.fg("dim", " │ 0 runs — waiting for baseline"),
+                theme.fg("dim", " │ init_experiment → run_experiment → log_experiment"),
+              ],
+              safeWidth
+            );
+            return [line];
+          },
+          invalidate(): void {},
+        }));
         return;
       }
 
@@ -2178,13 +2227,61 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const runtime = getRuntime(ctx);
     runtime.runningExperiment = null;
     if (overlayTui) overlayTui.requestRender();
+
+    // Per-turn gate semantics: agent_start reset experimentsThisSession, so at
+    // settle time > 0 means THIS turn logged an experiment → plain resume.
+    // With 0, the plain gate would end the loop silently on a drifted turn —
+    // instead: partial-cycle turns get a plain push, drifted turns get a
+    // corrective resume, bounded (goal-x anti-chat-loop pattern).
+    if (runtime.autoresearchMode && runtime.experimentsThisSession === 0 && !hasPendingResume(runtime)) {
+      const stopReason = autoResumeStopReasonFor(runtime);
+      if (stopReason !== null) {
+        notifyAutoResumeLimitReached(ctx, stopReason);
+        return;
+      }
+      if (runtime.lastTurnUsedExperimentTools) {
+        // Partial cycle (hypothesis registered, experiment running, branch ops):
+        // push forward without a drift accusation.
+        ensurePendingResume(ctx, () => true);
+        return;
+      }
+      if (runtime.consecutiveDriftResumes < MAX_CONSECUTIVE_DRIFT_RESUMES) {
+        runtime.consecutiveDriftResumes++;
+        markAutoResumeSent(runtime);
+        schedulePendingResume(ctx, runtime, composeDriftResumeMessage());
+        return;
+      }
+      ctx.ui.notify(
+        "Autoresearch paused — the last turns did no experiment work (no run_experiment/log_experiment). Run /autoresearch <goal> to resume the loop.",
+        "info",
+      );
+      return;
+    }
+
     ensurePendingResume(ctx, shouldAutoResumeAfterTurn);
+  });
+
+  // Track whether the in-flight turn does real loop work (goal-x pattern:
+  // the settled-turn drift policy reads this). Tree ops count: they advance
+  // the loop even before a run lands. Parallel tools are disabled
+  // (PARALLEL_TOOLS_ENABLED) — re-add their names here when re-enabled.
+  const EXPERIMENT_LOOP_TOOLS = new Set([
+    "run_experiment", "log_experiment", "propose_hypothesis", "init_experiment",
+    "explore_from", "restore_main", "compose", "finalize_research",
+  ]);
+  pi.on("tool_execution_end", async (event, ctx) => {
+    if (!EXPERIMENT_LOOP_TOOLS.has(event.toolName)) return;
+    const runtime = getRuntime(ctx);
+    runtime.lastTurnUsedExperimentTools = true;
+    runtime.consecutiveDriftResumes = 0;
   });
 
   // When in autoresearch mode, add a static note to the system prompt.
   // Only a short pointer — no file content, fully cache-safe.
   pi.on("before_agent_start", async (event, ctx) => {
     const runtime = getRuntime(ctx);
+    // Per-turn loop-tool tracking: fresh turn starts with no loop work done.
+    runtime.lastTurnUsedExperimentTools = false;
     if (!runtime.autoresearchMode) return;
 
     const workDir = resolveWorkDir(ctx.cwd);
@@ -2195,103 +2292,45 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const checksPath = autoresearchChecksPath(workDir);
     const hasChecks = fs.existsSync(checksPath);
 
+    // Compact, imperative, consequence-framed (adopted from pi-goal-x):
+    // every line targets one observable anti-pattern. Declares that a run
+    // outside the run_experiment+log_experiment cycle does not exist.
     let extra =
       "\n\n## Autoresearch Mode (ACTIVE)" +
-      "\nYou are in autoresearch mode. Optimize the primary metric through an autonomous experiment loop." +
-      "\nUse init_experiment, run_experiment, and log_experiment tools. NEVER STOP until interrupted." +
-      `\nExperiment rules: ${mdPath} — read this file at the start of every session and after compaction.` +
-      "\nWrite promising but deferred optimizations as files in .auto/ideas/ (one .md per idea) — don't let good ideas get lost." +
-      `\n${BENCHMARK_GUARDRAIL}` +
-      "\nIf the user sends a follow-on message while an experiment is running, finish the current run_experiment + log_experiment cycle first, then address their message in the next iteration." +
-      "\n\n## Experiment Protocol (MANDATORY — follow for EVERY iteration)" +
-      "\n  1. HYPOTHESIS — What will you change and WHY? What do you EXPECT?" +
-      "\n     Example: \"Replace array.indexOf with Set → expect Op1 O(n²)→O(n), ~30% gain\"" +
-      "\n  2. EDIT — Make the code change." +
-      "\n  3. SMOKE TEST — Quick sanity check (NOT a full benchmark):" +
-      "\n     - Run on tiny input or `node -e \"require('./module')\"` to verify no crashes." +
-      "\n     - If broken → DEBUG, fix, re-smoke-test. Do NOT proceed to full experiment with broken code." +
-      "\n  4. EXPERIMENT — run_experiment (full benchmark measurement)." +
-      "\n  5. DECISION GATE — Answer ALL before logging:" +
-      "\n     - Metric value: ___" +
-      "\n     - Current best: ___ → Better? Yes/No (state the delta)" +
-      "\n     - Did checks pass? Yes/No" +
-      "\n     - What did you LEARN? (1-2 sentences — even if the experiment failed)" +
-      "\n  6. LOG — log_experiment with status: keep/discard/crash." +
-      "\n     ⛔ NEVER skip this step. Every run_experiment MUST be logged." +
-      "\n  7. NEXT — Updated hypothesis based on what you learned." +
-      "\n     If stuck (3+ non-improving runs) → check .auto/ideas/ for alternative directions." +
-      "\n\n## Parallel Toolkit (CURRENTLY DISABLED — will be re-enabled in a future version)" +
-      "\nYou have parallel tools that test N hypotheses SIMULTANEOUSLY in isolated worktrees." +
-      "\nGoing parallel is almost always better than sequential trial-and-error when you have multiple ideas." +
-      "\n" +
-      "\nWHEN TO GO PARALLEL:" +
-      "\n  • 2+ ideas in .auto/ideas/ → BestOfN (test all at once, keep the best)" +
-      "\n  • 3+ sequential discards → BestOfN (try 3 different approaches in parallel)" +
-      "\n  • Optimization requires getting WORSE first (refactor, algorithm swap) → startPhase" +
-      "\n  • Stuck in a local optimum during a phase → valleyProbe (parallel escape attempts)" +
-      "\n  • Multimodal landscape (many strategies to try) → SpaceSearch beam search" +
-      "\n  • 2+ independent file-scoped optimizations → CheckOrthogonal (stack them)" +
-      "\n" +
-      "\nQUICK START — BestOfN with 3 hypotheses:" +
-      "\n  BestOfN({ candidates: [" +
-      "\n    {hypothesis:\"idea 1...\", complexity:\"simple\"}," +
-      "\n    {hypothesis:\"idea 2...\", complexity:\"simple\"}," +
-      "\n    {hypothesis:\"idea 3...\", complexity:\"simple\"}," +
-      "\n  ], metric_name:\"<your_metric>\", direction:\"lower\" })" +
-      "\n" +
-      "\nBestOfN handles everything: spawns workers, measures in isolated worktrees," +
-      "\nre-measures top candidates to eliminate selection bias, and returns keep/discard." +
-      "\nYou just call log_experiment with the result." +
+      "\nOptimize the primary metric through the experiment loop. Loop rules:" +
+      "\n- One idea = one cycle: propose_hypothesis \u2192 edit code \u2192 smoke test \u2192 run_experiment \u2192 log_experiment. A run that skipped run_experiment or log_experiment DOES NOT EXIST: it is not in the ledger, cannot be kept, and its edits are lost on the next revert." +
+      "\n- NEVER run the benchmark via bash: only run_experiment times the run, parses METRIC lines and updates the noise floor. Bash-run benchmarks are invisible to the ledger and corrupt the confidence score." +
+      "\n- Call log_experiment IMMEDIATELY after every run_experiment \u2014 keep/discard/crash/budget_exceeded, whatever the outcome. An unlogged run is wasted compute." +
+      "\n- Do not commit or revert manually: keep auto-commits; discard/crash/checks_failed auto-revert (autoresearch files preserved)." +
+      "\n- Experiment rules: " + mdPath + " \u2014 read at session start and after compaction. Ideas backlog: " + ideasPath + " \u2014 write promising deferred ideas there (one .md per idea)." +
+      "\n- " + BENCHMARK_GUARDRAIL +
+      "\n- Follow-on user message mid-experiment? Finish the current run_experiment + log_experiment cycle first, address it next iteration." +
+      "\n\n## Hypothesis-First Workflow (EVERY iteration)" +
+      "\n1. PROFILE FIRST \u2014 node --prof / console.time / --trace-deopt: find where time is actually spent. Do NOT guess. Record findings in the hypothesis." +
+      "\n2. propose_hypothesis(description) \u2192 node_id (SimHash + do_not_retry check). hypothesis_id is REQUIRED for all non-baseline runs." +
+      "\n3. EDIT the code for the hypothesis." +
+      "\n4. SMOKE TEST (tiny input / single import). Broken \u2192 fix first; do NOT benchmark broken code." +
+      "\n5. run_experiment(hypothesis_id, command, tight timeout_seconds) \u2014 full measurement." +
+      "\n6. DECISION GATE before logging: metric value? better/worse vs best (delta)? checks passed? what did you LEARN?" +
+      "\n7. log_experiment(hypothesis_id, metric, status, description=what happened/learned). \u26d4 NEVER skip \u2014 every run_experiment MUST be logged. Use the parsed METRIC values from run_experiment output, not hand-copied numbers." +
+      "\n8. NEXT hypothesis from what you learned; stuck 3+ non-improving runs \u2192 tree_status()." +
+      "\n\n## Tree Tools" +
+      "\ntree_status() \u2014 UCB1 suggestions and NEXT ACTION. explore_from(node_id) \u2014 backtrack (always restore_main() after). compose(a, b) \u2014 merge orthogonal branches." +
       "\n\n## Finalization" +
-      "\nIf you have PROVEN that further optimization is impossible or not worth the cost" +
-      "\n(mathematical floor, structural limit, noise floor reached, search space exhausted):" +
-      "\n  → Call finalize_research({ reason: \"...\", evidence: \"...\", confidence: 0.8 })" +
-      "\nThe observer will then recommend /autoresearch off. Do NOT grind indefinitely." +
-      "\n\n⚠ IMPORTANT: finalize_research is a RECOMMENDATION, not a stop. Only call it when" +
-      "\nyou have concrete PROOF (profiling, variance data, exhausted search space)." +
-      "\nA subjective \"this seems hard\" is NOT proof — try orthogonal approaches first." +
-      "\nIf you finalize prematurely and then" +
-      "\nfind an improvement, the observer will suppress the finalize signal automatically."
-    + "\nIf you continue working after finalize, the observer goes quiet — actionable"
-    + "\ntriggers (parallel opportunity, stagnation) will guide you instead."
-    + "\nThe finalize signal is the LOWEST priority steer: it only fires if nothing"
-    + "\nelse has concrete guidance." +
-      "\n\n## Observer Hooks" +
-      "\nIf you receive a 🔄 STAGNATION steer — STOP experimenting and REFLECT on the pattern." +
-      "\nIf you receive a 🎯 MILESTONE steer — Consider strategic alternatives and orthogonal directions." +
-      "\n\n## Rules" +
-      "\n⛔ NEVER call run_experiment without registering a hypothesis first (propose_hypothesis then hypothesis_id)." +
-      "\n⛔ NEVER skip log_experiment after run_experiment." +
-      "\n⛔ NEVER skip the smoke test — broken code wastes experiment time." +
-      "✅ Write promising but untried ideas to .auto/ideas/ — one .md file per idea (e.g. cache-ast-nodes.md).\nWhen you try an idea, add \"idea_id\": \"filename\" to the ASI in log_experiment — the file will be auto-removed so the untried count stays accurate." +
-      "\n\n## Experiment Tree" +
-      "\nEach experiment is recorded as a node in .auto/tree.json." +
-      "\n\n### Hypothesis-First Workflow (REQUIRED)" +
-      "\n1. PROFILE FIRST \u2014 use node --prof, console.time/timeEnd, or node --allow-natives-syntax --trace-deopt to find WHERE time is actually spent. Record findings in the hypothesis description. Do NOT guess.\n2. propose_hypothesis(description=\"...\") returns node_id. SimHash + do_not_retry check at registration." +
-      "\n3. EDIT THE CODE — implement the hypothesis in source files." +
-      "\n4. run_experiment(hypothesis_id=\"n6\", command=\"...\") runs the benchmark." +
-      "\n5. log_experiment(hypothesis_id=\"n6\", metric=..., status=\"keep\") records result." +
-      "\nIn log_experiment, description is a RESULT SUMMARY (what happened, what you learned). Do NOT repeat the hypothesis — it is already stored." +
-      "\nhypothesis_id is REQUIRED for all non-baseline experiments." +
-      "\n\n### Tree Tools" +
-      "\ntree_status() - view tree with UCB1 suggestions and NEXT ACTION." +
-      "\nexplore_from(node_id) - backtrack. Always call restore_main() after." +
-      "\nrestore_main() - return to main branch after explore_from." +
-      "\ncompose(node_a, node_b) - merge orthogonal diffs from different branches." +
-      "\nWhen you see many failures or stagnation, call tree_status() for suggestions.";
+      "\nfinalize_research({reason, evidence, confidence}) only with PROOF (mathematical floor, noise floor reached, search space exhausted). A subjective \u201cthis seems hard\u201d is NOT proof \u2014 try orthogonal approaches first. It is a RECOMMENDATION; the observer arbitrates and suppresses premature signals." +
+      "\n\n## Observer Steers" +
+      "\n\U0001f504 STAGNATION \u2014 STOP and REFLECT on the pattern. \U0001f3af MILESTONE \u2014 consider strategic alternatives and orthogonal directions.";
 
     if (hasChecks) {
       extra +=
         "\n\n## Backpressure Checks (ACTIVE)" +
-        `\n${checksPath} exists and runs automatically after every passing benchmark in run_experiment.` +
-        "\nIf the benchmark passes but checks fail, run_experiment will report it clearly." +
-        "\nUse status 'checks_failed' in log_experiment when this happens — it behaves like a crash (no commit, changes auto-reverted)." +
-        "\nYou cannot use status 'keep' when checks have failed." +
-        "\nThe checks execution time does NOT affect the primary metric.";
+        "\n" + checksPath + " runs automatically after every passing benchmark in run_experiment." +
+        "\nBenchmark passed but checks failed \u2192 run_experiment reports it; log status 'checks_failed' (behaves like a crash: no commit, changes auto-reverted; 'keep' is blocked)." +
+        "\nChecks execution time does NOT affect the primary metric.";
     }
 
     if (hasIdeas) {
-      extra += `\n\n💡 Ideas backlog exists at ${ideasPath} — check it for promising experiment paths. Prune stale entries.`;
+      extra += "\n\n\U0001f4a1 Ideas backlog exists at " + ideasPath + " \u2014 check it for promising experiment paths. Prune stale entries.";
     }
 
     return {
@@ -2346,6 +2385,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       state.name = params.name;
       state.metricName = params.metric_name;
       state.metricUnit = params.metric_unit ?? "";
+      // New segment = new measurement lineage: stale lastMeasurement must not
+      // bless the next baseline log as "measured".
+      runtime.lastMeasurement = null;
       if (params.direction === "lower" || params.direction === "higher") {
         state.bestDirection = params.direction;
       }
@@ -2706,7 +2748,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     promptSnippet:
       "Run a timed experiment command (captures duration, output, exit code)",
     promptGuidelines: [
-      "Use run_experiment instead of bash when running experiment commands — it handles timing and output capture automatically.",
+      "An experiment ONLY exists if it ran through run_experiment: bash-run benchmarks are invisible to the ledger, corrupt the noise floor, and their edits are lost on the next revert.",
       "Always pass a tight timeout_seconds (required). A runaway process will be force-killed at the limit and logged as 'crash'.",
       "After run_experiment, always call log_experiment to record the result.",
       "ALWAYS call propose_hypothesis BEFORE run_experiment to get a hypothesis_id. Pass hypothesis_id to both run_experiment and log_experiment.",
@@ -3122,6 +3164,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         metricUnit: state.metricUnit,
       };
 
+      // Honest-metric provenance: remember what run_experiment actually measured,
+      // so log_experiment can flag hand-copied or invented numbers (goal-x
+      // pattern: the claim is untrusted, the measurement is the evidence).
+      runtime.lastMeasurement = { primary: parsedPrimary, wallClockSeconds: durationSeconds };
+
       // Build LLM response
       let text = "";
       if (details.budgetExceeded) {
@@ -3368,6 +3415,36 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const workDir = resolveWorkDir(ctx.cwd);
       const secondaryMetrics = params.metrics ?? {};
 
+      // Honest-metric provenance (goal-x pattern: agent claims are untrusted,
+      // the run_experiment measurement is the evidence). Only statuses that
+      // carry a real measurement are checked; crash/budget/explore are exempt.
+      const provenanceChecked = params.status === "keep" || params.status === "discard" || params.status === "checks_failed";
+      let metricProvenance: string | undefined;
+      let provenanceNote = "";
+      if (provenanceChecked) {
+        const measurement = runtime.lastMeasurement;
+        if (!measurement) {
+          metricProvenance = "unmeasured";
+          provenanceNote = "\n⚠ METRIC PROVENANCE: no run_experiment measurement found this session — this value is agent-claimed, NOT measured. Re-run via run_experiment; unmeasured keeps are not trustworthy.";
+        } else if (measurement.primary !== null) {
+          const tolerance = Math.max(1e-9, Math.abs(measurement.primary) * 0.005);
+          if (Math.abs(params.metric - measurement.primary) <= tolerance) {
+            metricProvenance = "measured";
+          } else {
+            metricProvenance = "manual";
+            provenanceNote = `\n⚠ METRIC PROVENANCE: logged ${params.metric} differs from the measured ${measurement.primary} (${state.metricName}). The measured value is the evidence — this entry is flagged manual; use the parsed METRIC value run_experiment gave you.`;
+          }
+        } else {
+          // Run happened but no METRIC line was parsed; wall-clock fallback.
+          if (Math.abs(params.metric - measurement.wallClockSeconds) <= 2) {
+            metricProvenance = "wallclock";
+          } else {
+            metricProvenance = "manual";
+            provenanceNote = `\n⚠ METRIC PROVENANCE: run_experiment parsed no METRIC line and ${params.metric} ≠ wall-clock ${measurement.wallClockSeconds.toFixed(1)}s — value is agent-claimed, flagged manual. Print 'METRIC ${state.metricName}=<value>' from the benchmark.`;
+          }
+        }
+      }
+
       // Gate: prevent "keep" when last run's checks failed
       if (params.status === "keep" && runtime.lastRunChecks && !runtime.lastRunChecks.pass) {
         return {
@@ -3594,6 +3671,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
+      if (provenanceNote) {
+        text += provenanceNote;
+      }
+
       text += `\n(${segmentCount} experiments`;
       if (state.maxExperiments !== null) {
         text += ` / ${state.maxExperiments} max`;
@@ -3651,6 +3732,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         ...experiment,
       };
       if (!mergedASI) delete jsonlEntry.asi;
+      if (metricProvenance && metricProvenance !== "measured") jsonlEntry.mprov = metricProvenance;
       const jsonlLine = JSON.stringify(jsonlEntry);
 
       try {
@@ -3791,6 +3873,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           experiment: { ...experiment, metrics: { ...experiment.metrics } },
           state: cloneExperimentState(state),
           wallClockSeconds,
+          metricProvenance,
         } as LogDetails,
       };
     },
@@ -4345,7 +4428,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return { stdout: r.stdout ?? "", stderr: r.stderr ?? "", code: r.code, killed: !!r.killed };
   };
 
-  pi.registerTool({
+  if (PARALLEL_TOOLS_ENABLED) pi.registerTool({
     name: "BestOfN",
     label: "Best-of-N parallel hypotheses",
     description:
@@ -4397,7 +4480,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  if (PARALLEL_TOOLS_ENABLED) pi.registerTool({
     name: "startPhase",
     label: "Start a multi-step phase (valley crossing)",
     description:
@@ -4436,7 +4519,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  if (PARALLEL_TOOLS_ENABLED) pi.registerTool({
     name: "commitPhase",
     label: "Commit a multi-step phase",
     description:
@@ -4470,7 +4553,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  if (PARALLEL_TOOLS_ENABLED) pi.registerTool({
     name: "abortPhase",
     label: "Abort a multi-step phase",
     description: "Прервать фазу: revert к phaseBase/best-checkpoint без валидации финальной метрики.",
@@ -4488,7 +4571,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  if (PARALLEL_TOOLS_ENABLED) pi.registerTool({
     name: "valleyProbe",
     label: "Valley probe — escape a stuck phase",
     description:
@@ -4574,7 +4657,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     } catch { /* best-effort */ }
   }
 
-  pi.registerTool({
+  if (PARALLEL_TOOLS_ENABLED) pi.registerTool({
     name: "CheckOrthogonal",
     label: "Stack orthogonal patches",
     description:
@@ -4632,7 +4715,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
+  if (PARALLEL_TOOLS_ENABLED) pi.registerTool({
     name: "SpaceSearch",
     label: "Beam space search",
     description:
@@ -5567,6 +5650,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       recordAutoresearchActivation(workDir, true);
       setAutoresearchMode(ctx, true);
       runtime.autoResumeTurns = 0;
+      runtime.consecutiveDriftResumes = 0;
       const rulesLoaded = hasAutoresearchRules(ctx);
       // No .auto/prompt.md yet — load the create skill so the agent follows the
       // setup guidelines. `/skill:<name>` is expanded to the full SKILL.md when

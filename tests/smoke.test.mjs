@@ -68,35 +68,41 @@ console.log("## Smoke: real-extension registration");
 
 const EXPECTED_TOOLS = [
   "init_experiment", "propose_hypothesis", "run_experiment", "log_experiment",
-  "BestOfN", "startPhase", "commitPhase", "abortPhase", "valleyProbe",
-  "CheckOrthogonal", "SpaceSearch", "explore_from", "restore_main",
+  "explore_from", "restore_main",
   "tree_status", "compose", "finalize_research",
+];
+
+// Parallel tools (BestOfN, startPhase, commitPhase, abortPhase, valleyProbe,
+// CheckOrthogonal, SpaceSearch) are disabled via PARALLEL_TOOLS_ENABLED=false.
+const DISABLED_PARALLEL_TOOLS = [
+  "BestOfN", "startPhase", "commitPhase", "abortPhase", "valleyProbe",
+  "CheckOrthogonal", "SpaceSearch",
 ];
 
 const EXPECTED_HOOKS = [
   "session_start", "session_tree", "session_before_switch", "session_shutdown",
   "agent_start", "session_before_compact", "session_compact", "agent_end",
-  "before_agent_start",
+  "before_agent_start", "tool_execution_end",
 ];
 
-await test("registers all 16 tools", async () => {
+await test("registers all 9 tools (parallel disabled)", async () => {
   const dir = makeTempDir("reg");
   const { pi } = await loadExtension(dir);
   const names = pi.tools.map((t) => t.name);
   for (const expected of EXPECTED_TOOLS) {
     assert.ok(names.includes(expected), `Missing tool: ${expected}`);
   }
-  assert.strictEqual(names.length, 16, `Expected 16 tools, got ${names.length}: ${names.join(", ")}`);
+  assert.strictEqual(names.length, 9, `Expected 9 tools, got ${names.length}: ${names.join(", ")}`);
 });
 
-await test("registers all 9 hooks", async () => {
+await test("registers all 10 hooks", async () => {
   const dir = makeTempDir("hooks");
   const { pi } = await loadExtension(dir);
   const names = [...pi.hooks.keys()];
   for (const expected of EXPECTED_HOOKS) {
     assert.ok(names.includes(expected), `Missing hook: ${expected}`);
   }
-  assert.strictEqual(names.length, 9, `Expected 9 hooks, got ${names.length}`);
+  assert.strictEqual(names.length, 10, `Expected 10 hooks, got ${names.length}`);
 });
 
 await test("registers /autoresearch command", async () => {
@@ -265,6 +271,38 @@ await test("agent_end hook runs without crash", async () => {
   assert.ok(true, "agent_end ran without crash");
 });
 
+await test("drifted turns get bounded corrective resumes, then pause", async () => {
+  const dir = makeTempDir("drift");
+  initGitRepo(dir);
+  const { pi, tool, command, hook, ctx } = await loadExtension(dir);
+  await command("autoresearch").handler("on", ctx);
+  await tool("init_experiment").execute("id", {
+    name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower",
+  }, null, null, ctx);
+
+  // Simulate pure-chat turns: before_agent_start (flag reset) → agent_end with
+  // no loop-tool activity in between (no tool_execution_end events).
+  const settle = async () => {
+    await hook("before_agent_start")({ systemPrompt: "x" }, ctx);
+    await hook("agent_end")({ messages: [] }, ctx);
+    await new Promise((r) => setTimeout(r, 1000)); // SETTLED_WINDOW_MS = 800
+  };
+
+  await settle();
+  const nudges = () => pi.sentMessages.filter((m) => m.text.includes("used no experiment tools"));
+  assert.strictEqual(nudges().length, 1, `first drift should nudge, sent: ${pi.sentMessages.map((m) => m.text.slice(0, 60)).join(" | ")}`);
+
+  await settle();
+  assert.strictEqual(nudges().length, 2, "second drift should nudge again");
+
+  await settle();
+  assert.strictEqual(nudges().length, 2, "third drift must NOT nudge (bounded)");
+  assert.ok(
+    pi.notifications.some((n) => n.text.includes("Autoresearch paused")),
+    `user should be notified of the pause, got: ${pi.notifications.map((n) => n.text.slice(0, 60)).join(" | ")}`,
+  );
+});
+
 // ── Detailed lifecycle ───────────────────────────────────────────────
 
 console.log("\n## Smoke: detailed lifecycle");
@@ -348,6 +386,52 @@ await test("log_experiment with status keep creates experiment entry", async () 
   }
 });
 
+await test("log_experiment flags unmeasured metric (honest provenance)", async () => {
+  const dir = makeTempDir("prov");
+  initGitRepo(dir);
+  const { tool, command, ctx } = await loadExtension(dir);
+  await command("autoresearch").handler("on", ctx);
+  await tool("init_experiment").execute("id", {
+    name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower",
+  }, null, null, ctx);
+
+  // Log WITHOUT any prior run_experiment this session → agent-claimed metric
+  const res = await tool("log_experiment").execute("id", {
+    metric: 100, status: "discard", description: "claimed number",
+  }, null, null, ctx);
+  const text = res.content?.[0]?.text ?? "";
+  assert.ok(text.includes("METRIC PROVENANCE"), `expected provenance warning, got: ${text.slice(0, 200)}`);
+  assert.strictEqual(res.details?.metricProvenance, "unmeasured");
+});
+
+await test("log_experiment provenance: measured vs manual", async () => {
+  const dir = makeTempDir("prov2");
+  initGitRepo(dir);
+  const { tool, command, ctx } = await loadExtension(dir);
+  await command("autoresearch").handler("on", ctx);
+  await tool("init_experiment").execute("id", {
+    name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower",
+  }, null, null, ctx);
+
+  await tool("run_experiment").execute("id", {
+    command: `node -e "console.log('METRIC ms=123')"`, timeout_seconds: 10,
+  }, null, null, ctx);
+
+  // Baseline log at the measured value → measured provenance, no warning
+  const ok = await tool("log_experiment").execute("id", {
+    metric: 123, status: "discard", description: "baseline at measured value",
+  }, null, null, ctx);
+  assert.strictEqual(ok.details?.metricProvenance, "measured");
+  assert.ok(!ok.content[0].text.includes("METRIC PROVENANCE"), `unexpected provenance warning: ${ok.content[0].text.slice(0, 300)}`);
+
+  // Hand-copied number → manual + warning
+  const bad = await tool("log_experiment").execute("id", {
+    metric: 999, status: "discard", description: "invented number",
+  }, null, null, ctx);
+  assert.strictEqual(bad.details?.metricProvenance, "manual");
+  assert.ok(bad.content[0].text.includes("METRIC PROVENANCE"), `expected provenance warning, got: ${bad.content[0].text.slice(0, 300)}`);
+});
+
 await test("autoresearch off blocks gated tools", async () => {
   const dir = makeTempDir("off-gated");
   initGitRepo(dir);
@@ -365,19 +449,6 @@ await test("autoresearch off blocks gated tools", async () => {
   }, null, null, ctx);
   const text = res.content?.[0]?.text ?? "";
   assert.ok(text.includes("OFF") || text.includes("off"), `Tool should be blocked when off, got: ${text.slice(0, 80)}`);
-});
-
-await test("startPhase + abortPhase don't crash without init", async () => {
-  const dir = makeTempDir("phase-no-init");
-  initGitRepo(dir);
-  const { tool, command, ctx } = await loadExtension(dir);
-  await command("autoresearch").handler("on", ctx);
-
-  // Phase operations before init should handle gracefully
-  const res = await tool("startPhase").execute("id", {
-    name: "refactor", rationale: "testing",
-  }, null, null, ctx);
-  assert.ok(res.content?.[0]?.text, "startPhase should return a response");
 });
 
 await test("explore_from + restore_main don't crash on empty tree", async () => {
@@ -447,18 +518,17 @@ await test("before_agent_start mutates system prompt in autoresearch mode", asyn
   );
 });
 
-await test("BestOfN/SpaceSearch tools are registered", async () => {
-  const dir = makeTempDir("parallel-tools");
+await test("parallel tools are NOT registered (disabled)", async () => {
+  const dir = makeTempDir("parallel-disabled");
   const { tool } = await loadExtension(dir);
-  assert.ok(tool("BestOfN"), "BestOfN tool not found");
-  assert.ok(tool("SpaceSearch"), "SpaceSearch tool not found");
-  assert.ok(tool("valleyProbe"), "valleyProbe tool not found");
-  assert.ok(tool("CheckOrthogonal"), "CheckOrthogonal tool not found");
+  for (const name of DISABLED_PARALLEL_TOOLS) {
+    assert.ok(!tool(name), `${name} should be disabled (PARALLEL_TOOLS_ENABLED=false)`);
+  }
 });
 
-// ── Individual tool registration (smoke for all 16) ──────────────────
+// ── Individual tool registration (smoke for all 9) ──────────────────
 
-console.log("\n## Smoke: all 16 tools individually");
+console.log("\n## Smoke: all 9 tools individually");
 
 for (const toolName of EXPECTED_TOOLS) {
   await test(`tool '${toolName}' is registered with execute + schema`, async () => {

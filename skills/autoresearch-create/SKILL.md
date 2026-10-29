@@ -139,6 +139,7 @@ pnpm typecheck 2>&1 | grep -i error || true
 **LOOP FOREVER.** Never ask "should I continue?" — the user expects autonomous work.
 
 - **Primary metric is king.** Improved → `keep`. Worse/equal → `discard`. Secondary metrics rarely affect this.
+- **Benchmark only via `run_experiment`.** A bash-run benchmark does not exist: it never enters the ledger, corrupts the noise floor, and its edits are lost on the next revert. Log EVERY run via `log_experiment` immediately — an unlogged run is wasted compute. Log the parsed METRIC value, not a hand-copied number (deviations are flagged as manual provenance).
 - **Annotate every run with `asi`.** Record what you learned — not what you did. What would help the next iteration or a fresh agent resuming this session?
 - **Watch the confidence score.** After 3+ runs, `log_experiment` reports a confidence score (best improvement as a multiple of the session noise floor). ≥2.0× means the improvement is likely real. <1.0× means it's within noise — consider re-running to confirm before keeping. The score is advisory — it never auto-discards.
 - **Simpler is better.** Removing code for equal perf = keep. Ugly complexity for tiny gain = probably discard.
