@@ -15,7 +15,6 @@ import { performance } from "node:perf_hooks";
 
 import { parseJsonlEntry, reconstructJsonlState, type ReconstructedRun } from "./jsonl.ts";
 import { treeExists, loadTree, getPath, countFailedChildren } from "./parallel/tree.ts";
-import { rankNodes } from "./parallel/ucb1.ts";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -468,59 +467,6 @@ export function checkFloor(
 
 // ─── Trigger: Composition opportunity (tree-aware) ─────────────────────────
 
-function checkCompositionOpportunity(
-  state: ObserverState,
-  payload: ObserverPayload,
-  cwd: string,
-  oc: ObserverConfig,
-): string | null {
-  // Fire at streak 3+ (same as parallel opportunity) but only when tree exists
-  // and there are 2+ keep-nodes on different branches
-  if (state.streak < 3) return null;
-  if (state.streak >= oc.stagnationThreshold) return null;
-
-  try {
-    if (!treeExists(cwd)) return null;
-    const tree = loadTree(cwd);
-    if (!tree) return null;
-
-    // Find keep-nodes with commits on different branches (different parents)
-    const keepNodes = Object.values(tree.nodes).filter(
-      (n) => n.status === "keep" && n.commit && n.nodeType === "experiment",
-    );
-    if (keepNodes.length < 2) return null;
-
-    // Find keep-nodes with commits on different branches (neither is ancestor of the other)
-    const pairs: Array<{ a: typeof keepNodes[0]; b: typeof keepNodes[0] }> = [];
-    for (let i = 0; i < keepNodes.length; i++) {
-      for (let j = i + 1; j < keepNodes.length; j++) {
-        const pathA = getPath(tree, keepNodes[i].id);
-        const pathB = getPath(tree, keepNodes[j].id);
-        if (!pathA.includes(keepNodes[j].id) && !pathB.includes(keepNodes[i].id)) {
-          pairs.push({ a: keepNodes[i], b: keepNodes[j] });
-        }
-      }
-    }
-    if (pairs.length === 0) return null;
-
-    const unit = payload.metricUnit;
-    const bestPair = pairs[0];
-    return `🔗 COMPOSITION OPPORTUNITY: Tree has ${keepNodes.length} keep-nodes on different branches.
-
-💡 Try combining orthogonal improvements:
-   compose("${bestPair.a.id}", "${bestPair.b.id}")
-   ${bestPair.a.id}: "${bestPair.a.hypothesisLabel || bestPair.a.hypothesis}" (${bestPair.a.metric}${unit})
-   ${bestPair.b.id}: "${bestPair.b.hypothesisLabel || bestPair.b.hypothesis}" (${bestPair.b.metric}${unit})
-
-   If the changes touch different files, compose() will merge them — stacking improvements.
-   Call tree_status() to see the full tree and find the best pair.`;
-  } catch {
-    return null;
-  }
-}
-
-// ─── Trigger: Parallel opportunity (proactive, before stagnation) ───────────
-
 function checkParallelOpportunity(
   state: ObserverState,
   payload: ObserverPayload,
@@ -765,7 +711,7 @@ function checkStagnation(
    BestOfN({ candidates: [{hypothesis:"...",complexity:"medium"}, ...], metric_name:"...", direction:"..." })
    Workers run in isolated worktrees (cheap flash model), winner is re-measured in full.` : `
 
-💡 TREE HINT: Stuck on the same approach? Call tree_status() and explore_from() to a different branch.`;
+💡 TREE HINT: Stuck on the same approach? Call tree_status() and try a fundamentally different hypothesis.`;
       break;
     case 2:
       escalation = oc.parallelEnabled ? `
@@ -781,7 +727,7 @@ Or if you need to get worse before better (refactor, algorithm swap), use phases
 
 ⚠️  SECOND STAGNATION CYCLE. Your first reflection didn't break through.
 
-💡 Call tree_status() for the full experiment tree. Consider explore_from() to revisit a different branch and try a fundamentally different optimization direction.`;
+💡 Call tree_status() for the full hypothesis list and try a fundamentally different optimization direction.`;
       break;
     case 3:
       escalation = oc.parallelEnabled ? `
@@ -796,7 +742,7 @@ Otherwise: ABANDON the current direction entirely. Try a radically different app
 
 🚨 THIRD STAGNATION CYCLE. Two reflections, zero progress.
 
-💡 ABANDON the current branch entirely. Call explore_from() to backtrack, or restore_main() and try a radically different optimization category.`;
+💡 ABANDON the current approach entirely — discard it and try a radically different optimization category.`;
       break;
     default:
       escalation = `
@@ -842,23 +788,11 @@ Write your analysis to ${ideasPath}, then try the most fundamentally different a
       const tree = loadTree(cwd);
       if (tree) {
         const activeNode = tree.nodes[tree.activeNodeId];
-        const ranked = rankNodes(tree);
         const activeFailCount = activeNode ? countFailedChildren(tree, activeNode.id) : 0;
         
         if (activeFailCount >= 6) {
-          treeHint = `\n🌳 TREE STATUS: ${activeFailCount} failed attempts on current branch (${activeNode.id}).\n`;
-          if (ranked.length > 0) {
-            const top = ranked[0];
-            treeHint += `   UCB1 suggests: explore_from("${top.nodeId}") (UCB1=${top.ucb1.toFixed(2)}, ${top.reason})\n`;
-            treeHint += `   Call tree_status() for full map, or explore_from("${top.nodeId}") to backtrack.`;
-          } else {
-            treeHint += `   Call tree_status() to see the exploration map.`;
-          }
-        } else if (ranked.length > 0 && ranked[0].ucb1 > 0.5) {
-          const top = ranked[0];
-          treeHint = `\n🌳 TREE STATUS: UCB1 suggests a more promising node.\n`;
-          treeHint += `   explore_from("${top.nodeId}") (UCB1=${top.ucb1.toFixed(2)}, ${top.reason})\n`;
-          treeHint += `   Call tree_status() for full map.`;
+          treeHint = `\n🌳 TREE STATUS: ${activeFailCount} failed attempts on the current approach (${activeNode.id}).\n`;
+          treeHint += `   Call tree_status() for the hypothesis list and try a fundamentally different direction.`;
         }
       }
     }
@@ -971,10 +905,6 @@ export function runObserver(payload: ObserverPayload): string | null {
   // 1. Noise gate (system noise — continuing is pointless)
   const noiseSteer = checkNoiseGate(payload, cwd, oc);
   if (noiseSteer) return noiseSteer;
-
-  // 2. Composition opportunity (tree-aware: compose hint)
-  const compositionSteer = checkCompositionOpportunity(state, payload, cwd, oc);
-  if (compositionSteer) return compositionSteer;
 
   // 3. Parallel opportunity (actionable: concrete ideas → BestOfN/SpaceSearch)
   const parallelSteer = checkParallelOpportunity(state, payload, cwd, oc);

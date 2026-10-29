@@ -40,7 +40,7 @@ export function hypothesisNodeFilePath(workDir: string, nodeId: string): string 
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
-export type TreeNodeStatus = "baseline" | "keep" | "discard" | "crash" | "checks_failed" | "untested" | "running" | "duplicate";
+export type TreeNodeStatus = "baseline" | "keep" | "discard" | "crash" | "checks_failed" | "untested" | "running" | "duplicate" | "abandoned";
 
 export type TreeNodeType = "baseline" | "experiment" | "compose" | "hypothesis";
 

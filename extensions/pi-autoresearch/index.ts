@@ -1609,6 +1609,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // and to the smoke EXPECTED_TOOLS list.
   const PARALLEL_TOOLS_ENABLED = false;
 
+  // Branch/merge tree tools (explore_from, restore_main, compose) are disabled.
+  // Evidence: ~700 real runs across 7 campaigns produced ZERO branch operations —
+  // agents work a flat hypothesis list (propose_hypothesis → run_experiment →
+  // log_experiment) and even "retry an old idea" is done as a new hypothesis
+  // (observed verbatim: "H19 (повтор H16)"). Flip to true to re-enable; also
+  // re-add their names to EXPERIMENT_LOOP_TOOLS and smoke DISABLED_TOOLS.
+  const BRANCHING_TOOLS_ENABLED = false;
+
   const BENCHMARK_GUARDRAIL =
     "Be careful not to overfit to the benchmarks and do not cheat on the benchmarks.";
 
@@ -1924,6 +1932,26 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // Resolve effective working directory (config stays in ctx.cwd, files in workDir)
     const workDir = resolveWorkDir(ctx.cwd);
 
+    // Hypothesis nodes left "running" by a previous session can never resolve —
+    // the experiment process is gone. Mark them abandoned so the tree view and
+    // tree_status don't show ghost running nodes (observed: 5 of 23 nodes in a
+    // real session were stale "running" with metric 0).
+    try {
+      if (treeExists(workDir)) {
+        const tree = loadTree(workDir);
+        if (tree) {
+          let staleChanged = false;
+          for (const node of Object.values(tree.nodes)) {
+            if (node.status === "running") {
+              node.status = "abandoned";
+              staleChanged = true;
+            }
+          }
+          if (staleChanged) saveTree(workDir, tree);
+        }
+      }
+    } catch { /* best-effort — tree cleanup must never block session start */ }
+
     // Primary: read from .auto/log.jsonl (alongside .auto/prompt.md and .auto/measure.sh)
     const jsonlPath = autoresearchJsonlPath(workDir);
     const hasPersistedLog = fs.existsSync(jsonlPath);
@@ -2190,12 +2218,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   });
 
   // Track whether the in-flight turn does real loop work (goal-x pattern:
-  // the settled-turn drift policy reads this). Tree ops count: they advance
-  // the loop even before a run lands. Parallel tools are disabled
-  // (PARALLEL_TOOLS_ENABLED) — re-add their names here when re-enabled.
+  // the settled-turn drift policy reads this). Branching tools are disabled
+  // (BRANCHING_TOOLS_ENABLED) — re-add their names here when re-enabled.
   const EXPERIMENT_LOOP_TOOLS = new Set([
     "run_experiment", "log_experiment", "propose_hypothesis", "init_experiment",
-    "explore_from", "restore_main", "compose", "finalize_research",
+    "tree_status", "finalize_research",
   ]);
   pi.on("tool_execution_end", async (event, ctx) => {
     if (!EXPERIMENT_LOOP_TOOLS.has(event.toolName)) return;
@@ -2242,8 +2269,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\n6. DECISION GATE before logging: metric value? better/worse vs best (delta)? checks passed? what did you LEARN?" +
       "\n7. log_experiment(hypothesis_id, metric, status, description=what happened/learned). \u26d4 NEVER skip \u2014 every run_experiment MUST be logged. Use the parsed METRIC values from run_experiment output, not hand-copied numbers." +
       "\n8. NEXT hypothesis from what you learned; stuck 3+ non-improving runs \u2192 tree_status()." +
-      "\n\n## Tree Tools" +
-      "\ntree_status() \u2014 UCB1 suggestions and NEXT ACTION. explore_from(node_id) \u2014 backtrack (always restore_main() after). compose(a, b) \u2014 merge orthogonal branches." +
+      "\n\n## Hypothesis Tree" +
+      "\npropose_hypothesis() BEFORE each run_experiment. tree_status() \u2014 hypothesis list with statuses and the current best." +
       "\n\n## Finalization" +
       "\nfinalize_research({reason, evidence, confidence}) only with PROOF (mathematical floor, noise floor reached, search space exhausted). A subjective \u201cthis seems hard\u201d is NOT proof \u2014 try orthogonal approaches first. It is a RECOMMENDATION; the observer arbitrates and suppresses premature signals." +
       "\n\n## Observer Steers" +
@@ -2555,14 +2582,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           if (f.asi?.finding) warning += ` [finding: ${String(f.asi.finding).slice(0, 80)}]`;
           warning += `\n`;
         }
-        // UCB1 top alternative
-        try {
-          const ranked = rankNodes(tree);
-          if (ranked.length > 0 && ranked[0].nodeId !== parentId) {
-            warning += `   💡 UCB1 suggests: explore_from("${ranked[0].nodeId}") (UCB1=${ranked[0].ucb1.toFixed(2)})\n`;
-          }
-        } catch { /* best-effort */ }
-        warning += `   You can proceed — but is your approach FUNDAMENTALLY different?`;
+        // Many-failures warning (branching is disabled — UCB1/explore_from hints removed)
+        warning += `   You can proceed — but is your approach FUNDAMENTALLY different? See tree_status().`;
       }
 
       // ── SimHash duplicate detection ──
@@ -4724,7 +4745,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // ═════════════════════════════════════════════════════════════════
 
   // ── explore_from: backtrack to any tree node ──
-  registerGatedTool({
+  if (BRANCHING_TOOLS_ENABLED) registerGatedTool({
     name: "explore_from",
     label: "Backtrack to a tree node and explore from there",
     description:
@@ -4879,7 +4900,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   });
 
   // ── restore_main: return from detached HEAD to main branch ──
-  registerGatedTool({
+  if (BRANCHING_TOOLS_ENABLED) registerGatedTool({
     name: "restore_main",
     label: "Return to main branch from explore_from",
     description:
@@ -4989,24 +5010,23 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   }
   registerGatedTool({
     name: "tree_status",
-    label: "Show experiment tree and UCB1 suggestions",
+    label: "Show hypothesis tree with statuses",
     description:
-      "Display the experiment tree as an ASCII diagram with UCB1 ranking of expandable nodes. " +
-      "Use this to see the full exploration map, find dead ends, and decide where to explore next. " +
-      "Modes: 'summary' (tree + UCB1), 'full' (tree + all node details), 'ucb1' (UCB1 ranking only).",
-    promptSnippet: "View experiment tree and get exploration suggestions",
+      "Display the hypothesis tree as an ASCII diagram with statuses and metrics. " +
+      "Use this to see which hypotheses were tried, which were kept/discarded, and where the best result is. " +
+      "Modes: 'summary' (default, tree + high-failure warnings), 'full' (tree + all node details).",
+    promptSnippet: "View hypothesis tree: statuses, metrics, current best",
     promptGuidelines: [
-      "Call tree_status() when you're stuck, before backtracking, or after every 3-4 experiments to see the big picture.",
-      "tree_status 'ucb1' shows which nodes are most promising (balance of exploitation + exploration).",
-      "When tree_status shows a node with many failures, call explore_from() to backtrack to a promising node.",
+      "Call tree_status() after every 3-4 experiments or when you lose track of what was tried.",
+      "The tree shows the flat hypothesis list: baselines, keeps (with the current best ★), discards and abandoned nodes.",
     ],
     parameters: {
       type: "object",
       properties: {
         detail: {
           type: "string",
-          enum: ["summary", "full", "ucb1"],
-          description: "Level of detail: 'summary' (default, tree + UCB1), 'full' (all node details), 'ucb1' (UCB1 ranking only).",
+          enum: ["summary", "full"],
+          description: "Level of detail: 'summary' (default, tree + warnings), 'full' (all node details).",
         },
       },
     } as any,
@@ -5032,152 +5052,41 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       const detailMode = params.detail || "summary";
       const activeNode = tree.nodes[tree.activeNodeId];
-      const ranked = rankNodes(tree);
       const bestId = findBestNodeId(tree);
       const nodeCount = Object.keys(tree.nodes).length;
-
-      // ── Build structured recommendation for the agent (machine-parseable) ──
-      // The agent uses this to decide its next action without parsing ASCII art.
-      const activeFailCount = countFailedChildren(tree, tree.activeNodeId);
-      const isStrugglingHere = activeFailCount >= 6;
-      const topRanked = ranked.length > 0 ? ranked[0] : null;
-
-      // Find compose candidates: cross-branch keep-node pairs (different paths from root)
-      const keepNodes = Object.values(tree.nodes).filter(
-        (n) => n.status === "keep" && n.commit && n.id !== tree.rootId,
+      const strugglingList = Object.values(tree.nodes).filter(
+        (n) => countFailedChildren(tree, n.id) >= 6,
       );
-      const composeCandidates: Array<[string, string]> = [];
-      for (let i = 0; i < keepNodes.length; i++) {
-        for (let j = i + 1; j < keepNodes.length; j++) {
-          const a = keepNodes[i];
-          const b = keepNodes[j];
-          // Different branches = neither is in the other's ancestor path
-          const pathA = getPath(tree, a.id);
-          const pathB = getPath(tree, b.id);
-          if (!pathA.includes(b.id) && !pathB.includes(a.id)) {
-            composeCandidates.push([a.id, b.id]);
-          }
-        }
-      }
-
-      // Determine recommended action
-      let recAction: string;
-      let recNodeId: string | null = null;
-      let recReason: string;
-      if (isStrugglingHere && topRanked) {
-        recAction = "explore_from";
-        recNodeId = topRanked.nodeId;
-        recReason = `${activeFailCount} failed attempts here, ${topRanked.reason} (UCB1=${topRanked.ucb1.toFixed(2)})`;
-      } else if (topRanked && topRanked.ucb1 > 0.5) {
-        recAction = "explore_from";
-        recNodeId = topRanked.nodeId;
-        recReason = `${topRanked.reason} (UCB1=${topRanked.ucb1.toFixed(2)})`;
-      } else if (composeCandidates.length > 0) {
-        recAction = "compose";
-        recReason = `${composeCandidates.length} cross-branch pair(s) available`;
-      } else {
-        recAction = "continue";
-        recReason = "current branch is productive";
-      }
-
-      const recommendation = {
-        action: recAction,
-        node_id: recNodeId,
-        reason: recReason,
-        alternatives: ranked.slice(1, 4).map((r) => ({
-          node_id: r.nodeId,
-          ucb1: Number(r.ucb1.toFixed(2)),
-          reason: r.reason,
-        })),
-      };
 
       let text = "";
 
-      // ── Action directive at the TOP (most important for the agent) ──
-      const activeNodeHypothesis = activeNode?.hypothesisLabel || activeNode?.hypothesis || "";
-      if (recommendation.action === "explore_from" && recommendation.node_id) {
-        const recNode = tree.nodes[recommendation.node_id];
-        const recHypothesis = recNode?.hypothesisLabel || recNode?.hypothesis || "";
-        text += `▶ NEXT: explore_from("${recommendation.node_id}")\n`;
-        text += `  Reason: ${recommendation.reason}.\n`;
-        if (recHypothesis) text += `  Target: ${recommendation.node_id} — "${recHypothesis}" (${formatNodeMetric(recNode, tree)})\n`;
-        text += `\n`;
-      } else if (recommendation.action === "compose" && composeCandidates.length > 0) {
-        text += `▶ NEXT: compose("${composeCandidates[0][0]}", "${composeCandidates[0][1]}")\n`;
-        text += `  Reason: ${recommendation.reason}. Call compose() to merge orthogonal improvements.\n`;
-        text += `\n`;
-      } else {
-        text += `▶ NEXT: continue experimenting from ${tree.activeNodeId} (${formatNodeMetric(activeNode, tree)}).\n`;
-        text += `  Reason: ${recommendation.reason}.\n`;
-        text += `\n`;
+      // ── Where we are (one line, most important for the agent) ──
+      const activeHypothesis = activeNode?.hypothesisLabel || activeNode?.hypothesis || "";
+      text += `▶ Current: ${tree.activeNodeId}`;
+      if (activeHypothesis) text += ` — "${activeHypothesis}"`;
+      text += ` (${formatNodeMetric(activeNode, tree)})\n`;
+      if (bestId && bestId !== tree.activeNodeId) {
+        const bestNode = tree.nodes[bestId];
+        const bestHypothesis = bestNode?.hypothesisLabel || bestNode?.hypothesis || "";
+        text += `★ Best: ${bestId}`;
+        if (bestHypothesis) text += ` — "${bestHypothesis}"`;
+        text += ` (${formatNodeMetric(bestNode, tree)})\n`;
+      }
+      text += "\n";
+
+      text += renderTree(tree, 60, 3, 7);
+
+      // Show nodes with many failures
+      if (strugglingList.length > 0) {
+        text += `\n⚠️ HIGH FAILURE COUNT: ${strugglingList.map((n) => `${n.id} (${countFailedChildren(tree, n.id)} failures)`).join(", ")}\n`;
       }
 
-      // ── Compose candidates (cross-branch pairs — currently invisible to agent without this) ──
-      if (composeCandidates.length > 0) {
-        text += `🔗 COMPOSE CANDIDATES (cross-branch keep-nodes):\n`;
-        for (const [aId, bId] of composeCandidates.slice(0, 3)) {
-          const aNode = tree.nodes[aId];
-          const bNode = tree.nodes[bId];
-          text += `  compose("${aId}", "${bId}") — "${aNode?.hypothesisLabel || aNode?.hypothesis || ""}" + "${bNode?.hypothesisLabel || bNode?.hypothesis || ""}\n`;
-        }
-        text += `\n`;
-      }
-
-      if (detailMode === "ucb1") {
-        // UCB1 ranking only
-        text += `📊 UCB1 Ranking (${nodeCount} nodes)\n`;
-        text += "═".repeat(60) + "\n";
-        if (ranked.length === 0) {
-          text += "No expandable nodes yet.\n";
-        } else {
-          for (let i = 0; i < Math.min(ranked.length, 10); i++) {
-            const r = ranked[i];
-            const n = tree.nodes[r.nodeId];
-            text += `  #${i + 1}  ${r.nodeId}  UCB1=${r.ucb1.toFixed(2)}  (${n.children.length} children, ${r.reason})\n`;
-            if (i < 3) {
-              text += `       → explore_from("${r.nodeId}")\n`;
-            }
-          }
-        }
-        // Show nodes with many failures
-        const struggling = Object.values(tree.nodes).filter(
-          (n) => countFailedChildren(tree, n.id) >= 6,
-        );
-        if (struggling.length > 0) {
-          text += `\n⚠️ HIGH FAILURE COUNT: ${struggling.map((n) => `${n.id} (${countFailedChildren(tree, n.id)})`).join(", ")}\n`;
-        }
-      } else {
-        // Tree + UCB1 (summary or full)
-        text += renderTree(tree, 60, 3, 7);
-
-        // UCB1 suggestions
-        if (ranked.length > 0) {
-          text += `\nUCB1 Suggestions (expandable nodes):\n`;
-          for (let i = 0; i < Math.min(ranked.length, 5); i++) {
-            const r = ranked[i];
-            const n = tree.nodes[r.nodeId];
-            text += `  #${i + 1}  ${r.nodeId}  UCB1=${r.ucb1.toFixed(2)}  (${n.children.length} children) — ${r.reason}\n`;
-            if (i === 0) {
-              text += `       💡 Suggestion: explore_from("${r.nodeId}")\n`;
-            }
-          }
-        }
-
-        // Show nodes with many failures
-        const strugglingList = Object.values(tree.nodes).filter(
-          (n) => countFailedChildren(tree, n.id) >= 6,
-        );
-        if (strugglingList.length > 0) {
-          text += `\n⚠️ HIGH FAILURE COUNT: ${strugglingList.map((n) => `${n.id} (${countFailedChildren(tree, n.id)} failures)`).join(", ")}\n`;
-        }
-
-        // Full detail mode: append all node details
-        if (detailMode === "full") {
-          text += `\n${"═".repeat(80)}\n`;
-          text += `Node Details:\n\n`;
-          for (const node of Object.values(tree.nodes)) {
-            text += renderNodeDetail(tree, node) + "\n";
-          }
+      // Full detail mode: append all node details
+      if (detailMode === "full") {
+        text += `\n${"═".repeat(80)}\n`;
+        text += `Node Details:\n\n`;
+        for (const node of Object.values(tree.nodes)) {
+          text += renderNodeDetail(tree, node) + "\n";
         }
       }
 
@@ -5187,12 +5096,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           nodeCount,
           activeNodeId: tree.activeNodeId,
           bestNodeId: bestId,
-          recommendation,
-          strugglingBranches: Object.values(tree.nodes)
-            .filter((n) => countFailedChildren(tree, n.id) >= 6)
-            .map((n) => n.id),
-          composeCandidates: composeCandidates.slice(0, 5),
-          rankedNodes: ranked.slice(0, 5),
+          strugglingBranches: strugglingList.map((n) => n.id),
         },
       };
     },
@@ -5212,7 +5116,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   });
 
   // ── compose: merge orthogonal improvements from two branches ──
-  registerGatedTool({
+  if (BRANCHING_TOOLS_ENABLED) registerGatedTool({
     name: "compose",
     label: "Merge orthogonal improvements from two tree branches",
     description:
@@ -5584,6 +5488,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       setAutoresearchMode(ctx, true);
       runtime.autoResumeTurns = 0;
       runtime.consecutiveDriftResumes = 0;
+      // Register the widget NOW: the agent may take a while before its first
+      // init_experiment, and the mode indicator must be visible immediately.
+      updateWidget(ctx);
       const rulesLoaded = hasAutoresearchRules(ctx);
       // No .auto/prompt.md yet — load the create skill so the agent follows the
       // setup guidelines. `/skill:<name>` is expanded to the full SKILL.md when

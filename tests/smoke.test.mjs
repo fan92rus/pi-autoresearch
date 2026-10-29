@@ -68,15 +68,16 @@ console.log("## Smoke: real-extension registration");
 
 const EXPECTED_TOOLS = [
   "init_experiment", "propose_hypothesis", "run_experiment", "log_experiment",
-  "explore_from", "restore_main",
-  "tree_status", "compose", "finalize_research",
+  "tree_status", "finalize_research",
 ];
 
-// Parallel tools (BestOfN, startPhase, commitPhase, abortPhase, valleyProbe,
-// CheckOrthogonal, SpaceSearch) are disabled via PARALLEL_TOOLS_ENABLED=false.
-const DISABLED_PARALLEL_TOOLS = [
+// Disabled tool groups (both flags false):
+// - PARALLEL_TOOLS_ENABLED: BestOfN, startPhase, commitPhase, abortPhase,
+//   valleyProbe, CheckOrthogonal, SpaceSearch
+// - BRANCHING_TOOLS_ENABLED: explore_from, restore_main, compose
+const DISABLED_TOOLS = [
   "BestOfN", "startPhase", "commitPhase", "abortPhase", "valleyProbe",
-  "CheckOrthogonal", "SpaceSearch",
+  "CheckOrthogonal", "SpaceSearch", "explore_from", "restore_main", "compose",
 ];
 
 const EXPECTED_HOOKS = [
@@ -85,14 +86,14 @@ const EXPECTED_HOOKS = [
   "before_agent_start", "tool_execution_end",
 ];
 
-await test("registers all 9 tools (parallel disabled)", async () => {
+await test("registers all 6 tools (parallel + branching disabled)", async () => {
   const dir = makeTempDir("reg");
   const { pi } = await loadExtension(dir);
   const names = pi.tools.map((t) => t.name);
   for (const expected of EXPECTED_TOOLS) {
     assert.ok(names.includes(expected), `Missing tool: ${expected}`);
   }
-  assert.strictEqual(names.length, 9, `Expected 9 tools, got ${names.length}: ${names.join(", ")}`);
+  assert.strictEqual(names.length, 6, `Expected 6 tools, got ${names.length}: ${names.join(", ")}`);
 });
 
 await test("registers all 10 hooks", async () => {
@@ -451,8 +452,8 @@ await test("autoresearch off blocks gated tools", async () => {
   assert.ok(text.includes("OFF") || text.includes("off"), `Tool should be blocked when off, got: ${text.slice(0, 80)}`);
 });
 
-await test("explore_from + restore_main don't crash on empty tree", async () => {
-  const dir = makeTempDir("explore-empty");
+await test("tree_status returns the hypothesis list", async () => {
+  const dir = makeTempDir("tree-status");
   initGitRepo(dir);
   const { tool, command, ctx } = await loadExtension(dir);
   await command("autoresearch").handler("on", ctx);
@@ -460,25 +461,11 @@ await test("explore_from + restore_main don't crash on empty tree", async () => 
     name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower",
   }, null, null, ctx);
 
-  const res = await tool("explore_from").execute("id", {
-    node_id: "n0",
-  }, null, null, ctx);
-  assert.ok(res.content?.[0]?.text, "explore_from should return a response");
-});
-
-await test("compose returns error for non-existent nodes", async () => {
-  const dir = makeTempDir("compose-missing");
-  initGitRepo(dir);
-  const { tool, command, ctx } = await loadExtension(dir);
-  await command("autoresearch").handler("on", ctx);
-  await tool("init_experiment").execute("id", {
-    name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower",
-  }, null, null, ctx);
-
-  const res = await tool("compose").execute("id", {
-    node_a: "nX", node_b: "nY",
-  }, null, null, ctx);
-  assert.ok(res.content?.[0]?.text, "compose should return a response");
+  const res = await tool("tree_status").execute("id", {}, null, null, ctx);
+  const text = res.content?.[0]?.text ?? "";
+  assert.ok(text, "tree_status should return a response");
+  assert.ok(!text.includes("explore_from"), "no references to disabled branching tools");
+  assert.ok(!text.includes("compose("), "no compose suggestions");
 });
 
 await test("finalize_research returns a response", async () => {
@@ -518,17 +505,48 @@ await test("before_agent_start mutates system prompt in autoresearch mode", asyn
   );
 });
 
-await test("parallel tools are NOT registered (disabled)", async () => {
-  const dir = makeTempDir("parallel-disabled");
+await test("parallel + branching tools are NOT registered (disabled)", async () => {
+  const dir = makeTempDir("tools-disabled");
   const { tool } = await loadExtension(dir);
-  for (const name of DISABLED_PARALLEL_TOOLS) {
-    assert.ok(!tool(name), `${name} should be disabled (PARALLEL_TOOLS_ENABLED=false)`);
+  for (const name of DISABLED_TOOLS) {
+    assert.ok(!tool(name), `${name} should be disabled (flag=false)`);
   }
 });
 
-// ── Individual tool registration (smoke for all 9) ──────────────────
+await test("stale running tree nodes are marked abandoned on session start", async () => {
+  const dir = makeTempDir("stale-running");
+  initGitRepo(dir);
+  // Plant a tree.json with a ghost running node (like a crashed prior session)
+  const autoDir = path.join(dir, ".auto");
+  fs.mkdirSync(autoDir, { recursive: true });
+  const treeJson = {
+    version: 1,
+    rootId: "n0",
+    activeNodeId: "n2",
+    nextId: 3,
+    baselineMetric: 10,
+    direction: "lower",
+    metricName: "ms",
+    savedBranch: null,
+    nodes: {
+      n0: { id: "n0", parentId: null, children: ["n1", "n2"], nodeType: "baseline", status: "baseline", metric: 10, hypothesis: "baseline", hypothesisLabel: null, commit: null, asi: null, depth: 0 },
+      n1: { id: "n1", parentId: "n0", children: [], nodeType: "hypothesis", status: "running", metric: 0, hypothesis: "ghost run", hypothesisLabel: "GHOST", commit: null, asi: null, depth: 1 },
+      n2: { id: "n2", parentId: "n0", children: [], nodeType: "hypothesis", status: "keep", metric: 8, hypothesis: "resolved", hypothesisLabel: "OK", commit: null, asi: null, depth: 1 },
+    },
+  };
+  fs.writeFileSync(path.join(autoDir, "tree.json"), JSON.stringify(treeJson));
 
-console.log("\n## Smoke: all 9 tools individually");
+  const { hook } = await loadExtension(dir);
+  await hook("session_start")({}, makeCtx(dir, "sess-stale"));
+
+  const after = JSON.parse(fs.readFileSync(path.join(autoDir, "tree.json"), "utf-8"));
+  assert.strictEqual(after.nodes.n1.status, "abandoned", "ghost running node must become abandoned");
+  assert.strictEqual(after.nodes.n2.status, "keep", "resolved node must stay untouched");
+});
+
+// ── Individual tool registration (smoke for all 6) ──────────────────
+
+console.log("\n## Smoke: all 6 tools individually");
 
 for (const toolName of EXPECTED_TOOLS) {
   await test(`tool '${toolName}' is registered with execute + schema`, async () => {

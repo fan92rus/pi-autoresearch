@@ -32,6 +32,7 @@ const STATUS_ICONS: Record<string, string> = {
   untested: "◇",
   running: "◎",
   duplicate: "⊘",
+  abandoned: "◌",
 };
 
 /**
@@ -107,12 +108,14 @@ function renderNodeLine(
   const icon = node.nodeType === "compose" ? STATUS_ICONS.compose
     : node.nodeType === "hypothesis" ? (STATUS_ICONS[node.status] || "◇")
     : (STATUS_ICONS[node.status] || "?");
-  const metric = formatMetric(node.metric, tree.metricName?.replace("time_", "").replace("_us", "µs") || "");
+  // Metric value only — the unit lives in the header, repeating it per line
+  // wastes ~15 columns per row and real trees overflow the widget width.
+  const metric = node.metric.toFixed(1);
   const label = node.nodeType === "baseline" ? "baseline" : `"${truncateLabel(node.hypothesisLabel || node.hypothesis)}"`;
   const status = node.status;
   const delta = node.nodeType === "baseline" ? "" : deltaString(node.metric, tree.baselineMetric, tree.direction);
 
-  let line = `${prefix}${node.id}  ${metric.padStart(8)}  ${icon}  ${label.padEnd(32)} ${status.padEnd(8)}`;
+  let line = `${prefix}${node.id}  ${metric.padStart(7)}  ${icon}  ${label.padEnd(32)} ${status.padEnd(9)}`;
   if (delta) line += ` ${delta}`;
   if (isActive) line += SYMBOLS.active;
   if (isBest) line += SYMBOLS.best;
@@ -168,13 +171,20 @@ export function renderTree(
     if (node.depth > maxDepth) maxDepth = node.depth;
   }
 
-  // Compute branch truncation when tree is large
+  // Compute branch truncation when tree is large. Real trees are FLAT hypothesis
+  // lists (depth 1, dozens of siblings) — the 3-branch limit was tuned for deep
+  // legacy trees and would hide 90% of a flat list. Flat trees get an adaptive
+  // limit that fills the available lines instead.
   const effMaxBranches = maxBranches && maxBranches > 0 ? maxBranches : 0;
   const effNodesPerBranch = nodesPerBranch && nodesPerBranch > 0 ? nodesPerBranch : 0;
-  const truncateBranches = effMaxBranches > 0 && root.children.length > effMaxBranches;
+  const flatTree = maxDepth <= 1;
+  const branchLimit = flatTree
+    ? Math.max(effMaxBranches, maxLines - 12)
+    : effMaxBranches;
+  const truncateBranches = branchLimit > 0 && root.children.length > branchLimit;
   const truncateDepth = effNodesPerBranch > 0;
   const recentView = truncateBranches
-    ? getRecentView(tree, effMaxBranches, effNodesPerBranch)
+    ? getRecentView(tree, branchLimit, effNodesPerBranch)
     : null;
 
   if (recentView) {
@@ -236,7 +246,38 @@ export function renderTree(
       children = node.children.map((id) => tree.nodes[id]).filter(Boolean) as TreeNode[];
     }
 
-    if (children.length > 0) {
+    // Collapse runs of 3+ consecutive sibling leaf-discards (agents build flat
+    // hypothesis lists — a 22-run campaign is 22 siblings, and 3+ rejects in a
+    // row are noise, not information). Child-chains (the old heuristic) never
+    // occur in real trees.
+    type RenderItem = { node: TreeNode } | { collapse: TreeNode[] };
+    const renderItems: RenderItem[] = [];
+    {
+      let runBuf: TreeNode[] = [];
+      const isFailedLeaf = (n: TreeNode) =>
+        n.children.length === 0 &&
+        (n.status === "discard" || n.status === "crash" || n.status === "checks_failed");
+      const flush = () => {
+        if (runBuf.length >= 3) {
+          renderItems.push({ collapse: runBuf });
+        } else {
+          for (const n of runBuf) renderItems.push({ node: n });
+        }
+        runBuf = [];
+      };
+      for (const child of children) {
+        if (isFailedLeaf(child)) {
+          runBuf.push(child);
+        } else {
+          flush();
+          renderItems.push({ node: child });
+        }
+      }
+      flush();
+    }
+    const collapsedAny = renderItems.some((it) => "collapse" in it);
+
+    if (children.length > 0 || collapsedAny) {
       const remaining = maxLines - lines.length;
 
       // Nodes-per-branch limit: if root node and recentView, compute hidden sibling branches
@@ -264,16 +305,28 @@ export function renderTree(
         // Collapse all children
         let totalKids = 0;
         const visit = (id: string) => { totalKids++; const n = tree.nodes[id]; if (n) for (const c of n.children) visit(c); };
-        for (const ch of children) visit(ch.id);
+        for (const it of renderItems) {
+          if ("node" in it) visit(it.node.id);
+          else for (const n of it.collapse) visit(n.id);
+        }
         const childIndent = indent + (isLast ? SYMBOLS.emptyIndent : SYMBOLS.verticalIndent);
-        push(`${childIndent}${SYMBOLS.lastBranch}(${totalKids} more nodes — use tree_detail for full view)`);
+        push(`${childIndent}${SYMBOLS.lastBranch}(${totalKids} more nodes — tree_status detail=full)`);
         hiddenSubtree = true;
       } else {
-        for (let i = children.length - 1; i >= 0; i--) {
-          const childIsLast = i === children.length - 1;
-          const childIndent = indent + (isLast ? SYMBOLS.emptyIndent : SYMBOLS.verticalIndent);
-          const childDepth = isRoot ? 1 : depthFromBranch + 1;
-          stack.push([children[i].id, childIndent, childIsLast, false, childDepth]);
+        const childIndent = indent + (isLast ? SYMBOLS.emptyIndent : SYMBOLS.verticalIndent);
+        for (let i = renderItems.length - 1; i >= 0; i--) {
+          const item = renderItems[i];
+          const itemIsLast = i === renderItems.length - 1;
+          const itemPrefix = childIndent + (itemIsLast ? SYMBOLS.lastBranch : SYMBOLS.branch);
+          if ("collapse" in item) {
+            const first = item.collapse[0];
+            const last = item.collapse[item.collapse.length - 1];
+            const ids = item.collapse.length === 2 ? `${first.id}, ${last.id}` : `${first.id}..${last.id}`;
+            push(`${itemPrefix}${item.collapse.length} discarded hypotheses (${ids})`);
+          } else {
+            const childDepth = isRoot ? 1 : depthFromBranch + 1;
+            stack.push([item.node.id, childIndent, itemIsLast, false, childDepth]);
+          }
         }
       }
     }
@@ -299,7 +352,7 @@ export function renderTree(
   // Legend
   lines.push("");
   lines.push("─".repeat(80));
-  lines.push(" ● keep   ○ discard   ✕ crash   ◆ compose   ◇ untested   ◎ running   ⊘ duplicate   ★ best   ← active");
+  lines.push(" ● keep   ○ discard   ◌ abandoned   ✕ crash   ◇ untested   ◎ running   ⊘ duplicate   ★ best");
   lines.push("─".repeat(80));
 
   return lines.join("\n");
