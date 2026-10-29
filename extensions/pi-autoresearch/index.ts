@@ -250,6 +250,8 @@ interface AutoresearchRuntime {
   lastTurnUsedExperimentTools: boolean;
   /** Consecutive settled turns that did no loop work and were nudged. After MAX_CONSECUTIVE_DRIFT_RESUMES the loop stops instead of nudging again (anti chat-loop bound, goal-x pattern). Reset whenever a loop tool fires. */
   consecutiveDriftResumes: number;
+  /** Provenance warning from the LAST log_experiment (e.g. "manual"/"unmeasured"). Null when the last log was measured. Re-injected into every resume until an honest (measured) log lands — goal-x [AUDITOR REJECTION] pattern. */
+  lastLogFlag: string | null;
   /** What run_experiment actually measured last: parsed primary metric (or null if no METRIC line) + wall-clock fallback. Reset to null on init/compact. Read by log_experiment to flag agent-claimed metrics. */
   lastMeasurement: { primary: number | null; wallClockSeconds: number } | null;
 }
@@ -1272,6 +1274,7 @@ function createSessionRuntime(): AutoresearchRuntime {
     treeViewMode: false,
     lastTurnUsedExperimentTools: false,
     consecutiveDriftResumes: 0,
+    lastLogFlag: null,
     lastMeasurement: null,
   };
 }
@@ -1775,9 +1778,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     ctx.ui.notify(reason ?? `Autoresearch auto-resume limit reached`, "info");
   };
 
-  const composeResumeMessage = (_ctx: ExtensionContext): string => {
+  const composeResumeMessage = (ctx: ExtensionContext): string => {
+    const flag = getRuntime(ctx).lastLogFlag;
+    const head = flag
+      ? `⚠ Last log_experiment was flagged (${flag}) — that value was agent-claimed, NOT measured. Run run_experiment and log the parsed METRIC. `
+      : "";
     return [
-      "Run the next iteration now.",
+      head + "Run the next iteration now.",
       "Use the persisted autoresearch state as needed, pick the most promising hypothesis, then call run_experiment + log_experiment.",
       BENCHMARK_GUARDRAIL,
     ].join(" ");
@@ -1938,15 +1945,39 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // Hypothesis nodes left "running" by a previous session can never resolve —
     // the experiment process is gone. Mark them abandoned so the tree view and
     // tree_status don't show ghost running nodes (observed: 5 of 23 nodes in a
-    // real session were stale "running" with metric 0).
+    // real session were stale "running" with metric 0). Nodes with a dangling
+    // run_started ledger marker (session died MID-benchmark) get the more
+    // precise "crashed" instead.
     try {
       if (treeExists(workDir)) {
         const tree = loadTree(workDir);
         if (tree) {
+          // Collect dangling runs from the ledger: run_started without a
+          // matching run_result (correlated by started_at).
+          const danglingNodeIds = new Set<string>();
+          try {
+            const jsonlPath = autoresearchJsonlPath(workDir);
+            if (fs.existsSync(jsonlPath)) {
+              const started = new Map<string, string>();
+              for (const line of fs.readFileSync(jsonlPath, "utf-8").split("\n")) {
+                const line2 = line.trim();
+                if (!line2) continue;
+                try {
+                  const e = JSON.parse(line2) as { type?: string; started_at?: string; node_id?: string | null };
+                  if (e.type === "run_started" && e.started_at) started.set(e.started_at, e.node_id ?? "");
+                  else if (e.type === "run_result" && e.started_at) started.delete(e.started_at);
+                } catch { /* skip malformed line */ }
+              }
+              for (const nodeId of started.values()) {
+                if (nodeId) danglingNodeIds.add(nodeId);
+              }
+            }
+          } catch { /* ledger scan is best-effort */ }
+
           let staleChanged = false;
           for (const node of Object.values(tree.nodes)) {
             if (node.status === "running") {
-              node.status = "abandoned";
+              node.status = danglingNodeIds.has(node.id) ? "crashed" : "abandoned";
               staleChanged = true;
             }
           }
@@ -2060,7 +2091,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             );
             return [line];
           },
-          invalidate(): void {},
+          invalidate(): void { try { tui.requestRender(); } catch { /* headless */ } },
         }));
         return;
       }
@@ -2080,7 +2111,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           );
           return [runningLine];
         },
-        invalidate(): void {},
+        invalidate(): void { try { tui.requestRender(); } catch { /* headless */ } },
       }));
       return;
     }
@@ -2129,7 +2160,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             ),
           ];
         },
-        invalidate(): void {},
+        invalidate(): void { try { tui.requestRender(); } catch { /* headless */ } },
       }));
   };
 
@@ -2232,6 +2263,27 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const runtime = getRuntime(ctx);
     runtime.lastTurnUsedExperimentTools = true;
     runtime.consecutiveDriftResumes = 0;
+  });
+
+  // Hard gate (goal-x {block:true} pattern): while the loop is active, bash
+  // executions of the benchmark script are blocked. The discipline block says
+  // "NEVER benchmark via bash" — this makes it a law, not a request. A bash-run
+  // is invisible to the ledger: no METRIC capture, no provenance, no keep.
+  // run_experiment itself spawns via execBashScript (not this tool) — unaffected.
+  const BENCHMARK_EXEC_RE = /(?:^|[\s;&(])(?:bash|sh|\.\/)\s+\S*measure\.sh\b|\bBENCH_MODE\s*=/;
+  pi.on("tool_call", async (event, ctx) => {
+    if (event.toolName !== "bash" && event.toolName !== "powershell") return;
+    if (!getRuntime(ctx).autoresearchMode) return;
+    const cmd = typeof (event.input as { command?: unknown })?.command === "string"
+      ? (event.input as { command: string }).command
+      : "";
+    if (!cmd || !BENCHMARK_EXEC_RE.test(cmd)) return;
+    return {
+      block: true,
+      reason:
+        "Blocked: benchmarks must run via run_experiment. A bash-run is invisible to the ledger — " +
+        "no METRIC capture, no provenance, cannot be kept. Use run_experiment({ command: \"bash measure.sh\" }).",
+    };
   });
 
   // When in autoresearch mode, add a static note to the system prompt.
@@ -2867,6 +2919,22 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // TODO(/tree): replace compaction-based resume with a checkpoint-per-iteration model.
       runtime.runningExperiment = { startedAt: Date.now(), command: params.command };
+      // Ledger marker BEFORE the spawn (goal-x discipline: events before action).
+      // If the session dies mid-benchmark, reconstructState sees a run_started
+      // without a matching run_result and marks the hypothesis node crashed.
+      const runStartedAt = new Date().toISOString();
+      let runNodeId: string | null = params.hypothesis_id ?? null;
+      if (!runNodeId && treeExists(workDir)) {
+        try {
+          const startedTree = loadTree(workDir);
+          runNodeId = startedTree ? (findRunningNode(startedTree)?.id ?? null) : null;
+        } catch { runNodeId = null; }
+      }
+      try {
+        const jsonlPath = autoresearchJsonlPath(workDir);
+        ensureParentDir(jsonlPath);
+        fs.appendFileSync(jsonlPath, JSON.stringify({ type: "run_started", node_id: runNodeId, command: params.command, started_at: runStartedAt }) + "\n");
+      } catch { /* best-effort — the run itself matters more than its marker */ }
       updateWidget(ctx);
       if (overlayTui) overlayTui.requestRender();
 
@@ -3098,6 +3166,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         maxLines: EXPERIMENT_MAX_LINES,
         maxBytes: EXPERIMENT_MAX_BYTES,
       });
+
+      // Matching ledger marker AFTER the spawn resolves (exit/timeout/kill alike).
+      try {
+        const jsonlPath = autoresearchJsonlPath(workDir);
+        fs.appendFileSync(jsonlPath, JSON.stringify({ type: "run_result", started_at: runStartedAt, node_id: runNodeId, exit_code: exitCode, killed: timedOut, duration_seconds: Number(durationSeconds.toFixed(1)) }) + "\n");
+      } catch { /* best-effort */ }
 
       // Parse structured METRIC lines from output
       const parsedMetricMap = parseMetricLines(output);
@@ -3693,7 +3767,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         ...experiment,
       };
       if (!mergedASI) delete jsonlEntry.asi;
-      if (metricProvenance && metricProvenance !== "measured") jsonlEntry.mprov = metricProvenance;
+      if (metricProvenance && metricProvenance !== "measured") {
+        jsonlEntry.mprov = metricProvenance;
+        // Re-injection flag (goal-x [AUDITOR REJECTION] pattern): every resume
+        // reminds the agent until an honest (measured) log lands.
+        runtime.lastLogFlag = `${metricProvenance} metric provenance`;
+      } else if (metricProvenance === "measured") {
+        runtime.lastLogFlag = null;
+      }
       const jsonlLine = JSON.stringify(jsonlEntry);
 
       try {
@@ -4059,7 +4140,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           tui.requestRender();
         },
 
-        invalidate(): void {},
+        invalidate(): void { try { tui.requestRender(); } catch { /* headless */ } },
 
         dispose(): void {
           clearOverlay();

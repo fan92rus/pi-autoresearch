@@ -83,7 +83,7 @@ const DISABLED_TOOLS = [
 const EXPECTED_HOOKS = [
   "session_start", "session_tree", "session_before_switch", "session_shutdown",
   "agent_start", "session_before_compact", "session_compact", "agent_end",
-  "before_agent_start", "tool_execution_end",
+  "before_agent_start", "tool_execution_end", "tool_call",
 ];
 
 await test("registers all 6 tools (parallel + branching disabled)", async () => {
@@ -96,14 +96,14 @@ await test("registers all 6 tools (parallel + branching disabled)", async () => 
   assert.strictEqual(names.length, 6, `Expected 6 tools, got ${names.length}: ${names.join(", ")}`);
 });
 
-await test("registers all 10 hooks", async () => {
+await test("registers all 11 hooks", async () => {
   const dir = makeTempDir("hooks");
   const { pi } = await loadExtension(dir);
   const names = [...pi.hooks.keys()];
   for (const expected of EXPECTED_HOOKS) {
     assert.ok(names.includes(expected), `Missing hook: ${expected}`);
   }
-  assert.strictEqual(names.length, 10, `Expected 10 hooks, got ${names.length}`);
+  assert.strictEqual(names.length, 11, `Expected 11 hooks, got ${names.length}`);
 });
 
 await test("registers /autoresearch command", async () => {
@@ -552,6 +552,103 @@ await test("failure warning counts streak since last keep, not campaign total", 
   text = res.content?.[0]?.text ?? "";
   assert.ok(text.includes("6 consecutive failed hypotheses since last keep"), `streak warning expected, got: ${text.slice(-300)}`);
   assert.ok(!text.includes("All failures:"), "failure list must be capped, not 'All failures'");
+});
+
+await test("bash-run of measure.sh is blocked while mode is on (goal-x hard gate)", async () => {
+  const dir = makeTempDir("bench-gate");
+  initGitRepo(dir);
+  const { tool, command, hook, ctx } = await loadExtension(dir);
+  await command("autoresearch").handler("on", ctx);
+  await tool("init_experiment").execute("id", {
+    name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower",
+  }, null, null, ctx);
+
+  const call = (cmd) => hook("tool_call")({ toolName: "bash", input: { command: cmd } }, ctx);
+
+  const blocked = await call("bash measure.sh");
+  assert.ok(blocked?.block === true, "executing measure.sh via bash must be blocked");
+  assert.ok(String(blocked.reason).includes("run_experiment"), "reason must point to run_experiment");
+
+  const blockedEnv = await call("BENCH_MODE=quick ./measure.sh");
+  assert.ok(blockedEnv?.block === true, "BENCH_MODE= assignment must be blocked");
+
+  const reading = await call("cat measure.sh");
+  assert.ok(!reading?.block, `reading the script must stay allowed, got: ${JSON.stringify(reading)}`);
+
+  const off = makeCtx(dir, "sess-gate-off");
+  const offResult = await hook("tool_call")({ toolName: "bash", input: { command: "bash measure.sh" } }, off);
+  assert.ok(!offResult?.block, "mode off — no gating");
+});
+
+await test("run_started/run_result ledger markers wrap the benchmark run", async () => {
+  const dir = makeTempDir("run-markers");
+  initGitRepo(dir);
+  const { tool, command, ctx } = await loadExtension(dir);
+  await command("autoresearch").handler("on", ctx);
+  await tool("init_experiment").execute("id", {
+    name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower",
+  }, null, null, ctx);
+
+  await tool("run_experiment").execute("id", {
+    command: "node -e \"0\"", timeout_seconds: 10,
+  }, null, null, ctx);
+
+  const log = fs.readFileSync(path.join(dir, ".auto", "log.jsonl"), "utf-8");
+  const starts = log.split("\n").filter((l) => l.includes('"type":"run_started"'));
+  const results = log.split("\n").filter((l) => l.includes('"type":"run_result"'));
+  assert.strictEqual(starts.length, 1, `one run_started expected, log:\n${log}`);
+  assert.strictEqual(results.length, 1, "one run_result expected");
+  const startAt = JSON.parse(starts[0]).started_at;
+  assert.strictEqual(JSON.parse(results[0]).started_at, startAt, "run_result must correlate via started_at");
+});
+
+await test("dangling run_started marks the node crashed on session start", async () => {
+  const dir = makeTempDir("dangling");
+  initGitRepo(dir);
+  const autoDir = path.join(dir, ".auto");
+  fs.mkdirSync(autoDir, { recursive: true });
+  fs.writeFileSync(path.join(autoDir, "log.jsonl"),
+    JSON.stringify({ type: "config", name: "bench", metricName: "ms", metricUnit: "ms", bestDirection: "lower" }) + "\n" +
+    JSON.stringify({ type: "run_started", node_id: "n1", command: "bash measure.sh", started_at: "2026-10-29T00:00:00Z" }) + "\n");
+  fs.writeFileSync(path.join(autoDir, "tree.json"), JSON.stringify({
+    version: 1, rootId: "n0", activeNodeId: "n1", nextId: 2,
+    baselineMetric: 10, direction: "lower", metricName: "ms", savedBranch: null,
+    nodes: {
+      n0: { id: "n0", parentId: null, children: ["n1"], nodeType: "baseline", status: "baseline", metric: 10, hypothesis: "baseline", hypothesisLabel: null, commit: null, asi: null, depth: 0 },
+      n1: { id: "n1", parentId: "n0", children: [], nodeType: "hypothesis", status: "running", metric: 0, hypothesis: "mid-run death", hypothesisLabel: "GONE", commit: null, asi: null, depth: 1 },
+    },
+  }));
+
+  const { hook } = await loadExtension(dir);
+  await hook("session_start")({}, makeCtx(dir, "sess-dangling"));
+
+  const after = JSON.parse(fs.readFileSync(path.join(autoDir, "tree.json"), "utf-8"));
+  assert.strictEqual(after.nodes.n1.status, "crashed", "dangling run_started => crashed (not just abandoned)");
+});
+
+await test("flagged provenance is re-injected into the next resume", async () => {
+  const dir = makeTempDir("reinforce");
+  initGitRepo(dir);
+  const { tool, command, hook, ctx, pi } = await loadExtension(dir);
+  await command("autoresearch").handler("on", ctx);
+  await tool("init_experiment").execute("id", {
+    name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower",
+  }, null, null, ctx);
+
+  // Invented metric: no run_experiment preceded => provenance 'unmeasured'
+  await tool("log_experiment").execute("id", {
+    status: "keep", metric: 123, description: "invented number",
+  }, null, null, ctx);
+  await hook("tool_execution_end")({ toolName: "log_experiment" }, ctx);
+
+  // Settled turn end -> plain resume must carry the flag reminder
+  await hook("before_agent_start")({ systemPrompt: "x" }, ctx);
+  await hook("agent_end")({ messages: [] }, ctx);
+  await new Promise((r) => setTimeout(r, 1000)); // SETTLED_WINDOW_MS = 800
+
+  const last = pi.sentMessages[pi.sentMessages.length - 1]?.text ?? "";
+  assert.ok(last.includes("flagged"), `resume must carry the provenance reminder, got: ${last.slice(0, 200)}`);
+  assert.ok(last.includes("unmeasured"), "reminder must name the provenance problem");
 });
 
 await test("stale running tree nodes are marked abandoned on session start", async () => {
