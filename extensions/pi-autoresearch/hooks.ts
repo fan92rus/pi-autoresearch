@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { hasAutoresearchConfigHeader } from "./jsonl.ts";
 import { hookScriptPath, globalHookPath } from "./paths.ts";
 import { runObserver } from "./observer.ts";
+import { getBashSpawnOptions } from "./bash-shell.ts";
 
 const TIMEOUT_MS = 30_000;
 const STDOUT_MAX_BYTES = 8 * 1024;
@@ -85,7 +86,15 @@ const notFired: HookResult = {
 async function runSingleScript(script: string, payload: HookPayload): Promise<HookResult> {
   const t0 = Date.now();
   return new Promise<HookResult>((resolve) => {
-    const child = spawn("bash", [script], { cwd: payload.cwd, timeout: TIMEOUT_MS });
+    // Resolve the shell through getBashSpawnOptions: a bare spawn("bash") on
+    // Windows lets CreateProcess find System32\bash.exe (the WSL launcher)
+    // before any PATH entry — hooks would die/hang on machines without WSL.
+    const bashSpawn = getBashSpawnOptions();
+    const child = spawn(bashSpawn.shell, [script], {
+      cwd: payload.cwd,
+      timeout: TIMEOUT_MS,
+      windowsHide: true,
+    });
 
     let stdout = "";
     let stdoutBytes = 0;

@@ -36,6 +36,7 @@ import { fileURLToPath } from "node:url";
 import { createServer, type Server, type ServerResponse } from "node:http";
 
 import { spawn } from "node:child_process";
+import { getBashSpawnOptions, killTree } from "./bash-shell.ts";
 import { markIdeaTried } from "./observer.ts";
 import { createWriteStream } from "node:fs";
 import { randomBytes } from "node:crypto";
@@ -461,81 +462,8 @@ function formatElapsed(ms: number): string {
 
 /**
  * Resolve the bash shell path and spawn options for the current platform.
- * On Windows, finds Git Bash at known locations (avoiding WSL bash).
- * Mirrors the logic in pi-coding-agent's utils/shell.ts getShellConfig().
- */
-function getBashSpawnOptions(): { shell: string; spawnArgs: string[]; detached: boolean } {
-  if (process.platform === "win32") {
-    // Try Git Bash in known locations first (like pi's getShellConfig)
-    const candidates: string[] = [];
-    const programFiles = process.env.ProgramFiles;
-    if (programFiles) candidates.push(`${programFiles}\\Git\\bin\\bash.exe`);
-    const programFilesX86 = process.env["ProgramFiles(x86)"];
-    if (programFilesX86) candidates.push(`${programFilesX86}\\Git\\bin\\bash.exe`);
-
-    for (const candidate of candidates) {
-      if (fs.existsSync(candidate)) {
-        return { shell: candidate, spawnArgs: ["-c"], detached: false };
-      }
-    }
-
-    // Fallback: search bash.exe on PATH via 'where' (avoids WSL bash if Git Bash is first)
-    try {
-      const { spawnSync } = require("node:child_process");
-      const result = spawnSync("where", ["bash.exe"], { encoding: "utf-8", timeout: 5000, windowsHide: true });
-      if (result.status === 0 && result.stdout) {
-        const firstMatch = result.stdout.trim().split(/\r?\n/)[0];
-        if (firstMatch && fs.existsSync(firstMatch)) {
-          return { shell: firstMatch, spawnArgs: ["-c"], detached: false };
-        }
-      }
-    } catch {
-      // Ignore — fall through to bare "bash"
-    }
-  }
-
-  // Unix or fallback: use bare "bash" (PATH lookup works fine on Unix)
-  return { shell: "bash", spawnArgs: ["-c"], detached: true };
-}
-
-/**
- * Kill a process and all its children (cross-platform).
- * Mirrors pi core's killProcessTree (utils/shell.ts):
- *   - Windows: taskkill /F /T /PID (kills the entire process tree)
- *   - Unix:    SIGKILL on the process group (negative PID), then just the PID
- *
- * NOTE: The previous Unix-only SIGTERM implementation did NOT kill the tree on
- * Windows — process.kill(-pid) is unsupported there, and the fallback only
- * killed the immediate bash child, leaving the benchmark (go test, python, ...)
- * running as an orphan indefinitely.
- */
-function killTree(pid: number): void {
-  if (process.platform === "win32") {
-    // Use taskkill on Windows to kill the process tree.
-    // /F = force, /T = kill child processes (tree), /PID = target
-    try {
-      spawn("taskkill", ["/F", "/T", "/PID", String(pid)], {
-        stdio: "ignore",
-        detached: true,
-        windowsHide: true,
-      });
-    } catch {
-      // Ignore errors if taskkill fails
-    }
-  } else {
-    // Unix: SIGKILL the process group (negative PID).
-    // SIGKILL (not SIGTERM) — cannot be caught/ignored, guarantees death.
-    try {
-      process.kill(-pid, "SIGKILL");
-    } catch {
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch {
-        // Process already dead
-      }
-    }
-  }
-}
+// getBashSpawnOptions() and killTree() live in ./bash-shell.ts — shared with
+// hooks.ts so EVERY bash spawn on Windows resolves Git Bash, never WSL.
 
 /**
  * Execute a bash script/command using the SAME Git Bash that getBashSpawnOptions()
@@ -2927,9 +2855,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }>((resolve, reject) => {
         let processTimedOut = false;
 
-        const child = spawn("bash", ["-c", params.command], {
+        // Resolve the shell through getBashSpawnOptions: a bare spawn("bash") on
+        // Windows lets CreateProcess find System32\bash.exe (the WSL launcher)
+        // before any PATH entry — with WSL installed but broken this is exactly
+        // the "experiment invokes WSL bash" failure mode.
+        const bashSpawn = getBashSpawnOptions();
+        const child = spawn(bashSpawn.shell, ["-c", params.command], {
           cwd: workDir,
-          detached: true,
+          detached: bashSpawn.detached,
           stdio: ["ignore", "pipe", "pipe"],
           env: params.bench_mode ? { ...process.env, BENCH_MODE: params.bench_mode } : process.env,
           windowsHide: true,
