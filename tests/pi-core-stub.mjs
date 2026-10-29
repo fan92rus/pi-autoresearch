@@ -37,6 +37,10 @@ export function formatSize(bytes) {
 
 /** Return a temp agent dir (hermetic — does NOT touch real ~/.pi/agent). */
 export function getAgentDir() {
+  // Honour the same env override as the real pi so tests can point the
+  // extension at a scratch agent dir (see withAgentDir in shortcuts.test.mjs).
+  const fromEnv = process.env.PI_CODING_AGENT_DIR;
+  if (fromEnv) return fromEnv;
   const dir = path.join(os.tmpdir(), `pi-test-agent-${process.pid}`);
   return dir;
 }

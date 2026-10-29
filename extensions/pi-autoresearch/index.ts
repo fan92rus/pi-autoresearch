@@ -4856,7 +4856,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       return new Text(text, 0, 0);
     },
 
-    renderResult(result, theme) {
+    renderResult(result, _options, theme) {
       const t = result.content[0];
       return new Text(t?.type === "text" ? t.text : "", 0, 0);
     },
@@ -4957,7 +4957,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       return new Text(theme.fg("toolTitle", theme.bold("restore_main")), 0, 0);
     },
 
-    renderResult(result, theme) {
+    renderResult(result, _options, theme) {
       const t = result.content[0];
       return new Text(t?.type === "text" ? t.text : "", 0, 0);
     },
@@ -5189,7 +5189,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       return new Text(text, 0, 0);
     },
 
-    renderResult(result, theme) {
+    renderResult(result, _options, theme) {
       const t = result.content[0];
       return new Text(t?.type === "text" ? t.text : "", 0, 0);
     },
@@ -5316,7 +5316,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       return new Text(text, 0, 0);
     },
 
-    renderResult(result, theme) {
+    renderResult(result, _options, theme) {
       const t = result.content[0];
       return new Text(t?.type === "text" ? t.text : "", 0, 0);
     },

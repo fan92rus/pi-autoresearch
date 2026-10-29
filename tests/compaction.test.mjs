@@ -25,7 +25,9 @@ function writeJsonlLines(workDir, lines) {
 test("summary contains all persisted sources when present", () => {
   withTempWorkDir((workDir) => {
     fs.writeFileSync(path.join(workDir, "autoresearch.md"), "# Rules\nDo not cheat.");
-    fs.writeFileSync(path.join(workDir, "autoresearch.ideas.md"), "- Try memoization\n- Try parallelism");
+    // Fork layout: ideas are a directory of per-idea .md files (not a single file).
+    fs.mkdirSync(path.join(workDir, "autoresearch.ideas.md"), { recursive: true });
+    fs.writeFileSync(path.join(workDir, "autoresearch.ideas.md", "memoization.md"), "- Try memoization\n- Try parallelism");
     writeJsonlLines(workDir, [
       '{"type":"config","name":"Speed up parser","metricName":"total_us","metricUnit":"us","bestDirection":"lower"}',
       '{"run":1,"commit":"aaa1111","metric":100,"status":"keep","description":"baseline","timestamp":1,"metrics":{},"asi":{"hypothesis":"start point"}}',
@@ -44,7 +46,8 @@ test("summary contains all persisted sources when present", () => {
     assert.match(summary, /Best\s+\(#2\): 80us \(-20\.0%\)/);
     assert.match(summary, /## Experiment Rules \(autoresearch\.md\)/);
     assert.match(summary, /Do not cheat\./);
-    assert.match(summary, /## Ideas Backlog \(autoresearch\.ideas\.md\)/);
+    assert.match(summary, /## Ideas Backlog \(autoresearch\.ideas\.md\/\)/);
+    assert.match(summary, /### memoization\.md/);
     assert.match(summary, /Try memoization/);
     assert.match(summary, /## Recent Runs \(last 3\)/);
     assert.match(summary, /#1 keep/);
@@ -63,7 +66,9 @@ test("summary uses the .auto layout filenames when present", () => {
     const autoDir = path.join(workDir, ".auto");
     fs.mkdirSync(autoDir, { recursive: true });
     fs.writeFileSync(path.join(autoDir, "prompt.md"), "# Rules\nDo not cheat.");
-    fs.writeFileSync(path.join(autoDir, "ideas.md"), "- Try memoization");
+    // Fork layout: ideas are a directory of per-idea .md files (not a single file).
+    fs.mkdirSync(path.join(autoDir, "ideas"), { recursive: true });
+    fs.writeFileSync(path.join(autoDir, "ideas", "memoization.md"), "- Try memoization");
     fs.writeFileSync(
       path.join(autoDir, "log.jsonl"),
       [
@@ -75,7 +80,7 @@ test("summary uses the .auto layout filenames when present", () => {
     const summary = buildAutoresearchCompactionSummary(autoresearchSummaryPathsFor(workDir));
 
     assert.match(summary, /## Experiment Rules \(\.auto\/prompt\.md\)/);
-    assert.match(summary, /## Ideas Backlog \(\.auto\/ideas\.md\)/);
+    assert.match(summary, /## Ideas Backlog \(\.auto\/ideas\/\)/);
     assert.match(summary, /read additional lines from \.auto\/log\.jsonl\./);
   });
 });

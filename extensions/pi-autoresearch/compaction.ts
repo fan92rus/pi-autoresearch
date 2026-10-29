@@ -141,7 +141,8 @@ function isBetter(value: number, current: number, direction: "lower" | "higher")
 function readablePath(workDir: string, filePath: string): string {
   const relative = path.relative(workDir, filePath);
   if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return filePath;
-  return relative;
+  // Normalize to forward slashes so prompts/tests are platform-independent.
+  return relative.replaceAll("\\", "/");
 }
 
 function rulesSection(workDir: string, mdPath: string): string {

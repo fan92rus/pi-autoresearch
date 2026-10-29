@@ -107,10 +107,39 @@ await test("registers /autoresearch command", async () => {
   assert.strictEqual(typeof cmd.handler, "function");
 });
 
-await test("registers a shortcut", async () => {
+await test("registers no shortcuts by default (opt-in)", async () => {
   const dir = makeTempDir("shortcut");
-  const { pi } = await loadExtension(dir);
-  assert.ok(pi.shortcuts.length >= 1, "No shortcut registered");
+  const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-smoke-agent-"));
+  const prev = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir; // no config written there
+  try {
+    const { pi } = await loadExtension(dir);
+    assert.strictEqual(pi.shortcuts.length, 0, "shortcuts must be opt-in — none bound by default");
+  } finally {
+    if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prev;
+    fs.rmSync(agentDir, { recursive: true, force: true });
+  }
+});
+
+await test("registers a shortcut opted in via agent config", async () => {
+  const dir = makeTempDir("shortcut");
+  const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-smoke-agent-"));
+  const prev = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    fs.mkdirSync(path.join(agentDir, "extensions"), { recursive: true });
+    fs.writeFileSync(
+      path.join(agentDir, "extensions", "pi-autoresearch.json"),
+      JSON.stringify({ shortcuts: { fullscreenDashboard: "ctrl+shift+u" } })
+    );
+    const { pi } = await loadExtension(dir);
+    assert.ok(pi.shortcuts.length >= 1, "opted-in shortcut not registered");
+  } finally {
+    if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prev;
+    fs.rmSync(agentDir, { recursive: true, force: true });
+  }
 });
 
 // ── Lifecycle e2e ────────────────────────────────────────────────────

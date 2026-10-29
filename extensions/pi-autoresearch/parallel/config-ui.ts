@@ -38,10 +38,13 @@ export interface AutocompleteEntry {
 
 export const AUTORESEARCH_SUBCOMMANDS: AutocompleteEntry[] = [
   { value: "off", label: "off", description: "Turn autoresearch mode off" },
+  { value: "finalize", label: "finalize", description: "Stop the loop and load the autoresearch-finalize skill" },
   { value: "clear", label: "clear", description: "Delete session log and reset state" },
   { value: "tree", label: "tree", description: "Toggle tree/list view in dashboard widget" },
   { value: "config", label: "config", description: "Interactive parallel mode configuration (models, concurrency, budget)" },
   { value: "export", label: "export", description: "Open live dashboard in browser" },
+  { value: "dashboard", label: "dashboard", description: "Open the fullscreen scrollable dashboard overlay in the terminal" },
+  { value: "help", label: "help", description: "Show /autoresearch usage help" },
   { value: "parallel-best-of-n", label: "parallel-best-of-n", description: "Try N hypotheses at once, keep the best" },
   { value: "parallel-stack", label: "parallel-stack", description: "Stack independent file-scoped optimizations" },
   { value: "parallel-search", label: "parallel-search", description: "Beam search (K states × M candidates)" },

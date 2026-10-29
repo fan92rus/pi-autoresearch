@@ -22,10 +22,9 @@ jobs:
         with:
           node-version: 22.22.2
           cache: pnpm
-          cache-dependency-path: |
-            pnpm-lock.yaml
-            site/pnpm-lock.yaml
-      - run: pnpm install --frozen-lockfile
+          cache-dependency-path: site/pnpm-lock.yaml
+      # Root manifest has no dependencies: the test suite is hermetic
+      # (type-stripping + stubs), so no root install is needed.
       - run: pnpm test
       - run: pnpm --dir site install --frozen-lockfile --ignore-scripts
       - run: pnpm --dir site build
