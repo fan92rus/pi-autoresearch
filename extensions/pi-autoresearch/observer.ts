@@ -314,7 +314,7 @@ export function checkFinalize(allEntries: Record<string, unknown>[], oc: Observe
    The agent has explicitly recorded a finalize entry with high confidence.
    Strongly recommended: run /autoresearch off to finalize this session.` +
       (payload?.advisorAvailable
-        ? `\n   Before that, consult advisor({ stage: "final-check" }) with your proof claims — let it challenge the conclusion.`
+        ? `\n   Before that, consult advisor({ stage: "final-check" }) with your proof claims — let it challenge the conclusion.\n   ${ADVISOR_ARGUE}`
         : "") + `
    To override: delete the finalize entry from .auto/log.jsonl, set observer.finalize_enabled=false in .auto/config.json, or lower the threshold in /autoresearch config.`;
   }
@@ -705,7 +705,7 @@ function checkStagnation(
    The observer will not ask you to "change direction" again — the evidence
    in your ASI fields shows there is nowhere to change TO.` +
       (payload.advisorAvailable
-        ? `\n\n📞 ADVISOR: Before finalizing, consult advisor({ stage: "final-check" }) with your proof claims (ASI floor/exhaustion evidence) — let it challenge the conclusion.`
+        ? `\n\n📞 ADVISOR: Before finalizing, consult advisor({ stage: "final-check" }) with your proof claims (ASI floor/exhaustion evidence) — let it challenge the conclusion.\n${ADVISOR_ARGUE}`
         : "");
     }
     // Finalize recommendation disabled — fall through to actionable stagnation advice.
@@ -813,7 +813,7 @@ Write your analysis to ${ideasPath}, then try the most fundamentally different a
   // Advisor-aware: when the pi-advisor plugin is present, route the strategic
   // review to the stronger model instead of self-reflection only.
   const advisorHint = payload.advisorAvailable
-    ? `\n\n📞 ADVISOR: Consult advisor({ stage: "recovery" }) with: best-so-far ${bestStr}, the failure pattern above, and your untried ideas — ask for a strategic direction check.`
+    ? `\n\n📞 ADVISOR: Consult advisor({ stage: "recovery" }) with: best-so-far ${bestStr}, the failure pattern above, and your untried ideas — ask for a strategic direction check.\n${ADVISOR_ARGUE}`
     : "";
 
   return `🔄 STAGNATION: No metric improvement in ${state.streak} runs.
@@ -833,6 +833,15 @@ ${reflectQuestions}${advisorHint}`;
 // the run COUNT regardless of outcome, so flat/grinding campaigns still get
 // a periodic step-back. Checked after floor/stagnation so alarm triggers
 // keep priority; before progress so the 5-run milestone doesn't shadow it.
+// ─── Advisor argue protocol (Anthropic reconciliation pattern, adapted) ─────
+// Advice gets weight; ledger evidence wins; a contested point is settled by a
+// discriminating experiment, never by rhetoric. pi-advisor gotcha (source:
+// advisor-messages.ts skips toolResult entries): the advisor CANNOT see its own
+// past verdicts, so the executor must quote the disputed advice verbatim when
+// re-consulting.
+const ADVISOR_ARGUE =
+  `If your ledger evidence contradicts the advice: quote the disputed advice verbatim in your message and re-consult ONCE ("Ledger shows X, you suggest Y — which constraint breaks the tie?"). Still contested → settle it with a discriminating experiment, not words, and record the outcome in ASI (learned / next_action_hint).`;
+
 function checkReflection(state: ObserverState, payload: ObserverPayload, oc: ObserverConfig): string | null {
   const decidedRuns = state.improvements + state.streak;
   if (decidedRuns <= 0 || decidedRuns % oc.reflectionIntervalRuns !== 0) return null;
@@ -847,6 +856,7 @@ function checkReflection(state: ObserverState, payload: ObserverPayload, oc: Obs
     lines.push(
       `Then consult advisor({ stage: "recovery" }) with these 3 answers, the best-so-far metric and your untried ideas — ask it to challenge the plan before you spend the next 10 runs.`,
     );
+    lines.push(ADVISOR_ARGUE);
   } else {
     lines.push(`Answer in 3 short lines, then continue with the strongest candidate.`);
   }

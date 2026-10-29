@@ -878,6 +878,8 @@ await test("stagnation hint addresses advisor when the tool is present", async (
   const withAdvisor = runObserver({ ...payload, advisorAvailable: true });
   assert.ok(withAdvisor?.includes("STAGNATION"), `expected stagnation, got: ${withAdvisor?.slice(0, 120)}`);
   assert.ok(withAdvisor.includes('advisor({ stage: "recovery" })'), "stagnation must route to advisor when present");
+  assert.ok(withAdvisor.includes("discriminating experiment"), "argue protocol must be present");
+  assert.ok(withAdvisor.includes("quote the disputed advice"), "quote-before-reconsult must be present (advisor sees no toolResults)");
 
   const withoutAdvisor = runObserver(payload);
   assert.ok(withoutAdvisor?.includes("STAGNATION"));
