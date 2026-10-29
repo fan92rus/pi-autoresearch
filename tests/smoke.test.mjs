@@ -513,6 +513,47 @@ await test("parallel + branching tools are NOT registered (disabled)", async () 
   }
 });
 
+await test("failure warning counts streak since last keep, not campaign total", async () => {
+  const dir = makeTempDir("streak");
+  initGitRepo(dir);
+  const { tool, command, ctx } = await loadExtension(dir);
+  await command("autoresearch").handler("on", ctx);
+  await tool("init_experiment").execute("id", {
+    name: "bench", metric_name: "f1", metric_unit: "", direction: "higher",
+  }, null, null, ctx);
+
+  // Helper: plant a flat tree with an interleaved keep/failure history
+  // (the owner's real scenario: 10 failures + keeps on the board, then a new
+  // proposal — the old TOTAL count scolded despite the breakthroughs).
+  const plantTree = (statuses) => {
+    const nodes = {
+      n0: { id: "n0", parentId: null, children: [], nodeType: "baseline", status: "baseline", metric: 0.28, hypothesis: "baseline", hypothesisLabel: null, commit: null, asi: null, depth: 0 },
+    };
+    statuses.forEach((st, i) => {
+      const id = `n${i + 1}`;
+      nodes[id] = { id, parentId: "n0", children: [], nodeType: "experiment", status: st, metric: st === "keep" ? 0.4 : 0, hypothesis: `H${i}`, hypothesisLabel: `H${i}`, commit: null, asi: null, depth: 1 };
+      nodes.n0.children.push(id);
+    });
+    fs.writeFileSync(path.join(dir, ".auto", "tree.json"), JSON.stringify({
+      version: 1, rootId: "n0", activeNodeId: "n0", nextId: statuses.length + 1,
+      baselineMetric: 0.28, direction: "higher", metricName: "f1", savedBranch: null, nodes,
+    }));
+  };
+
+  // Case 1: recent keeps — NO warning despite 10 total failures on the root
+  plantTree(["discard","discard","keep","discard","discard","keep","discard","discard","discard","discard","keep"]);
+  let res = await tool("propose_hypothesis").execute("id", { description: "H-next after breakthrough: new idea, force=true" }, null, null, ctx);
+  let text = res.content?.[0]?.text ?? "";
+  assert.ok(!text.includes("consecutive failed"), `no streak warning right after a keep, got: ${text.slice(-300)}`);
+
+  // Case 2: 6 consecutive failures after the last keep — warning IS shown
+  plantTree(["keep","discard","discard","discard","discard","discard","discard"]);
+  res = await tool("propose_hypothesis").execute("id", { description: "H-next after losing streak, force=true" }, null, null, ctx);
+  text = res.content?.[0]?.text ?? "";
+  assert.ok(text.includes("6 consecutive failed hypotheses since last keep"), `streak warning expected, got: ${text.slice(-300)}`);
+  assert.ok(!text.includes("All failures:"), "failure list must be capped, not 'All failures'");
+});
+
 await test("stale running tree nodes are marked abandoned on session start", async () => {
   const dir = makeTempDir("stale-running");
   initGitRepo(dir);

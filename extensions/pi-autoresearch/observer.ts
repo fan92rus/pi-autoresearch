@@ -14,7 +14,7 @@ import { execSync } from "node:child_process";
 import { performance } from "node:perf_hooks";
 
 import { parseJsonlEntry, reconstructJsonlState, type ReconstructedRun } from "./jsonl.ts";
-import { treeExists, loadTree, getPath, countFailedChildren } from "./parallel/tree.ts";
+import { treeExists, loadTree, getPath, failedStreakSinceLastKeep } from "./parallel/tree.ts";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -788,10 +788,10 @@ Write your analysis to ${ideasPath}, then try the most fundamentally different a
       const tree = loadTree(cwd);
       if (tree) {
         const activeNode = tree.nodes[tree.activeNodeId];
-        const activeFailCount = activeNode ? countFailedChildren(tree, activeNode.id) : 0;
+        const activeFailCount = activeNode ? failedStreakSinceLastKeep(tree, activeNode.id) : 0;
         
         if (activeFailCount >= 6) {
-          treeHint = `\n🌳 TREE STATUS: ${activeFailCount} failed attempts on the current approach (${activeNode.id}).\n`;
+          treeHint = `\n🌳 TREE STATUS: ${activeFailCount} consecutive failed hypotheses since last keep.\n`;
           treeHint += `   Call tree_status() for the hypothesis list and try a fundamentally different direction.`;
         }
       }

@@ -400,6 +400,46 @@ export function countFailedChildren(tree: ExperimentTree, nodeId: string): numbe
 }
 
 /**
+ * Consecutive failed proposals since the last keep, walking the parent's
+ * children NEWEST-first (children are appended in creation order). A keep
+ * (breakthrough) or the baseline resets the streak; untested/running/abandoned
+ * nodes neither count nor reset it.
+ *
+ * This replaces countFailedChildren() for "is the agent stuck" decisions:
+ * real trees are flat hypothesis lists where EVERY proposal shares the root as
+ * parent, so the total accumulates over the whole campaign and scolds the
+ * agent right after a breakthrough ("10 failed attempts" with 10 keeps on the
+ * board). The streak answers the actual question: "how many tries since the
+ * last thing that worked?"
+ */
+export function failedStreakSinceLastKeep(tree: ExperimentTree, parentId: string): number {
+  const parent = tree.nodes[parentId];
+  if (!parent) return 0;
+  let streak = 0;
+  for (let i = parent.children.length - 1; i >= 0; i--) {
+    const n = tree.nodes[parent.children[i]];
+    if (!n) continue;
+    if (n.status === "keep" || n.status === "baseline") break;
+    if (n.status === "discard" || n.status === "crash" || n.status === "checks_failed") streak++;
+  }
+  return streak;
+}
+
+/**
+ * The most recent kept sibling, or the parent itself (baseline) when nothing
+ * was kept yet — "last breakthrough" context for stuck-detection warnings.
+ */
+export function lastKeepNode(tree: ExperimentTree, parentId: string): TreeNode | null {
+  const parent = tree.nodes[parentId];
+  if (!parent) return null;
+  for (let i = parent.children.length - 1; i >= 0; i--) {
+    const n = tree.nodes[parent.children[i]];
+    if (n && n.status === "keep") return n;
+  }
+  return parent;
+}
+
+/**
  * Get all failed children (discard/crash/checks_failed) of a node.
  */
 export function getFailedChildren(tree: ExperimentTree, nodeId: string): TreeNode[] {

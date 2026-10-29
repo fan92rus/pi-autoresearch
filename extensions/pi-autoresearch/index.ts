@@ -87,6 +87,8 @@ import {
   getChildren,
   countFailedChildren,
   getFailedChildren,
+  failedStreakSinceLastKeep,
+  lastKeepNode,
   findRunningNode,
   hypothesisNodeFilePath,
   createHypothesisNode,
@@ -1039,8 +1041,9 @@ async function recordTreeNode(
   // Informational warning: many failed attempts on parent.
   let warning: string | null = null;
   const failCount = countFailedChildren(tree, parentId);
-  if (failCount >= 6) {
-    warning = `\n⚠️ tree: ${failCount} failed attempts at ${parentId} — consider tree_status() for alternatives.`;
+  const failStreak = failedStreakSinceLastKeep(tree, parentId);
+  if (failStreak >= 6) {
+    warning = `\n⚠️ tree: ${failStreak} consecutive failed hypotheses since last keep at ${parentId} — consider tree_status() for alternatives.`;
   }
 
   saveTree(workDir, tree);
@@ -1121,9 +1124,9 @@ async function finalizeExistingNode(
   // Informational warning: many failed attempts on parent.
   let warning: string | null = null;
   if (node.parentId) {
-    const failCount = countFailedChildren(tree, node.parentId);
-    if (failCount >= 6) {
-      warning = `\n⚠️ tree: ${failCount} failed attempts at ${node.parentId} — consider tree_status() for alternatives.`;
+    const failStreak = failedStreakSinceLastKeep(tree, node.parentId);
+    if (failStreak >= 6) {
+      warning = `\n⚠️ tree: ${failStreak} consecutive failed hypotheses since last keep at ${node.parentId} — consider tree_status() for alternatives.`;
     }
   }
 
@@ -2566,23 +2569,27 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
 
-      // ── Soft warning: many failed attempts on this node (after 6) ──
+      // ── Soft warning: CONSECUTIVE failures since last keep (after 6) ──
+      // Not the total: flat trees accumulate the whole campaign on the root,
+      // and scolding right after a breakthrough is noise. A keep resets it.
       let warning = "";
-      const failedCount = countFailedChildren(tree, parentId);
-      if (failedCount >= 6) {
-        const failedNodes = getFailedChildren(tree, parentId);
+      const failedStreak = failedStreakSinceLastKeep(tree, parentId);
+      if (failedStreak >= 6) {
+        const failedNodes = getFailedChildren(tree, parentId).slice(-failedStreak);
+        const lastKeep = lastKeepNode(tree, parentId);
+        const keepLabel = lastKeep && lastKeep.id !== parentId
+          ? `${lastKeep.id} "${(lastKeep.hypothesisLabel || lastKeep.hypothesis || "").slice(0, 50)}"`
+          : "the baseline";
         warning +=
-          `\n⚠️ ${failedCount} failed attempts on this node (${parentId}).\n` +
-          `   All failures:\n`;
-        for (const f of failedNodes) {
+          `\n⚠️ ${failedStreak} consecutive failed hypotheses since last keep (${keepLabel}).\n` +
+          `   Recent failures:\n`;
+        for (const f of failedNodes.slice(-3)) {
           const fLabel = (f.hypothesisLabel || f.hypothesis || "").slice(0, 60);
-          const fMetric = f.metric ? `${f.metric.toFixed(0)}µs` : "no metric";
-          warning += `   • ${f.id}: "${fLabel}" → ${f.status} (${fMetric})`;
-          if (f.asi?.do_not_retry) warning += ` [do_not_retry: ${String(f.asi.do_not_retry).slice(0, 80)}]`;
+          const fMetric = f.metric ? ` (${f.metric.toFixed(0)})` : "";
+          warning += `   • ${f.id}: "${fLabel}" → ${f.status}${fMetric}`;
           if (f.asi?.finding) warning += ` [finding: ${String(f.asi.finding).slice(0, 80)}]`;
           warning += `\n`;
         }
-        // Many-failures warning (branching is disabled — UCB1/explore_from hints removed)
         warning += `   You can proceed — but is your approach FUNDAMENTALLY different? See tree_status().`;
       }
 
@@ -5054,9 +5061,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const activeNode = tree.nodes[tree.activeNodeId];
       const bestId = findBestNodeId(tree);
       const nodeCount = Object.keys(tree.nodes).length;
-      const strugglingList = Object.values(tree.nodes).filter(
-        (n) => countFailedChildren(tree, n.id) >= 6,
-      );
+      const failStreak = failedStreakSinceLastKeep(tree, tree.activeNodeId);
 
       let text = "";
 
@@ -5076,9 +5081,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       text += renderTree(tree, 60, 3, 7);
 
-      // Show nodes with many failures
-      if (strugglingList.length > 0) {
-        text += `\n⚠️ HIGH FAILURE COUNT: ${strugglingList.map((n) => `${n.id} (${countFailedChildren(tree, n.id)} failures)`).join(", ")}\n`;
+      // Failure streak since last keep (NOT the total — flat trees accumulate
+      // the whole campaign on the root and the total always looks catastrophic)
+      if (failStreak >= 6) {
+        text += `\n⚠️ ${failStreak} consecutive failed hypotheses since last keep — consider a FUNDAMENTALLY different direction.\n`;
       }
 
       // Full detail mode: append all node details
@@ -5096,7 +5102,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           nodeCount,
           activeNodeId: tree.activeNodeId,
           bestNodeId: bestId,
-          strugglingBranches: strugglingList.map((n) => n.id),
+          failStreakSinceLastKeep: failStreak,
         },
       };
     },
