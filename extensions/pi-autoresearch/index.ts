@@ -1873,7 +1873,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     goal: state.name ?? "",
   });
 
-  const fireHook = async (payload: HookPayload): Promise<string | null> => {
+  const advisorToolAvailable = (ctx: unknown): boolean => {
+    try {
+      const tools = (ctx as { tools?: readonly { name?: string }[] } | null | undefined)?.tools;
+      return Array.isArray(tools) && tools.some((t) => t?.name === "advisor");
+    } catch {
+      return false;
+    }
+  };
+
+  const fireHook = async (payload: HookPayload, ctx?: unknown): Promise<string | null> => {
+    payload.advisorAvailable = advisorToolAvailable(ctx);
     const result = await runHook(payload);
     appendHookLogEntryIfConfigured(autoresearchJsonlPath(payload.cwd), payload.event, result);
     return steerMessageFor(payload.event, result);
@@ -2485,7 +2495,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           next_run: state.results.length + 1,
           last_run: readLastRun(workDir),
           session: buildSessionSnapshot(state),
-        });
+        }, ctx);
         if (steer) pi.sendUserMessage(steer, { deliverAs: "steer" });
       }
 
@@ -3878,7 +3888,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         cwd: workDir,
         run_entry: jsonlEntry,
         session: buildSessionSnapshot(state),
-      });
+      }, ctx);
       if (afterSteer) pi.sendUserMessage(afterSteer, { deliverAs: "steer" });
 
       const wallClockSeconds = runtime.lastRunDuration;
@@ -3900,7 +3910,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           next_run: state.results.length + 1,
           last_run: jsonlEntry,
           session: buildSessionSnapshot(state),
-        });
+        }, ctx);
         if (beforeSteer) pi.sendUserMessage(beforeSteer, { deliverAs: "steer" });
       }
 
@@ -5602,7 +5612,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         next_run: state.results.length + 1,
         last_run: readLastRun(workDir),
         session: buildSessionSnapshot(state),
-      });
+      }, ctx);
 
       // Prepend hook output only when prompt.md exists; otherwise the message
       // must stay `/skill:...`-prefixed for command expansion.

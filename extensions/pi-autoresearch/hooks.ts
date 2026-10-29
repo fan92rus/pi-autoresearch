@@ -44,6 +44,8 @@ export interface BeforeHookPayload {
   next_run: number;
   last_run: Record<string, unknown> | null;
   session: SessionSnapshot;
+  /** True when an `advisor` tool is registered in the session (pi-advisor plugin) — observer hints become advisor-addressed. */
+  advisorAvailable?: boolean;
 }
 
 export interface AfterHookPayload {
@@ -51,6 +53,8 @@ export interface AfterHookPayload {
   cwd: string;
   run_entry: Record<string, unknown>;
   session: SessionSnapshot;
+  /** See BeforeHookPayload.advisorAvailable. */
+  advisorAvailable?: boolean;
 }
 
 export type HookPayload = BeforeHookPayload | AfterHookPayload;
@@ -286,6 +290,7 @@ function runBundledObserver(payload: HookPayload): HookResult {
       bestMetric: payload.session.best_metric,
       runCount: payload.session.run_count,
       goal: payload.session.goal,
+      advisorAvailable: payload.advisorAvailable === true,
     });
     return {
       fired: steer !== null,

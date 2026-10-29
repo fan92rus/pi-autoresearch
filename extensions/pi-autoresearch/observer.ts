@@ -61,6 +61,7 @@ export const DEFAULT_OBSERVER_CONFIG: ObserverConfig = {
   noiseSamples: 3,
   stagnationThreshold: 5,
   progressMilestone: 5,
+  reflectionIntervalRuns: 10,
   finalizeEnabled: true,
   floorDetectionEnabled: true,
   finalizeRecommendations: true,
@@ -82,6 +83,7 @@ function readObserverConfig(cwd: string): ObserverConfig {
     if (typeof obs.floor_cv_threshold === "number") cfg.floorCvThreshold = obs.floor_cv_threshold;
     if (typeof obs.noise_gate_margin === "number") cfg.noiseGateMargin = obs.noise_gate_margin;
     if (typeof obs.stagnation_threshold === "number") cfg.stagnationThreshold = obs.stagnation_threshold;
+    if (typeof obs.reflection_interval_runs === "number" && obs.reflection_interval_runs > 0) cfg.reflectionIntervalRuns = obs.reflection_interval_runs;
     // Boolean toggles (default true; presence of a boolean value overrides)
     if (typeof obs.finalize_enabled === "boolean") cfg.finalizeEnabled = obs.finalize_enabled;
     if (typeof obs.floor_detection_enabled === "boolean") cfg.floorDetectionEnabled = obs.floor_detection_enabled;
@@ -105,6 +107,8 @@ export interface ObserverPayload {
   bestMetric: number | null;
   runCount: number;
   goal: string;
+  /** True when an `advisor` tool is registered in the session (pi-advisor plugin). Hints become advisor-addressed instead of self-reflection. */
+  advisorAvailable?: boolean;
 }
 
 export interface ObserverState {
@@ -266,7 +270,7 @@ export function markIdeaTried(ideasDir: string, ideaId: string): boolean {
 
 // ─── Trigger: Finalize ───────────────────────────────────────────────────────
 
-export function checkFinalize(allEntries: Record<string, unknown>[], oc: ObserverConfig, state: ObserverState, ideasDir: string): string | null {
+export function checkFinalize(allEntries: Record<string, unknown>[], oc: ObserverConfig, state: ObserverState, ideasDir: string, payload?: ObserverPayload): string | null {
   const finalizeEntries = allEntries.filter((e) => e.type === "finalize");
   if (finalizeEntries.length === 0) return null;
 
@@ -308,7 +312,10 @@ export function checkFinalize(allEntries: Record<string, unknown>[], oc: Observe
    Reason: ${reason}
 
    The agent has explicitly recorded a finalize entry with high confidence.
-   Strongly recommended: run /autoresearch off to finalize this session.
+   Strongly recommended: run /autoresearch off to finalize this session.` +
+      (payload?.advisorAvailable
+        ? `\n   Before that, consult advisor({ stage: "final-check" }) with your proof claims — let it challenge the conclusion.`
+        : "") + `
    To override: delete the finalize entry from .auto/log.jsonl, set observer.finalize_enabled=false in .auto/config.json, or lower the threshold in /autoresearch config.`;
   }
 
@@ -696,7 +703,10 @@ function checkStagnation(
 
    RECOMMENDED: Call finalize_research() or run /autoresearch off.
    The observer will not ask you to "change direction" again — the evidence
-   in your ASI fields shows there is nowhere to change TO.`;
+   in your ASI fields shows there is nowhere to change TO.` +
+      (payload.advisorAvailable
+        ? `\n\n📞 ADVISOR: Before finalizing, consult advisor({ stage: "final-check" }) with your proof claims (ASI floor/exhaustion evidence) — let it challenge the conclusion.`
+        : "");
     }
     // Finalize recommendation disabled — fall through to actionable stagnation advice.
   }
@@ -800,6 +810,12 @@ Write your analysis to ${ideasPath}, then try the most fundamentally different a
     // Tree hint is best-effort
   }
 
+  // Advisor-aware: when the pi-advisor plugin is present, route the strategic
+  // review to the stronger model instead of self-reflection only.
+  const advisorHint = payload.advisorAvailable
+    ? `\n\n📞 ADVISOR: Consult advisor({ stage: "recovery" }) with: best-so-far ${bestStr}, the failure pattern above, and your untried ideas — ask for a strategic direction check.`
+    : "";
+
   return `🔄 STAGNATION: No metric improvement in ${state.streak} runs.
 
 ${patternHint}
@@ -808,7 +824,33 @@ Recent runs (none beat best ${bestStr}):
 ${recentFormatted}
 ${escalation}
 ${treeHint}
-${reflectQuestions}`;
+${reflectQuestions}${advisorHint}`;
+}
+
+// ─── Trigger: Reflection checkpoint ─────────────────────────────────────
+// Every N decided runs of the segment: a structured strategic pause.
+// Different from checkProgress (milestone-framed, keeps-only): this fires on
+// the run COUNT regardless of outcome, so flat/grinding campaigns still get
+// a periodic step-back. Checked after floor/stagnation so alarm triggers
+// keep priority; before progress so the 5-run milestone doesn't shadow it.
+function checkReflection(state: ObserverState, payload: ObserverPayload, oc: ObserverConfig): string | null {
+  const decidedRuns = state.improvements + state.streak;
+  if (decidedRuns <= 0 || decidedRuns % oc.reflectionIntervalRuns !== 0) return null;
+
+  const lines = [
+    `🪞 REFLECTION CHECKPOINT (${decidedRuns} decided runs this segment). Pause: no experiment until you have answered.`,
+    `1. What worked — which hypothesis family produced the keeps?`,
+    `2. What do the last ~5 discards share? (tree_status detail=full for the list)`,
+    `3. What will you try next — and why is it NOT a repeat of an existing discard?`,
+  ];
+  if (payload.advisorAvailable) {
+    lines.push(
+      `Then consult advisor({ stage: "recovery" }) with these 3 answers, the best-so-far metric and your untried ideas — ask it to challenge the plan before you spend the next 10 runs.`,
+    );
+  } else {
+    lines.push(`Answer in 3 short lines, then continue with the strongest candidate.`);
+  }
+  return lines.join("\n");
 }
 
 // ─── Trigger: Progress milestone ─────────────────────────────────────────────
@@ -924,13 +966,17 @@ export function runObserver(payload: ObserverPayload): string | null {
     if (floorSteer) return floorSteer;
   }
 
+  // 5b. Reflection checkpoint (periodic structured review; advisor-aware)
+  const reflectionSteer = checkReflection(state, payload, oc);
+  if (reflectionSteer) return reflectionSteer;
+
   // 6. Progress milestone (positive reinforcement — always useful)
   const progressSteer = checkProgress(state, payload, cwd, oc);
   if (progressSteer) return progressSteer;
 
   // 7. Finalize (fallback — lowest priority; agent self-assessment)
   if (oc.finalizeEnabled && oc.finalizeRecommendations) {
-    const finalizeSteer = checkFinalize(allEntries, oc, state, ideasPath);
+    const finalizeSteer = checkFinalize(allEntries, oc, state, ideasPath, payload);
     if (finalizeSteer) return finalizeSteer;
   }
 

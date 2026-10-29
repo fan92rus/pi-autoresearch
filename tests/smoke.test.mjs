@@ -821,6 +821,91 @@ await test("propose_hypothesis writes idea file to .auto/ideas/", async () => {
 });
 
 // ──────────────────────────────────────────────────────────────────────
+// Reflection checkpoints + advisor-aware hints (goal-x / pi-advisor)
+// ──────────────────────────────────────────────────────────────────────
+
+function plantRunLog(dir, runs) {
+  const autoDir = path.join(dir, ".auto");
+  fs.mkdirSync(autoDir, { recursive: true });
+  const lines = [JSON.stringify({ type: "config", name: "bench", metricName: "ms", metricUnit: "ms", bestDirection: "lower" })];
+  for (let i = 0; i < runs; i++) {
+    lines.push(JSON.stringify({ run: i + 1, metric: 100 - i, status: "keep", description: `keep ${i}` }));
+  }
+  fs.writeFileSync(path.join(autoDir, "log.jsonl"), lines.join("\n") + "\n");
+}
+
+await test("reflection checkpoint fires at the run interval, without advisor when absent", async () => {
+  const dir = makeTempDir("reflect");
+  plantRunLog(dir, 10); // 10 improving keeps → decidedRuns = 10
+  const { runObserver } = await import(pathToFileURL(path.join("extensions", "pi-autoresearch", "observer.ts")));
+
+  const steer = runObserver({
+    cwd: dir, direction: "lower", metricName: "ms", metricUnit: "ms",
+    baselineMetric: 100, bestMetric: 91, runCount: 10, goal: "bench",
+  });
+  assert.ok(steer?.includes("REFLECTION CHECKPOINT"), `expected reflection steer, got: ${steer?.slice(0, 200)}`);
+  assert.ok(steer.includes("advisor") === false, "no advisor mention when the tool is absent");
+  assert.ok(!steer.includes("MILESTONE"), "reflection shadows the 5-run progress milestone");
+});
+
+await test("reflection checkpoint does not fire off-interval", async () => {
+  const dir = makeTempDir("reflect-off");
+  plantRunLog(dir, 11);
+  const { runObserver } = await import(pathToFileURL(path.join("extensions", "pi-autoresearch", "observer.ts")));
+
+  const steer = runObserver({
+    cwd: dir, direction: "lower", metricName: "ms", metricUnit: "ms",
+    baselineMetric: 100, bestMetric: 90, runCount: 11, goal: "bench",
+  });
+  assert.ok(!steer?.includes("REFLECTION CHECKPOINT"), `off-interval must not fire, got: ${steer?.slice(0, 120)}`);
+});
+
+await test("stagnation hint addresses advisor when the tool is present", async () => {
+  const dir = makeTempDir("advisor-stag");
+  const autoDir = path.join(dir, ".auto");
+  fs.mkdirSync(autoDir, { recursive: true });
+  const lines = [JSON.stringify({ type: "config", name: "bench", metricName: "ms", metricUnit: "ms", bestDirection: "lower" })];
+  for (let i = 0; i < 5; i++) {
+    lines.push(JSON.stringify({ run: i + 1, metric: 120 + i, status: "discard", description: `tweak ${i}` }));
+  }
+  fs.writeFileSync(path.join(autoDir, "log.jsonl"), lines.join("\n") + "\n");
+  const { runObserver } = await import(pathToFileURL(path.join("extensions", "pi-autoresearch", "observer.ts")));
+
+  const payload = {
+    cwd: dir, direction: "lower", metricName: "ms", metricUnit: "ms",
+    baselineMetric: 100, bestMetric: 100, runCount: 5, goal: "bench",
+  };
+  const withAdvisor = runObserver({ ...payload, advisorAvailable: true });
+  assert.ok(withAdvisor?.includes("STAGNATION"), `expected stagnation, got: ${withAdvisor?.slice(0, 120)}`);
+  assert.ok(withAdvisor.includes('advisor({ stage: "recovery" })'), "stagnation must route to advisor when present");
+
+  const withoutAdvisor = runObserver(payload);
+  assert.ok(withoutAdvisor?.includes("STAGNATION"));
+  assert.ok(!withoutAdvisor.includes("ADVISOR"), "no advisor line when tool absent");
+});
+
+await test("observer steers carry advisor awareness through the hook pipeline", async () => {
+  const dir = makeTempDir("advisor-wire");
+  initGitRepo(dir);
+  plantRunLog(dir, 9); // log_experiment appends the 10th → checkpoint fires on the after-hook
+  const { tool, command, pi } = await loadExtension(dir);
+  const ctx = Object.assign(makeCtx(dir, "sess-adv", pi), { tools: [{ name: "advisor" }, { name: "bash" }] });
+
+  await command("autoresearch").handler("on", ctx);
+  await tool("init_experiment").execute("id", {
+    name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower",
+  }, null, null, ctx);
+  plantRunLog(dir, 9); // init archives pre-existing logs — plant AFTER init, before the 10th run lands
+  await tool("log_experiment").execute("id", {
+    status: "keep", metric: 91, description: "tenth run",
+  }, null, null, ctx);
+
+  const joined = pi.sentMessages.map((m) => m.text ?? "").join("\n");
+  assert.ok(joined.includes("REFLECTION CHECKPOINT"), `after-steer must carry the checkpoint, got: ${joined.slice(0, 300)}`);
+  assert.ok(joined.includes('advisor({ stage: "recovery" })'), "pipeline must see ctx.tools and mention advisor");
+});
+
+// ──────────────────────────────────────────────────────────────────────
 // Results
 // ──────────────────────────────────────────────────────────────────────
 
