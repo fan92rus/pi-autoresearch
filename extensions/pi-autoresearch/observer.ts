@@ -819,7 +819,7 @@ Write your analysis to ${ideasPath}, then try the most fundamentally different a
 
   // The council is also self-service: the agent may convene it at any time,
   // with no limits, so the stagnation steer always mentions that door.
-  const councilHint = `\n🏛 COUNCIL: If self-reflection is not enough, convene a hypothesis council yourself — no limits, any time: council_convene({ note: "why you are stuck and what to focus on" }). Three independent analysts will cross-examine the problem and return a slate of vetted experiments.`;
+  const councilHint = `\n🏛 COUNCIL: If self-reflection is not enough, convene a hypothesis council yourself — no limits, any time: council_convene({ note: "why you are stuck and what to focus on" }). It is autonomous and BLOCKING: the tool spawns the analysts, runs the cross-examination and the chair itself, and returns a vetted experiment slate.`;
 
   return `🔄 STAGNATION: No metric improvement in ${state.streak} runs.
 

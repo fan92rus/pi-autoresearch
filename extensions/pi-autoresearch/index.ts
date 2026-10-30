@@ -39,7 +39,17 @@ import { spawn } from "node:child_process";
 import { getBashSpawnOptions, killTree } from "./bash-shell.ts";
 import { markIdeaTried } from "./observer.ts";
 import { registerCouncilTools } from "./council-tools.ts";
-import { checkCouncilTrigger, readCouncilConfig, readCouncilState } from "./council.ts";
+import {
+  checkCouncilTrigger,
+  composeConveneNudge,
+  composeFacilitatorMessage,
+  findUnfinishedCouncil,
+  personaPrompt,
+  readCouncilConfig,
+  readNoiseFloor,
+  resolveRoster,
+  validateSlate,
+} from "./council.ts";
 import { createWriteStream } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -2272,6 +2282,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // Council facilitation IS loop work: without these, drift-resume would nag
     // the agent mid-council (observed in the E2E run).
     "council_write_entry", "council_check_consensus",
+    // council_convene BLOCKS the turn running the whole council — campaign work.
+    "council_convene",
   ]);
   pi.on("tool_execution_end", async (event, ctx) => {
     if (!EXPERIMENT_LOOP_TOOLS.has(event.toolName)) return;
@@ -2344,8 +2356,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\n\n## Finalization" +
       "\nfinalize_research({reason, evidence, confidence}) only with PROOF (mathematical floor, noise floor reached, search space exhausted). A subjective \u201cthis seems hard\u201d is NOT proof \u2014 try orthogonal approaches first. It is a RECOMMENDATION; the observer arbitrates and suppresses premature signals." +
       "\n\n## Stagnation Council" +
-      "\nWhen the observer convenes a STAGNATION COUNCIL, follow its facilitator protocol exactly: spawn the analyst subagents, verify their entries via council_read_index (retry missing ones), run challenge rounds via council_check_consensus, get the chair's slate, then register each slate experiment with propose_hypothesis and execute them in the normal loop. You may append ONLY objective-facts entries (phase: \"facts\") — never judge hypotheses yourself. A council opinion is not evidence; the benchmark is." +
-      "\nYou can also convene a council YOURSELF at any time, with no limits, when you feel stuck: call council_convene({ note: \"why you are stuck and what to focus on\" }) and follow the returned protocol. Your note reaches the analysts through the brief.\n" +
+      "\nWhen the observer convenes a STAGNATION COUNCIL, call council_convene({ note: \"...\" }) immediately — the tool runs the whole council itself (spawns analysts, runs challenge rounds, gets the chair's slate) and BLOCKS until the finished slate returns. Then register each slate experiment with propose_hypothesis and execute them in the normal loop. You may append ONLY objective-facts blackboard entries (phase: \"facts\") — never judge hypotheses yourself. A council opinion is not evidence; the benchmark is." +
+      "\nYou can also convene a council YOURSELF at any time, with no limits, when you feel stuck: council_convene({ note: \"why you are stuck and what to focus on\" }). It is autonomous (it supervises the subagents) and blocking (it returns the finished slate) — you only execute the slate." +
       "\n\n## Observer Steers" +
       "\n\U0001f504 STAGNATION \u2014 STOP and REFLECT on the pattern. \U0001f3af MILESTONE \u2014 consider strategic alternatives and orthogonal directions.";
 
@@ -5226,18 +5238,23 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   // Self-service council: the campaign agent convenes it whenever it feels
   // stuck — no stagnation threshold, no cooldown, no cap (only council.enabled
-  // vetoes). The agent's note goes verbatim into the brief the analysts read.
+  // vetoes). AUTONOMOUS + BLOCKING: the whole council (analyst batches, challenge
+  // rounds, chair slate) runs inside this one tool call as a pi-subagents
+  // workflow (workflows/council-loop.js — the pi-agile "workflow in a file"
+  // pattern); the agent just waits and executes the returned slate.
+  const councilWorkflowPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "workflows", "council-loop.js");
   registerGatedTool({
     name: "council_convene",
-    label: "Convene a hypothesis council yourself",
+    label: "Convene a hypothesis council (autonomous, blocking)",
     description:
       "Convene a stagnation council at any time, with no limits — no stagnation threshold, no cooldown, no cap " +
-      "(only council.enabled in .auto/config.json can veto). Use it when you feel stuck: repeated failures, " +
-      "no improvement in sight, or a direction you cannot settle alone. Your note is added to the brief the analysts read.",
-    promptSnippet: "Convene a hypothesis council yourself when stuck (no limits); your note reaches the analysts",
+      "(only council.enabled in .auto/config.json can veto). AUTONOMOUS: this tool spawns and supervises the analyst " +
+      "subagents, runs the challenge rounds and the chair itself. BLOCKING: it returns only when the council is done, " +
+      "with the finished slate. Use it when you feel stuck; your note is added to the brief the analysts read.",
+    promptSnippet: "Convene a hypothesis council yourself (autonomous + blocking) — returns the finished slate",
     promptGuidelines: [
-      "When stuck (e.g. a long failure streak with no keep in sight, or every direction ends in 'no effect'), convene a council yourself: council_convene({ note: \"...\" }).",
-      "In the note say where you are stuck and what the council should focus on; then follow the returned facilitator protocol exactly.",
+      "When stuck (e.g. a long failure streak with no keep in sight, or every direction ends in 'no effect'), convene a council: council_convene({ note: \"...\" }).",
+      "The tool runs the whole council itself (several minutes) and returns the finished slate — you only register the slate experiments via propose_hypothesis and run them in the normal loop.",
     ],
     parameters: {
       type: "object",
@@ -5256,22 +5273,144 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (!cfg.enabled) {
         return { content: [{ type: "text", text: "❌ Council is disabled (council.enabled=false in .auto/config.json)." }], details: {} };
       }
+      const note = typeof params?.note === "string" && params.note.trim() ? params.note.trim() : "";
       const state = getRuntime(ctx).state;
-      const msg = checkCouncilTrigger(0, state.results.length, workDir, {
+      const briefInput = {
         metricName: state.metricName,
         metricUnit: state.metricUnit,
         direction: state.bestDirection,
         baselineMetric: state.bestMetric,
         bestMetric: findBestMetric(state.results, state.currentSegment, state.bestDirection),
         goal: state.name ?? "",
-      }, { force: true, agentNote: typeof params?.note === "string" && params.note.trim() ? params.note : undefined });
-      if (!msg) {
-        return { content: [{ type: "text", text: "❌ Council could not be convened (disabled)." }], details: {} };
+      };
+
+      // Resume an interrupted council (brief exists, slate missing) instead of re-sequencing.
+      let pending = findUnfinishedCouncil(workDir);
+      if (!pending) {
+        const triggered = checkCouncilTrigger(0, state.results.length, workDir, briefInput, { force: true, agentNote: note });
+        if (!triggered) {
+          return { content: [{ type: "text", text: "❌ Council could not be convened (disabled)." }], details: {} };
+        }
+        pending = findUnfinishedCouncil(workDir);
       }
-      const seq = readCouncilState(workDir).councilsRun;
+      if (!pending) {
+        return { content: [{ type: "text", text: "❌ Council dir could not be resolved after convening." }], details: {} };
+      }
+      const seq = pending.seq;
+      const councilDirAbs = pending.dir;
+      const councilDirRel = path.relative(workDir, councilDirAbs).split(path.sep).join("/");
+      const briefAbsPath = path.join(councilDirAbs, "00-brief.md");
+
+      const roster = resolveRoster(cfg);
+
+      // Fallback: without the subagent tool the extension cannot run the
+      // workflow — hand the agent the manual facilitator protocol instead.
+      const hasSubagent = Array.isArray(ctx.tools) && ctx.tools.some((t) => t?.name === "subagent");
+      if (!hasSubagent) {
+        const protocol = composeFacilitatorMessage({
+          councilDir: councilDirRel,
+          seq,
+          briefAbsPath,
+          roster,
+          maxChallengeRounds: 5,
+          minExperiments: 3,
+        });
+        return {
+          content: [{ type: "text", text: "COUNCIL #" + seq + " convened (MANUAL mode — the subagent tool is unavailable, orchestrate by hand).\n\n" + protocol }],
+          details: { councilSeq: seq, mode: "manual-fallback" },
+        };
+      }
+
+      let briefText = "";
+      try { briefText = fs.readFileSync(briefAbsPath, "utf-8"); } catch { /* validated below */ }
+      if (!briefText) {
+        return { content: [{ type: "text", text: "❌ Brief is missing at " + briefAbsPath + " — cannot run the council." }], details: {} };
+      }
+      const wfArgs: Record<string, unknown> = {
+        briefText,
+        participants: roster.participants.map((p) => ({ name: p.name, letter: p.letter, model: p.model, personaPrompt: personaPrompt(p.persona) })),
+        chairModel: roster.chairModel,
+        maxChallengeRounds: 5,
+        minExperiments: 3,
+        note,
+      };
+      try { ctx.ui.notify("Council #" + seq + " running (autonomous — analysts, rounds, chair; this blocks for a few minutes)", "info"); } catch { /* headless */ }
+
+      // The script returns "COUNCIL_RESULT:{...}" — parse the first balanced
+      // object after the marker (child receipts may surround it in the text).
+      const parseResult = (text: string): Record<string, unknown> | null => {
+        const marker = text.indexOf("COUNCIL_RESULT:");
+        if (marker < 0) return null;
+        const start = text.indexOf("{", marker);
+        if (start < 0) return null;
+        for (let end = text.indexOf("}", start); end > start; end = text.indexOf("}", end + 1)) {
+          try {
+            return JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>;
+          } catch { /* try the next closing brace */ }
+        }
+        return null;
+      };
+
+      const runWorkflow = async (fixErrors: string): Promise<{ text: string; result: Record<string, unknown> | null }> => {
+        const args2: Record<string, unknown> = fixErrors ? { ...wfArgs, chairFix: fixErrors } : wfArgs;
+        let outcome: { isError?: boolean; result?: { content?: { type: string; text?: string }[] } } | undefined;
+        try {
+          outcome = (await ctx.executeTool("subagent", {
+            workflow: councilWorkflowPath,
+            args: args2,
+            async: false,
+            cwd: workDir,
+            options: { timeoutMs: cfg.timeoutMinutes * 60_000 },
+          })) as typeof outcome;
+        } catch (e) {
+          return { text: "workflow launch failed: " + (e instanceof Error ? e.message : String(e)), result: null };
+        }
+        const text = (outcome?.result?.content ?? []).map((c) => (c?.type === "text" ? c.text ?? "" : "")).join("\n");
+        return { text, result: parseResult(text) };
+      };
+
+      // FILELESS dispute: the slate arrives in the workflow result (chat), not on
+      // disk. The extension validates it and persists it to the board for audit
+      // and resume detection (findUnfinishedCouncil).
+      const persistSlate = (body: string): string => {
+        const ed = path.join(councilDirAbs, "entries");
+        fs.mkdirSync(ed, { recursive: true });
+        const file = String(Date.now()).slice(-6) + "-Chair.md";
+        fs.writeFileSync(path.join(ed, file), "---\nspeaker: Chair\nphase: slate\nsummary: final slate\n---\n" + body.trim() + "\n", "utf-8");
+        return file;
+      };
+
+      const slateFrom = (r: Record<string, unknown> | null): { body: string } | null =>
+        r && typeof r.slate === "string" && r.slate.trim() ? { body: r.slate } : null;
+
+      // First run; if the chair's slate fails validation, ONE corrective re-run.
+      let run = await runWorkflow("");
+      let slate = slateFrom(run.result);
+      let validation = slate ? validateSlate(slate.body, readNoiseFloor(workDir)) : { ok: false, errors: ["no slate returned"] };
+      if (!validation.ok && run.result?.ok === true) {
+        try { ctx.ui.notify("Council #" + seq + ": slate failed validation — one corrective chair pass", "info"); } catch { /* headless */ }
+        run = await runWorkflow((validation.errors ?? []).join(" "));
+        slate = slateFrom(run.result);
+        validation = slate ? validateSlate(slate.body, readNoiseFloor(workDir)) : { ok: false, errors: ["no slate returned"] };
+      }
+
+      if (!run.result || run.result.ok !== true) {
+        const reason = run.result ? String(run.result.reason ?? "unknown") : "workflow failed";
+        const detail = run.result ? String(run.result.detail ?? "") : run.text.slice(-600);
+        return {
+          content: [{ type: "text", text: "❌ COUNCIL #" + seq + " did not complete (" + reason + "). " + detail + "\n\nCall council_convene again to resume the council (finished children are reused)." }],
+          details: { councilSeq: seq, outcome: "failed", reason },
+        };
+      }
+
+      const slateFile = slate ? persistSlate(slate.body) : null;
+      const consensus = run.result.consensus ? JSON.stringify(run.result.consensus) : "(unavailable)";
+      const unavailable = Array.isArray(run.result.unavailable) && run.result.unavailable.length > 0 ? " Unavailable: " + (run.result.unavailable as string[]).join(", ") + "." : "";
+      const rounds = Number(run.result.rounds ?? 0);
+      const validationLine = validation.ok ? "validated ✓" : "⚠ validation issues: " + (validation.errors ?? []).join(" ");
       return {
-        content: [{ type: "text", text: `COUNCIL #${seq} CONVENED — your note is in the brief (section "Lead agent's note"). Follow the facilitator protocol below exactly.\n\n${msg}` }],
-        details: { councilSeq: seq, agentNoteIncluded: Boolean(params?.note?.trim()) },
+        content: [{ type: "text", text: "🏛 COUNCIL #" + seq + " COMPLETE — " + rounds + " challenge round(s). Consensus: " + consensus + "." + unavailable + "\nSlate (persisted to " + councilDirRel + "/entries/" + (slateFile ?? "?") + "): " + validationLine + "\n\n" + (slate?.body ?? "(no slate)") + "\n\nRegister each EXP via propose_hypothesis (SimHash dedup applies) and run them through the normal loop. Honor the KILL_WHEN gates — the slate may legitimately skip experiments." }],
+        details: { councilSeq: seq, outcome: "complete", rounds, validated: validation.ok === true },
       };
     },
   });
@@ -5552,8 +5691,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       if (command === "council" || command.startsWith("council ")) {
-        // Manual stagnation council trigger (same path as the automatic one).
-        // Anything after "council" is the lead's note, delivered into the brief.
+        // Delegate to the autonomous tool (single code path). The command
+        // context has no executeTool, so the agent performs the blocking call.
         const note = trimmedArgs.replace(/^council\b\s*/i, "").trim();
         const workDir = resolveWorkDir(ctx.cwd);
         const cfg = readCouncilConfig(workDir);
@@ -5561,19 +5700,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           ctx.ui.notify("Council is disabled (council.enabled=false in .auto/config.json)", "error");
           return;
         }
-        const state = runtime.state;
-        const msg = checkCouncilTrigger(0, state.results.length, workDir, {
-          metricName: state.metricName,
-          metricUnit: state.metricUnit,
-          direction: state.bestDirection,
-          baselineMetric: state.bestMetric,
-          bestMetric: findBestMetric(state.results, state.currentSegment, state.bestDirection),
-          goal: state.name ?? "",
-        }, { force: true, agentNote: note || undefined });
-        if (msg) {
-          pi.sendUserMessage(msg, { deliverAs: "followUp" });
-          ctx.ui.notify(`Council #${readCouncilState(workDir).councilsRun} convened${note ? " — your note is in the brief" : ""} — protocol sent`, "info");
-        }
+        const noteArg = note ? ", note: " + JSON.stringify(note) : "";
+        pi.sendUserMessage(
+          "Convene a hypothesis council NOW: call council_convene({" + noteArg + "}). " +
+          "The tool is autonomous and BLOCKING — it runs the analysts, challenge rounds and chair itself and returns the finished slate. " +
+          "When it returns, register each slate EXP via propose_hypothesis and run them through the normal loop.",
+          { deliverAs: "followUp" },
+        );
+        ctx.ui.notify("Council delegated to council_convene — the agent will run it autonomously", "info");
         return;
       }
 

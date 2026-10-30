@@ -34,6 +34,8 @@ export interface CouncilConfig {
   cooldownRuns: number;
   maxCouncils: number;
   mode: "auto" | "models" | "personas";
+  /** Wall-clock budget for the autonomous council workflow (minutes). */
+  timeoutMinutes: number;
 }
 
 const DEFAULT_PARTICIPANTS: CouncilParticipantConfig[] = [
@@ -54,6 +56,7 @@ export function defaultCouncilConfig(): CouncilConfig {
     stagnationRuns: 10,
     cooldownRuns: 5,
     maxCouncils: Infinity,
+  timeoutMinutes: 30,
     mode: "auto",
   };
 }
@@ -76,6 +79,7 @@ export function readCouncilConfig(cwd: string): CouncilConfig {
     if (typeof c.stagnation_runs === "number" && c.stagnation_runs > 0) cfg.stagnationRuns = Math.floor(c.stagnation_runs);
     if (typeof c.cooldown_runs === "number" && c.cooldown_runs >= 0) cfg.cooldownRuns = Math.floor(c.cooldown_runs);
     if (typeof c.max_councils === "number" && c.max_councils > 0) cfg.maxCouncils = Math.floor(c.max_councils);
+    if (typeof c.timeout_minutes === "number" && c.timeout_minutes > 0) cfg.timeoutMinutes = Math.min(Math.max(Math.floor(c.timeout_minutes), 5), 120);
     if (c.mode === "models" || c.mode === "personas") cfg.mode = c.mode;
     if (Array.isArray(c.participants) && c.participants.length >= 2) {
       const parsed: CouncilParticipantConfig[] = [];
@@ -450,6 +454,44 @@ export function readNoiseFloor(cwd: string): number | null {
 }
 
 /**
+ * Find the newest council that has a brief but NO slate entry yet — an
+ * interrupted/abandoned council that should be resumed, not re-sequenced.
+ */
+export function findUnfinishedCouncil(workDir: string): { seq: number; dir: string } | null {
+  const st = readCouncilState(workDir);
+  for (let seq = st.councilsRun; seq >= 1; seq--) {
+    const dir = path.join(workDir, ".auto", "councils", String(seq));
+    if (!fs.existsSync(path.join(dir, "00-brief.md"))) continue;
+    let hasSlate = false;
+    try {
+      const entriesDir = path.join(dir, "entries");
+      for (const f of fs.readdirSync(entriesDir)) {
+        if (!f.endsWith(".md")) continue;
+        const head = fs.readFileSync(path.join(entriesDir, f), "utf-8").slice(0, 500);
+        if (/^phase:\s*slate\s*$/m.test(head)) {
+          hasSlate = true;
+          break;
+        }
+      }
+    } catch {
+      /* no entries dir yet → definitely unfinished */
+    }
+    if (!hasSlate) return { seq, dir };
+  }
+  return null;
+}
+
+/** Pointer message: the blackboard is ready — the agent convenes via the tool. */
+export function composeConveneNudge(seq: number, councilDirRel: string, briefAbsPath: string): string {
+  return [
+    `🏛 STAGNATION COUNCIL #${seq} — the blackboard is ready (${councilDirRel}).`,
+    `Call council_convene({}) NOW — it is autonomous and BLOCKING: the tool spawns the analysts, runs the challenge rounds and the chair itself, and returns the finished slate. Add your assessment via council_convene({ note: "where you are stuck and what to focus on" }) — the note reaches the analysts through the brief.`,
+    `Brief: ${briefAbsPath}`,
+    `When the slate returns: register each EXP via propose_hypothesis (SimHash dedup applies) and run them through the normal loop. The benchmark decides — a council opinion is not evidence.`,
+  ].join("\n");
+}
+
+/**
  * Stagnation council trigger. Fires when the campaign is stalled (no best
  * improvement for stagnation_runs), the council budget/cooldown allow it, and
  * the council feature is enabled. On fire: writes the brief + state, returns the
@@ -464,6 +506,11 @@ export function checkCouncilTrigger(
 ): string | null {
   const cfg = readCouncilConfig(cwd);
   if (!cfg.enabled) return null;
+  // A pending (brief written, no slate yet) council is pointed at again, never re-sequenced.
+  const pending = findUnfinishedCouncil(cwd);
+  if (pending) {
+    return composeConveneNudge(pending.seq, path.relative(cwd, pending.dir).split(path.sep).join("/"), path.join(pending.dir, "00-brief.md"));
+  }
   if (!options?.force) {
     if (runsSinceBestImprovement < cfg.stagnationRuns) return null;
     const st = readCouncilState(cwd);
@@ -472,18 +519,10 @@ export function checkCouncilTrigger(
   }
 
   const { seq, dir } = nextCouncilDir(cwd);
-  const roster = resolveRoster(cfg);
   const noiseFloor = readNoiseFloor(cwd);
-  const brief = buildBrief(cwd, dir, { ...briefInput, seq, noiseFloor, agentNote: options?.agentNote });
+  buildBrief(cwd, dir, { ...briefInput, seq, noiseFloor, agentNote: options?.agentNote });
   writeCouncilState(cwd, { councilsRun: seq, lastCouncilRun: runCount });
-  return composeFacilitatorMessage({
-    councilDir: path.relative(cwd, dir).split(path.sep).join("/"),
-    seq,
-    briefAbsPath: brief.path,
-    roster,
-    maxChallengeRounds: 5,
-    minExperiments: 3,
-  });
+  return composeConveneNudge(seq, path.relative(cwd, dir).split(path.sep).join("/"), path.join(dir, "00-brief.md"));
 }
 
 // ─── Facilitator message ─────────────────────────────────────────────────────
