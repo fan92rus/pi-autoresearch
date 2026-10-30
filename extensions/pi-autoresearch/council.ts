@@ -53,7 +53,7 @@ export function defaultCouncilConfig(): CouncilConfig {
     chairModel: DEFAULT_CHAIR_MODEL,
     stagnationRuns: 10,
     cooldownRuns: 5,
-    maxCouncils: 3,
+    maxCouncils: Infinity,
     mode: "auto",
   };
 }
@@ -496,6 +496,8 @@ function participantTask(name: string, letter: string, model: string, persona: C
       "  a quick orientation pass (project layout, the benchmarked source and the measure script, tail of .auto/log.jsonl, git log --oneline if this is a repo), not an audit.",
       "  Cite exact file:line for anything you take from the code.",
       "  Two hard lines: don't run builds or benchmarks (the campaign executes experiments, not you), don't write files.",
+      "",
+      "Also use codex_search (a handful of targeted queries) to ground your hypotheses in external knowledge: established techniques, algorithm/library prior art, known pitfalls for the area you are proposing. Cite what you found when it shapes a hypothesis. Skip it only if the tool is missing in your session.",
       "If what you see contradicts the brief (missing or stale facts, e.g. no noise floor), say so explicitly in your entry.",
       "",
       "Propose EXACTLY 3 experiment hypotheses. Format each as a markdown section:",
@@ -517,6 +519,7 @@ function participantTask(name: string, letter: string, model: string, persona: C
       "Do not accept something merely because it sounds confident; do not reject merely to disagree. " +
       "For refine verdicts, name exactly what must change.",
     "You may also look at the project yourself when a verdict hinges on code reality rather than brief facts — look around freely, just don't rabbit-hole; and never run builds or benchmarks or write files (that's the campaign's job).",
+    "codex_search is fair game too when a verdict hinges on prior art or external facts about a technique — again, without rabbit-holing.",
     "You may also append 1 improvement paragraph per hypothesis you refined.",
     "",
     "Write the FULL text with council_write_entry:",
@@ -601,6 +604,7 @@ export function composeFacilitatorMessage(input: FacilitatorInput): string {
       "that is expected and fine), then run them through the normal loop: run_experiment → log_experiment with ASI " +
       "(finding / do_not_retry). The benchmark decides — a council opinion is not evidence.",
     "",
-    `Budget note: this council counts against max_councils. A keep from this slate resets the stagnation clock.`,
+    `Budget note: councils are unlimited by default — a long campaign may convene as many as stagnation demands. ` +
+      `Set council.max_councils in .auto/config.json to cap them. A keep from this slate resets the stagnation clock.`,
   ].join("\n");
 }

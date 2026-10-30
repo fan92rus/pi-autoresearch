@@ -1043,7 +1043,7 @@ await test("council config: defaults, overrides, malformed input falls back", ()
   const defaults = readCouncilConfig(dir);
   assert.strictEqual(defaults.enabled, true);
   assert.strictEqual(defaults.stagnationRuns, 10);
-  assert.strictEqual(defaults.maxCouncils, 3);
+  assert.strictEqual(defaults.maxCouncils, Infinity, "no cap by default — long campaigns may convene many councils");
 
   fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
   fs.writeFileSync(path.join(dir, ".auto", "config.json"), JSON.stringify({
@@ -1076,10 +1076,15 @@ await test("council trigger: threshold, cooldown, cap, enabled flag, force", () 
   msg = checkCouncilTrigger(10, 16, dir, brief);
   assert.ok(msg?.includes("COUNCIL #2"), "cooldown passed → council #2");
 
-  // cap: force councils_run to max
-  councilMod.writeCouncilState(dir, { councilsRun: 3, lastCouncilRun: null });
-  assert.strictEqual(checkCouncilTrigger(10, 30, dir, brief), null, "max councils reached");
-  assert.ok(checkCouncilTrigger(10, 30, dir, brief, { force: true })?.includes("COUNCIL #4"), "manual force bypasses cap/cooldown");
+  // no cap by default: even many past councils do not block a new one
+  councilMod.writeCouncilState(dir, { councilsRun: 10, lastCouncilRun: null });
+  assert.ok(checkCouncilTrigger(10, 30, dir, brief)?.includes("COUNCIL #11"), "unlimited by default (long campaigns)");
+
+  // cap applies only when configured
+  fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".auto", "config.json"), JSON.stringify({ council: { max_councils: 3 } }));
+  assert.strictEqual(checkCouncilTrigger(10, 30, dir, brief), null, "configured max_councils reached");
+  assert.ok(checkCouncilTrigger(10, 30, dir, brief, { force: true })?.includes("COUNCIL #12"), "manual force bypasses cap/cooldown");
 
   // enabled=false blocks even force
   fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
@@ -1094,7 +1099,9 @@ await test("facilitator message: phases, roster, WROTE_ENTRY marker, facts rule"
   assert.ok(msg, "message produced");
   for (const marker of ["Phase 1 — Diverge", "Phase 2 — Challenge", "Phase 3 — Chair", "Phase 4 — Execute", "WROTE_ENTRY", "council_check_consensus", "propose_hypothesis", "ONLY to correct objective facts", "Chair",
     // free-but-bounded exploration guidance for analysts (2026-10-30)
-    "look around freely", "don't dig in", "don't run builds or benchmarks", "look at the project yourself"]) {
+    "look around freely", "don't dig in", "don't run builds or benchmarks", "look at the project yourself",
+    // codex_search grounding + unlimited councils budget note (2026-10-30)
+    "use codex_search", "unlimited by default"]) {
     assert.ok(msg.includes(marker), `message must contain "${marker}"`);
   }
   // persona line for the default (models) roster
