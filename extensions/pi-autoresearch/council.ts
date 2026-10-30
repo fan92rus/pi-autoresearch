@@ -492,6 +492,12 @@ function participantTask(name: string, letter: string, model: string, persona: C
       `First read the campaign brief: ${input.briefAbsPath}`,
       `Your lens: ${personaPrompt(persona)}`,
       "",
+      "Beyond the brief, you may also study the problem in the project yourself — look around freely, just don't dig in:",
+      "  a quick orientation pass (project layout, the benchmarked source and the measure script, tail of .auto/log.jsonl, git log --oneline if this is a repo), not an audit.",
+      "  Cite exact file:line for anything you take from the code.",
+      "  Two hard lines: don't run builds or benchmarks (the campaign executes experiments, not you), don't write files.",
+      "If what you see contradicts the brief (missing or stale facts, e.g. no noise floor), say so explicitly in your entry.",
+      "",
       "Propose EXACTLY 3 experiment hypotheses. Format each as a markdown section:",
       "### H-<YOUR LETTER><N>: <short title>",
       "<why this could work, grounded in brief facts; expected effect vs noise; cost/complexity; kill condition>",
@@ -510,6 +516,7 @@ function participantTask(name: string, letter: string, model: string, persona: C
     "Base verdicts on the brief's facts: expected effect vs noise floor, cost, risk, kill condition. " +
       "Do not accept something merely because it sounds confident; do not reject merely to disagree. " +
       "For refine verdicts, name exactly what must change.",
+    "You may also look at the project yourself when a verdict hinges on code reality rather than brief facts — look around freely, just don't rabbit-hole; and never run builds or benchmarks or write files (that's the campaign's job).",
     "You may also append 1 improvement paragraph per hypothesis you refined.",
     "",
     "Write the FULL text with council_write_entry:",

@@ -1092,7 +1092,9 @@ await test("facilitator message: phases, roster, WROTE_ENTRY marker, facts rule"
   const { checkCouncilTrigger } = councilMod;
   const msg = checkCouncilTrigger(10, 11, dir, { metricName: "ms", metricUnit: "ms", direction: "lower", baselineMetric: 100, bestMetric: 100, goal: "bench" });
   assert.ok(msg, "message produced");
-  for (const marker of ["Phase 1 — Diverge", "Phase 2 — Challenge", "Phase 3 — Chair", "Phase 4 — Execute", "WROTE_ENTRY", "council_check_consensus", "propose_hypothesis", "ONLY to correct objective facts", "Chair"]) {
+  for (const marker of ["Phase 1 — Diverge", "Phase 2 — Challenge", "Phase 3 — Chair", "Phase 4 — Execute", "WROTE_ENTRY", "council_check_consensus", "propose_hypothesis", "ONLY to correct objective facts", "Chair",
+    // free-but-bounded exploration guidance for analysts (2026-10-30)
+    "look around freely", "don't dig in", "don't run builds or benchmarks", "look at the project yourself"]) {
     assert.ok(msg.includes(marker), `message must contain "${marker}"`);
   }
   // persona line for the default (models) roster
