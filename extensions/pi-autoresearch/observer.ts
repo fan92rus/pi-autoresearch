@@ -817,6 +817,10 @@ Write your analysis to ${ideasPath}, then try the most fundamentally different a
     ? `\n\n📞 ADVISOR: Consult advisor({ stage: "recovery" }) with: best-so-far ${bestStr}, the failure pattern above, and your untried ideas — ask for a strategic direction check.\n${ADVISOR_ARGUE}`
     : "";
 
+  // The council is also self-service: the agent may convene it at any time,
+  // with no limits, so the stagnation steer always mentions that door.
+  const councilHint = `\n🏛 COUNCIL: If self-reflection is not enough, convene a hypothesis council yourself — no limits, any time: council_convene({ note: "why you are stuck and what to focus on" }). Three independent analysts will cross-examine the problem and return a slate of vetted experiments.`;
+
   return `🔄 STAGNATION: No metric improvement in ${state.streak} runs.
 
 ${patternHint}
@@ -825,6 +829,7 @@ Recent runs (none beat best ${bestStr}):
 ${recentFormatted}
 ${escalation}
 ${treeHint}
+${councilHint}
 ${reflectQuestions}${advisorHint}`;
 }
 

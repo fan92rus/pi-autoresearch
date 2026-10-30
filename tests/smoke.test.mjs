@@ -1128,6 +1128,8 @@ await test("observer fires the council on a stalled ledger (replaces stagnation 
     baselineMetric: 100, bestMetric: 100, runCount: 12, goal: "bench",
   });
   assert.ok(steer2?.includes("STAGNATION:"), `cooldown → plain stagnation: ${steer2?.slice(0, 80)}`);
+  assert.ok(steer2?.includes("COUNCIL:"), "plain stagnation must mention the self-service council door");
+  assert.ok(steer2?.includes("council_convene({ note:"), "stagnation hint names the convene tool with the note arg");
 });
 
 await test("brief builder: sections and determinism", () => {
