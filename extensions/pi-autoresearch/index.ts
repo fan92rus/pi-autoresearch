@@ -1914,7 +1914,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const autoresearchHelp = () =>
     [
-      "Usage: /autoresearch [off|clear|council|config|export|<text>|parallel-*]",
+      "Usage: /autoresearch [off|clear|council [note]|config|export|<text>|parallel-*]",
       "",
       "<text> enters autoresearch mode and starts or resumes the loop.",
       "off leaves autoresearch mode.",
@@ -2345,6 +2345,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\nfinalize_research({reason, evidence, confidence}) only with PROOF (mathematical floor, noise floor reached, search space exhausted). A subjective \u201cthis seems hard\u201d is NOT proof \u2014 try orthogonal approaches first. It is a RECOMMENDATION; the observer arbitrates and suppresses premature signals." +
       "\n\n## Stagnation Council" +
       "\nWhen the observer convenes a STAGNATION COUNCIL, follow its facilitator protocol exactly: spawn the analyst subagents, verify their entries via council_read_index (retry missing ones), run challenge rounds via council_check_consensus, get the chair's slate, then register each slate experiment with propose_hypothesis and execute them in the normal loop. You may append ONLY objective-facts entries (phase: \"facts\") — never judge hypotheses yourself. A council opinion is not evidence; the benchmark is." +
+      "\nYou can also convene a council YOURSELF at any time, with no limits, when you feel stuck: call council_convene({ note: \"why you are stuck and what to focus on\" }) and follow the returned protocol. Your note reaches the analysts through the brief.\n" +
       "\n\n## Observer Steers" +
       "\n\U0001f504 STAGNATION \u2014 STOP and REFLECT on the pattern. \U0001f3af MILESTONE \u2014 consider strategic alternatives and orthogonal directions.";
 
@@ -5223,6 +5224,58 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // separate headless sessions with no autoresearch mode of their own) ──
   registerCouncilTools(pi);
 
+  // Self-service council: the campaign agent convenes it whenever it feels
+  // stuck — no stagnation threshold, no cooldown, no cap (only council.enabled
+  // vetoes). The agent's note goes verbatim into the brief the analysts read.
+  registerGatedTool({
+    name: "council_convene",
+    label: "Convene a hypothesis council yourself",
+    description:
+      "Convene a stagnation council at any time, with no limits — no stagnation threshold, no cooldown, no cap " +
+      "(only council.enabled in .auto/config.json can veto). Use it when you feel stuck: repeated failures, " +
+      "no improvement in sight, or a direction you cannot settle alone. Your note is added to the brief the analysts read.",
+    promptSnippet: "Convene a hypothesis council yourself when stuck (no limits); your note reaches the analysts",
+    promptGuidelines: [
+      "When stuck (e.g. a long failure streak with no keep in sight, or every direction ends in 'no effect'), convene a council yourself: council_convene({ note: \"...\" }).",
+      "In the note say where you are stuck and what the council should focus on; then follow the returned facilitator protocol exactly.",
+    ],
+    parameters: {
+      type: "object",
+      properties: {
+        note: {
+          type: "string",
+          description: "Why you are stuck and what the council should focus on. Goes verbatim into the brief.",
+        },
+      },
+    },
+    async execute(_toolCallId: string, params: { note?: string }, _signal, _onUpdate, ctx: ExtensionContext) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
+      const workDir = resolveWorkDir(ctx.cwd);
+      const cfg = readCouncilConfig(workDir);
+      if (!cfg.enabled) {
+        return { content: [{ type: "text", text: "❌ Council is disabled (council.enabled=false in .auto/config.json)." }], details: {} };
+      }
+      const state = getRuntime(ctx).state;
+      const msg = checkCouncilTrigger(0, state.results.length, workDir, {
+        metricName: state.metricName,
+        metricUnit: state.metricUnit,
+        direction: state.bestDirection,
+        baselineMetric: state.bestMetric,
+        bestMetric: findBestMetric(state.results, state.currentSegment, state.bestDirection),
+        goal: state.name ?? "",
+      }, { force: true, agentNote: typeof params?.note === "string" && params.note.trim() ? params.note : undefined });
+      if (!msg) {
+        return { content: [{ type: "text", text: "❌ Council could not be convened (disabled)." }], details: {} };
+      }
+      const seq = readCouncilState(workDir).councilsRun;
+      return {
+        content: [{ type: "text", text: `COUNCIL #${seq} CONVENED — your note is in the brief (section "Lead agent's note"). Follow the facilitator protocol below exactly.\n\n${msg}` }],
+        details: { councilSeq: seq, agentNoteIncluded: Boolean(params?.note?.trim()) },
+      };
+    },
+  });
+
   // ── compose: merge orthogonal improvements from two branches ──
   if (BRANCHING_TOOLS_ENABLED) registerGatedTool({
     name: "compose",
@@ -5498,8 +5551,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return;
       }
 
-      if (command === "council") {
+      if (command === "council" || command.startsWith("council ")) {
         // Manual stagnation council trigger (same path as the automatic one).
+        // Anything after "council" is the lead's note, delivered into the brief.
+        const note = trimmedArgs.replace(/^council\b\s*/i, "").trim();
         const workDir = resolveWorkDir(ctx.cwd);
         const cfg = readCouncilConfig(workDir);
         if (!cfg.enabled) {
@@ -5514,10 +5569,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           baselineMetric: state.bestMetric,
           bestMetric: findBestMetric(state.results, state.currentSegment, state.bestDirection),
           goal: state.name ?? "",
-        }, { force: true });
+        }, { force: true, agentNote: note || undefined });
         if (msg) {
           pi.sendUserMessage(msg, { deliverAs: "followUp" });
-          ctx.ui.notify(`Council #${readCouncilState(workDir).councilsRun} convened — protocol sent`, "info");
+          ctx.ui.notify(`Council #${readCouncilState(workDir).councilsRun} convened${note ? " — your note is in the brief" : ""} — protocol sent`, "info");
         }
         return;
       }

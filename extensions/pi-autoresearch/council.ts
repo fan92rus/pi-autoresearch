@@ -205,6 +205,8 @@ export interface BriefInput {
   bestMetric: number | null;
   noiseFloor: number | null;
   goal: string;
+  /** Verbatim note from the lead agent on why it convened the council (council_convene / /autoresearch council [note]). */
+  agentNote?: string;
 }
 
 function fmtMetric(v: number | null, unit: string): string {
@@ -365,6 +367,16 @@ export function buildBrief(workDir: string, councilDir: string, input: BriefInpu
     );
   }
 
+  if (input.agentNote?.trim()) {
+    sections.push(
+      "## Lead agent's note (why the campaign agent convened this council)",
+      input.agentNote.trim(),
+      "",
+      "- This note is the lead's own assessment of where it is stuck — treat it as a hypothesis from the lead, not as evidence.",
+      "",
+    );
+  }
+
   sections.push(
     "## Rules",
     "- NEVER propose anything that cheats or games the benchmark (no precomputed answers, no benchmark-condition exploitation, no measuring the wrong thing).",
@@ -448,7 +460,7 @@ export function checkCouncilTrigger(
   runCount: number,
   cwd: string,
   briefInput: Omit<BriefInput, "seq" | "noiseFloor">,
-  options?: { force?: boolean },
+  options?: { force?: boolean; agentNote?: string },
 ): string | null {
   const cfg = readCouncilConfig(cwd);
   if (!cfg.enabled) return null;
@@ -462,7 +474,7 @@ export function checkCouncilTrigger(
   const { seq, dir } = nextCouncilDir(cwd);
   const roster = resolveRoster(cfg);
   const noiseFloor = readNoiseFloor(cwd);
-  const brief = buildBrief(cwd, dir, { ...briefInput, seq, noiseFloor });
+  const brief = buildBrief(cwd, dir, { ...briefInput, seq, noiseFloor, agentNote: options?.agentNote });
   writeCouncilState(cwd, { councilsRun: seq, lastCouncilRun: runCount });
   return composeFacilitatorMessage({
     councilDir: path.relative(cwd, dir).split(path.sep).join("/"),

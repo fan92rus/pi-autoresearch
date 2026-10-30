@@ -70,6 +70,7 @@ const EXPECTED_TOOLS = [
   "init_experiment", "propose_hypothesis", "run_experiment", "log_experiment",
   "tree_status", "finalize_research",
   "council_write_entry", "council_read_index", "council_read_entry", "council_check_consensus",
+  "council_convene",
 ];
 
 // Disabled tool groups (both flags false):
@@ -94,7 +95,7 @@ await test("registers all 10 tools (parallel + branching disabled)", async () =>
   for (const expected of EXPECTED_TOOLS) {
     assert.ok(names.includes(expected), `Missing tool: ${expected}`);
   }
-  assert.strictEqual(names.length, 10, `Expected 10 tools, got ${names.length}: ${names.join(", ")}`);
+  assert.strictEqual(names.length, 11, `Expected 11 tools, got ${names.length}: ${names.join(", ")}`);
 });
 
 await test("registers all 11 hooks", async () => {
@@ -1241,10 +1242,41 @@ await test("/autoresearch council command forces a council and sends the protoco
   const dir = makeTempDir("council-cmd");
   initGitRepo(dir);
   const { command, ctx, pi } = await loadExtension(dir);
-  await command("autoresearch").handler("council", ctx);
+  await command("autoresearch").handler("council Stuck on the parser; focus on IO first", ctx);
   const joined = pi.sentMessages.map((m) => m.text ?? "").join("\n");
   assert.ok(joined.includes("STAGNATION COUNCIL #1"), `manual council must send the protocol, got: ${joined.slice(0, 200)}`);
-  assert.ok(fs.existsSync(path.join(dir, ".auto", "councils", "1", "00-brief.md")));
+  const brief = fs.readFileSync(path.join(dir, ".auto", "councils", "1", "00-brief.md"), "utf-8");
+  assert.ok(brief.includes("Lead agent's note"), "brief carries the lead's note section");
+  assert.ok(brief.includes("Stuck on the parser"), "note text lands verbatim");
+  assert.ok(brief.includes("not as evidence"), "note framed as lead's hypothesis, not evidence");
+});
+
+await test("council_convene: agent convenes with a note (no limits), note lands in brief; gated when mode off", async () => {
+  const dir = makeTempDir("council-convene");
+  initGitRepo(dir);
+  const { command, tool, ctx } = await loadExtension(dir);
+  await command("autoresearch").handler("on", ctx);
+
+  const res = await tool("council_convene").execute("id", {
+    note: "Stuck: 8 discards in a row, every micro-opt lands within noise. Focus on whether the harness itself dominates.",
+  }, null, null, ctx);
+  const text = res.content[0].text;
+  assert.ok(text.includes("COUNCIL #1 CONVENED"), `tool returns the protocol: ${text.slice(0, 200)}`);
+  assert.ok(text.includes("Phase 1 — Diverge"), "tool result carries the facilitator protocol");
+  const brief = fs.readFileSync(path.join(dir, ".auto", "councils", "1", "00-brief.md"), "utf-8");
+  assert.ok(brief.includes("Lead agent's note"), "brief carries the lead's note section");
+  assert.ok(brief.includes("8 discards in a row"), "note lands verbatim");
+  assert.strictEqual(councilMod.readCouncilState(dir).councilsRun, 1, "state incremented");
+
+  // no limits: a second immediate convene goes through (force bypasses cooldown)
+  const res2 = await tool("council_convene").execute("id", { note: "still stuck" }, null, null, ctx);
+  assert.ok(res2.content[0].text.includes("COUNCIL #2 CONVENED"), "immediate second convene allowed (no cooldown for self-service)");
+
+  // mode off → gated
+  const dir2 = makeTempDir("council-convene-off");
+  const { tool: tool2, ctx: ctx2 } = await loadExtension(dir2);
+  const blocked = await tool2("council_convene").execute("id", { note: "x" }, null, null, ctx2);
+  assert.ok(blocked.content[0].text.includes("OFF"), `gated when mode is off: ${blocked.content[0].text}`);
 });
 
 // ──────────────────────────────────────────────────────────────────────
