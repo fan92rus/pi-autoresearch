@@ -191,6 +191,33 @@ await test("log.jsonl config header is unique (no duplicate on re-init)", async 
   assert.ok(configs.length >= 1, "No config entries");
 });
 
+await test("init_experiment with identical config resumes the segment (no re-segmentation)", async () => {
+  const dir = makeTempDir("init-resume");
+  initGitRepo(dir);
+  fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
+  const lines = [
+    JSON.stringify({ type: "config", name: "bench", metricName: "ms", metricUnit: "ms", bestDirection: "lower" }),
+    JSON.stringify({ run: 1, metric: 100, status: "keep", description: "baseline", timestamp: 1793380062 }),
+    JSON.stringify({ run: 2, metric: 99, status: "keep", description: "improved", timestamp: 1793380162 }),
+  ];
+  fs.writeFileSync(path.join(dir, ".auto", "log.jsonl"), lines.join(String.fromCharCode(10)) + String.fromCharCode(10));
+  const { tool, command, hook, ctx } = await loadExtension(dir);
+  await command("autoresearch").handler("on", ctx);
+  await hook("session_start")({}, ctx);
+  const res = await tool("init_experiment").execute("id", {
+    name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower",
+  }, null, null, ctx);
+  assert.strictEqual(res.details?.resumed, true, "identical-config init must resume, not re-segment");
+  assert.strictEqual(readLog(dir).filter((e) => e.type === "config").length, 1, "no second config header on resume");
+
+  // A genuinely different target still re-segments (one new header).
+  const res2 = await tool("init_experiment").execute("id", {
+    name: "other-bench", metric_name: "ops", metric_unit: "", direction: "higher",
+  }, null, null, ctx);
+  assert.ok(res2.details?.resumed !== true, "config change must not be a resume");
+  assert.strictEqual(readLog(dir).filter((e) => e.type === "config").length, 2, "config change appends exactly one header");
+});
+
 await test("propose + run + log(keep) updates tree and log", async () => {
   const dir = makeTempDir("lifecycle");
   initGitRepo(dir);
@@ -1116,7 +1143,7 @@ await test("nudge message names the tool; facilitator message stays the manual f
   const briefInput = { metricName: "ms", metricUnit: "ms", direction: "lower", baselineMetric: 100, bestMetric: 100, goal: "bench" };
   const nudge = checkCouncilTrigger(10, 11, dir, briefInput);
   assert.ok(nudge?.includes("council_convene"), "nudge points at the tool");
-  assert.ok(nudge?.includes("BLOCKING"), "nudge says the tool blocks");
+  assert.ok(nudge?.includes("blocks for several minutes"), "nudge says the workflow blocks");
   assert.ok(nudge?.includes("00-brief.md"), "nudge carries the brief path");
 
   const msg = composeFacilitatorMessage({
@@ -1283,7 +1310,7 @@ await test("/autoresearch council [note] delegates to the autonomous tool", asyn
   assert.ok(!fs.existsSync(path.join(dir, ".auto", "councils")), "no council dir until the tool actually runs");
 });
 
-await test("council_convene (manual fallback, no subagent tool): convene, resume same seq, gated when mode off", async () => {
+await test("council_convene step 1: orchestration launch + manual fallback + resume same seq, gated when mode off", async () => {
   const dir = makeTempDir("council-convene");
   initGitRepo(dir);
   const { command, tool, ctx } = await loadExtension(dir);
@@ -1293,128 +1320,85 @@ await test("council_convene (manual fallback, no subagent tool): convene, resume
     note: "Stuck: 8 discards in a row, every micro-opt lands within noise. Focus on whether the harness itself dominates.",
   }, null, null, ctx);
   const text = res.content[0].text;
-  assert.ok(text.includes("COUNCIL #1 convened (MANUAL mode"), `fallback announces manual mode: ${text.slice(0, 160)}`);
-  assert.ok(text.includes("Phase 1 — Diverge"), "fallback carries the manual facilitator protocol");
+  assert.ok(text.includes("COUNCIL #1 convened"), `convene banner: ${text.slice(0, 160)}`);
+  assert.ok(text.includes("council-loop.js"), "carries the workflow file path");
+  assert.ok(text.includes('"async": false'), "launch is blocking");
+  assert.ok(text.includes('"timeoutMs"'), "launch carries the timeout");
+  assert.ok(text.includes("subagent("), "exact subagent call shape given to the agent");
+  assert.ok(text.includes("council_convene({ slate"), "step 2 (validate + persist) is spelled out");
+  assert.ok(text.includes("Manual fallback"), "manual protocol included as the no-subagent path");
+  assert.ok(text.includes("Phase 1 — Diverge"), "manual protocol carries the phases");
   const brief = fs.readFileSync(path.join(dir, ".auto", "councils", "1", "00-brief.md"), "utf-8");
   assert.ok(brief.includes("Lead agent's note"), "brief carries the lead's note section");
   assert.ok(brief.includes("8 discards in a row"), "note lands verbatim");
   assert.strictEqual(councilMod.readCouncilState(dir).councilsRun, 1, "state incremented");
 
-  // pending council (no slate) → a second immediate convene RESUMES the same dir
-  const res2 = await tool("council_convene").execute("id", { note: "still stuck" }, null, null, ctx);
-  assert.ok(res2.content[0].text.includes("COUNCIL #1 convened (MANUAL mode"), "resume reuses seq #1 while the council is unfinished");
-  assert.strictEqual(councilMod.readCouncilState(dir).councilsRun, 1, "no new seq while pending");
-
-  // mode off → gated
-  const dir2 = makeTempDir("council-convene-off");
-  const { tool: tool2, ctx: ctx2 } = await loadExtension(dir2);
-  const blocked = await tool2("council_convene").execute("id", { note: "x" }, null, null, ctx2);
-  assert.ok(blocked.content[0].text.includes("OFF"), `gated when mode is off: ${blocked.content[0].text}`);
-});
-
-await test("council_convene autonomous: runs the workflow and returns the validated slate", async () => {
-  const dir = makeTempDir("council-auto");
-  initGitRepo(dir);
-  const { command, tool, ctx } = await loadExtension(dir);
-  await command("autoresearch").handler("on", ctx);
-  const SLATE = "## EXP1: a\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: x\n\n## EXP2: b\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: y\n\n## EXP3: c\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: z";
-  const calls = [];
-  ctx.tools = [{ name: "subagent" }, { name: "bash" }];
-  ctx.executeTool = async (name, callArgs) => {
-    assert.strictEqual(name, "subagent", "orchestration goes through the subagent tool");
-    calls.push(callArgs);
-    return {
-      isError: false,
-      result: { content: [{ type: "text", text: "child receipts ...\nCOUNCIL_RESULT:" + JSON.stringify({ ok: true, slate: SLATE, unavailable: [], rounds: 2, consensus: { canConverge: true, settledCount: 3, contestedCount: 0 } }) + "\n" }] },
-    };
-  };
-
-  const res = await tool("council_convene").execute("id", { note: "stuck on io" }, null, null, ctx);
-  const text = res.content[0].text;
-  assert.strictEqual(calls.length, 1, "one workflow launch");
-  const call = calls[0];
-  assert.ok(String(call.workflow).includes("council-loop.js"), "workflow file passed to the engine");
-  assert.strictEqual(call.async, false, "blocking launch");
-  assert.strictEqual(call.args.participants.length, 3, "roster in args");
-  assert.ok(call.args.note === "stuck on io", "note forwarded");
-  assert.ok(call.args.briefText.includes("Campaign"), "brief inlined into args");
-  assert.strictEqual(call.args.chairModel, "zai-coding-cn/glm-5.3:high", "default chair model");
-  assert.strictEqual(call.options.timeoutMs, 30 * 60_000, "default 30 min budget");
-  assert.ok(text.includes("COUNCIL #1 COMPLETE"), `complete banner: ${text.slice(0, 160)}`);
-  assert.ok(text.includes("2 challenge round(s)"), "round count reported");
-  assert.ok(text.includes("validated ✓"), "slate validated");
-  assert.ok(text.includes("## EXP1: a"), "slate body returned to the agent");
-  // the extension persists the final slate to the board (audit + resume detection)
-  const ed = path.join(dir, ".auto", "councils", "1", "entries");
-  assert.ok(fs.existsSync(ed), "slate persisted to the blackboard");
-  const persisted = fs.readdirSync(ed).find((f) => f.endsWith("-Chair.md"));
-  assert.ok(persisted && fs.readFileSync(path.join(ed, persisted), "utf-8").includes("phase: slate"), "persisted entry is the slate");
-});
-
-await test("council_convene autonomous: invalid slate gets ONE corrective chair pass", async () => {
-  const dir = makeTempDir("council-fix");
-  initGitRepo(dir);
-  const { command, tool, ctx } = await loadExtension(dir);
-  await command("autoresearch").handler("on", ctx);
-  const VALID = "## EXP1: a\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: x\n\n## EXP2: b\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: y\n\n## EXP3: c\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: z";
-  const INVALID = "## EXP1: a\nEXPECTED_GAIN: 100 ms\n\n## EXP2: b\nEXPECTED_GAIN: 100 ms\n\n## EXP3: c\nEXPECTED_GAIN: 100 ms";
-  const calls = [];
-  ctx.tools = [{ name: "subagent" }];
-  ctx.executeTool = async (name, callArgs) => {
-    calls.push(callArgs);
-    const slate = calls.length === 1 ? INVALID : VALID;
-    return {
-      isError: false,
-      result: { content: [{ type: "text", text: "COUNCIL_RESULT:" + JSON.stringify({ ok: true, slate, unavailable: [], rounds: 1 }) }] },
-    };
-  };
-  const res = await tool("council_convene").execute("id", {}, null, null, ctx);
-  const text = res.content[0].text;
-  assert.strictEqual(calls.length, 2, "corrective re-run after validation failure");
-  assert.ok(calls[1].args.chairFix.includes("KILL_WHEN"), "validation errors forwarded to the chair");
-  assert.ok(text.includes("validated ✓"), "final slate validated");
-});
-
-await test("council_convene autonomous: honest failure on quorum/timeout, council resumable", async () => {
-  const dir = makeTempDir("council-fail");
-  initGitRepo(dir);
-  const { command, tool, ctx } = await loadExtension(dir);
-  await command("autoresearch").handler("on", ctx);
-  ctx.tools = [{ name: "subagent" }];
-  ctx.executeTool = async () => ({
-    isError: false,
-    result: { content: [{ type: "text", text: "COUNCIL_RESULT:" + JSON.stringify({ ok: false, reason: "quorum", detail: "fewer than 2 analysts delivered proposals" }) }] },
-  });
-  const res = await tool("council_convene").execute("id", {}, null, null, ctx);
-  const text = res.content[0].text;
-  assert.ok(text.includes("did not complete (quorum)"), `honest failure: ${text.slice(0, 160)}`);
-  assert.ok(text.includes("resume"), "failure points at resuming");
-  assert.strictEqual(res.details.outcome, "failed");
-});
-
-await test("council_convene autonomous: resumes an unfinished council (same seq/dir)", async () => {
-  const dir = makeTempDir("council-resume");
-  initGitRepo(dir);
-  const { command, tool, ctx } = await loadExtension(dir);
-  await command("autoresearch").handler("on", ctx);
-  // council #1 already convened (observer path): brief written, no slate anywhere
-  councilMod.checkCouncilTrigger(10, 11, dir, { metricName: "ms", metricUnit: "ms", direction: "lower", baselineMetric: 100, bestMetric: 100, goal: "bench" });
-  const calls = [];
-  const SLATE = "## EXP1: a\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: x\n\n## EXP2: b\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: y\n\n## EXP3: c\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: z";
-  ctx.tools = [{ name: "subagent" }];
-  ctx.executeTool = async (name, callArgs) => {
-    calls.push(callArgs);
-    return { isError: false, result: { content: [{ type: "text", text: "COUNCIL_RESULT:" + JSON.stringify({ ok: true, slate: SLATE, unavailable: ["AnalystB", "AnalystC"], rounds: 1 }) }] } };
-  };
-  await tool("council_convene").execute("id", { note: "continue" }, null, null, ctx);
-  assert.strictEqual(calls.length, 1);
-  assert.ok(calls[0].args.councilDir === undefined, "the fileless workflow takes no council dir");
-  assert.ok(calls[0].args.briefText.includes("Campaign"), "brief text inlined");
+  // pending council (no slate) → a second immediate convene RESUMES the same dir;
+  // no note given → the launch args must NOT contain an empty note key (engine rejects it)
+  const res2 = await tool("council_convene").execute("id", {}, null, null, ctx);
+  assert.ok(res2.content[0].text.includes("RESUMING the interrupted council"), "resume re-nudges the same council");
+  const resumeLaunch = /subagent\((\{[\s\S]*?\})\)/.exec(res2.content[0].text);
+  assert.ok(resumeLaunch, "resume carries the launch JSON");
+  assert.ok(!/"note":/.test(resumeLaunch[1]), "no empty note key in the launch args");
   const dirs = fs.readdirSync(path.join(dir, ".auto", "councils")).filter((f) => f !== "state.json");
-  assert.deepStrictEqual(dirs.sort(), ["1"], "no second council dir created");
-  // after completion the slate is persisted → the council is no longer "pending"
+  assert.deepStrictEqual(dirs.sort(), ["1"], "no second council dir on resume");
+
+  // gated when mode off
+  await command("autoresearch").handler("off", ctx);
+  const res3 = await tool("council_convene").execute("id", {}, null, null, ctx);
+  assert.ok(res3.content[0].text.toLowerCase().includes("mode"), "mode gate refused");
+});
+
+await test("council_convene step 2: valid slate is validated, persisted and closes the council", async () => {
+  const dir = makeTempDir("council-slate");
+  initGitRepo(dir);
+  const { command, tool, ctx } = await loadExtension(dir);
+  await command("autoresearch").handler("on", ctx);
+  await tool("council_convene").execute("id", { note: "stuck" }, null, null, ctx);
+  const SLATE = "## EXP1: a\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: x\n\n## EXP2: b\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: y\n\n## EXP3: c\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: z";
+  const res = await tool("council_convene").execute("id", { slate: SLATE }, null, null, ctx);
+  const text = res.content[0].text;
+  assert.ok(text.includes("COUNCIL #1 COMPLETE"), `complete banner: ${text.slice(0, 160)}`);
+  assert.ok(text.includes("validated ✓"), "slate validated");
+  assert.ok(text.includes("## EXP1: a"), "slate body returned");
+  const ed = path.join(dir, ".auto", "councils", "1", "entries");
+  const persisted = fs.readdirSync(ed).find((f) => f.endsWith("-Chair.md"));
+  assert.ok(persisted && fs.readFileSync(path.join(ed, persisted), "utf-8").includes("phase: slate"), "slate persisted to the blackboard");
   assert.strictEqual(councilMod.findUnfinishedCouncil(dir), null, "completed council is closed");
 });
+
+await test("council_convene step 2: invalid slate returns the exact chairFix instruction", async () => {
+  const dir = makeTempDir("council-slate-bad");
+  initGitRepo(dir);
+  const { command, tool, ctx } = await loadExtension(dir);
+  await command("autoresearch").handler("on", ctx);
+  await tool("council_convene").execute("id", {}, null, null, ctx);
+  const INVALID = "## EXP1: a\nEXPECTED_GAIN: 100 ms\n\n## EXP2: b\nEXPECTED_GAIN: 100 ms\n\n## EXP3: c\nEXPECTED_GAIN: 100 ms";
+  const res = await tool("council_convene").execute("id", { slate: INVALID }, null, null, ctx);
+  const text = res.content[0].text;
+  assert.ok(text.includes("failed validation"), "validation failure reported");
+  assert.ok(text.includes("KILL_WHEN"), "validation errors named");
+  assert.ok(text.includes("args.chairFix"), "corrective workflow instruction given");
+  assert.strictEqual(res.details?.outcome, "invalid-slate");
+  // the council stays pending (no slate persisted) → still resumable
+  assert.strictEqual(councilMod.findUnfinishedCouncil(dir)?.seq, 1, "invalid slate keeps the council pending");
+});
+
+await test("council_convene step 1 forwards the note into the workflow args and honours config timeout", async () => {
+  const dir = makeTempDir("council-args");
+  initGitRepo(dir);
+  fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".auto", "config.json"), JSON.stringify({ council: { timeout_minutes: 45 } }), "utf-8");
+  const { command, tool, ctx } = await loadExtension(dir);
+  await command("autoresearch").handler("on", ctx);
+  const res = await tool("council_convene").execute("id", { note: "io-bound, harness dominates" }, null, null, ctx);
+  const text = res.content[0].text;
+  assert.ok(text.includes('"timeoutMs": 2700000'), "timeout_minutes mapped to ms");
+  assert.ok(text.includes("io-bound, harness dominates"), "note forwarded into workflow args");
+  assert.ok(text.includes('"chairModel": "zai-coding-cn/glm-5.3:high"'), "default chair model in args");
+  assert.ok((text.match(/"personaPrompt"/g) ?? []).length === 3, "three analysts in the roster");
+});
+
 
 await test("council-loop.js: full fileless pipeline in a fake sandbox — diverge, one challenge round, chair slate", async () => {
   const participants = [

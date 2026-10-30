@@ -124,8 +124,11 @@ function challengeTask(p, round, contested, othersText) {
   if (round > 1 && contested.length) {
     lines.push("This round addresses ONLY the still-contested hypotheses: " + contested.join(", ") + ".", "");
   }
+  const scope = round > 1 && contested.length
+    ? "For every STILL-CONTESTED hypothesis not authored by you (" + contested.join(", ") + "), add one verdict line:"
+    : "For EVERY hypothesis NOT authored by you, add one verdict line:";
   lines.push(
-    "For EVERY hypothesis NOT authored by you, add one verdict line:",
+    scope,
     "VERDICT H-<letter><n>: accept — <reason>   (or reject / refine)",
     "Base verdicts on facts: expected effect vs noise floor, cost, risk, kill condition. Do not accept because it sounds confident; do not reject to disagree. For refine, name exactly what must change.",
     "You may look at the project yourself when a verdict hinges on code reality — look around freely, just don't rabbit-hole; never run builds or benchmarks, never write files.",
@@ -184,9 +187,14 @@ const verdictRecords = []; // { id, verdict, speaker } in arrival order
 
 // ── Phase 1 — Diverge (chat outputs only) ──
 emitLine("phase 1: diverge (" + live.length + " analysts)");
+// Children run as agent "delegate": its strict core-tool allowlist never
+// references ambient extension tools, so foreground children cannot die at
+// startup the way extension-referencing profiles (scout + advisor/codemode…)
+// do. The task text carries the full role; missing optional tools (e.g.
+// codex_search) are skipped gracefully by the child.
 const firstBatch = await runs.all(live.map((p) => ({
   key: "diverge-" + p.name + "-a1",
-  agent: "scout",
+  agent: "delegate",
   model: p.model,
   task: divergeTask(p),
 })));
@@ -198,9 +206,9 @@ for (let attempt = 2; attempt <= MAX_ATTEMPTS; attempt++) {
   emitLine("diverge retry " + (attempt - 1) + " for: " + absent.map((p) => p.name).join(", "));
   const results = await runs.all(absent.map((p) => ({
     key: "diverge-" + p.name + "-a" + attempt,
-    agent: "scout",
+    agent: "delegate",
     model: p.model,
-    task: divergeTask(p),
+      task: divergeTask(p),
   })));
   absent.forEach((p, i) => {
     const text = childText(results[i]);
@@ -236,9 +244,9 @@ for (let round = 1; round <= maxChallengeRounds; round++) {
   const othersText = live.map((p) => "### Proposals by " + p.name + ":\n" + (proposalTexts[p.name] || "(none)")).join("\n\n");
   const results = await runs.all(live.map((p) => ({
     key: "challenge-r" + round + "-" + p.name + "-a1",
-    agent: "scout",
+    agent: "delegate",
     model: p.model,
-    task: challengeTask(p, round, contested, othersText),
+      task: challengeTask(p, round, contested, othersText),
   })));
   results.forEach((res, i) => {
     for (const v of parseVerdicts(childText(res), live[i].name)) verdictRecords.push(v);
@@ -256,7 +264,7 @@ for (let round = 1; round <= maxChallengeRounds; round++) {
 emitLine("phase 3: chair slate");
 const allProposals = live.map((p) => "--- " + p.name + " (" + p.letter + ") ---\n" + (proposalTexts[p.name] || "(none)")).join("\n\n");
 const allVerdicts = verdictRecords.map((v) => "VERDICT " + v.id + ": " + v.verdict + " — by " + v.speaker).join("\n");
-const chairRes = childText(await runs.run("chair-a1", { agent: "scout", model: chairModel, task: chairTask(allProposals, allVerdicts) }));
+const chairRes = childText(await runs.run("chair-a1", { agent: "delegate", model: chairModel, task: chairTask(allProposals, allVerdicts) }));
 const slate = chairRes.trim();
 
 if (!slate || !/##\s*EXP/i.test(slate)) {

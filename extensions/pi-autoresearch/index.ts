@@ -40,15 +40,18 @@ import { getBashSpawnOptions, killTree } from "./bash-shell.ts";
 import { markIdeaTried } from "./observer.ts";
 import { registerCouncilTools } from "./council-tools.ts";
 import {
+  buildBrief,
   checkCouncilTrigger,
   composeConveneNudge,
   composeFacilitatorMessage,
   findUnfinishedCouncil,
+  nextCouncilDir,
   personaPrompt,
   readCouncilConfig,
   readNoiseFloor,
   resolveRoster,
   validateSlate,
+  writeCouncilState,
 } from "./council.ts";
 import { createWriteStream } from "node:fs";
 import { randomBytes } from "node:crypto";
@@ -2356,8 +2359,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\n\n## Finalization" +
       "\nfinalize_research({reason, evidence, confidence}) only with PROOF (mathematical floor, noise floor reached, search space exhausted). A subjective \u201cthis seems hard\u201d is NOT proof \u2014 try orthogonal approaches first. It is a RECOMMENDATION; the observer arbitrates and suppresses premature signals." +
       "\n\n## Stagnation Council" +
-      "\nWhen the observer convenes a STAGNATION COUNCIL, call council_convene({ note: \"...\" }) immediately — the tool runs the whole council itself (spawns analysts, runs challenge rounds, gets the chair's slate) and BLOCKS until the finished slate returns. Then register each slate experiment with propose_hypothesis and execute them in the normal loop. You may append ONLY objective-facts blackboard entries (phase: \"facts\") — never judge hypotheses yourself. A council opinion is not evidence; the benchmark is." +
-      "\nYou can also convene a council YOURSELF at any time, with no limits, when you feel stuck: council_convene({ note: \"why you are stuck and what to focus on\" }). It is autonomous (it supervises the subagents) and blocking (it returns the finished slate) — you only execute the slate." +
+      "\nWhen the observer convenes a STAGNATION COUNCIL, call council_convene({ note: \"...\" }) immediately — the tool returns a ready-made subagent workflow launch (council-loop.js) — run it EXACTLY as given; it blocks for several minutes and returns a COUNCIL_RESULT JSON with the finished slate. Then call council_convene({ slate: \"<that slate>\" }) to validate and persist it, and register each slate experiment with propose_hypothesis. You may append ONLY objective-facts blackboard entries (phase: \"facts\") — never judge hypotheses yourself. A council opinion is not evidence; the benchmark is." +
+      "\nYou can also convene a council YOURSELF at any time, with no limits, when you feel stuck: council_convene({ note: \"why you are stuck and what to focus on\" }). same two-step flow: run the returned workflow launch (blocking), then bring the slate back via council_convene({ slate })." +
       "\n\n## Observer Steers" +
       "\n\U0001f504 STAGNATION \u2014 STOP and REFLECT on the pattern. \U0001f3af MILESTONE \u2014 consider strategic alternatives and orthogonal directions.";
 
@@ -2421,6 +2424,30 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       const isReinit = state.results.length > 0;
+
+      // Same-config re-init = RESUME, not a new segment. Appending another
+      // config header would split the ledger's segment and orphan the whole
+      // history from the observer (council/stagnation hints only see the
+      // current segment — an empty one right after the split). A genuine
+      // target change (different name/metric/workload) still re-segments.
+      if (isReinit) {
+        const requestedDirection = params.direction === "lower" || params.direction === "higher" ? params.direction : state.bestDirection;
+        const sameConfig =
+          state.name === params.name &&
+          state.metricName === params.metric_name &&
+          (state.metricUnit ?? "") === (params.metric_unit ?? "") &&
+          state.bestDirection === requestedDirection;
+        if (sameConfig) {
+          broadcastDashboardUpdate(resolveWorkDir(ctx.cwd));
+          return {
+            content: [{
+              type: "text",
+              text: "ℹ️ Session is already initialized with this exact config (name/metric/unit/direction) — continuing the current segment without re-segmentation. History and streaks stay intact. Call init_experiment again only to change the optimization target (different name/metric/workload); that starts a new segment.",
+            }],
+            details: { resumed: true, segment: state.currentSegment, bestMetric: state.bestMetric },
+          };
+        }
+      }
 
       state.name = params.name;
       state.metricName = params.metric_name;
@@ -5248,13 +5275,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     label: "Convene a hypothesis council (autonomous, blocking)",
     description:
       "Convene a stagnation council at any time, with no limits — no stagnation threshold, no cooldown, no cap " +
-      "(only council.enabled in .auto/config.json can veto). AUTONOMOUS: this tool spawns and supervises the analyst " +
-      "subagents, runs the challenge rounds and the chair itself. BLOCKING: it returns only when the council is done, " +
-      "with the finished slate. Use it when you feel stuck; your note is added to the brief the analysts read.",
+      "(only council.enabled in .auto/config.json can veto). Returns a ready-made pi-subagents workflow launch " +
+      "(council-loop.js): run it through your subagent tool exactly as given — it spawns the analysts, runs the " +
+      "fileless dispute and the chair, and blocks until the finished slate returns. Then call this tool again with " +
+      "{ slate } to validate and persist it. Use it when you feel stuck; your note is added to the brief the analysts read.",
     promptSnippet: "Convene a hypothesis council yourself (autonomous + blocking) — returns the finished slate",
     promptGuidelines: [
       "When stuck (e.g. a long failure streak with no keep in sight, or every direction ends in 'no effect'), convene a council: council_convene({ note: \"...\" }).",
-      "The tool runs the whole council itself (several minutes) and returns the finished slate — you only register the slate experiments via propose_hypothesis and run them in the normal loop.",
+      "The tool returns a ready-made subagent workflow launch — run it exactly as given (it blocks for several minutes), then call council_convene({ slate: \"<the slate from COUNCIL_RESULT>\" }) to validate and persist it.",
     ],
     parameters: {
       type: "object",
@@ -5263,154 +5291,139 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           type: "string",
           description: "Why you are stuck and what the council should focus on. Goes verbatim into the brief.",
         },
+        slate: {
+          type: "string",
+          description: "STEP 2 ONLY: the slate markdown from the COUNCIL_RESULT of the workflow you ran. The tool validates it (3–5 EXP sections, EXPECTED_GAIN >= 2x noise floor, KILL_WHEN), persists it to the blackboard and returns the final verdict.",
+        },
       },
     },
-    async execute(_toolCallId: string, params: { note?: string }, _signal, _onUpdate, ctx: ExtensionContext) {
+    async execute(_toolCallId: string, params: { note?: string; slate?: string }, _signal, _onUpdate, ctx: ExtensionContext) {
       const modeGate = assertModeActive(ctx);
       if (modeGate) return modeGate;
       const workDir = resolveWorkDir(ctx.cwd);
+      const state = getRuntime(ctx).state;
       const cfg = readCouncilConfig(workDir);
       if (!cfg.enabled) {
-        return { content: [{ type: "text", text: "❌ Council is disabled (council.enabled=false in .auto/config.json)." }], details: {} };
+        return {
+          content: [{ type: "text", text: "❌ Councils are disabled (council.enabled = false in .auto/config.json)." }],
+          details: { outcome: "disabled" },
+        };
       }
-      const note = typeof params?.note === "string" && params.note.trim() ? params.note.trim() : "";
-      const state = getRuntime(ctx).state;
-      const briefInput = {
-        metricName: state.metricName,
-        metricUnit: state.metricUnit,
-        direction: state.bestDirection,
-        baselineMetric: state.bestMetric,
-        bestMetric: findBestMetric(state.results, state.currentSegment, state.bestDirection),
-        goal: state.name ?? "",
-      };
 
-      // Resume an interrupted council (brief exists, slate missing) instead of re-sequencing.
-      let pending = findUnfinishedCouncil(workDir);
-      if (!pending) {
-        const triggered = checkCouncilTrigger(0, state.results.length, workDir, briefInput, { force: true, agentNote: note });
-        if (!triggered) {
-          return { content: [{ type: "text", text: "❌ Council could not be convened (disabled)." }], details: {} };
+      // ── STEP 2: the agent ran the workflow and brings the slate back ──
+      if (typeof params.slate === "string" && params.slate.trim()) {
+        const pending = findUnfinishedCouncil(workDir);
+        const seq = pending ? pending.seq : readCouncilState(workDir).councilsRun;
+        const councilDirRel = ".auto/councils/" + seq;
+        const floor = readNoiseFloor(workDir);
+        const validation = validateSlate(params.slate, floor);
+        if (!validation.ok) {
+          return {
+            content: [{ type: "text", text: "⚠ Slate failed validation (" + (validation.errors ?? []).join(" ") + ")\n\nFix the slate: re-run the workflow with args.chairFix = " + JSON.stringify((validation.errors ?? []).join(" ")) + " (the engine reuses finished children, only the chair re-runs), then call council_convene({ slate }) again with the corrected slate." }],
+            details: { councilSeq: seq, outcome: "invalid-slate", errors: validation.errors ?? [] },
+          };
         }
-        pending = findUnfinishedCouncil(workDir);
+        const ed = path.join(workDir, ".auto", "councils", String(seq), "entries");
+        fs.mkdirSync(ed, { recursive: true });
+        const file = String(Date.now()).slice(-6) + "-Chair.md";
+        fs.writeFileSync(path.join(ed, file), "---\nspeaker: Chair\nphase: slate\nsummary: final slate\n---\n" + params.slate.trim() + "\n", "utf-8");
+        return {
+          content: [{ type: "text", text: "🏛 COUNCIL #" + seq + " COMPLETE — slate validated ✓ and persisted to " + councilDirRel + "/entries/" + file + "\n\n" + params.slate.trim() + "\n\nRegister each EXP via propose_hypothesis (SimHash dedup applies) and run them through the normal loop. Honor the KILL_WHEN gates — the slate may legitimately skip experiments." }],
+          details: { councilSeq: seq, outcome: "complete", validated: true },
+        };
       }
-      if (!pending) {
-        return { content: [{ type: "text", text: "❌ Council dir could not be resolved after convening." }], details: {} };
-      }
-      const seq = pending.seq;
-      const councilDirAbs = pending.dir;
-      const councilDirRel = path.relative(workDir, councilDirAbs).split(path.sep).join("/");
-      const briefAbsPath = path.join(councilDirAbs, "00-brief.md");
 
+      // ── STEP 1: gates, resume, and the ready-made workflow launch ──
       const roster = resolveRoster(cfg);
 
-      // Fallback: without the subagent tool the extension cannot run the
-      // workflow — hand the agent the manual facilitator protocol instead.
-      const hasSubagent = Array.isArray(ctx.tools) && ctx.tools.some((t) => t?.name === "subagent");
-      if (!hasSubagent) {
-        const protocol = composeFacilitatorMessage({
+      // A pending (brief written, no slate yet) council is resumed, never re-sequenced.
+      const pending = findUnfinishedCouncil(workDir);
+      let seq: number;
+      let councilDirAbs: string;
+      let councilDirRel: string;
+      let briefAbsPath: string;
+      if (pending) {
+        seq = pending.seq;
+        councilDirAbs = pending.dir;
+        councilDirRel = path.relative(workDir, pending.dir).split(path.sep).join("/");
+        briefAbsPath = path.join(pending.dir, "00-brief.md");
+      } else {
+        const next = nextCouncilDir(workDir);
+        seq = next.seq;
+        councilDirAbs = next.dir;
+        councilDirRel = path.relative(workDir, next.dir).split(path.sep).join("/");
+        const noiseFloor = readNoiseFloor(workDir);
+        buildBrief(workDir, next.dir, {
+          seq,
+          noiseFloor,
+          metricName: state.metricName || "metric",
+          metricUnit: state.metricUnit || "",
+          direction: state.bestDirection,
+          baselineMetric: state.baselineMetric ?? state.bestMetric ?? null,
+          bestMetric: state.bestMetric ?? null,
+          goal: state.goal || state.name || "",
+          agentNote: params.note,
+        });
+        writeCouncilState(workDir, { councilsRun: seq, lastCouncilRun: state.results.length });
+        briefAbsPath = path.join(next.dir, "00-brief.md");
+      }
+
+      let briefText = "";
+      try { briefText = fs.readFileSync(briefAbsPath, "utf-8"); } catch { /* validated below */ }
+      if (!briefText) {
+        return {
+          content: [{ type: "text", text: "❌ Brief is missing at " + briefAbsPath + " — cannot assemble the council." }],
+          details: { councilSeq: seq, outcome: "no-brief" },
+        };
+      }
+
+      const workflowArgs: Record<string, unknown> = {
+        briefText,
+        participants: roster.participants.map((p) => ({ name: p.name, letter: p.letter, model: p.model, personaPrompt: personaPrompt(p.persona) })),
+        chairModel: roster.chairModel,
+        maxChallengeRounds: 5,
+        minExperiments: 3,
+      };
+      // The engine rejects an empty-string note ("args.note must not be empty")
+      // — omit the key entirely when the agent passed no note.
+      if (params.note && params.note.trim()) workflowArgs.note = params.note;
+      const timeoutMinutes = cfg.timeoutMinutes;
+
+      const launch = JSON.stringify({
+        workflow: councilWorkflowPath,
+        args: workflowArgs,
+        async: false,
+        cwd: workDir,
+        options: { timeoutMs: timeoutMinutes * 60_000 },
+      }, null, 2);
+
+      const text = [
+        "🏛 COUNCIL #" + seq + " convened — " + (pending ? "RESUMING the interrupted council (same dir, finished children are reused)." : "the blackboard is ready (" + councilDirRel + ")."),
+        "",
+        "Run the council through your subagent tool with EXACTLY this call (it BLOCKS for several minutes and returns a 'COUNCIL_RESULT:{...}' JSON marker):",
+        "",
+        "subagent(" + launch + ")",
+        "",
+        "Then: take result.slate from the COUNCIL_RESULT JSON and call council_convene({ slate: \"<that slate>\" }) — this tool validates it and persists it to the blackboard. If validation fails it tells you exactly what to fix (re-run the workflow with args.chairFix set).",
+        "",
+        roster.participants.map((p) => "- " + p.name + " (" + p.letter + ", " + p.model + ")").join("\n") + "\n- Chair (" + roster.chairModel + ")",
+        "",
+        "If the subagent tool is unavailable in this session, orchestrate the manual protocol below instead.",
+        "",
+        "── Manual fallback (only when the subagent tool does not exist here) ──",
+        composeFacilitatorMessage({
           councilDir: councilDirRel,
           seq,
           briefAbsPath,
           roster,
           maxChallengeRounds: 5,
           minExperiments: 3,
-        });
-        return {
-          content: [{ type: "text", text: "COUNCIL #" + seq + " convened (MANUAL mode — the subagent tool is unavailable, orchestrate by hand).\n\n" + protocol }],
-          details: { councilSeq: seq, mode: "manual-fallback" },
-        };
-      }
+        }),
+      ].join("\n");
 
-      let briefText = "";
-      try { briefText = fs.readFileSync(briefAbsPath, "utf-8"); } catch { /* validated below */ }
-      if (!briefText) {
-        return { content: [{ type: "text", text: "❌ Brief is missing at " + briefAbsPath + " — cannot run the council." }], details: {} };
-      }
-      const wfArgs: Record<string, unknown> = {
-        briefText,
-        participants: roster.participants.map((p) => ({ name: p.name, letter: p.letter, model: p.model, personaPrompt: personaPrompt(p.persona) })),
-        chairModel: roster.chairModel,
-        maxChallengeRounds: 5,
-        minExperiments: 3,
-        note,
-      };
-      try { ctx.ui.notify("Council #" + seq + " running (autonomous — analysts, rounds, chair; this blocks for a few minutes)", "info"); } catch { /* headless */ }
-
-      // The script returns "COUNCIL_RESULT:{...}" — parse the first balanced
-      // object after the marker (child receipts may surround it in the text).
-      const parseResult = (text: string): Record<string, unknown> | null => {
-        const marker = text.indexOf("COUNCIL_RESULT:");
-        if (marker < 0) return null;
-        const start = text.indexOf("{", marker);
-        if (start < 0) return null;
-        for (let end = text.indexOf("}", start); end > start; end = text.indexOf("}", end + 1)) {
-          try {
-            return JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>;
-          } catch { /* try the next closing brace */ }
-        }
-        return null;
-      };
-
-      const runWorkflow = async (fixErrors: string): Promise<{ text: string; result: Record<string, unknown> | null }> => {
-        const args2: Record<string, unknown> = fixErrors ? { ...wfArgs, chairFix: fixErrors } : wfArgs;
-        let outcome: { isError?: boolean; result?: { content?: { type: string; text?: string }[] } } | undefined;
-        try {
-          outcome = (await ctx.executeTool("subagent", {
-            workflow: councilWorkflowPath,
-            args: args2,
-            async: false,
-            cwd: workDir,
-            options: { timeoutMs: cfg.timeoutMinutes * 60_000 },
-          })) as typeof outcome;
-        } catch (e) {
-          return { text: "workflow launch failed: " + (e instanceof Error ? e.message : String(e)), result: null };
-        }
-        const text = (outcome?.result?.content ?? []).map((c) => (c?.type === "text" ? c.text ?? "" : "")).join("\n");
-        return { text, result: parseResult(text) };
-      };
-
-      // FILELESS dispute: the slate arrives in the workflow result (chat), not on
-      // disk. The extension validates it and persists it to the board for audit
-      // and resume detection (findUnfinishedCouncil).
-      const persistSlate = (body: string): string => {
-        const ed = path.join(councilDirAbs, "entries");
-        fs.mkdirSync(ed, { recursive: true });
-        const file = String(Date.now()).slice(-6) + "-Chair.md";
-        fs.writeFileSync(path.join(ed, file), "---\nspeaker: Chair\nphase: slate\nsummary: final slate\n---\n" + body.trim() + "\n", "utf-8");
-        return file;
-      };
-
-      const slateFrom = (r: Record<string, unknown> | null): { body: string } | null =>
-        r && typeof r.slate === "string" && r.slate.trim() ? { body: r.slate } : null;
-
-      // First run; if the chair's slate fails validation, ONE corrective re-run.
-      let run = await runWorkflow("");
-      let slate = slateFrom(run.result);
-      let validation = slate ? validateSlate(slate.body, readNoiseFloor(workDir)) : { ok: false, errors: ["no slate returned"] };
-      if (!validation.ok && run.result?.ok === true) {
-        try { ctx.ui.notify("Council #" + seq + ": slate failed validation — one corrective chair pass", "info"); } catch { /* headless */ }
-        run = await runWorkflow((validation.errors ?? []).join(" "));
-        slate = slateFrom(run.result);
-        validation = slate ? validateSlate(slate.body, readNoiseFloor(workDir)) : { ok: false, errors: ["no slate returned"] };
-      }
-
-      if (!run.result || run.result.ok !== true) {
-        const reason = run.result ? String(run.result.reason ?? "unknown") : "workflow failed";
-        const detail = run.result ? String(run.result.detail ?? "") : run.text.slice(-600);
-        return {
-          content: [{ type: "text", text: "❌ COUNCIL #" + seq + " did not complete (" + reason + "). " + detail + "\n\nCall council_convene again to resume the council (finished children are reused)." }],
-          details: { councilSeq: seq, outcome: "failed", reason },
-        };
-      }
-
-      const slateFile = slate ? persistSlate(slate.body) : null;
-      const consensus = run.result.consensus ? JSON.stringify(run.result.consensus) : "(unavailable)";
-      const unavailable = Array.isArray(run.result.unavailable) && run.result.unavailable.length > 0 ? " Unavailable: " + (run.result.unavailable as string[]).join(", ") + "." : "";
-      const rounds = Number(run.result.rounds ?? 0);
-      const validationLine = validation.ok ? "validated ✓" : "⚠ validation issues: " + (validation.errors ?? []).join(" ");
       return {
-        content: [{ type: "text", text: "🏛 COUNCIL #" + seq + " COMPLETE — " + rounds + " challenge round(s). Consensus: " + consensus + "." + unavailable + "\nSlate (persisted to " + councilDirRel + "/entries/" + (slateFile ?? "?") + "): " + validationLine + "\n\n" + (slate?.body ?? "(no slate)") + "\n\nRegister each EXP via propose_hypothesis (SimHash dedup applies) and run them through the normal loop. Honor the KILL_WHEN gates — the slate may legitimately skip experiments." }],
-        details: { councilSeq: seq, outcome: "complete", rounds, validated: validation.ok === true },
+        content: [{ type: "text", text }],
+        details: { councilSeq: seq, outcome: "orchestration", pending: pending !== null },
       };
     },
   });
