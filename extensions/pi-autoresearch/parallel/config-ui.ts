@@ -44,6 +44,7 @@ export const AUTORESEARCH_SUBCOMMANDS: AutocompleteEntry[] = [
   { value: "config", label: "config", description: "Interactive parallel mode configuration (models, concurrency, budget)" },
   { value: "export", label: "export", description: "Open live dashboard in browser" },
   { value: "dashboard", label: "dashboard", description: "Open the fullscreen scrollable dashboard overlay in the terminal" },
+  { value: "council", label: "council", description: "Convene a stagnation council (multi-model hypothesis review)" },
   { value: "help", label: "help", description: "Show /autoresearch usage help" },
   { value: "parallel-best-of-n", label: "parallel-best-of-n", description: "Try N hypotheses at once, keep the best" },
   { value: "parallel-stack", label: "parallel-stack", description: "Stack independent file-scoped optimizations" },

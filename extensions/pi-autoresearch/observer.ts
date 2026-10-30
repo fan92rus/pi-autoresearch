@@ -15,6 +15,7 @@ import { performance } from "node:perf_hooks";
 
 import { parseJsonlEntry, reconstructJsonlState, type ReconstructedRun } from "./jsonl.ts";
 import { treeExists, loadTree, getPath, failedStreakSinceLastKeep } from "./parallel/tree.ts";
+import { checkCouncilTrigger } from "./council.ts";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -965,6 +966,19 @@ export function runObserver(payload: ObserverPayload): string | null {
   // 3b. Profiling gate (warn when optimizing blind)
   const profilingSteer = checkProfilingGate(state, asi);
   if (profilingSteer) return profilingSteer;
+
+  // 3c. Stagnation council (multi-model hypothesis council; replaces the plain
+  // stagnation hint when it fires — the campaign is stalled badly enough to
+  // convene analysts). Checked before stagnation so they don't both fire.
+  const councilSteer = checkCouncilTrigger(state.runsSinceBestImprovement, payload.runCount, cwd, {
+    metricName: payload.metricName,
+    metricUnit: payload.metricUnit,
+    direction: payload.direction,
+    baselineMetric: payload.baselineMetric,
+    bestMetric: payload.bestMetric,
+    goal: payload.goal,
+  });
+  if (councilSteer) return councilSteer;
 
   // 4. Stagnation (actionable: reflection + escalation hints)
   const stagnationSteer = checkStagnation(state, asi, payload, cwd, oc);

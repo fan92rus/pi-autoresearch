@@ -69,6 +69,7 @@ console.log("## Smoke: real-extension registration");
 const EXPECTED_TOOLS = [
   "init_experiment", "propose_hypothesis", "run_experiment", "log_experiment",
   "tree_status", "finalize_research",
+  "council_write_entry", "council_read_index", "council_read_entry", "council_check_consensus",
 ];
 
 // Disabled tool groups (both flags false):
@@ -86,14 +87,14 @@ const EXPECTED_HOOKS = [
   "before_agent_start", "tool_execution_end", "tool_call",
 ];
 
-await test("registers all 6 tools (parallel + branching disabled)", async () => {
+await test("registers all 10 tools (parallel + branching disabled)", async () => {
   const dir = makeTempDir("reg");
   const { pi } = await loadExtension(dir);
   const names = pi.tools.map((t) => t.name);
   for (const expected of EXPECTED_TOOLS) {
     assert.ok(names.includes(expected), `Missing tool: ${expected}`);
   }
-  assert.strictEqual(names.length, 6, `Expected 6 tools, got ${names.length}: ${names.join(", ")}`);
+  assert.strictEqual(names.length, 10, `Expected 10 tools, got ${names.length}: ${names.join(", ")}`);
 });
 
 await test("registers all 11 hooks", async () => {
@@ -905,6 +906,336 @@ await test("observer steers carry advisor awareness through the hook pipeline", 
   const joined = pi.sentMessages.map((m) => m.text ?? "").join("\n");
   assert.ok(joined.includes("REFLECTION CHECKPOINT"), `after-steer must carry the checkpoint, got: ${joined.slice(0, 300)}`);
   assert.ok(joined.includes('advisor({ stage: "recovery" })'), "pipeline must see ctx.tools and mention advisor");
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// Stagnation Council: blackboard tools, roster, consensus, slate, trigger
+// ──────────────────────────────────────────────────────────────────────
+
+const councilMod = await import(pathToFileURL(path.join("extensions", "pi-autoresearch", "council.ts")));
+const councilToolsMod = await import(pathToFileURL(path.join("extensions", "pi-autoresearch", "council-tools.ts")));
+
+function makeToolCtx(dir) {
+  return { cwd: dir };
+}
+
+async function writeEntry(dir, entry) {
+  const { tool } = await loadExtension(dir);
+  return tool("council_write_entry").execute("id", entry, null, null, makeToolCtx(dir));
+}
+
+function plantStalledLedger(dir, stalledRuns = 10) {
+  const autoDir = path.join(dir, ".auto");
+  fs.mkdirSync(autoDir, { recursive: true });
+  const lines = [JSON.stringify({ type: "config", name: "bench", metricName: "ms", metricUnit: "ms", bestDirection: "lower" })];
+  lines.push(JSON.stringify({ run: 1, metric: 100, status: "keep", description: "baseline-ish keep" }));
+  for (let i = 0; i < stalledRuns; i++) {
+    lines.push(JSON.stringify({ run: i + 2, metric: 120 + i, status: "discard", description: `tweak ${i}` }));
+  }
+  fs.writeFileSync(path.join(autoDir, "log.jsonl"), lines.join("\n") + "\n");
+}
+
+await test("council blackboard: write, index, read roundtrip", async () => {
+  const dir = makeTempDir("council-bb");
+  await writeEntry(dir, { councilDir: ".auto/councils/1", speaker: "AnalystA", phase: "diverge", summary: "three hypotheses", content: "### H-A1: cache warm\nstuff\n### H-A2: fewer iters\nstuff" });
+  await writeEntry(dir, { councilDir: ".auto/councils/1", speaker: "AnalystB", phase: "challenge", summary: "verdicts", content: "VERDICT H-A1: accept — cheap\nVERDICT H-A2: reject — below noise" });
+
+  const { tool } = await loadExtension(dir);
+  const idx = await tool("council_read_index").execute("id", { councilDir: ".auto/councils/1" }, null, null, makeToolCtx(dir));
+  const idxText = idx.content[0].text;
+  assert.ok(idxText.includes("2 entries"), `index lists both entries: ${idxText}`);
+  assert.ok(idxText.includes("[diverge] AnalystA"));
+  assert.ok(idxText.includes("[challenge] AnalystB"));
+
+  const entry = await tool("council_read_entry").execute("id", { councilDir: ".auto/councils/1", entryFile: "entries/0001-AnalystA.md" }, null, null, makeToolCtx(dir));
+  assert.ok(entry.content[0].text.includes("H-A1: cache warm"));
+  assert.ok(entry.content[0].text.includes("H-A2"));
+});
+
+await test("council blackboard rejects paths outside .auto/councils", async () => {
+  const dir = makeTempDir("council-path");
+  const { tool } = await loadExtension(dir);
+  const bad = await tool("council_write_entry").execute("id", { councilDir: ".auto/../elsewhere", speaker: "X", phase: "diverge", summary: "s", content: "c" }, null, null, makeToolCtx(dir));
+  assert.ok(bad.content[0].text.startsWith("❌"), `escape must be rejected: ${bad.content[0].text}`);
+  const badIdx = await tool("council_read_index").execute("id", { councilDir: "D:/tmp" }, null, null, makeToolCtx(dir));
+  assert.ok(badIdx.content[0].text.startsWith("❌"));
+});
+
+await test("consensus detector: settled requires all other voters and no refine", async () => {
+  const { detectConsensus } = councilToolsMod;
+  const participants = [{ name: "AnalystA", letter: "A" }, { name: "AnalystB", letter: "B" }, { name: "AnalystC", letter: "C" }];
+  const entries = [
+    { file: "e1", speaker: "AnalystA", phase: "diverge", summary: "" },
+    { file: "e2", speaker: "AnalystB", phase: "diverge", summary: "" },
+    { file: "e3", speaker: "AnalystC", phase: "diverge", summary: "" },
+  ];
+  const bodies = new Map([
+    ["e1", "### H-A1: proposal one\n### H-A2: proposal two"],
+    ["e2", "### H-B1: proposal three"],
+    ["e3", "### H-C1: proposal four"],
+  ]);
+  // No challenge entries yet → all contested.
+  let report = detectConsensus(entries, (e) => bodies.get(e.file) ?? null, participants, 3);
+  assert.strictEqual(report.hypotheses.length, 4);
+  assert.strictEqual(report.settledCount, 0);
+  assert.strictEqual(report.canConverge, false);
+
+  // A's entry challenges B1 (accept) and C1 (accept) — those become settled (owner excluded from voting).
+  entries.push({ file: "e4", speaker: "AnalystA", phase: "challenge", summary: "" });
+  bodies.set("e4", "VERDICT H-B1: accept — grounded\nVERDICT H-C1: refine — needs cheaper kill test");
+  entries.push({ file: "e5", speaker: "AnalystB", phase: "challenge", summary: "" });
+  bodies.set("e5", "VERDICT H-A1: accept — ok\nVERDICT H-C1: accept — fine");
+  entries.push({ file: "e6", speaker: "AnalystC", phase: "challenge", summary: "" });
+  bodies.set("e6", "VERDICT H-A1: reject — too costly\nVERDICT H-B1: refine — cut scope first");
+
+  report = detectConsensus(entries, (e) => bodies.get(e.file) ?? null, participants, 3);
+  const byId = Object.fromEntries(report.hypotheses.map((h) => [h.id, h]));
+  assert.strictEqual(byId["H-A1"].settled, true, "A1: voted by B+C, no refine (reject is a final verdict)");
+  assert.strictEqual(byId["H-B1"].settled, false, "B1: refine from C keeps it contested");
+  assert.strictEqual(byId["H-C1"].settled, false, "C1: has refine from A");
+  assert.deepStrictEqual(byId["H-A1"].missingFrom, []);
+  assert.strictEqual(byId["H-A1"].verdictsBy["AnalystB"], "accept");
+  assert.strictEqual(byId["H-A1"].verdictsBy["AnalystC"], "reject");
+  assert.strictEqual(report.canConverge, false);
+});
+
+await test("slate validator: count, gain threshold, kill criterion", () => {
+  const { validateSlate } = councilMod;
+  const good = [
+    "## EXP1: warm cache", "- EXPECTED_GAIN: 5", "- KILL_WHEN: no gain after 2 runs",
+    "## EXP2: cut iterations", "- EXPECTED_GAIN: 3", "- KILL_WHEN: variance explodes",
+    "## EXP3: drop parser pass", "- EXPECTED_GAIN: 4", "- KILL_WHEN: correctness drops",
+  ].join("\n");
+  const v = validateSlate(good, 1.0);
+  assert.strictEqual(v.ok, true, `expected ok, errors: ${v.errors.join("; ")}`);
+
+  const lowGain = good.replace("EXPECTED_GAIN: 5", "EXPECTED_GAIN: 1.5");
+  const v2 = validateSlate(lowGain, 1.0);
+  assert.strictEqual(v2.ok, false);
+  assert.ok(v2.errors[0].includes("below 2× noise"));
+
+  const noKill = good.replace(/- KILL_WHEN:[^\n]+\n/g, "");
+  assert.strictEqual(validateSlate(noKill, 1.0).ok, false);
+
+  assert.strictEqual(validateSlate("## EXP1: x\n- EXPECTED_GAIN: 9\n- KILL_WHEN: y", 1.0).ok, false, "1 experiment is not enough");
+  assert.strictEqual(validateSlate(good, null).ok, true, "no noise floor — presence checks only");
+});
+
+await test("roster resolver: models vs personas mode with letter assignment", () => {
+  const { resolveRoster, defaultCouncilConfig } = councilMod;
+  const cfg = defaultCouncilConfig();
+  const distinct = resolveRoster(cfg);
+  assert.strictEqual(distinct.mode, "models");
+  assert.deepStrictEqual(distinct.participants.map((p) => p.letter), ["A", "B", "C"]);
+  assert.ok(distinct.participants.every((p) => p.model === p.model));
+
+  const sameModel = resolveRoster({ ...cfg, participants: cfg.participants.map((p) => ({ ...p, model: "zai-coding-cn/glm-5.3-flash" })) });
+  assert.strictEqual(sameModel.mode, "personas", "identical models → persona mode");
+  assert.ok(sameModel.participants.every((p) => p.model === "zai-coding-cn/glm-5.3-flash"));
+
+  const forced = resolveRoster({ ...cfg, mode: "personas" });
+  assert.strictEqual(forced.mode, "personas");
+});
+
+await test("council config: defaults, overrides, malformed input falls back", () => {
+  const dir = makeTempDir("council-cfg");
+  const { readCouncilConfig } = councilMod;
+  const defaults = readCouncilConfig(dir);
+  assert.strictEqual(defaults.enabled, true);
+  assert.strictEqual(defaults.stagnationRuns, 10);
+  assert.strictEqual(defaults.maxCouncils, 3);
+
+  fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".auto", "config.json"), JSON.stringify({
+    council: { enabled: false, stagnation_runs: 4, max_councils: 2, chair_model: "test/model", participants: [{ name: "Solo", model: "m", persona: "skeptic" }, { name: "Duo", model: "m", persona: "explorer" }] },
+  }));
+  const cfg = readCouncilConfig(dir);
+  assert.strictEqual(cfg.enabled, false);
+  assert.strictEqual(cfg.stagnationRuns, 4);
+  assert.strictEqual(cfg.maxCouncils, 2);
+  assert.strictEqual(cfg.chairModel, "test/model");
+  assert.strictEqual(cfg.participants.length, 2);
+
+  fs.writeFileSync(path.join(dir, ".auto", "config.json"), "{ broken json");
+  assert.strictEqual(readCouncilConfig(dir).enabled, true, "malformed config → defaults");
+});
+
+await test("council trigger: threshold, cooldown, cap, enabled flag, force", () => {
+  const dir = makeTempDir("council-trigger");
+  const { checkCouncilTrigger, readCouncilState } = councilMod;
+  const brief = { metricName: "ms", metricUnit: "ms", direction: "lower", baselineMetric: 100, bestMetric: 100, goal: "bench" };
+
+  assert.strictEqual(checkCouncilTrigger(9, 10, dir, brief), null, "below stagnation threshold");
+  let msg = checkCouncilTrigger(10, 11, dir, brief);
+  assert.ok(msg?.includes("STAGNATION COUNCIL #1"), "fires at threshold");
+  assert.ok(msg.includes(".auto/councils/1"), "message carries the council dir");
+  assert.ok(fs.existsSync(path.join(dir, ".auto", "councils", "1", "00-brief.md")), "brief written");
+  assert.strictEqual(readCouncilState(dir).councilsRun, 1);
+
+  assert.strictEqual(checkCouncilTrigger(10, 13, dir, brief), null, "cooldown still active (2 < 5 runs since council)");
+  msg = checkCouncilTrigger(10, 16, dir, brief);
+  assert.ok(msg?.includes("COUNCIL #2"), "cooldown passed → council #2");
+
+  // cap: force councils_run to max
+  councilMod.writeCouncilState(dir, { councilsRun: 3, lastCouncilRun: null });
+  assert.strictEqual(checkCouncilTrigger(10, 30, dir, brief), null, "max councils reached");
+  assert.ok(checkCouncilTrigger(10, 30, dir, brief, { force: true })?.includes("COUNCIL #4"), "manual force bypasses cap/cooldown");
+
+  // enabled=false blocks even force
+  fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".auto", "config.json"), JSON.stringify({ council: { enabled: false } }));
+  assert.strictEqual(checkCouncilTrigger(10, 40, dir, brief, { force: true }), null, "enabled=false wins over force");
+});
+
+await test("facilitator message: phases, roster, WROTE_ENTRY marker, facts rule", () => {
+  const dir = makeTempDir("council-msg");
+  const { checkCouncilTrigger } = councilMod;
+  const msg = checkCouncilTrigger(10, 11, dir, { metricName: "ms", metricUnit: "ms", direction: "lower", baselineMetric: 100, bestMetric: 100, goal: "bench" });
+  assert.ok(msg, "message produced");
+  for (const marker of ["Phase 1 — Diverge", "Phase 2 — Challenge", "Phase 3 — Chair", "Phase 4 — Execute", "WROTE_ENTRY", "council_check_consensus", "propose_hypothesis", "ONLY to correct objective facts", "Chair"]) {
+    assert.ok(msg.includes(marker), `message must contain "${marker}"`);
+  }
+  // persona line for the default (models) roster
+  assert.ok(msg.includes("AnalystA (letter A"), "roster with letters");
+  assert.ok(msg.includes("council_write_entry"), "task templates teach the blackboard tool");
+});
+
+await test("observer fires the council on a stalled ledger (replaces stagnation hint)", async () => {
+  const dir = makeTempDir("council-obs");
+  plantStalledLedger(dir, 10);
+  const observer = await import(pathToFileURL(path.join("extensions", "pi-autoresearch", "observer.ts")));
+  const steer = observer.runObserver({
+    cwd: dir, direction: "lower", metricName: "ms", metricUnit: "ms",
+    baselineMetric: 100, bestMetric: 100, runCount: 11, goal: "bench",
+  });
+  assert.ok(steer?.includes("STAGNATION COUNCIL"), `council must fire on stalled ledger, got: ${steer?.slice(0, 120)}`);
+  assert.ok(!steer.includes("STAGNATION:"), "plain stagnation hint must be replaced");
+  assert.ok(fs.existsSync(path.join(dir, ".auto", "councils", "state.json")));
+
+  // immediate next call is cooldown-blocked → plain stagnation hint returns
+  const steer2 = observer.runObserver({
+    cwd: dir, direction: "lower", metricName: "ms", metricUnit: "ms",
+    baselineMetric: 100, bestMetric: 100, runCount: 12, goal: "bench",
+  });
+  assert.ok(steer2?.includes("STAGNATION:"), `cooldown → plain stagnation: ${steer2?.slice(0, 80)}`);
+});
+
+await test("brief builder: sections and determinism", () => {
+  const dir = makeTempDir("council-brief");
+  plantStalledLedger(dir, 12);
+  const { buildBrief } = councilMod;
+  const { path: briefPath, text } = buildBrief(dir, path.join(dir, ".auto", "councils", "1"), {
+    seq: 1, metricName: "ms", metricUnit: "ms", direction: "lower", baselineMetric: 100, bestMetric: 100, noiseFloor: 2, goal: "bench",
+  });
+  for (const section of ["## Goal", "## Recent runs", "## Rules", "Noise floor", "tweak 11", "NEVER propose anything that cheats"]) {
+    assert.ok(text.includes(section), `brief must contain "${section}"`);
+  }
+  const again = buildBrief(dir, path.join(dir, ".auto", "councils", "1"), {
+    seq: 1, metricName: "ms", metricUnit: "ms", direction: "lower", baselineMetric: 100, bestMetric: 100, noiseFloor: 2, goal: "bench",
+  });
+  assert.strictEqual(again.text, text, "brief is deterministic");
+  assert.ok(fs.existsSync(briefPath));
+});
+
+await test("council blackboard rejects symlinked roots (physical-path escape)", async () => {
+  const dir = makeTempDir("council-symlink");
+  const evil = path.join(os.tmpdir(), `pi-ar-evil-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
+  fs.mkdirSync(evil, { recursive: true });
+  try {
+    // Case 1: .auto/councils itself is a symlink outside the project.
+    fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
+    let linked = true;
+    try { fs.symlinkSync(evil, path.join(dir, ".auto", "councils"), "dir"); } catch { linked = false; }
+    if (linked) {
+      const { tool } = await loadExtension(dir);
+      const res = await tool("council_write_entry").execute("id", { councilDir: ".auto/councils/1", speaker: "X", phase: "diverge", summary: "s", content: "c" }, null, null, makeToolCtx(dir));
+      assert.ok(res.content[0].text.startsWith("❌"), `symlinked councils root must be rejected: ${res.content[0].text}`);
+      assert.strictEqual(fs.existsSync(path.join(evil, "1")), false, "nothing may be written outside the project");
+    }
+
+    // Case 2: .auto itself is the symlink; councils is a real dir inside the target.
+    const dir2 = makeTempDir("council-symlink2");
+    fs.mkdirSync(path.join(evil, "councils"), { recursive: true });
+    let linked2 = true;
+    try { fs.symlinkSync(evil, path.join(dir2, ".auto"), "dir"); } catch { linked2 = false; }
+    if (linked2) {
+      const { tool } = await loadExtension(dir2);
+      const res = await tool("council_write_entry").execute("id", { councilDir: ".auto/councils/1", speaker: "X", phase: "diverge", summary: "s", content: "c" }, null, null, makeToolCtx(dir2));
+      assert.ok(res.content[0].text.startsWith("❌"), `symlinked .auto must be rejected: ${res.content[0].text}`);
+      assert.strictEqual(fs.existsSync(path.join(evil, "councils", "1")), false, "nothing written via symlinked .auto");
+    }
+    fs.rmSync(evil, { recursive: true, force: true });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("council blackboard: seq collision falls through, nothing is overwritten", async () => {
+  const dir = makeTempDir("council-collide");
+  fs.mkdirSync(path.join(dir, ".auto", "councils", "1", "entries"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".auto", "councils", "1", "entries", "0001-AnalystA.md"), "---\nspeaker: AnalystA\nphase: diverge\nsummary: pre-existing\n---\nkeep me");
+  const { tool } = await loadExtension(dir);
+  const res = await tool("council_write_entry").execute("id", { councilDir: ".auto/councils/1", speaker: "AnalystA", phase: "diverge", summary: "new entry", content: "### H-A9: fresh" }, null, null, makeToolCtx(dir));
+  assert.ok(res.content[0].text.includes("0002-AnalystA.md"), `collision must bump seq: ${res.content[0].text}`);
+  const kept = fs.readFileSync(path.join(dir, ".auto", "councils", "1", "entries", "0001-AnalystA.md"), "utf-8");
+  assert.ok(kept.includes("keep me"), "pre-existing entry must survive");
+});
+
+await test("council blackboard: parallel batch keeps every entry", async () => {
+  const dir = makeTempDir("council-par");
+  const { tool } = await loadExtension(dir);
+  const names = ["AnalystA", "AnalystB", "AnalystC", "AnalystD", "AnalystE"];
+  const results = await Promise.all(names.map((s) =>
+    tool("council_write_entry").execute("id", { councilDir: ".auto/councils/1", speaker: s, phase: "diverge", summary: `entry ${s}`, content: `### H-${s.slice(-1)}1: x` }, null, null, makeToolCtx(dir)),
+  ));
+  for (const r of results) {
+    assert.ok(r.content[0].text.includes("WROTE_ENTRY OK"), "each parallel write must succeed");
+  }
+  const idx = await tool("council_read_index").execute("id", { councilDir: ".auto/councils/1" }, null, null, makeToolCtx(dir));
+  assert.ok(idx.content[0].text.includes("5 entries"), `all 5 entries preserved: ${idx.content[0].text}`);
+});
+
+await test("consensus: later verdicts supersede earlier ones (recency rule)", async () => {
+  const { detectConsensus } = councilToolsMod;
+  const participants = [{ name: "AnalystA", letter: "A" }, { name: "AnalystB", letter: "B" }, { name: "AnalystC", letter: "C" }];
+  const entries = [
+    { file: "e1", speaker: "AnalystA", phase: "diverge", summary: "" },
+    { file: "e2", speaker: "AnalystB", phase: "diverge", summary: "" },
+    { file: "e3", speaker: "AnalystC", phase: "diverge", summary: "" },
+  ];
+  const bodies = new Map([
+    ["e1", "### H-A1: alpha"],
+    ["e2", "### H-B1: beta"],
+    ["e3", "### H-C1: gamma"],
+  ]);
+  // Round 1: C's hypothesis gets refine from both voters.
+  entries.push({ file: "e4", speaker: "AnalystA", phase: "challenge", summary: "r1" });
+  bodies.set("e4", "VERDICT H-B1: accept — ok\nVERDICT H-C1: refine — needs a cheaper kill test");
+  entries.push({ file: "e5", speaker: "AnalystB", phase: "challenge", summary: "r1" });
+  bodies.set("e5", "VERDICT H-A1: accept — ok\nVERDICT H-C1: refine — same");
+  // Round 2 (later seq): both voters revise their C1 verdicts to final ones.
+  entries.push({ file: "e6", speaker: "AnalystA", phase: "challenge", summary: "r2" });
+  bodies.set("e6", "VERDICT H-C1: accept — revised form is fine");
+  entries.push({ file: "e7", speaker: "AnalystB", phase: "challenge", summary: "r2" });
+  bodies.set("e7", "VERDICT H-C1: reject — still below noise");
+
+  const report = detectConsensus(entries, (e) => bodies.get(e.file) ?? null, participants, 3);
+  const byId = Object.fromEntries(report.hypotheses.map((h) => [h.id, h]));
+  assert.strictEqual(byId["H-C1"].settled, true, "round-2 verdicts must supersede round-1 refines");
+  assert.strictEqual(byId["H-C1"].dispositions.refine, 0);
+  assert.strictEqual(byId["H-C1"].dispositions.accept, 1);
+  assert.strictEqual(byId["H-C1"].dispositions.reject, 1);
+  assert.strictEqual(report.settledCount, 1, "A1 (B accepted, C has not voted) and B1 (A accepted, C has not voted) stay open");
+});
+
+await test("/autoresearch council command forces a council and sends the protocol", async () => {
+  const dir = makeTempDir("council-cmd");
+  initGitRepo(dir);
+  const { command, ctx, pi } = await loadExtension(dir);
+  await command("autoresearch").handler("council", ctx);
+  const joined = pi.sentMessages.map((m) => m.text ?? "").join("\n");
+  assert.ok(joined.includes("STAGNATION COUNCIL #1"), `manual council must send the protocol, got: ${joined.slice(0, 200)}`);
+  assert.ok(fs.existsSync(path.join(dir, ".auto", "councils", "1", "00-brief.md")));
 });
 
 // ──────────────────────────────────────────────────────────────────────

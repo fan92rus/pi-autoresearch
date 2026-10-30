@@ -38,6 +38,8 @@ import { createServer, type Server, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
 import { getBashSpawnOptions, killTree } from "./bash-shell.ts";
 import { markIdeaTried } from "./observer.ts";
+import { registerCouncilTools } from "./council-tools.ts";
+import { checkCouncilTrigger, readCouncilConfig, readCouncilState } from "./council.ts";
 import { createWriteStream } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -1912,7 +1914,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const autoresearchHelp = () =>
     [
-      "Usage: /autoresearch [off|clear|config|export|<text>|parallel-*]",
+      "Usage: /autoresearch [off|clear|council|config|export|<text>|parallel-*]",
       "",
       "<text> enters autoresearch mode and starts or resumes the loop.",
       "off leaves autoresearch mode.",
@@ -2267,6 +2269,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const EXPERIMENT_LOOP_TOOLS = new Set([
     "run_experiment", "log_experiment", "propose_hypothesis", "init_experiment",
     "tree_status", "finalize_research",
+    // Council facilitation IS loop work: without these, drift-resume would nag
+    // the agent mid-council (observed in the E2E run).
+    "council_write_entry", "council_check_consensus",
   ]);
   pi.on("tool_execution_end", async (event, ctx) => {
     if (!EXPERIMENT_LOOP_TOOLS.has(event.toolName)) return;
@@ -2338,6 +2343,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\npropose_hypothesis() BEFORE each run_experiment. tree_status() \u2014 hypothesis list with statuses and the current best." +
       "\n\n## Finalization" +
       "\nfinalize_research({reason, evidence, confidence}) only with PROOF (mathematical floor, noise floor reached, search space exhausted). A subjective \u201cthis seems hard\u201d is NOT proof \u2014 try orthogonal approaches first. It is a RECOMMENDATION; the observer arbitrates and suppresses premature signals." +
+      "\n\n## Stagnation Council" +
+      "\nWhen the observer convenes a STAGNATION COUNCIL, follow its facilitator protocol exactly: spawn the analyst subagents, verify their entries via council_read_index (retry missing ones), run challenge rounds via council_check_consensus, get the chair's slate, then register each slate experiment with propose_hypothesis and execute them in the normal loop. You may append ONLY objective-facts entries (phase: \"facts\") — never judge hypotheses yourself. A council opinion is not evidence; the benchmark is." +
       "\n\n## Observer Steers" +
       "\n\U0001f504 STAGNATION \u2014 STOP and REFLECT on the pattern. \U0001f3af MILESTONE \u2014 consider strategic alternatives and orthogonal directions.";
 
@@ -5212,6 +5219,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     },
   });
 
+  // ── Council blackboard tools (NOT mode-gated: council participants are
+  // separate headless sessions with no autoresearch mode of their own) ──
+  registerCouncilTools(pi);
+
   // ── compose: merge orthogonal improvements from two branches ──
   if (BRANCHING_TOOLS_ENABLED) registerGatedTool({
     name: "compose",
@@ -5484,6 +5495,30 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       if (command === "export") {
         await exportDashboard(ctx);
+        return;
+      }
+
+      if (command === "council") {
+        // Manual stagnation council trigger (same path as the automatic one).
+        const workDir = resolveWorkDir(ctx.cwd);
+        const cfg = readCouncilConfig(workDir);
+        if (!cfg.enabled) {
+          ctx.ui.notify("Council is disabled (council.enabled=false in .auto/config.json)", "error");
+          return;
+        }
+        const state = runtime.state;
+        const msg = checkCouncilTrigger(0, state.results.length, workDir, {
+          metricName: state.metricName,
+          metricUnit: state.metricUnit,
+          direction: state.bestDirection,
+          baselineMetric: state.bestMetric,
+          bestMetric: findBestMetric(state.results, state.currentSegment, state.bestDirection),
+          goal: state.name ?? "",
+        }, { force: true });
+        if (msg) {
+          pi.sendUserMessage(msg, { deliverAs: "followUp" });
+          ctx.ui.notify(`Council #${readCouncilState(workDir).councilsRun} convened — protocol sent`, "info");
+        }
         return;
       }
 

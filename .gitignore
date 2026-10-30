@@ -15,3 +15,6 @@ nano-banana-*.png
 .agile/
 .pi-subagents/
 node_modules/
+
+# local pi state (goals etc.)
+.pi/
