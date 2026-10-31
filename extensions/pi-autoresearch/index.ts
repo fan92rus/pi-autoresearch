@@ -2380,6 +2380,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\n- Experiment rules: " + mdPath + " \u2014 read at session start and after compaction. Ideas backlog: " + ideasPath + " \u2014 write promising deferred ideas there (one .md per idea)." +
       "\n- " + experimentLimitClause(ctx.cwd) + "\n- " + BENCHMARK_GUARDRAIL +
       "\n- Follow-on user message mid-experiment? Finish the current run_experiment + log_experiment cycle first, address it next iteration." +
+      "\n- EVERYTHING within the active goal is PRE-APPROVED — experiments (expensive included), code edits, script fixes, retries after failures: do NOT ask the owner before acting — decide yourself, record assumptions in the hypothesis/ASI, and keep the loop running. Ask the owner ONLY when stepping outside the goal's frame: new external data, foreign resources, goal/metric change, irreversible damage." +
       "\n\n## Hypothesis-First Workflow (EVERY iteration)" +
       "\n1. PROFILE FIRST \u2014 node --prof / console.time / --trace-deopt: find where time is actually spent. Do NOT guess. Record findings in the hypothesis." +
       "\n2. propose_hypothesis(description) \u2192 node_id (SimHash + do_not_retry check). hypothesis_id is REQUIRED for all non-baseline runs." +

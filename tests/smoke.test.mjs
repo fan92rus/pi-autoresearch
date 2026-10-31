@@ -576,6 +576,13 @@ await test("before_agent_start mutates system prompt in autoresearch mode", asyn
     promptExtended || capturedPrompt,
     "systemPrompt should be extended in autoresearch mode",
   );
+  // Experiments within the active goal are pre-approved (no owner questions).
+  const combined = (event.systemPrompt || "") + " " + (pi._lastSystemPrompt || "");
+  assert.ok(
+    combined.includes("PRE-APPROVED") &&
+      combined.includes("Ask the owner ONLY when stepping outside"),
+    "prompt should state experiments are pre-approved without owner questions",
+  );
 });
 
 await test("parallel + branching tools are NOT registered (disabled)", async () => {
