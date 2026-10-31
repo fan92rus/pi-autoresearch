@@ -53,6 +53,11 @@ import {
   validateSlate,
   writeCouncilState,
 } from "./council.ts";
+import {
+  delegationAvailable,
+  persistSlateEntry,
+  runCouncilDelegated,
+} from "./council-delegation.ts";
 import { createWriteStream } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -2359,8 +2364,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\n\n## Finalization" +
       "\nfinalize_research({reason, evidence, confidence}) only with PROOF (mathematical floor, noise floor reached, search space exhausted). A subjective \u201cthis seems hard\u201d is NOT proof \u2014 try orthogonal approaches first. It is a RECOMMENDATION; the observer arbitrates and suppresses premature signals." +
       "\n\n## Stagnation Council" +
-      "\nWhen the observer convenes a STAGNATION COUNCIL, call council_convene({ note: \"...\" }) immediately — the tool returns a ready-made subagent workflow launch (council-loop.js) — run it EXACTLY as given; it blocks for several minutes and returns a COUNCIL_RESULT JSON with the finished slate. Then call council_convene({ slate: \"<that slate>\" }) to validate and persist it, and register each slate experiment with propose_hypothesis. You may append ONLY objective-facts blackboard entries (phase: \"facts\") — never judge hypotheses yourself. A council opinion is not evidence; the benchmark is." +
-      "\nYou can also convene a council YOURSELF at any time, with no limits, when you feel stuck: council_convene({ note: \"why you are stuck and what to focus on\" }). same two-step flow: run the returned workflow launch (blocking), then bring the slate back via council_convene({ slate })." +
+      "\nWhen the observer convenes a STAGNATION COUNCIL, call council_convene({ note: \"...\" }) immediately — the tool convenes the whole council itself (analysts, dispute, chair), BLOCKS for several minutes and returns the validated, persisted slate; register each slate experiment with propose_hypothesis. You may append ONLY objective-facts blackboard entries (phase: \"facts\") — never judge hypotheses yourself. A council opinion is not evidence; the benchmark is." +
+      "\nYou can also convene a council YOURSELF at any time, with no limits, when you feel stuck: council_convene({ note: \"why you are stuck and what to focus on\" }). Same one-call flow: it blocks, then you execute the returned slate." +
       "\n\n## Observer Steers" +
       "\n\U0001f504 STAGNATION \u2014 STOP and REFLECT on the pattern. \U0001f3af MILESTONE \u2014 consider strategic alternatives and orthogonal directions.";
 
@@ -5266,23 +5271,22 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // Self-service council: the campaign agent convenes it whenever it feels
   // stuck — no stagnation threshold, no cooldown, no cap (only council.enabled
   // vetoes). AUTONOMOUS + BLOCKING: the whole council (analyst batches, challenge
-  // rounds, chair slate) runs inside this one tool call as a pi-subagents
-  // workflow (workflows/council-loop.js — the pi-agile "workflow in a file"
-  // pattern); the agent just waits and executes the returned slate.
-  const councilWorkflowPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "workflows", "council-loop.js");
+  // rounds, chair slate) runs inside this one tool call via pi-subagents'
+  // structured delegation seam (council-delegation.ts); the agent just waits
+  // and executes the returned slate.
   registerGatedTool({
     name: "council_convene",
     label: "Convene a hypothesis council (autonomous, blocking)",
     description:
       "Convene a stagnation council at any time, with no limits — no stagnation threshold, no cooldown, no cap " +
-      "(only council.enabled in .auto/config.json can veto). Returns a ready-made pi-subagents workflow launch " +
-      "(council-loop.js): run it through your subagent tool exactly as given — it spawns the analysts, runs the " +
-      "fileless dispute and the chair, and blocks until the finished slate returns. Then call this tool again with " +
-      "{ slate } to validate and persist it. Use it when you feel stuck; your note is added to the brief the analysts read.",
+      "(only council.enabled in .auto/config.json can veto). The tool itself convenes the council: spawns the " +
+      "analysts, runs the fileless dispute and the chair, validates the slate (3–5 EXP sections, EXPECTED_GAIN >= 2x " +
+      "noise floor, KILL_WHEN) and persists it to the blackboard. It BLOCKS for several minutes and returns the " +
+      "finished slate. Use it when you feel stuck; your note is added to the brief the analysts read.",
     promptSnippet: "Convene a hypothesis council yourself (autonomous + blocking) — returns the finished slate",
     promptGuidelines: [
       "When stuck (e.g. a long failure streak with no keep in sight, or every direction ends in 'no effect'), convene a council: council_convene({ note: \"...\" }).",
-      "The tool returns a ready-made subagent workflow launch — run it exactly as given (it blocks for several minutes), then call council_convene({ slate: \"<the slate from COUNCIL_RESULT>\" }) to validate and persist it.",
+      "The tool runs the whole council itself and blocks for several minutes; the returned text carries the finished slate — register each EXP via propose_hypothesis.",
     ],
     parameters: {
       type: "object",
@@ -5291,13 +5295,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           type: "string",
           description: "Why you are stuck and what the council should focus on. Goes verbatim into the brief.",
         },
-        slate: {
-          type: "string",
-          description: "STEP 2 ONLY: the slate markdown from the COUNCIL_RESULT of the workflow you ran. The tool validates it (3–5 EXP sections, EXPECTED_GAIN >= 2x noise floor, KILL_WHEN), persists it to the blackboard and returns the final verdict.",
-        },
       },
     },
-    async execute(_toolCallId: string, params: { note?: string; slate?: string }, _signal, _onUpdate, ctx: ExtensionContext) {
+    async execute(_toolCallId: string, params: { note?: string }, _signal, _onUpdate, ctx: ExtensionContext) {
       const modeGate = assertModeActive(ctx);
       if (modeGate) return modeGate;
       const workDir = resolveWorkDir(ctx.cwd);
@@ -5310,30 +5310,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
 
-      // ── STEP 2: the agent ran the workflow and brings the slate back ──
-      if (typeof params.slate === "string" && params.slate.trim()) {
-        const pending = findUnfinishedCouncil(workDir);
-        const seq = pending ? pending.seq : readCouncilState(workDir).councilsRun;
-        const councilDirRel = ".auto/councils/" + seq;
-        const floor = readNoiseFloor(workDir);
-        const validation = validateSlate(params.slate, floor);
-        if (!validation.ok) {
-          return {
-            content: [{ type: "text", text: "⚠ Slate failed validation (" + (validation.errors ?? []).join(" ") + ")\n\nFix the slate: re-run the workflow with args.chairFix = " + JSON.stringify((validation.errors ?? []).join(" ")) + " (the engine reuses finished children, only the chair re-runs), then call council_convene({ slate }) again with the corrected slate." }],
-            details: { councilSeq: seq, outcome: "invalid-slate", errors: validation.errors ?? [] },
-          };
-        }
-        const ed = path.join(workDir, ".auto", "councils", String(seq), "entries");
-        fs.mkdirSync(ed, { recursive: true });
-        const file = String(Date.now()).slice(-6) + "-Chair.md";
-        fs.writeFileSync(path.join(ed, file), "---\nspeaker: Chair\nphase: slate\nsummary: final slate\n---\n" + params.slate.trim() + "\n", "utf-8");
-        return {
-          content: [{ type: "text", text: "🏛 COUNCIL #" + seq + " COMPLETE — slate validated ✓ and persisted to " + councilDirRel + "/entries/" + file + "\n\n" + params.slate.trim() + "\n\nRegister each EXP via propose_hypothesis (SimHash dedup applies) and run them through the normal loop. Honor the KILL_WHEN gates — the slate may legitimately skip experiments." }],
-          details: { councilSeq: seq, outcome: "complete", validated: true },
-        };
-      }
-
-      // ── STEP 1: gates, resume, and the ready-made workflow launch ──
+      // ── Resume or create the council dir (shared by both paths) ──
       const roster = resolveRoster(cfg);
 
       // A pending (brief written, no slate yet) council is resumed, never re-sequenced.
@@ -5377,40 +5354,75 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
 
-      const workflowArgs: Record<string, unknown> = {
-        briefText,
-        participants: roster.participants.map((p) => ({ name: p.name, letter: p.letter, model: p.model, personaPrompt: personaPrompt(p.persona) })),
-        chairModel: roster.chairModel,
-        maxChallengeRounds: 5,
-        minExperiments: 3,
-      };
-      // The engine rejects an empty-string note ("args.note must not be empty")
-      // — omit the key entirely when the agent passed no note.
-      if (params.note && params.note.trim()) workflowArgs.note = params.note;
-      const timeoutMinutes = cfg.timeoutMinutes;
-
-      const launch = JSON.stringify({
-        workflow: councilWorkflowPath,
-        args: workflowArgs,
-        async: false,
-        cwd: workDir,
-        options: { timeoutMs: timeoutMinutes * 60_000 },
-      }, null, 2);
+      // ── Single step: delegate the whole council through pi-subagents' structured
+      // delegation seam (children are foreground leaves; the tool call blocks until
+      // the validated slate returns). Falls back to the manual facilitator protocol
+      // only when the seam is unavailable.
+      if (delegationAvailable(pi)) {
+        const floor = readNoiseFloor(workDir);
+        const validate = (slate: string) => validateSlate(slate, floor);
+        const deadlineAt = Date.now() + cfg.timeoutMinutes * 60_000;
+        const outcome = await runCouncilDelegated(pi, {
+          seq,
+          briefText,
+          participants: roster.participants.map((p) => ({ name: p.name, letter: p.letter, model: p.model, personaPrompt: personaPrompt(p.persona) })),
+          chairModel: roster.chairModel,
+          maxChallengeRounds: 5,
+          minExperiments: 3,
+          note: params.note && params.note.trim() ? params.note : undefined,
+          cwd: workDir,
+          deadlineAt,
+          validate,
+        });
+        if (!outcome.ok && outcome.seamUnavailable) {
+          // The delegation bridge itself is dead in this session type (e.g. SDK-hosted) —
+          // degrade to the manual facilitator protocol instead of blaming the models.
+          const text = [
+            "🏛 COUNCIL #" + seq + " convened — " + (pending ? "RESUMING the interrupted council (same dir)." : "the blackboard is ready (" + councilDirRel + ")."),
+            "",
+            "The automatic delegation seam is unavailable in this session — orchestrate the manual protocol below instead (via your own subagent tool, or by self-organizing the roles if even that is missing).",
+            "",
+            composeFacilitatorMessage({
+              councilDir: councilDirRel,
+              seq,
+              briefAbsPath,
+              roster,
+              maxChallengeRounds: 5,
+              minExperiments: 3,
+            }),
+          ].join("\n");
+          return {
+            content: [{ type: "text", text }],
+            details: { councilSeq: seq, outcome: "manual-protocol", pending: pending !== null },
+          };
+        }
+        if (!outcome.ok) {
+          const text = outcome.reason === "quorum"
+            ? "🏛 COUNCIL #" + seq + " — quorum failed: " + outcome.detail + "\n\nYou may retry later (a fresh call reuses this council dir), or continue the campaign normally."
+            : outcome.reason === "deadline"
+              ? "🏛 COUNCIL #" + seq + " — deadline hit: " + outcome.detail + "\n\nCalling council_convene again resumes this council dir."
+              : "🏛 COUNCIL #" + seq + " — no slate: " + outcome.detail + "\n\nYou may retry with a different note, or continue the campaign normally.";
+          return {
+            content: [{ type: "text", text }],
+            details: { councilSeq: seq, outcome: outcome.reason, unavailable: outcome.unavailable, rounds: outcome.rounds },
+          };
+        }
+        const file = persistSlateEntry(councilDirAbs, outcome.slate);
+        const header = "🏛 COUNCIL #" + seq + " COMPLETE — " + outcome.rounds + " challenge round(s)"
+          + (outcome.corrected ? ", slate corrected after validation" : "")
+          + (outcome.unavailable.length ? ", unavailable: " + outcome.unavailable.join(", ") : "")
+          + ". Slate persisted to " + councilDirRel + "/entries/" + file + "\n\n";
+        return {
+          content: [{ type: "text", text: header + outcome.slate + "\n\nRegister each EXP via propose_hypothesis (SimHash dedup applies) and run them through the normal loop. Honor the KILL_WHEN gates — the slate may legitimately skip experiments." }],
+          details: { councilSeq: seq, outcome: "complete", validated: true, rounds: outcome.rounds, corrected: outcome.corrected },
+        };
+      }
 
       const text = [
-        "🏛 COUNCIL #" + seq + " convened — " + (pending ? "RESUMING the interrupted council (same dir, finished children are reused)." : "the blackboard is ready (" + councilDirRel + ")."),
+        "🏛 COUNCIL #" + seq + " convened — " + (pending ? "RESUMING the interrupted council (same dir)." : "the blackboard is ready (" + councilDirRel + ")."),
         "",
-        "Run the council through your subagent tool with EXACTLY this call (it BLOCKS for several minutes and returns a 'COUNCIL_RESULT:{...}' JSON marker):",
+        "The automatic delegation seam is unavailable in this session — orchestrate the manual protocol below instead (via your own subagent tool, or by self-organizing the roles if even that is missing).",
         "",
-        "subagent(" + launch + ")",
-        "",
-        "Then: take result.slate from the COUNCIL_RESULT JSON and call council_convene({ slate: \"<that slate>\" }) — this tool validates it and persists it to the blackboard. If validation fails it tells you exactly what to fix (re-run the workflow with args.chairFix set).",
-        "",
-        roster.participants.map((p) => "- " + p.name + " (" + p.letter + ", " + p.model + ")").join("\n") + "\n- Chair (" + roster.chairModel + ")",
-        "",
-        "If the subagent tool is unavailable in this session, orchestrate the manual protocol below instead.",
-        "",
-        "── Manual fallback (only when the subagent tool does not exist here) ──",
         composeFacilitatorMessage({
           councilDir: councilDirRel,
           seq,
@@ -5423,7 +5435,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       return {
         content: [{ type: "text", text }],
-        details: { councilSeq: seq, outcome: "orchestration", pending: pending !== null },
+        details: { councilSeq: seq, outcome: "manual-protocol", pending: pending !== null },
       };
     },
   });

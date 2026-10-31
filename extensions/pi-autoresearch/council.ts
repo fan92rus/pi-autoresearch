@@ -485,7 +485,7 @@ export function findUnfinishedCouncil(workDir: string): { seq: number; dir: stri
 export function composeConveneNudge(seq: number, councilDirRel: string, briefAbsPath: string): string {
   return [
     `🏛 STAGNATION COUNCIL #${seq} — the blackboard is ready (${councilDirRel}).`,
-    `Call council_convene({ note: "where you are stuck and what to focus on" }) NOW — it returns a ready-made subagent workflow launch; run it exactly as given (it blocks for several minutes), then call council_convene({ slate }) with the returned slate to validate and persist it.`,
+    `Call council_convene({ note: "where you are stuck and what to focus on" }) NOW — the tool convenes the whole council itself and blocks for several minutes; the finished, validated slate comes back in its result.`,
     `Brief: ${briefAbsPath}`,
     `When the slate returns: register each EXP via propose_hypothesis (SimHash dedup applies) and run them through the normal loop. The benchmark decides — a council opinion is not evidence.`,
   ].join("\n");

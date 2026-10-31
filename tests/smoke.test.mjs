@@ -57,7 +57,7 @@ async function loadExtension(dir, sessionId = "smoke", opts = {}) {
     pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")).href
   );
   autoresearchExtension(pi);
-  return { pi, tool, command, hook, ctx };
+  return { pi, tool, command, hook, ctx, events: pi.events };
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1310,202 +1310,293 @@ await test("/autoresearch council [note] delegates to the autonomous tool", asyn
   assert.ok(!fs.existsSync(path.join(dir, ".auto", "councils")), "no council dir until the tool actually runs");
 });
 
-await test("council_convene step 1: orchestration launch + manual fallback + resume same seq, gated when mode off", async () => {
-  const dir = makeTempDir("council-convene");
+// ─── Delegation-engine emulation: the test answers delegation requests the way pi-subagents would ───
+
+function installDelegationEngine(events, respond) {
+  events.on("prompt-template:subagent:request", (req) => {
+    const r = respond(req);
+    const payload = {
+      requestId: req.requestId,
+      ownerRunId: req.ownerRunId,
+      nodeId: req.nodeId,
+      status: r.status ?? "completed",
+    };
+    if (r.error) payload.error = r.error;
+    if (r.text !== undefined) payload.result = { kind: "text", text: r.text };
+    events.emit("prompt-template:subagent:response", payload);
+  });
+}
+
+const GOOD_SLATE = "## EXP1: a\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: x\n\n## EXP2: b\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: y\n\n## EXP3: c\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: z";
+const BAD_SLATE = "## EXP1: a\nEXPECTED_GAIN: 100 ms\n\n## EXP2: b\nEXPECTED_GAIN: 100 ms\n\n## EXP3: c\nEXPECTED_GAIN: 100 ms";
+const NAMES = ["AnalystA", "AnalystB", "AnalystC"];
+const hypFor = (name) => "### H-" + name.slice(-1) + "1: alpha hypothesis\nEXPECTED_GAIN: 5 ms; KILL_WHEN: nothing";
+const verdictsFrom = (selfName) => NAMES.filter((n) => n !== selfName).map((n) => "VERDICT H-" + n.slice(-1) + "1: accept — ok").join("\n");
+const selfNameOf = (task) => NAMES.find((n) => task.includes("You are " + n + " ("));
+
+await test("council_convene: single-step delegation — the whole council runs inside the call, slate validated + persisted", async () => {
+  const dir = makeTempDir("council-one-step");
   initGitRepo(dir);
-  const { command, tool, ctx } = await loadExtension(dir);
+  const { command, tool, ctx, events } = await loadExtension(dir);
   await command("autoresearch").handler("on", ctx);
+  const requests = [];
+  installDelegationEngine(events, (req) => {
+    requests.push(req);
+    if (req.nodeId.startsWith("diverge")) return { text: hypFor(selfNameOf(req.task)) };
+    if (req.nodeId.startsWith("challenge")) return { text: verdictsFrom(selfNameOf(req.task)) };
+    if (req.nodeId.startsWith("chair")) return { text: GOOD_SLATE };
+    return { status: "failed", error: "unexpected node " + req.nodeId };
+  });
+
+  const res = await tool("council_convene").execute("id", { note: "stuck on the parser" }, null, null, ctx);
+  const text = res.content[0].text;
+  assert.ok(text.includes("COUNCIL #1 COMPLETE"), `complete banner: ${text.slice(0, 200)}`);
+  assert.ok(text.includes("1 challenge round"), "round count reported");
+  assert.ok(text.includes("## EXP1: a"), "slate body returned to the agent");
+  assert.strictEqual(res.details?.outcome, "complete");
+  assert.strictEqual(res.details?.corrected, false);
+  assert.strictEqual(res.details?.rounds, 1);
+  const ed = path.join(dir, ".auto", "councils", "1", "entries");
+  const persisted = fs.readdirSync(ed).find((f) => f.endsWith("-Chair.md"));
+  assert.ok(persisted && fs.readFileSync(path.join(ed, persisted), "utf-8").includes("phase: slate"), "slate persisted to the blackboard");
+  assert.strictEqual(councilMod.findUnfinishedCouncil(dir), null, "completed council is closed");
+
+  const diverge = requests.filter((r) => r.nodeId.startsWith("diverge"));
+  assert.strictEqual(diverge.length, 3, "exactly one diverge attempt per analyst");
+  assert.ok(diverge.every((r) => r.task.includes("stuck on the parser") && r.task.includes("<<<BRIEF")), "diverge tasks carry the brief and the note");
+  assert.ok(requests.some((r) => r.nodeId.startsWith("chair")), "chair ran in the same call");
+  const challenge = requests.filter((r) => r.nodeId.startsWith("challenge"));
+  assert.ok(challenge.every((r) => r.task.includes("alpha hypothesis")), "challenge tasks relay the proposals verbatim");
+});
+
+await test("council_convene: invalid slate triggers the corrective chair re-run inside the same call", async () => {
+  const dir = makeTempDir("council-chairfix");
+  initGitRepo(dir);
+  const { command, tool, ctx, events } = await loadExtension(dir);
+  await command("autoresearch").handler("on", ctx);
+  let chairCalls = 0;
+  installDelegationEngine(events, (req) => {
+    if (req.nodeId.startsWith("diverge")) return { text: hypFor(selfNameOf(req.task)) };
+    if (req.nodeId.startsWith("challenge")) return { text: verdictsFrom(selfNameOf(req.task)) };
+    if (req.nodeId.startsWith("chair")) {
+      chairCalls++;
+      return { text: chairCalls === 1 ? BAD_SLATE : GOOD_SLATE };
+    }
+    return { status: "failed", error: "unexpected node" };
+  });
+
+  const res = await tool("council_convene").execute("id", {}, null, null, ctx);
+  assert.strictEqual(res.details?.outcome, "complete", "corrected slate completes the council");
+  assert.strictEqual(res.details?.corrected, true, "corrective re-run is reported");
+  assert.strictEqual(chairCalls, 2, "chair ran twice (initial + fix)");
+  assert.strictEqual(councilMod.findUnfinishedCouncil(dir), null, "council closed after the fix");
+});
+
+await test("council_convene: chair never produces a valid slate — honest failure, council stays pending", async () => {
+  const dir = makeTempDir("council-noslate");
+  initGitRepo(dir);
+  const { command, tool, ctx, events } = await loadExtension(dir);
+  await command("autoresearch").handler("on", ctx);
+  installDelegationEngine(events, (req) => {
+    if (req.nodeId.startsWith("diverge")) return { text: hypFor(selfNameOf(req.task)) };
+    if (req.nodeId.startsWith("challenge")) return { text: verdictsFrom(selfNameOf(req.task)) };
+    if (req.nodeId.startsWith("chair")) return { text: BAD_SLATE };
+    return { status: "failed", error: "unexpected node" };
+  });
+
+  const res = await tool("council_convene").execute("id", {}, null, null, ctx);
+  const text = res.content[0].text;
+  assert.strictEqual(res.details?.outcome, "no-slate");
+  assert.ok(text.includes("no slate"), `honest failure text: ${text.slice(0, 160)}`);
+  assert.ok(text.includes("KILL_WHEN"), "validation errors named in the failure");
+  assert.strictEqual(councilMod.findUnfinishedCouncil(dir)?.seq, 1, "council stays pending");
+  const ed = path.join(dir, ".auto", "councils", "1", "entries");
+  assert.ok(!fs.existsSync(ed) || !fs.readdirSync(ed).some((f) => f.endsWith("-Chair.md")), "no slate persisted");
+});
+
+await test("council_convene: dead analyst is marked UNAVAILABLE, quorum failure is honest at tool level", async () => {
+  const dir = makeTempDir("council-quorum");
+  initGitRepo(dir);
+  const { command, tool, ctx, events } = await loadExtension(dir);
+  await command("autoresearch").handler("on", ctx);
+    const deadDiverge = new Set();
+  let allAlive = false; // flipped before the resume call
+  installDelegationEngine(events, (req) => {
+    const self = selfNameOf(req.task);
+    if (req.nodeId.startsWith("diverge")) {
+      // AnalystB and AnalystC never deliver hypotheses (3 attempts each)
+      if (!allAlive && self !== "AnalystA") { deadDiverge.add(self); return { text: "I could not produce hypotheses." }; }
+      return { text: hypFor(self) };
+    }
+    if (req.nodeId.startsWith("challenge")) {
+      if (!allAlive && self !== "AnalystA") return { text: "" };
+      return { text: verdictsFrom(self) };
+    }
+    if (req.nodeId.startsWith("chair")) return { text: GOOD_SLATE };
+    return { status: "failed", error: "unexpected node" };
+  });
+
+  // Only AnalystA alive → quorum failure, no chair, council pending.
+  const res = await tool("council_convene").execute("id", {}, null, null, ctx);
+  const text = res.content[0].text;
+  assert.strictEqual(res.details?.outcome, "quorum");
+  assert.ok(text.includes("quorum failed"), `quorum text: ${text.slice(0, 160)}`);
+  assert.ok(text.includes("AnalystB") && text.includes("AnalystC"), "dead analysts named");
+  assert.ok(!fs.existsSync(path.join(dir, ".auto", "councils", "1", "entries")), "no slate persisted on quorum failure");
+  assert.ok(deadDiverge.size === 2, "both dead analysts attempted");
+
+  // Resume: a fresh convene with all analysts live proceeds and completes on the same seq.
+  allAlive = true;
+  const res2 = await tool("council_convene").execute("id", {}, null, null, ctx);
+  assert.ok(res2.content[0].text.includes("COUNCIL #1 COMPLETE"), "resumed council reuses seq 1 and completes");
+  const dirs = fs.readdirSync(path.join(dir, ".auto", "councils")).filter((f) => f !== "state.json");
+  assert.deepStrictEqual(dirs.sort(), ["1"], "no second council dir on resume");
+});
+
+await test("council_convene: brief carries the note verbatim; mode gate refuses when off", async () => {
+  const dir = makeTempDir("council-note");
+  initGitRepo(dir);
+  const { command, tool, ctx, events } = await loadExtension(dir);
+  await command("autoresearch").handler("on", ctx);
+  installDelegationEngine(events, (req) => {
+    if (req.nodeId.startsWith("diverge")) return { text: hypFor(selfNameOf(req.task)) };
+    if (req.nodeId.startsWith("challenge")) return { text: verdictsFrom(selfNameOf(req.task)) };
+    if (req.nodeId.startsWith("chair")) return { text: GOOD_SLATE };
+    return { status: "failed", error: "unexpected node" };
+  });
 
   const res = await tool("council_convene").execute("id", {
-    note: "Stuck: 8 discards in a row, every micro-opt lands within noise. Focus on whether the harness itself dominates.",
+    note: "8 discards in a row — is the harness itself dominating?",
   }, null, null, ctx);
-  const text = res.content[0].text;
-  assert.ok(text.includes("COUNCIL #1 convened"), `convene banner: ${text.slice(0, 160)}`);
-  assert.ok(text.includes("council-loop.js"), "carries the workflow file path");
-  assert.ok(text.includes('"async": false'), "launch is blocking");
-  assert.ok(text.includes('"timeoutMs"'), "launch carries the timeout");
-  assert.ok(text.includes("subagent("), "exact subagent call shape given to the agent");
-  assert.ok(text.includes("council_convene({ slate"), "step 2 (validate + persist) is spelled out");
-  assert.ok(text.includes("Manual fallback"), "manual protocol included as the no-subagent path");
-  assert.ok(text.includes("Phase 1 — Diverge"), "manual protocol carries the phases");
   const brief = fs.readFileSync(path.join(dir, ".auto", "councils", "1", "00-brief.md"), "utf-8");
   assert.ok(brief.includes("Lead agent's note"), "brief carries the lead's note section");
   assert.ok(brief.includes("8 discards in a row"), "note lands verbatim");
+  assert.ok(res.content[0].text.includes("COUNCIL #1 COMPLETE"));
   assert.strictEqual(councilMod.readCouncilState(dir).councilsRun, 1, "state incremented");
 
-  // pending council (no slate) → a second immediate convene RESUMES the same dir;
-  // no note given → the launch args must NOT contain an empty note key (engine rejects it)
-  const res2 = await tool("council_convene").execute("id", {}, null, null, ctx);
-  assert.ok(res2.content[0].text.includes("RESUMING the interrupted council"), "resume re-nudges the same council");
-  const resumeLaunch = /subagent\((\{[\s\S]*?\})\)/.exec(res2.content[0].text);
-  assert.ok(resumeLaunch, "resume carries the launch JSON");
-  assert.ok(!/"note":/.test(resumeLaunch[1]), "no empty note key in the launch args");
-  const dirs = fs.readdirSync(path.join(dir, ".auto", "councils")).filter((f) => f !== "state.json");
-  assert.deepStrictEqual(dirs.sort(), ["1"], "no second council dir on resume");
-
-  // gated when mode off
   await command("autoresearch").handler("off", ctx);
   const res3 = await tool("council_convene").execute("id", {}, null, null, ctx);
   assert.ok(res3.content[0].text.toLowerCase().includes("mode"), "mode gate refused");
 });
 
-await test("council_convene step 2: valid slate is validated, persisted and closes the council", async () => {
-  const dir = makeTempDir("council-slate");
+await test("council_convene: delegation seam dead (unavailable_context) — degrades to the manual protocol, not quorum blame", async () => {
+  const dir = makeTempDir("council-seamdead");
   initGitRepo(dir);
-  const { command, tool, ctx } = await loadExtension(dir);
+  const { command, tool, ctx, events } = await loadExtension(dir);
   await command("autoresearch").handler("on", ctx);
-  await tool("council_convene").execute("id", { note: "stuck" }, null, null, ctx);
-  const SLATE = "## EXP1: a\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: x\n\n## EXP2: b\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: y\n\n## EXP3: c\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: z";
-  const res = await tool("council_convene").execute("id", { slate: SLATE }, null, null, ctx);
-  const text = res.content[0].text;
-  assert.ok(text.includes("COUNCIL #1 COMPLETE"), `complete banner: ${text.slice(0, 160)}`);
-  assert.ok(text.includes("validated ✓"), "slate validated");
-  assert.ok(text.includes("## EXP1: a"), "slate body returned");
-  const ed = path.join(dir, ".auto", "councils", "1", "entries");
-  const persisted = fs.readdirSync(ed).find((f) => f.endsWith("-Chair.md"));
-  assert.ok(persisted && fs.readFileSync(path.join(ed, persisted), "utf-8").includes("phase: slate"), "slate persisted to the blackboard");
-  assert.strictEqual(councilMod.findUnfinishedCouncil(dir), null, "completed council is closed");
-});
+  installDelegationEngine(events, () => ({ status: "failed", error: "unavailable_context: No active extension context for delegated subagent execution." }));
 
-await test("council_convene step 2: invalid slate returns the exact chairFix instruction", async () => {
-  const dir = makeTempDir("council-slate-bad");
-  initGitRepo(dir);
-  const { command, tool, ctx } = await loadExtension(dir);
-  await command("autoresearch").handler("on", ctx);
-  await tool("council_convene").execute("id", {}, null, null, ctx);
-  const INVALID = "## EXP1: a\nEXPECTED_GAIN: 100 ms\n\n## EXP2: b\nEXPECTED_GAIN: 100 ms\n\n## EXP3: c\nEXPECTED_GAIN: 100 ms";
-  const res = await tool("council_convene").execute("id", { slate: INVALID }, null, null, ctx);
+  const res = await tool("council_convene").execute("id", {}, null, null, ctx);
   const text = res.content[0].text;
-  assert.ok(text.includes("failed validation"), "validation failure reported");
-  assert.ok(text.includes("KILL_WHEN"), "validation errors named");
-  assert.ok(text.includes("args.chairFix"), "corrective workflow instruction given");
-  assert.strictEqual(res.details?.outcome, "invalid-slate");
-  // the council stays pending (no slate persisted) → still resumable
-  assert.strictEqual(councilMod.findUnfinishedCouncil(dir)?.seq, 1, "invalid slate keeps the council pending");
-});
-
-await test("council_convene step 1 forwards the note into the workflow args and honours config timeout", async () => {
-  const dir = makeTempDir("council-args");
-  initGitRepo(dir);
-  fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
-  fs.writeFileSync(path.join(dir, ".auto", "config.json"), JSON.stringify({ council: { timeout_minutes: 45 } }), "utf-8");
-  const { command, tool, ctx } = await loadExtension(dir);
-  await command("autoresearch").handler("on", ctx);
-  const res = await tool("council_convene").execute("id", { note: "io-bound, harness dominates" }, null, null, ctx);
-  const text = res.content[0].text;
-  assert.ok(text.includes('"timeoutMs": 2700000'), "timeout_minutes mapped to ms");
-  assert.ok(text.includes("io-bound, harness dominates"), "note forwarded into workflow args");
-  assert.ok(text.includes('"chairModel": "zai-coding-cn/glm-5.3:high"'), "default chair model in args");
-  assert.ok((text.match(/"personaPrompt"/g) ?? []).length === 3, "three analysts in the roster");
+  assert.strictEqual(res.details?.outcome, "manual-protocol", "seam death degrades to the manual protocol");
+  assert.ok(text.includes("delegation seam is unavailable"), `degrade text: ${text.slice(0, 200)}`);
+  assert.ok(text.includes("Phase 1 — Diverge"), "manual protocol phases included");
+  assert.ok(!text.includes("quorum failed"), "models are not blamed for a dead seam");
 });
 
 
-await test("council-loop.js: full fileless pipeline in a fake sandbox — diverge, one challenge round, chair slate", async () => {
-  const participants = [
-    { name: "AnalystA", letter: "A", model: "model-a", personaPrompt: "patterns lens" },
-    { name: "AnalystB", letter: "B", model: "model-b", personaPrompt: "explorer lens" },
-    { name: "AnalystC", letter: "C", model: "model-c", personaPrompt: "skeptic lens" },
-  ];
-  const script = fs.readFileSync(path.join("extensions", "pi-autoresearch", "workflows", "council-loop.js"), "utf-8");
-  const launched = [];
-  const runs = {
-    async all(items) { return Promise.all(items.map((it) => runs.run(it.key, it))); },
-    async run(key, params) {
-      launched.push({ key, model: params.model, task: params.task });
-      let m = /^diverge-(\w+)-a(\d+)$/.exec(key);
-      if (m) {
-        const L = m[1].slice(-1);
-        return { output: "### H-" + L + "1: alpha hypothesis\nEXPECTED_GAIN: 5 ms; KILL_WHEN: nothing" };
-      }
-      m = /^challenge-r(\d+)-(\w+)-a1$/.exec(key);
-      if (m) {
-        const verdicts = ["A", "B", "C"].filter((L) => L !== m[2]).map((L) => "VERDICT H-" + L + "1: accept — ok").join("\n");
-        return { output: verdicts };
-      }
-      if (key === "chair-a1") {
-        return { output: "## EXP1: a\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: x\n\n## EXP2: b\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: y\n\n## EXP3: c\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: z" };
-      }
-      throw new Error("unexpected child key: " + key);
-    },
+// ─── council-delegation.ts unit tests (fake event bus, no real children) ───
+
+const delegationMod = await import(pathToFileURL(path.join("extensions", "pi-autoresearch", "council-delegation.ts")));
+
+function miniPi(respond) {
+  const listeners = new Map();
+  const bus = {
+    on(n, h) { if (!listeners.has(n)) listeners.set(n, new Set()); listeners.get(n).add(h); },
+    emit(n, p) { for (const h of [...(listeners.get(n) ?? [])]) h(p); },
   };
-  const fn = new Function("args", "runs", "emit", "return (async () => {\n" + script + "\n})()");
-  const raw = await fn({
-    briefText: "# Council brief\nCampaign: test\n\n## Recent runs\n(nothing)",
-    participants,
-    chairModel: "model-chair",
-    maxChallengeRounds: 5,
-    minExperiments: 3,
-    note: "test note",
-  }, runs, () => {});
-  assert.ok(String(raw).startsWith("COUNCIL_RESULT:"), "script returns the marker: " + String(raw).slice(0, 140));
-  const result = JSON.parse(String(raw).slice("COUNCIL_RESULT:".length));
-  assert.strictEqual(result.ok, true, "pipeline ok");
-  assert.strictEqual(result.rounds, 1, "consensus at round 1");
-  assert.deepStrictEqual(result.unavailable, []);
-  assert.strictEqual(result.consensus.canConverge, true, "consensus reached in-script");
-  assert.strictEqual(result.consensus.settledCount, 3);
-  assert.ok(result.slate.includes("## EXP1: a"), "slate text returned");
-  const diverge = launched.filter((l) => l.key.startsWith("diverge-"));
+  bus.on("prompt-template:subagent:request", (req) => {
+    const r = respond(req);
+    const payload = { requestId: req.requestId, status: r.status ?? "completed" };
+    if (r.text !== undefined) payload.result = { kind: "text", text: r.text };
+    bus.emit("prompt-template:subagent:response", payload);
+  });
+  return { events: bus };
+}
+
+const PARTICIPANTS = [
+  { name: "AnalystA", letter: "A", model: "model-a", personaPrompt: "patterns lens" },
+  { name: "AnalystB", letter: "B", model: "model-b", personaPrompt: "explorer lens" },
+  { name: "AnalystC", letter: "C", model: "model-c", personaPrompt: "skeptic lens" },
+];
+const baseArgs = (over = {}) => ({
+  seq: 1,
+  briefText: "# Council brief\nCampaign: test",
+  participants: PARTICIPANTS,
+  chairModel: "model-chair",
+  maxChallengeRounds: 5,
+  minExperiments: 3,
+  note: "test note",
+  cwd: ".",
+  deadlineAt: Date.now() + 10 * 60000,
+  validate: (s) => ({ ok: (String(s).match(/##\s*EXP/gi) ?? []).length >= 3, errors: [] }),
+  ...over,
+});
+const stdEngine = (req) => {
+  const self = selfNameOf(req.task);
+  if (req.nodeId.startsWith("diverge")) return { text: hypFor(self) };
+  if (req.nodeId.startsWith("challenge")) return { text: verdictsFrom(self) };
+  if (req.nodeId.startsWith("chair")) return { text: GOOD_SLATE };
+  return { status: "failed", error: "unexpected node" };
+};
+
+await test("council-delegation: full pipeline on a fake bus — diverge, one round, chair, consensus mechanical", async () => {
+  const requests = [];
+  const pi = miniPi((req) => { requests.push(req); return stdEngine(req); });
+  const out = await delegationMod.runCouncilDelegated(pi, baseArgs());
+  assert.strictEqual(out.ok, true, "pipeline ok");
+  assert.strictEqual(out.rounds, 1, "consensus at round 1");
+  assert.deepStrictEqual(out.unavailable, []);
+  assert.strictEqual(out.consensus.canConverge, true);
+  assert.strictEqual(out.consensus.settledCount, 3);
+  assert.ok(out.slate.includes("## EXP1: a"), "slate text returned");
+  assert.strictEqual(out.corrected, false);
+  const diverge = requests.filter((r) => r.nodeId.startsWith("diverge"));
   assert.strictEqual(diverge.length, 3);
-  assert.ok(diverge.every((l) => l.task.includes("test note") && l.task.includes("<<<BRIEF") && l.task.includes("H-" + l.key.split("-")[1].slice(-1))), "diverge tasks carry the brief, the note and the letter format");
-  assert.ok(launched.some((l) => l.key === "chair-a1" && l.model === "model-chair"), "chair runs on the chair model");
-  assert.ok(launched.every((l) => !l.key.startsWith("referee")), "no referee children — consensus is in-script");
-  const challenge = launched.filter((l) => l.key.startsWith("challenge-r1-"));
-  assert.ok(challenge.every((l) => l.task.includes("alpha hypothesis")), "challenge tasks relay the proposals verbatim");
+  assert.ok(diverge.every((r) => r.task.includes("test note") && r.task.includes("<<<BRIEF")), "diverge tasks carry the brief and the note");
+  assert.ok(diverge.every((r) => String(r.model).startsWith("model-")), "analyst models forwarded");
+  const chair = requests.find((r) => r.nodeId.startsWith("chair"));
+  assert.ok(chair && chair.task.includes("CAMPAIGN BRIEF") && chair.task.includes("VERDICT H-A1"), "chair sees the record");
 });
 
-await test("council-loop.js: unavailable analyst degrades, quorum failure is honest", async () => {
-  const participants = [
-    { name: "AnalystA", letter: "A", model: "model-a", personaPrompt: "patterns" },
-    { name: "AnalystB", letter: "B", model: "model-b", personaPrompt: "explorer" },
-    { name: "AnalystC", letter: "C", model: "model-c", personaPrompt: "skeptic" },
-  ];
-  const script = fs.readFileSync(path.join("extensions", "pi-autoresearch", "workflows", "council-loop.js"), "utf-8");
-  const makeRuns = (absent) => {
-    const launched = [];
-    return { launched, runs: {
-      async all(items) { return Promise.all(items.map((it) => this.run(it.key, it))); },
-      async run(key, params) {
-        launched.push({ key, task: params.task });
-        let m = /^diverge-(\w+)-a(\d+)$/.exec(key);
-        if (m) {
-          if (absent.has(m[1])) return { output: "I could not produce hypotheses." };
-          return { output: "### H-" + m[1].slice(-1) + "1: alpha hypothesis\nEXPECTED_GAIN: 5 ms; KILL_WHEN: nothing" };
-        }
-        m = /^challenge-r(\d+)-(\w+)-a1$/.exec(key);
-        if (m) {
-          if (absent.has(m[2])) return { output: "" };
-          const others = participants.map((p) => p.letter).filter((L) => L !== m[2] && !absent.has("Analyst" + L));
-          return { output: others.map((L) => "VERDICT H-" + L + "1: accept — ok").join("\n") };
-        }
-        if (key === "chair-a1") {
-          return { output: "## EXP1: a\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: x\n\n## EXP2: b\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: y\n\n## EXP3: c\nEXPECTED_GAIN: 100 ms\nKILL_WHEN: z" };
-        }
-        throw new Error("unexpected child key: " + key);
-      },
-    } };
-  };
-  const fn = new Function("args", "runs", "emit", "return (async () => {\n" + script + "\n})()");
-  const baseArgs = { briefText: "# brief\nCampaign: test", participants, chairModel: "model-chair", maxChallengeRounds: 5, minExperiments: 2, note: "" };
-
-  // Case 1: one analyst dead → UNAVAILABLE after retries, council proceeds with 2.
-  let { runs, launched } = makeRuns(new Set(["AnalystB"]));
-  let raw = await fn({ ...baseArgs }, runs, () => {});
-  let result = JSON.parse(String(raw).slice("COUNCIL_RESULT:".length));
-  assert.strictEqual(result.ok, true, "council proceeds with 2 analysts");
-  assert.deepStrictEqual(result.unavailable, ["AnalystB"], "dead analyst reported UNAVAILABLE");
-  assert.ok(launched.filter((l) => /^diverge-AnalystB-a\d+$/.test(l.key)).length === 3, "three attempts before UNAVAILABLE");
-
-  // Case 2: only one analyst alive → honest quorum failure, no chair.
-  ({ runs, launched } = makeRuns(new Set(["AnalystB", "AnalystC"])));
-  raw = await fn({ ...baseArgs }, runs, () => {});
-  result = JSON.parse(String(raw).slice("COUNCIL_RESULT:".length));
-  assert.strictEqual(result.ok, false, "quorum failure is honest");
-  assert.strictEqual(result.reason, "quorum");
-  assert.ok(!launched.some((l) => l.key === "chair-a1"), "no chair without quorum");
+await test("council-delegation: dead analyst gets 3 attempts, is reported UNAVAILABLE, council proceeds with 2", async () => {
+  const requests = [];
+  const pi = miniPi((req) => {
+    requests.push(req);
+    const self = selfNameOf(req.task);
+    if (req.nodeId.startsWith("diverge") && self === "AnalystB") return { text: "no hypotheses here" };
+    return stdEngine(req);
+  });
+  const out = await delegationMod.runCouncilDelegated(pi, baseArgs());
+  assert.strictEqual(out.ok, true, "council proceeds with 2 analysts");
+  assert.deepStrictEqual(out.unavailable, ["AnalystB"], "dead analyst reported UNAVAILABLE");
+  const bAttempts = requests.filter((r) => r.nodeId.startsWith("diverge") && selfNameOf(r.task) === "AnalystB");
+  assert.strictEqual(bAttempts.length, 3, "three attempts before UNAVAILABLE");
+  assert.ok(requests.every((r) => !r.nodeId.startsWith("referee")), "no referee children — consensus is mechanical");
 });
 
-// ──────────────────────────────────────────────────────────────────────
+await test("council-delegation: fewer than 2 live analysts — honest quorum failure without a chair", async () => {
+  const requests = [];
+  const pi = miniPi((req) => {
+    requests.push(req);
+    const self = selfNameOf(req.task);
+    if (req.nodeId.startsWith("diverge") && self !== "AnalystA") return { text: "junk" };
+    return stdEngine(req);
+  });
+  const out = await delegationMod.runCouncilDelegated(pi, baseArgs({ minExperiments: 2 }));
+  assert.strictEqual(out.ok, false);
+  assert.strictEqual(out.reason, "quorum");
+  assert.ok(out.detail.includes("AnalystB") && out.detail.includes("AnalystC"));
+  assert.ok(!requests.some((r) => r.nodeId.startsWith("chair")), "no chair without quorum");
+});
+
+await test("council-delegation: delegationAvailable gate", async () => {
+  assert.strictEqual(delegationMod.delegationAvailable({ events: { on() {}, emit() {} } }), true);
+  assert.strictEqual(delegationMod.delegationAvailable({}), false);
+  assert.strictEqual(delegationMod.delegationAvailable(null), false);
+});
+
+
 // Results
 // ──────────────────────────────────────────────────────────────────────
 
