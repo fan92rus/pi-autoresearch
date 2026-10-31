@@ -293,6 +293,7 @@ Create `.auto/config.json` in your pi session directory to customize behavior:
 |-------|------|-------------|
 | `workingDir` | string | Override the directory for all autoresearch operations — file I/O, command execution, and git. Supports absolute or relative paths (resolved against the pi session cwd). The config file itself always stays under the session cwd. Fails if the directory doesn't exist. |
 | `maxIterations` | number | Maximum experiments before auto-stopping. The agent is told to stop and won't run more experiments until a new segment is initialized. |
+| `experiment_max_minutes` | number | Per-project cap (minutes) for a single experiment's `timeout_seconds`. When set, `run_experiment` rejects bigger timeouts with a reminder to adapt the experiment (smaller workload, quick subset) — the agent is expected to fit experiments into the cap, not raise it. Unset = no cap. |
 | `parallel.ucb1C` | number | UCB1 exploration constant for tree node ranking (default: 0.5). Higher = more exploration (favor unexplored nodes); lower = more exploitation (favor proven territory). |
 
 ### Observer settings

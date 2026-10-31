@@ -287,7 +287,7 @@ const RunParams = Type.Object({
   }),
   timeout_seconds: Type.Number({
     description:
-      "Hard kill timeout in seconds. REQUIRED — the experiment fails if the command exceeds it. Pick a tight bound (e.g. 60–300) so runaway processes are killed promptly. Must be > 0.",
+      "Hard kill timeout in seconds. REQUIRED — the experiment fails if the command exceeds it. Pick a tight bound (e.g. 60–300) so runaway processes are killed promptly. Must be > 0. When the project sets experiment_max_minutes in .auto/config.json, this must not exceed that cap — bigger values are rejected with a reminder to adapt the experiment instead.",
     minimum: 1,
   }),
   checks_timeout_seconds: Type.Optional(
@@ -677,6 +677,8 @@ function currentResults(results: ExperimentResult[], segment: number): Experimen
 interface AutoresearchConfig {
   maxIterations?: number;
   workingDir?: string;
+  /** Per-project cap for a single experiment's timeout_seconds, in minutes. Unset = no cap. */
+  experiment_max_minutes?: number;
 }
 
 /** Read the config file (.auto/config.json, legacy autoresearch.config.json) from the given directory (always ctx.cwd) */
@@ -695,6 +697,14 @@ function readMaxExperiments(cwd: string): number | null {
   const config = readConfig(cwd);
   return (typeof config.maxIterations === "number" && config.maxIterations > 0)
     ? Math.floor(config.maxIterations)
+    : null;
+}
+
+/** Read the per-project experiment time cap (minutes) from .auto/config.json; null = no cap. */
+function readExperimentMaxMinutes(cwd: string): number | null {
+  const config = readConfig(cwd);
+  return (typeof config.experiment_max_minutes === "number" && config.experiment_max_minutes > 0)
+    ? config.experiment_max_minutes
     : null;
 }
 
@@ -1646,6 +1656,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const BENCHMARK_GUARDRAIL =
     "Be careful not to overfit to the benchmarks and do not cheat on the benchmarks.";
 
+  const MEASUREMENT_GUARDRAIL =
+    "Every measurement goes through run_experiment -> log_experiment; never run the benchmark via bash — bash runs are invisible to the ledger and get blocked.";
+
   // ── Migrate old auto-installed hook ─────────────────────────────────
   // Previous versions auto-installed the observer to ~/.pi/agent/autoresearch/hooks/before.sh.
   // Now the observer runs from the extension dir. Remove the old managed copy if present.
@@ -1806,6 +1819,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return [
       head + "Run the next iteration now.",
       "Use the persisted autoresearch state as needed, pick the most promising hypothesis, then call run_experiment + log_experiment.",
+      MEASUREMENT_GUARDRAIL,
       BENCHMARK_GUARDRAIL,
     ].join(" ");
   };
@@ -1815,6 +1829,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return [
       "⚠ Last turn used no experiment tools (chat/reads don't advance the loop).",
       "Resume the cycle now: propose_hypothesis → run_experiment → log_experiment.",
+      MEASUREMENT_GUARDRAIL,
       BENCHMARK_GUARDRAIL,
     ].join(" ");
   };
@@ -1826,6 +1841,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "Run the next iteration now.",
       "Pick the most promising hypothesis from the ideas backlog or the latest `next:` hints in recent runs, then call run_experiment + log_experiment.",
       "Do not re-read .auto/prompt.md or .auto/log.jsonl — the compaction summary already contains them.",
+      MEASUREMENT_GUARDRAIL,
       BENCHMARK_GUARDRAIL,
     ].join(" ");
   };
@@ -2842,6 +2858,40 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
       const workDir = resolveWorkDir(ctx.cwd);
+      // The config (and therefore the cap) always lives in ctx.cwd — even when
+      // workingDir redirects the experiment work elsewhere (see readConfig).
+      const expMaxMinutes = readExperimentMaxMinutes(ctx.cwd);
+
+      // Project time cap (.auto/config.json experiment_max_minutes): reject a
+      // timeout beyond it with a reminder — the agent must adapt the experiment
+      // (smaller workload, quick subset) instead of asking for more time.
+      if (expMaxMinutes !== null && params.timeout_seconds > expMaxMinutes * 60) {
+        return {
+          content: [{ type: "text", text:
+            `⛔ TIMEOUT OVER PROJECT LIMIT: timeout_seconds=${params.timeout_seconds}s but experiment_max_minutes=${expMaxMinutes} (${expMaxMinutes * 60}s) in .auto/config.json.\n` +
+            `The cap is fixed — ADAPT THE EXPERIMENT to fit, do not ask for more time:\n` +
+            `- cut the workload: smaller fixture/corpus, fewer iterations, measure a subset\n` +
+            `- add a BENCH_MODE=quick subset to measure.sh and benchmark that\n` +
+            `- move warm-up/caching outside the timed region\n` +
+            `Re-issue run_experiment with timeout_seconds <= ${expMaxMinutes * 60}.` }],
+          details: {
+            command: params.command,
+            exitCode: null,
+            durationSeconds: 0,
+            passed: false,
+            crashed: true,
+            timedOut: false,
+            budgetExceeded: false,
+            tailOutput: "",
+            checksPass: null,
+            checksTimedOut: false,
+            checksOutput: "",
+            checksDuration: 0,
+            overTimeLimit: true,
+            limitSeconds: expMaxMinutes * 60,
+          } as RunDetails,
+        };
+      }
 
       // Block if max experiments limit already reached
       if (state.maxExperiments !== null) {
@@ -3270,10 +3320,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       let text = "";
       if (details.budgetExceeded) {
         text += `⏰ BUDGET EXCEEDED after ${durationSeconds.toFixed(1)}s (budget ${params.budget_seconds}s)\n`;
-        text += `Log this as 'budget_exceeded'. The experiment is too slow — before continuing, speed up measure.sh (add a BENCH_MODE=quick subset, cache prebuilt artifacts, or cut fixture/iter count) so a single run fits the budget.\n`;
+        text += `Log this as 'budget_exceeded'. The time cap is fixed${expMaxMinutes !== null ? ` (experiment_max_minutes=${expMaxMinutes} in .auto/config.json)` : ""} — do not drop the experiment and do not benchmark via bash: ADAPT it so a single run fits — smaller fixture/corpus, fewer iterations, a BENCH_MODE=quick subset, warm-up outside the timed region.\n`;
       } else if (details.timedOut) {
         text += `⏰ TIMEOUT after ${durationSeconds.toFixed(1)}s (hard limit ${params.timeout_seconds}s)\n`;
-        text += `Log this as 'crash'. The experiment exceeded the hard timeout — reduce the workload (fewer iterations, BENCH_MODE=quick) or raise timeout_seconds if the run genuinely needs more time.\n`;
+        text += `Log this as 'crash'. The time cap is fixed${expMaxMinutes !== null ? ` (experiment_max_minutes=${expMaxMinutes} in .auto/config.json)` : ""} — do not raise timeout_seconds beyond it: ADAPT the experiment so a single run fits — smaller fixture/corpus, fewer iterations, a BENCH_MODE=quick subset, warm-up outside the timed region.\n`;
       } else if (!benchmarkPassed) {
         text += `💥 FAILED (exit code ${exitCode}) in ${durationSeconds.toFixed(1)}s\n`;
       } else if (checksTimedOut) {

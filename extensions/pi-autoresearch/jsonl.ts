@@ -22,7 +22,7 @@ export interface ReconstructedRun {
   commit: string;
   metric: number;
   metrics: Record<string, number>;
-  status: "keep" | "discard" | "crash" | "checks_failed";
+  status: "keep" | "discard" | "crash" | "checks_failed" | "budget_exceeded" | "explore";
   description: string;
   timestamp: number;
   segment: number;
@@ -75,6 +75,11 @@ function statusFrom(value: unknown): ReconstructedRun["status"] {
   if (value === "discard") return "discard";
   if (value === "crash") return "crash";
   if (value === "checks_failed") return "checks_failed";
+  // Preserve the exact statuses: folding budget_exceeded/explore into "keep"
+  // made them able to refresh the best metric and broke time-death streak
+  // detection in the observer.
+  if (value === "budget_exceeded") return "budget_exceeded";
+  if (value === "explore") return "explore";
   return "keep";
 }
 

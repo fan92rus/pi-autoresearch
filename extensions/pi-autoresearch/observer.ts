@@ -653,6 +653,29 @@ function checkProfilingGate(state: ObserverState, asi: AsiFlags): string | null 
   return "PROFILING GATE: No profiling data in recent experiments. You are optimizing BLIND. Profile first (node --prof, console.time, cProfile, pprof), record findings in hypothesis.";
 }
 
+// ─── Trigger: Time-limit struggles ─────────────────────────────────────────────
+
+/** 3+ consecutive finished runs died on time (crash / budget_exceeded): the
+ *  harness does not fit the project time cap — adapt the workload, not the cap.
+ *  run_experiment logs hard-timeout kills as 'crash', so a bug-streak can also
+ *  match; the hint tells the agent to ignore it in that case. */
+function checkTimeLimitStruggles(state: ObserverState): string | null {
+  const decided = state.recent.filter((r) => r.status !== "explore");
+  const tail = decided.slice(-3);
+  if (tail.length < 3) return null;
+  // Death signature: hard-timeout kills are logged as 'crash', budget kills as
+  // 'budget_exceeded' (both preserved by reconstructJsonlState); checks_failed
+  // counts too — checks usually time out because the benchmark hogged the box.
+  if (!tail.every((r) => r.status === "crash" || r.status === "budget_exceeded" || r.status === "checks_failed")) return null;
+  return (
+    "⏱ TIME LIMIT: the last 3 runs all died on time (crash/budget_exceeded). " +
+    "The cap is fixed — adapt the experiment so a single run fits: smaller fixture/corpus, fewer iterations, " +
+    "a BENCH_MODE=quick subset in measure.sh, warm-up outside the timed region. " +
+    "Do not raise timeout_seconds beyond experiment_max_minutes (when the project set one). " +
+    "If these are plain bugs rather than time kills, fix them first and ignore this hint."
+  );
+}
+
 // ─── Trigger: Stagnation ───────────────────────────────────────────────────────
 
 function checkStagnation(
@@ -967,6 +990,11 @@ export function runObserver(payload: ObserverPayload): string | null {
   // 3. Parallel opportunity (actionable: concrete ideas → BestOfN/SpaceSearch)
   const parallelSteer = checkParallelOpportunity(state, payload, cwd, oc);
   if (parallelSteer) return parallelSteer;
+
+  // 3ab. Time-limit struggles (harness does not fit the project cap — adapt it;
+  //      more urgent than the profiling advice: dying runs cannot be optimized)
+  const timeLimitSteer = checkTimeLimitStruggles(state);
+  if (timeLimitSteer) return timeLimitSteer;
 
   // 3b. Profiling gate (warn when optimizing blind)
   const profilingSteer = checkProfilingGate(state, asi);

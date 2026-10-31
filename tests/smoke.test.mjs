@@ -301,6 +301,46 @@ await test("agent_end hook runs without crash", async () => {
   assert.ok(true, "agent_end ran without crash");
 });
 
+await test("observer TIME LIMIT: explore does not break the streak; budget deaths count; two deaths do not fire", async () => {
+  const dir = makeTempDir("exp-limit-observer2");
+  initGitRepo(dir);
+  fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
+  const mk = (runs) => [
+    JSON.stringify({ type: "config", name: "t", metric_name: "ms", metric_unit: "ms", direction: "lower" }),
+    JSON.stringify({ run: 1, metric: 100, status: "keep", description: "baseline", timestamp: 1700000000 }),
+    ...runs,
+  ].join("\n") + "\n";
+  const observerMod = await import(pathToFileURL(path.join("extensions", "pi-autoresearch", "observer.ts")));
+  const run = (runs) => {
+    fs.writeFileSync(path.join(dir, ".auto", "log.jsonl"), mk(runs), "utf-8");
+    return observerMod.runObserver({ cwd: dir, direction: "lower", metricName: "ms", metricUnit: "ms" });
+  };
+
+  // explore in between does not break a death streak
+  let steer = run([
+    JSON.stringify({ run: 2, metric: 100, status: "crash", description: "a", timestamp: 1700000060 }),
+    JSON.stringify({ run: 3, metric: 100, status: "explore", description: "recon", timestamp: 1700000090 }),
+    JSON.stringify({ run: 4, metric: 100, status: "crash", description: "b", timestamp: 1700000120 }),
+    JSON.stringify({ run: 5, metric: 100, status: "crash", description: "c", timestamp: 1700000180 }),
+  ]);
+  assert.ok(steer && steer.includes("TIME LIMIT"), `explore must not break the streak, got: ${String(steer).slice(0, 100)}`);
+
+  // budget_exceeded deaths count
+  steer = run([
+    JSON.stringify({ run: 2, metric: 100, status: "budget_exceeded", description: "a", timestamp: 1700000060 }),
+    JSON.stringify({ run: 3, metric: 100, status: "budget_exceeded", description: "b", timestamp: 1700000120 }),
+    JSON.stringify({ run: 4, metric: 100, status: "budget_exceeded", description: "c", timestamp: 1700000180 }),
+  ]);
+  assert.ok(steer && steer.includes("TIME LIMIT"), "budget deaths fire the hint");
+
+  // two deaths are not enough
+  steer = run([
+    JSON.stringify({ run: 2, metric: 100, status: "crash", description: "a", timestamp: 1700000060 }),
+    JSON.stringify({ run: 3, metric: 100, status: "crash", description: "b", timestamp: 1700000120 }),
+  ]);
+  assert.ok(!steer || !steer.includes("TIME LIMIT"), "two deaths do not fire");
+});
+
 await test("drifted turns get bounded corrective resumes, then pause", async () => {
   const dir = makeTempDir("drift");
   initGitRepo(dir);
@@ -321,6 +361,10 @@ await test("drifted turns get bounded corrective resumes, then pause", async () 
   await settle();
   const nudges = () => pi.sentMessages.filter((m) => m.text.includes("used no experiment tools"));
   assert.strictEqual(nudges().length, 1, `first drift should nudge, sent: ${pi.sentMessages.map((m) => m.text.slice(0, 60)).join(" | ")}`);
+  assert.ok(
+    pi.sentMessages.some((m) => m.text.includes("invisible to the ledger")),
+    "drift resume carries the measurement discipline (never benchmark via bash)",
+  );
 
   await settle();
   assert.strictEqual(nudges().length, 2, "second drift should nudge again");
@@ -1494,6 +1538,128 @@ await test("council_convene: delegation seam dead (unavailable_context) — degr
   assert.ok(!text.includes("quorum failed"), "models are not blamed for a dead seam");
 });
 
+
+await test("experiment_max_minutes: run_experiment rejects a timeout over the project cap with an adapt reminder", async () => {
+  const dir = makeTempDir("exp-limit");
+  initGitRepo(dir);
+  fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".auto", "config.json"), JSON.stringify({ experiment_max_minutes: 1 }), "utf-8");
+  const { tool, command, ctx } = await loadExtension(dir);
+  await command("autoresearch").handler("on", ctx);
+  await tool("init_experiment").execute("id", {
+    name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower",
+  }, null, null, ctx);
+
+  const res = await tool("run_experiment").execute("id", {
+    command: 'node -e "0"', timeout_seconds: 120,
+  }, null, null, ctx);
+  const text = res.content?.[0]?.text ?? "";
+  assert.ok(text.includes("TIMEOUT OVER PROJECT LIMIT"), `reject text: ${text.slice(0, 160)}`);
+  assert.ok(text.includes("experiment_max_minutes"), "the limit is named");
+  assert.ok(text.includes("ADAPT THE EXPERIMENT"), "adaptation demanded");
+  assert.ok(text.includes("timeout_seconds <= 60"), "the exact allowed bound given");
+  assert.strictEqual(res.details?.overTimeLimit, true);
+  assert.strictEqual(res.details?.durationSeconds, 0, "no command ran");
+
+  // boundary: exactly at the cap (60s) → allowed; well under → allowed
+  const edge = await tool("run_experiment").execute("id", {
+    command: 'node -e "0"', timeout_seconds: 60,
+  }, null, null, ctx);
+  assert.ok(!String(edge.content?.[0]?.text).includes("TIMEOUT OVER PROJECT LIMIT"), "timeout == cap is allowed (strict >)");
+  const ok = await tool("run_experiment").execute("id", {
+    command: 'node -e "0"', timeout_seconds: 30,
+  }, null, null, ctx);
+  assert.ok(!String(ok.content?.[0]?.text).includes("TIMEOUT OVER PROJECT LIMIT"), "within-cap run is not rejected");
+});
+
+await test("experiment_max_minutes: unset cap never rejects", async () => {
+  const dir = makeTempDir("exp-limit-unset");
+  initGitRepo(dir);
+  const { tool, command, ctx } = await loadExtension(dir);
+  await command("autoresearch").handler("on", ctx);
+  await tool("init_experiment").execute("id", {
+    name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower",
+  }, null, null, ctx);
+  const res = await tool("run_experiment").execute("id", {
+    command: 'node -e "0"', timeout_seconds: 3600,
+  }, null, null, ctx);
+  assert.ok(!String(res.content?.[0]?.text).includes("TIMEOUT OVER PROJECT LIMIT"), "no cap configured → no rejection");
+});
+
+await test("run_experiment hard timeout: text demands adaptation, never suggests raising the timeout", async () => {
+  const dir = makeTempDir("exp-timeout-text");
+  initGitRepo(dir);
+  fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".auto", "config.json"), JSON.stringify({ experiment_max_minutes: 1 }), "utf-8");
+  const { tool, command, ctx } = await loadExtension(dir);
+  await command("autoresearch").handler("on", ctx);
+  await tool("init_experiment").execute("id", {
+    name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower",
+  }, null, null, ctx);
+
+  const res = await tool("run_experiment").execute("id", {
+    command: 'node -e "setTimeout(() => process.exit(0), 3000)"',
+    timeout_seconds: 1,
+  }, null, null, ctx);
+  const text = String(res.content?.[0]?.text ?? "");
+  assert.ok(text.includes("TIMEOUT after"), `timeout text: ${text.slice(0, 200)}`);
+  assert.ok(text.includes("Log this as 'crash'"), "kill is logged as crash");
+  assert.ok(text.includes("ADAPT"), "adaptation demanded");
+  assert.ok(text.includes("experiment_max_minutes=1"), "the configured cap is quoted");
+  assert.ok(!text.includes("or raise timeout_seconds"), "no invitation to raise the timeout");
+}, 20);
+
+await test("run_experiment budget exceeded: text demands adaptation instead of dropping the experiment", async () => {
+  const dir = makeTempDir("exp-budget-text");
+  initGitRepo(dir);
+  const { tool, command, ctx } = await loadExtension(dir);
+  await command("autoresearch").handler("on", ctx);
+  await tool("init_experiment").execute("id", {
+    name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower",
+  }, null, null, ctx);
+
+  const res = await tool("run_experiment").execute("id", {
+    command: 'node -e "setTimeout(() => process.exit(0), 3000)"',
+    timeout_seconds: 10,
+    budget_seconds: 1,
+  }, null, null, ctx);
+  const text = String(res.content?.[0]?.text ?? "");
+  assert.ok(text.includes("BUDGET EXCEEDED"), `budget text: ${text.slice(0, 200)}`);
+  assert.ok(text.includes("Log this as 'budget_exceeded'"), "budget status named");
+  assert.ok(text.includes("ADAPT"), "adaptation demanded");
+  assert.ok(!text.includes("speed up measure.sh"), "old hint text is gone");
+}, 20);
+
+await test("observer fires TIME LIMIT hint after 3 consecutive time deaths", async () => {
+  const dir = makeTempDir("exp-limit-observer");
+  initGitRepo(dir);
+  fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
+  const lines = [
+    JSON.stringify({ type: "config", name: "t", metric_name: "ms", metric_unit: "ms", direction: "lower" }),
+    JSON.stringify({ run: 1, metric: 100, status: "keep", description: "baseline", timestamp: 1700000000 }),
+    JSON.stringify({ run: 2, metric: 100, status: "budget_exceeded", description: "budget kill", timestamp: 1700000060 }),
+    JSON.stringify({ run: 3, metric: 100, status: "crash", description: "killed", timestamp: 1700000120 }),
+    JSON.stringify({ run: 4, metric: 100, status: "crash", description: "killed again", timestamp: 1700000180 }),
+  ];
+  fs.writeFileSync(path.join(dir, ".auto", "log.jsonl"), lines.join("\n") + "\n", "utf-8");
+
+  const observerMod = await import(pathToFileURL(path.join("extensions", "pi-autoresearch", "observer.ts")));
+  const steer = observerMod.runObserver({
+    cwd: dir, direction: "lower", metricName: "ms", metricUnit: "ms",
+  });
+  assert.ok(steer && steer.includes("TIME LIMIT"), `expected time-limit steer, got: ${String(steer).slice(0, 140)}`);
+  assert.ok(steer.includes("ADAPT") || steer.includes("adapt"), "adaptation demanded");
+
+  // a healthy tail → no hint
+  const lines2 = lines.slice(0, 4).concat([
+    JSON.stringify({ run: 4, metric: 100, status: "discard", description: "ran fine, no gain", timestamp: 1700000180 }),
+  ]);
+  fs.writeFileSync(path.join(dir, ".auto", "log.jsonl"), lines2.join("\n") + "\n", "utf-8");
+  const steer2 = observerMod.runObserver({
+    cwd: dir, direction: "lower", metricName: "ms", metricUnit: "ms",
+  });
+  assert.ok(!steer2 || !steer2.includes("TIME LIMIT"), "healthy tail does not trigger the hint");
+});
 
 // ─── council-delegation.ts unit tests (fake event bus, no real children) ───
 
