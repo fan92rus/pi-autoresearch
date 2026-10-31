@@ -1740,6 +1740,22 @@ await test("/autoresearch limit without args opens the interactive dialog (TUI)"
   assert.ok(!("experiment_max_minutes" in cfg3), "blank input cancels");
 });
 
+await test("config menu header shows the experiment limit separately from the parallel budget", async () => {
+  const dir = makeTempDir("limit-header");
+  initGitRepo(dir);
+  fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".auto", "config.json"), JSON.stringify({ experiment_max_minutes: 16 }), "utf-8");
+  const { command, ctx } = await loadExtension(dir);
+  ctx.hasUI = true;
+  const notes = [];
+  ctx.ui.notify = (text, type) => notes.push({ text, type });
+  ctx.ui.select = async (_t, options) => options[options.length - 1]; // done immediately
+  await command("autoresearch").handler("config", ctx);
+  const shown = notes.map((n) => n.text).join("\n");
+  assert.ok(/лимит эксперимента|experiment limit/.test(shown) && /16\s*(мин|min)/.test(shown), `limit shown: ${shown.slice(0, 300)}`);
+  assert.ok(shown.includes("(parallel)"), "parallel budget is labeled as parallel");
+});
+
 await test("/autoresearch config menu includes the limit item and opens its dialog", async () => {
   const dir = makeTempDir("limit-menu");
   initGitRepo(dir);
@@ -1759,6 +1775,74 @@ await test("/autoresearch config menu includes the limit item and opens its dial
   assert.ok(/Experiment Time Limit|Лимит времени/.test(joined), `menu: ${joined}`);
   const cfg = JSON.parse(fs.readFileSync(path.join(dir, ".auto", "config.json"), "utf-8"));
   assert.strictEqual(cfg.experiment_max_minutes, 2, "menu path writes the limit");
+});
+
+await test("/autoresearch config council models dialog sets analyst and chair models", async () => {
+  const dir = makeTempDir("council-menu");
+  initGitRepo(dir);
+  const { command, ctx } = await loadExtension(dir);
+  ctx.hasUI = true;
+  const picks = ["AnalystB", "Chair"];
+  let menuVisits = 0;
+  ctx.ui.select = async (title, options) => {
+    if (!/Council models|Модели совета/.test(title)) {
+      menuVisits++;
+      return menuVisits === 1 ? options[1] : options[options.length - 1]; // enter once, then done
+    }
+    const next = picks.shift();
+    if (!next) return options[options.length - 1]; // Back
+    return options.find((o) => o.startsWith(next));
+  };
+  const inputs = ["openai-codex/gpt-6-luna", "zai-coding-cn/glm-5.3:high"];
+  ctx.ui.input = async () => inputs.shift() ?? "";
+
+  await command("autoresearch").handler("config", ctx);
+  const cfg = JSON.parse(fs.readFileSync(path.join(dir, ".auto", "config.json"), "utf-8"));
+  assert.ok(cfg.council, "council section written");
+  assert.strictEqual(cfg.council.chair_model, "zai-coding-cn/glm-5.3:high", "chair model set");
+  const b = cfg.council.participants.find((p) => p.name === "AnalystB");
+  assert.strictEqual(b.model, "openai-codex/gpt-6-luna", "AnalystB model set");
+  assert.strictEqual(b.persona, "explorer", "persona preserved");
+  const a = cfg.council.participants.find((p) => p.name === "AnalystA");
+  assert.strictEqual(a.model, "anthropic/claude-haiku-5-5", "untouched analyst keeps default model");
+
+  // blank input does not write
+  const before = fs.readFileSync(path.join(dir, ".auto", "config.json"), "utf-8");
+  picks.push("AnalystA");
+  ctx.ui.input = async () => "";
+  ctx.ui.select = async (title, options) => {
+    if (!/Council models|Модели совета/.test(title)) return options[options.length - 1]; // leave menu
+    const next = picks.shift();
+    if (!next) return options[options.length - 1]; // Back
+    return options.find((o) => o.startsWith(next));
+  };
+  await command("autoresearch").handler("config", ctx);
+  assert.strictEqual(fs.readFileSync(path.join(dir, ".auto", "config.json"), "utf-8"), before, "blank input writes nothing");
+});
+
+await test("models written by the council dialog are what readCouncilConfig resolves", async () => {
+  const dir = makeTempDir("council-menu-roundtrip");
+  initGitRepo(dir);
+  fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
+  const { command, ctx } = await loadExtension(dir);
+  ctx.hasUI = true;
+  let menuCalls = 0;
+  let dialogVisits = 0;
+  ctx.ui.select = async (title, options) => {
+    if (/Council models|Модели совета/.test(title)) {
+      dialogVisits++;
+      return dialogVisits === 1 ? options.find((o) => o.startsWith("Chair")) : options[options.length - 1]; // set chair once, then Back
+    }
+    menuCalls++;
+    return menuCalls === 1 ? options[1] : options[options.length - 1]; // enter council, then done
+  };
+  ctx.ui.input = async () => "custom/chair-model:high";
+  await command("autoresearch").handler("config", ctx);
+
+  const councilMod = await import(pathToFileURL(path.join("extensions", "pi-autoresearch", "council.ts")));
+  const cc = councilMod.readCouncilConfig(dir);
+  assert.strictEqual(cc.chairModel, "custom/chair-model:high", "the council resolves the menu-set chair");
+  assert.strictEqual(cc.participants.length, 3, "default roster count kept");
 });
 
 // ─── council-delegation.ts unit tests (fake event bus, no real children) ───

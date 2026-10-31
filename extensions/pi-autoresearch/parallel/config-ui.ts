@@ -13,6 +13,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 
 import { DEFAULT_CONFIG, resolveConfig, type ParallelConfig, type Tier } from "./config.ts";
+import { DEFAULT_PARTICIPANTS, DEFAULT_CHAIR_MODEL } from "../council.ts";
 
 // ─── Types (duck-typed from ExtensionCommandContext) ─────────────────────────
 
@@ -69,6 +70,8 @@ const RU = detectRu();
 
 const L = {
   // Main menu
+  councilModels: RU ? "🧠 Модели совета (аналитики + председатель)..." : "🧠 Council models (analysts + chair)...",
+  parallelOff: RU ? " (параллельный режим выключен)" : " (parallel mode is off)",
   presets: RU ? "📦 Пресеты..." : "📦 Presets...",
   models: RU ? "🔧 Модели (индивидуально)..." : "🔧 Models (individual)...",
   concurrency: RU ? "⚡ Конкурентность..." : "⚡ Concurrency...",
@@ -169,14 +172,15 @@ function getConfigParallel(workDir: string): ParallelConfig {
   return resolveConfig(readConfig(workDir));
 }
 
-function formatCurrent(cfg: ParallelConfig): string {
+function formatCurrent(cfg: ParallelConfig, expLimit: number | null = null): string {
   const conc = cfg.concurrency ?? L.concAuto;
   return [
+    "  " + (RU ? "лимит эксперимента" : "experiment limit") + ": " + (expLimit === null ? (RU ? "не задан" : "not set") : expLimit + (RU ? " мин (experiment_max_minutes)" : " min (experiment_max_minutes)")),
     "  fast:   " + cfg.tiers.fast,
     "  mid:    " + cfg.tiers.mid,
     "  strong: " + cfg.tiers.strong,
     "  " + (RU ? "конкурентность" : "concurrency") + ": " + conc,
-    "  " + (RU ? "бюджет" : "budget") + ": " + cfg.budgetSeconds + "s",
+    "  " + (RU ? "бюджет (parallel)" : "budget (parallel)") + ": " + cfg.budgetSeconds + "s",
   ].join("\n");
 }
 
@@ -464,6 +468,54 @@ async function configureObserver(ctx: ConfigCtx, workDir: string): Promise<boole
 
 // ─── Main entry point ────────────────────────────────────────────────────────
 
+// ─── Council models (active today: analysts + chair of the Stagnation Council) ──
+
+function councilModelsFromConfig(configCwd: string): { participants: { name: string; model: string; persona: string }[]; chair: string } {
+  const raw = readConfig(configCwd);
+  const c = (raw.council ?? {}) as Record<string, unknown>;
+  const participants = (Array.isArray(c.participants) && c.participants.length >= 2
+    ? (c.participants as Record<string, unknown>[]).map((p, i) => ({
+        name: typeof p?.name === "string" && p.name.trim() ? p.name.trim() : DEFAULT_PARTICIPANTS[i % DEFAULT_PARTICIPANTS.length].name,
+        model: typeof p?.model === "string" && p.model.trim() ? p.model.trim() : DEFAULT_PARTICIPANTS[i % DEFAULT_PARTICIPANTS.length].model,
+        persona: typeof p?.persona === "string" && p.persona.trim() ? p.persona.trim() : DEFAULT_PARTICIPANTS[i % DEFAULT_PARTICIPANTS.length].persona,
+      }))
+    : DEFAULT_PARTICIPANTS.map((x) => ({ ...x }))
+  );
+  const chair = typeof c.chair_model === "string" && c.chair_model.trim() ? c.chair_model.trim() : DEFAULT_CHAIR_MODEL;
+  return { participants, chair };
+}
+
+function writeCouncilModels(configCwd: string, models: { participants: { name: string; model: string; persona: string }[]; chair: string }): void {
+  const raw = readConfig(configCwd);
+  const c = { ...((raw.council ?? {}) as Record<string, unknown>) };
+  c.participants = models.participants.map((p) => ({ name: p.name, model: p.model, persona: p.persona }));
+  c.chair_model = models.chair;
+  (raw as Record<string, unknown>).council = c;
+  writeConfig(configCwd, raw);
+}
+
+/** Interactive dialog: set the model of each council analyst and the chair. */
+export async function configureCouncilModels(ctx: ConfigCtx): Promise<void> {
+  while (true) {
+    const current = councilModelsFromConfig(ctx.cwd);
+    const items = current.participants.map((p) => p.name + " — " + p.model).concat(["Chair — " + current.chair, L.back]);
+    const choice = await ctx.ui.select(RU ? "Модели совета (секция council в .auto/config.json)" : "Council models (council section of .auto/config.json)", items);
+    if (!choice || choice === L.back) return;
+    const isChair = choice.startsWith("Chair");
+    const idx = current.participants.findIndex((p) => choice.startsWith(p.name + " —"));
+    if (!isChair && idx < 0) continue;
+    const currentModel = isChair ? current.chair : current.participants[idx].model;
+    const title = (isChair ? "Chair" : current.participants[idx].name) + (RU ? " — текущая модель: " : " — current model: ") + currentModel;
+    const input = await ctx.ui.input(title + "\n" + (RU ? "Новая модель (пусто — отмена):" : "New model (blank = cancel):"), currentModel);
+    if (!input || !input.trim()) continue;
+    const model = input.trim();
+    if (isChair) current.chair = model;
+    else current.participants[idx].model = model;
+    writeCouncilModels(ctx.cwd, current);
+    ctx.ui.notify(RU ? "Модели совета сохранены." : "Council models saved.", "info");
+  }
+}
+
 // ─── Experiment time limit (campaign-level, lives in ctx.cwd config) ─────────
 
 function readExperimentMaxMinutes(configCwd: string): number | null {
@@ -523,17 +575,20 @@ export async function configureExperimentLimit(ctx: ConfigCtx): Promise<void> {
 
 export async function interactiveParallelConfig(ctx: ConfigCtx, workDir: string): Promise<void> {
   const cfg = getConfigParallel(workDir);
-  ctx.ui.notify((RU ? "Конфигурация:\n" : "Parallel Config:\n") + formatCurrent(cfg), "info");
+  ctx.ui.notify((RU ? "Конфигурация:\n" : "Parallel Config:\n") + formatCurrent(cfg, readExperimentMaxMinutes(ctx.cwd)), "info");
 
   while (true) {
     const current = getConfigParallel(workDir);
-    const header = L.configTitle + "\n\n" + L.currentLabel + "\n" + formatCurrent(current) + "\n";
+    const header = L.configTitle + "\n\n" + L.currentLabel + "\n" + formatCurrent(current, readExperimentMaxMinutes(ctx.cwd)) + "\n";
 
-    const choice = await ctx.ui.select(header, [L.limitItem, L.presets, L.models, L.concurrency, L.budget, L.observer, L.done]);
+    const choice = await ctx.ui.select(header, [L.limitItem, L.councilModels, L.presets + L.parallelOff, L.models + L.parallelOff, L.concurrency + L.parallelOff, L.budget + L.parallelOff, L.observer + L.parallelOff, L.done]);
     if (!choice || choice === L.done) break;
 
     try {
-      switch (choice) {
+      // Parallel items carry the off-marker suffix — match by prefix.
+      if (choice === L.councilModels) { await configureCouncilModels(ctx); continue; }
+      const parallelChoice = choice.endsWith(L.parallelOff) ? choice.slice(0, -L.parallelOff.length) : choice;
+      switch (parallelChoice) {
         case L.limitItem: await configureExperimentLimit(ctx); break;
         case L.presets: await configurePresets(ctx, workDir); break;
         case L.models: await configureModels(ctx, workDir); break;
@@ -547,5 +602,5 @@ export async function interactiveParallelConfig(ctx: ConfigCtx, workDir: string)
   }
 
   const finalCfg = getConfigParallel(workDir);
-  ctx.ui.notify(L.configSaved + "\n" + formatCurrent(finalCfg), "info");
+  ctx.ui.notify(L.configSaved + "\n" + formatCurrent(finalCfg, readExperimentMaxMinutes(ctx.cwd)), "info");
 }

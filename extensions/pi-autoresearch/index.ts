@@ -2395,7 +2395,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\nfinalize_research({reason, evidence, confidence}) only with PROOF (mathematical floor, noise floor reached, search space exhausted). A subjective \u201cthis seems hard\u201d is NOT proof \u2014 try orthogonal approaches first. It is a RECOMMENDATION; the observer arbitrates and suppresses premature signals." +
       "\n\n## Stagnation Council" +
       "\nWhen the observer convenes a STAGNATION COUNCIL, call council_convene({ note: \"...\" }) immediately — the tool convenes the whole council itself (analysts, dispute, chair), BLOCKS for several minutes and returns the validated, persisted slate; register each slate experiment with propose_hypothesis. You may append ONLY objective-facts blackboard entries (phase: \"facts\") — never judge hypotheses yourself. A council opinion is not evidence; the benchmark is." +
-      "\nYou can also convene a council YOURSELF at any time, with no limits, when you feel stuck: council_convene({ note: \"why you are stuck and what to focus on\" }). Same one-call flow: it blocks, then you execute the returned slate." +
+      "\nYou can convene a council YOURSELF at any time, with no limits, when you feel stuck: the same council_convene tool — one call, it blocks, you execute the returned slate." +
+      "\nNEVER hand-roll a council: do not launch analyst subagents yourself, do not run a manual chair, do not track consensus by hand. The only manual path is when council_convene itself returns a manual-protocol message (delegation seam unavailable) — then follow exactly what that message says." +
       "\n\n## Observer Steers" +
       "\n\U0001f504 STAGNATION \u2014 STOP and REFLECT on the pattern. \U0001f3af MILESTONE \u2014 consider strategic alternatives and orthogonal directions.";
 

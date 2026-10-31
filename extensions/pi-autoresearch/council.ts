@@ -38,13 +38,13 @@ export interface CouncilConfig {
   timeoutMinutes: number;
 }
 
-const DEFAULT_PARTICIPANTS: CouncilParticipantConfig[] = [
+export const DEFAULT_PARTICIPANTS: CouncilParticipantConfig[] = [
   { name: "AnalystA", model: "anthropic/claude-haiku-5-5", persona: "patterns" },
   { name: "AnalystB", model: "zai-coding-cn/glm-5.3-flash", persona: "explorer" },
   { name: "AnalystC", model: "openai-codex/gpt-6-luna", persona: "skeptic" },
 ];
 
-const DEFAULT_CHAIR_MODEL = "zai-coding-cn/glm-5.3:high";
+export const DEFAULT_CHAIR_MODEL = "zai-coding-cn/glm-5.3:high";
 
 const PERSONA_CYCLE: CouncilPersona[] = ["patterns", "explorer", "skeptic"];
 
