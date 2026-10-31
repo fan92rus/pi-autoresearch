@@ -1661,6 +1661,106 @@ await test("observer fires TIME LIMIT hint after 3 consecutive time deaths", asy
   assert.ok(!steer2 || !steer2.includes("TIME LIMIT"), "healthy tail does not trigger the hint");
 });
 
+await test("prompt block shows the experiment time limit (set and unset)", async () => {
+  const dir = makeTempDir("limit-prompt");
+  initGitRepo(dir);
+  fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".auto", "config.json"), JSON.stringify({ experiment_max_minutes: 5 }), "utf-8");
+  const { tool, command, hook, ctx } = await loadExtension(dir);
+  await command("autoresearch").handler("on", ctx);
+  await tool("init_experiment").execute("id", { name: "t", metric_name: "ms", metric_unit: "ms", direction: "lower" }, null, null, ctx);
+
+  const ev1 = { systemPrompt: "You are a coding agent." };
+  const out1 = await hook("before_agent_start")(ev1, ctx);
+  const prompt1 = out1?.systemPrompt ?? ev1.systemPrompt;
+  assert.ok(prompt1.includes("Experiment time limit: 5 min per run_experiment"), `clause: ${String(prompt1).slice(-400)}`);
+  assert.ok(prompt1.includes("timeout_seconds <= 300"), "the exact bound is spelled out");
+  assert.ok(prompt1.includes("BENCH_MODE=quick subset"), "adaptation playbook in the prompt");
+
+  fs.writeFileSync(path.join(dir, ".auto", "config.json"), JSON.stringify({}), "utf-8");
+  const ev2 = { systemPrompt: "You are a coding agent." };
+  const out2 = await hook("before_agent_start")(ev2, ctx);
+  const prompt2 = out2?.systemPrompt ?? ev2.systemPrompt;
+  assert.ok(prompt2.includes("Experiment time limit: none"), "unset clause present");
+  assert.ok(prompt2.includes("/autoresearch limit <minutes>"), "how to set it");
+});
+
+await test("/autoresearch limit 5 sets the cap; limit off clears it (no UI needed)", async () => {
+  const dir = makeTempDir("limit-cmd");
+  initGitRepo(dir);
+  const { pi, tool, command, ctx } = await loadExtension(dir);
+  await command("autoresearch").handler("limit 5", ctx);
+  const cfg1 = JSON.parse(fs.readFileSync(path.join(dir, ".auto", "config.json"), "utf-8"));
+  assert.strictEqual(cfg1.experiment_max_minutes, 5, "limit written to ctx.cwd config");
+  const notes = pi.notifications.map((n) => n.text).join(" | ");
+  assert.ok(/5\s*(min|мин)/.test(notes), `notify: ${notes}`);
+
+  await command("autoresearch").handler("limit off", ctx);
+  const cfg2 = JSON.parse(fs.readFileSync(path.join(dir, ".auto", "config.json"), "utf-8"));
+  assert.ok(!("experiment_max_minutes" in cfg2), "limit off removes the key");
+
+  await command("autoresearch").handler("limit nonsense", ctx);
+  assert.ok(pi.notifications.some((n) => n.text.includes("Usage: /autoresearch limit")), "bad arg gets usage hint");
+
+  // the gate immediately honors the CLI-set cap
+  await command("autoresearch").handler("limit 5", ctx);
+  await command("autoresearch").handler("on", ctx);
+  await tool("init_experiment").execute("id", { name: "t", metric_name: "ms", metric_unit: "ms", direction: "lower" }, null, null, ctx);
+  const res = await tool("run_experiment").execute("id", { command: 'node -e "0"', timeout_seconds: 999 }, null, null, ctx);
+  assert.ok(String(res.content?.[0]?.text).includes("TIMEOUT OVER PROJECT LIMIT"), "gate sees the CLI-set cap");
+});
+
+await test("/autoresearch limit without args opens the interactive dialog (TUI)", async () => {
+  const dir = makeTempDir("limit-tui");
+  initGitRepo(dir);
+  const { pi, command, ctx } = await loadExtension(dir);
+  let asked = "";
+  let chose = "";
+  ctx.ui.select = async (title, options) => { chose = title; return options[0]; }; // "Set/change limit"
+  ctx.ui.input = async (title) => { asked = title; return "7"; };
+
+  await command("autoresearch").handler("limit", ctx);
+  const cfg = JSON.parse(fs.readFileSync(path.join(dir, ".auto", "config.json"), "utf-8"));
+  assert.strictEqual(cfg.experiment_max_minutes, 7, "interactive set");
+  assert.ok(/Minutes per run_experiment|Минуты на один run_experiment/.test(asked), `input prompt: ${asked}`);
+  const notes = pi.notifications.map((n) => n.text).join(" | ");
+  assert.ok(/7\s*(min|мин)/.test(notes), `saved notification: ${notes}`);
+
+  // remove path
+  ctx.ui.select = async (_t, options) => options[1]; // "Remove limit"
+  await command("autoresearch").handler("limit", ctx);
+  const cfg2 = JSON.parse(fs.readFileSync(path.join(dir, ".auto", "config.json"), "utf-8"));
+  assert.ok(!("experiment_max_minutes" in cfg2), "interactive remove");
+
+  // blank input cancels without writing
+  ctx.ui.select = async (_t, options) => options[0];
+  ctx.ui.input = async () => "";
+  await command("autoresearch").handler("limit", ctx);
+  const cfg3 = JSON.parse(fs.readFileSync(path.join(dir, ".auto", "config.json"), "utf-8"));
+  assert.ok(!("experiment_max_minutes" in cfg3), "blank input cancels");
+});
+
+await test("/autoresearch config menu includes the limit item and opens its dialog", async () => {
+  const dir = makeTempDir("limit-menu");
+  initGitRepo(dir);
+  const { command, ctx } = await loadExtension(dir);
+  const seenTitles = [];
+  let menuCalls = 0;
+  ctx.ui.select = async (title, options) => {
+    seenTitles.push(title);
+    if (/Experiment Time Limit|Лимит времени/.test(title)) return options[0]; // dialog: Set/change
+    menuCalls++;
+    return menuCalls === 1 ? options[0] : options[options.length - 1]; // menu: limit item, then done
+  };
+  ctx.ui.input = async () => "2";
+
+  await command("autoresearch").handler("config", ctx);
+  const joined = seenTitles.join(" | ");
+  assert.ok(/Experiment Time Limit|Лимит времени/.test(joined), `menu: ${joined}`);
+  const cfg = JSON.parse(fs.readFileSync(path.join(dir, ".auto", "config.json"), "utf-8"));
+  assert.strictEqual(cfg.experiment_max_minutes, 2, "menu path writes the limit");
+});
+
 // ─── council-delegation.ts unit tests (fake event bus, no real children) ───
 
 const delegationMod = await import(pathToFileURL(path.join("extensions", "pi-autoresearch", "council-delegation.ts")));

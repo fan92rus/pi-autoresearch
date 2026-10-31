@@ -91,7 +91,7 @@ import { runValleyProbe } from "./parallel/valley.ts";
 import { reMeasureWinner, applyDiff } from "./parallel/remeasure.ts";
 import { computeNoiseFloor } from "./parallel/aggregate.ts";
 import { resolveConfig, defaultConcurrency } from "./parallel/config.ts";
-import { interactiveParallelConfig, filterSubcommands } from "./parallel/config-ui.ts";
+import { interactiveParallelConfig, filterSubcommands, applyExperimentLimitArg, configureExperimentLimit } from "./parallel/config-ui.ts";
 import { resolveRepoRoot, cleanupAllWorktrees } from "./parallel/worktree.ts";
 import { newPhaseStore, startPhase, recordExploreStep, endPhaseDecision, clearPhase, markBestCheckpoint, persistPhase, clearPersistedPhase, commitPhaseGit, abortPhaseGit } from "./parallel/phases.ts";
 import type { Direction } from "./parallel/types.ts";
@@ -1659,6 +1659,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const MEASUREMENT_GUARDRAIL =
     "Every measurement goes through run_experiment -> log_experiment; never run the benchmark via bash — bash runs are invisible to the ledger and get blocked.";
 
+  // Experiment time limit, re-read from .auto/config.json on every use so the
+  // value is always current (the TUI menu can change it mid-session).
+  const experimentLimitClause = (cwd: string): string => {
+    const minutes = readExperimentMaxMinutes(cwd);
+    if (minutes === null) {
+      return "Experiment time limit: none (set experiment_max_minutes in .auto/config.json, or /autoresearch limit <minutes>, to cap a single run).";
+    }
+    return "Experiment time limit: " + minutes + " min per run_experiment — pick timeout_seconds <= " + minutes * 60 + " and ADAPT the experiment to fit (smaller fixture, fewer iterations, a BENCH_MODE=quick subset); bigger timeouts are rejected.";
+  };
+
   // ── Migrate old auto-installed hook ─────────────────────────────────
   // Previous versions auto-installed the observer to ~/.pi/agent/autoresearch/hooks/before.sh.
   // Now the observer runs from the extension dir. Remove the old managed copy if present.
@@ -1820,16 +1830,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       head + "Run the next iteration now.",
       "Use the persisted autoresearch state as needed, pick the most promising hypothesis, then call run_experiment + log_experiment.",
       MEASUREMENT_GUARDRAIL,
+      experimentLimitClause(ctx.cwd),
       BENCHMARK_GUARDRAIL,
     ].join(" ");
   };
 
   /** Corrective resume for a settled turn that did no loop work (bounded — see MAX_CONSECUTIVE_DRIFT_RESUMES). */
-  const composeDriftResumeMessage = (): string => {
+  const composeDriftResumeMessage = (cwd: string): string => {
     return [
       "⚠ Last turn used no experiment tools (chat/reads don't advance the loop).",
       "Resume the cycle now: propose_hypothesis → run_experiment → log_experiment.",
       MEASUREMENT_GUARDRAIL,
+      experimentLimitClause(cwd),
       BENCHMARK_GUARDRAIL,
     ].join(" ");
   };
@@ -1842,6 +1854,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "Pick the most promising hypothesis from the ideas backlog or the latest `next:` hints in recent runs, then call run_experiment + log_experiment.",
       "Do not re-read .auto/prompt.md or .auto/log.jsonl — the compaction summary already contains them.",
       MEASUREMENT_GUARDRAIL,
+      experimentLimitClause(_ctx.cwd),
       BENCHMARK_GUARDRAIL,
     ].join(" ");
   };
@@ -1948,12 +1961,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const autoresearchHelp = () =>
     [
-      "Usage: /autoresearch [off|clear|council [note]|config|export|<text>|parallel-*]",
+      "Usage: /autoresearch [off|clear|council [note]|config|limit [minutes|off]|export|<text>|parallel-*]",
       "",
       "<text> enters autoresearch mode and starts or resumes the loop.",
       "off leaves autoresearch mode.",
       "clear deletes the session log (.auto/log.jsonl) and turns autoresearch mode off.",
-      "config opens an interactive dialog to set worker models, concurrency, and budget.",
+      "config opens an interactive dialog to set the experiment time limit, worker models, concurrency, and budget.",
+      "limit sets the experiment time limit: limit 5 — 5 minutes per run_experiment; limit off — remove; limit — interactive dialog.",
       "export opens a local live dashboard for the session log in your browser.",
       "",
       "Parallel modes (fan out worker subagents over the event bus):",
@@ -2284,7 +2298,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (runtime.consecutiveDriftResumes < MAX_CONSECUTIVE_DRIFT_RESUMES) {
         runtime.consecutiveDriftResumes++;
         markAutoResumeSent(runtime);
-        schedulePendingResume(ctx, runtime, composeDriftResumeMessage());
+        schedulePendingResume(ctx, runtime, composeDriftResumeMessage(ctx.cwd));
         return;
       }
       ctx.ui.notify(
@@ -2364,7 +2378,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\n- Call log_experiment IMMEDIATELY after every run_experiment \u2014 keep/discard/crash/budget_exceeded, whatever the outcome. An unlogged run is wasted compute." +
       "\n- Do not commit or revert manually: keep auto-commits; discard/crash/checks_failed auto-revert (autoresearch files preserved)." +
       "\n- Experiment rules: " + mdPath + " \u2014 read at session start and after compaction. Ideas backlog: " + ideasPath + " \u2014 write promising deferred ideas there (one .md per idea)." +
-      "\n- " + BENCHMARK_GUARDRAIL +
+      "\n- " + experimentLimitClause(ctx.cwd) + "\n- " + BENCHMARK_GUARDRAIL +
       "\n- Follow-on user message mid-experiment? Finish the current run_experiment + log_experiment cycle first, address it next iteration." +
       "\n\n## Hypothesis-First Workflow (EVERY iteration)" +
       "\n1. PROFILE FIRST \u2014 node --prof / console.time / --trace-deopt: find where time is actually spent. Do NOT guess. Record findings in the hypothesis." +
@@ -5843,6 +5857,27 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             : "📋 List view ON — dashboard table restored",
           "info",
         );
+        return;
+      }
+
+      // ===== limit subcommand: experiment time limit (minutes) =====
+      const limitMatch = command.match(/^limit\b\s*(.*)$/);
+      if (limitMatch) {
+        const arg = limitMatch[1].trim();
+        if (arg) {
+          const msg = applyExperimentLimitArg(ctx.cwd, arg);
+          if (msg === null) {
+            ctx.ui.notify("Usage: /autoresearch limit <minutes> — set; /autoresearch limit off — clear; /autoresearch limit — interactive.", "warning");
+          } else {
+            ctx.ui.notify(msg, "info");
+          }
+          return;
+        }
+        if (!ctx.hasUI) {
+          ctx.ui.notify("Interactive limit editor requires TUI mode. Use /autoresearch limit <minutes> or /autoresearch limit off.", "warning");
+          return;
+        }
+        await configureExperimentLimit(ctx);
         return;
       }
 

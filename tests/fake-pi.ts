@@ -251,6 +251,7 @@ export function makeCtx(dir, sessionId, piRef) {
   const sessionManager = createSessionManager(sessionId);
   return {
     cwd: dir,
+    hasUI: true,
     sessionManager,
     ui: {
       // Route to pi.notifications so tests can assert user-facing notifies.

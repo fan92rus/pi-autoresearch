@@ -323,6 +323,9 @@ The built-in observer runs before each iteration and emits **steer messages** (a
 
 Numeric thresholds (`finalize_strong_threshold`, `floor_cv_threshold`, `stagnation_threshold`, etc.) can also be tuned interactively via `/autoresearch config` → **Observer settings** → **Toggles**.
 
+Set or clear the experiment time limit without editing the config by hand:
+`/autoresearch limit 5` — 5 minutes per `run_experiment`; `/autoresearch limit off` — remove; `/autoresearch limit` — interactive dialog (also available as the first item of the `/autoresearch config` menu). The active limit is shown to the agent in the mode prompt on every turn, so it always knows the time budget it must fit.
+
 **Stale-finalize protection.** If the agent calls `finalize_research()` but then continues working and finds an improvement (a `keep` run after the finalize entry), the observer automatically suppresses the finalize signal — the claim was premature. This prevents the observer from nagging the agent to stop when work is clearly still productive.
 
 **Anti-nagging & priority reordering.** The finalize signal is now the **lowest-priority** observer trigger. The trigger order is: noise gate → parallel opportunity → stagnation → floor detection → progress milestone → finalize (fallback). This means concrete actionable advice (BestOfN with real hypotheses, stagnation reflection) always takes priority over the abstract "stop" recommendation. Additionally, once the agent continues working after calling `finalize_research()` (any run after the finalize entry), the observer **goes completely quiet** about finalize — the tool already sent a one-time confirmation steer when called, and repeating it every iteration creates counterproductive pressure. Actionable triggers take over steering instead.

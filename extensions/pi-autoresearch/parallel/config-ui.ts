@@ -41,7 +41,8 @@ export const AUTORESEARCH_SUBCOMMANDS: AutocompleteEntry[] = [
   { value: "finalize", label: "finalize", description: "Stop the loop and load the autoresearch-finalize skill" },
   { value: "clear", label: "clear", description: "Delete session log and reset state" },
   { value: "tree", label: "tree", description: "Toggle tree/list view in dashboard widget" },
-  { value: "config", label: "config", description: "Interactive parallel mode configuration (models, concurrency, budget)" },
+  { value: "config", label: "config", description: "Interactive campaign configuration (time limit, models, concurrency, budget)" },
+  { value: "limit", label: "limit", description: "Experiment time limit in minutes: /autoresearch limit 5 — set, /autoresearch limit off — clear, /autoresearch limit — interactive" },
   { value: "export", label: "export", description: "Open live dashboard in browser" },
   { value: "dashboard", label: "dashboard", description: "Open the fullscreen scrollable dashboard overlay in the terminal" },
   { value: "council", label: "council", description: "Convene a stagnation council (multi-model hypothesis review)" },
@@ -79,7 +80,7 @@ const L = {
   reset: RU ? "♻️ Сбросить к дефолтам" : "♻️ Reset to defaults",
 
   // Headers
-  configTitle: RU ? "Конфигурация параллельного режима" : "Parallel Configuration",
+  configTitle: RU ? "Конфигурация кампании (лимит времени + параллельный режим)" : "Campaign Configuration (time limit + parallel mode)",
   currentLabel: RU ? "Текущие:" : "Current:",
   observerTitle: RU ? "Настройки наблюдателя — что настроить?" : "Observer Settings — what to configure?",
   choosePreset: RU ? "Выберите пресет" : "Choose a preset",
@@ -97,6 +98,18 @@ const L = {
   presetApplied: RU ? "пресет применён" : "preset applied",
   noChange: RU ? "Без изменений" : "No change",
   configSaved: RU ? "Конфиг сохранён." : "Config saved.",
+
+  // Experiment time limit
+  limitTitle: RU ? "Лимит времени эксперимента" : "Experiment Time Limit",
+  limitItem: RU ? "⏱ Лимит времени эксперимента" : "⏱ Experiment time limit",
+  limitSet: RU ? "Задать/изменить лимит (минуты)" : "Set/change limit (minutes)",
+  limitRemove: RU ? "Убрать лимит" : "Remove limit",
+  limitPrompt: RU ? "Минуты на один run_experiment (пусто — отмена):" : "Minutes per run_experiment (blank = cancel):",
+  limitSaved: RU ? (m: string) => `Лимит задан: ${m} мин на эксперимент (.auto/config.json experiment_max_minutes).` : (m: string) => `Limit set: ${m} min per experiment (.auto/config.json experiment_max_minutes).`,
+  limitRemoved: RU ? "Лимит убран — время не ограничено." : "Limit removed — no time cap.",
+  limitInvalid: RU ? "Нужно положительное число минут." : "Expected a positive number of minutes.",
+  limitCurrent: RU ? (m: string) => `Текущий: ${m}` : (m: string) => `Current: ${m}`,
+  limitCurrentNone: RU ? "Текущий: не задан" : "Current: not set",
 
   // Concurrency
   concAuto: RU ? "авто" : "auto",
@@ -451,6 +464,63 @@ async function configureObserver(ctx: ConfigCtx, workDir: string): Promise<boole
 
 // ─── Main entry point ────────────────────────────────────────────────────────
 
+// ─── Experiment time limit (campaign-level, lives in ctx.cwd config) ─────────
+
+function readExperimentMaxMinutes(configCwd: string): number | null {
+  const raw = readConfig(configCwd);
+  return typeof raw.experiment_max_minutes === "number" && raw.experiment_max_minutes > 0
+    ? raw.experiment_max_minutes
+    : null;
+}
+
+function setExperimentMaxMinutes(configCwd: string, minutes: number | null): void {
+  const raw = readConfig(configCwd);
+  if (minutes === null) delete raw.experiment_max_minutes;
+  else raw.experiment_max_minutes = minutes;
+  writeConfig(configCwd, raw);
+}
+
+/** Apply a limit from a command argument: "5" sets 5 min, "off"/"0" clears, "" is ignored. Returns a notify message or null when nothing matched. */
+export function applyExperimentLimitArg(configCwd: string, arg: string): string | null {
+  const trimmed = arg.trim();
+  if (!trimmed) return null;
+  if (/^(off|none|0)$/i.test(trimmed)) {
+    setExperimentMaxMinutes(configCwd, null);
+    return L.limitRemoved;
+  }
+  const minutes = Number(trimmed);
+  if (!Number.isFinite(minutes) || minutes <= 0) return null;
+  const clamped = Math.max(1, Math.round(minutes));
+  setExperimentMaxMinutes(configCwd, clamped);
+  return L.limitSaved(String(clamped));
+}
+
+/** Interactive dialog to set/clear the experiment time limit (TUI). */
+export async function configureExperimentLimit(ctx: ConfigCtx): Promise<void> {
+  const current = readExperimentMaxMinutes(ctx.cwd);
+  ctx.ui.notify(current === null ? L.limitCurrentNone : L.limitCurrent(String(current) + " min"), "info");
+
+  const choice = await ctx.ui.select(L.limitTitle, [L.limitSet, L.limitRemove, L.back]);
+  if (!choice || choice === L.back) return;
+
+  if (choice === L.limitRemove) {
+    setExperimentMaxMinutes(ctx.cwd, null);
+    ctx.ui.notify(L.limitRemoved, "info");
+    return;
+  }
+
+  const raw = await ctx.ui.input(L.limitTitle + " — " + L.limitPrompt, "30");
+  if (raw === undefined || raw.trim() === "") return;
+  const minutes = Number(raw.trim());
+  if (!Number.isFinite(minutes) || minutes <= 0) {
+    ctx.ui.notify(L.limitInvalid, "error");
+    return;
+  }
+  const clamped = Math.max(1, Math.round(minutes));
+  setExperimentMaxMinutes(ctx.cwd, clamped);
+  ctx.ui.notify(L.limitSaved(String(clamped)), "info");
+}
+
 export async function interactiveParallelConfig(ctx: ConfigCtx, workDir: string): Promise<void> {
   const cfg = getConfigParallel(workDir);
   ctx.ui.notify((RU ? "Конфигурация:\n" : "Parallel Config:\n") + formatCurrent(cfg), "info");
@@ -459,11 +529,12 @@ export async function interactiveParallelConfig(ctx: ConfigCtx, workDir: string)
     const current = getConfigParallel(workDir);
     const header = L.configTitle + "\n\n" + L.currentLabel + "\n" + formatCurrent(current) + "\n";
 
-    const choice = await ctx.ui.select(header, [L.presets, L.models, L.concurrency, L.budget, L.observer, L.done]);
+    const choice = await ctx.ui.select(header, [L.limitItem, L.presets, L.models, L.concurrency, L.budget, L.observer, L.done]);
     if (!choice || choice === L.done) break;
 
     try {
       switch (choice) {
+        case L.limitItem: await configureExperimentLimit(ctx); break;
         case L.presets: await configurePresets(ctx, workDir); break;
         case L.models: await configureModels(ctx, workDir); break;
         case L.concurrency: await configureConcurrency(ctx, workDir); break;
