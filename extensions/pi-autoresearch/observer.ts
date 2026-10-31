@@ -983,6 +983,18 @@ export function runObserver(payload: ObserverPayload): string | null {
   // abstract "stop" recommendation. Finalize is the lowest-priority fallback
   // — it only fires if nothing else has actionable guidance.
 
+  // 0. Missing config header: runs exist but the target (name/metric/direction)
+  // was never initialized (or the log was cleared without re-init). The agent
+  // knows its own campaign goal — it must re-arm init_experiment itself rather
+  // than block on an owner decision.
+  if (reconstructed.results.length > 0 && !reconstructed.hasConfigHeader) {
+    return [
+      "⚠ NO CONFIG HEADER in the ledger: runs exist, but init_experiment was never called (or the log was recreated without it) — direction/metric defaults are in effect, so keep/discard decisions and direction-dependent observers may be wrong.",
+      "Fix it YOURSELF right now: call init_experiment with the campaign's own target (the name, primary metric and better-direction you are already optimizing), then continue the loop with genuinely next work. The existing runs stay in the current segment.",
+      "Do NOT stop the loop and do not ask the owner — this is bookkeeping you can resolve alone.",
+    ].join(" ");
+  }
+
   // 1. Noise gate (system noise — continuing is pointless)
   const noiseSteer = checkNoiseGate(payload, cwd, oc);
   if (noiseSteer) return noiseSteer;

@@ -3659,20 +3659,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       // Validate secondary metrics consistency (after first experiment establishes them)
+      let droppedMissing: string[] = [];
       if (state.secondaryMetrics.length > 0) {
         const knownNames = new Set(state.secondaryMetrics.map((m) => m.name));
         const providedNames = new Set(Object.keys(secondaryMetrics));
 
-        // Check for missing metrics
+        // Metrics the harness stopped producing are recorded, not rejected:
+        // the agent must never invent values for them (that is exactly the
+        // manual-provenance failure mode).
         const missing = [...knownNames].filter((n) => !providedNames.has(n));
         if (missing.length > 0) {
-          return {
-            content: [{
-              type: "text",
-              text: `❌ Missing secondary metrics: ${missing.join(", ")}\n\nYou must provide all previously tracked metrics. Expected: ${[...knownNames].join(", ")}\nGot: ${[...providedNames].join(", ") || "(none)"}\n\nFix: include ${missing.map((m) => `"${m}": <value>`).join(", ")} in the metrics parameter.`,
-            }],
-            details: {},
-          };
+          droppedMissing = missing;
         }
 
         // Check for new metrics not yet tracked
@@ -3688,10 +3685,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
-      // ASI: agent-supplied free-form diagnostics
-      const mergedASI = (params.asi && Object.keys(params.asi).length > 0)
-        ? params.asi as ASI
-        : undefined;
+      // ASI: agent-supplied free-form diagnostics + honest provenance for
+      // previously-tracked metrics the harness no longer produces.
+      const asiRecord: ASI = { ...((params.asi ?? {}) as ASI) };
+      if (droppedMissing.length > 0) {
+        asiRecord.secondary_metrics_not_measured = droppedMissing.join(", ");
+      }
+      const mergedASI = Object.keys(asiRecord).length > 0 ? asiRecord : undefined;
 
       const experiment: ExperimentResult = {
         commit: (params.commit ?? "").slice(0, 7),
@@ -3740,6 +3740,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           const sign = delta > 0 ? "+" : "";
           text += ` | this: ${formatNum(params.metric, state.metricUnit)} (${sign}${pct}%)`;
         }
+      }
+
+      if (droppedMissing.length > 0) {
+        text += `\nℹ️ Not provided this run: ${droppedMissing.join(", ")}. Either omitted by mistake or the harness no longer outputs them — check the last run_experiment output. Recorded in ASI as secondary_metrics_not_measured. Do NOT invent values for them.`;
       }
 
       // Show secondary metrics

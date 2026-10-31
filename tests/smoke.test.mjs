@@ -1845,6 +1845,115 @@ await test("models written by the council dialog are what readCouncilConfig reso
   assert.strictEqual(cc.participants.length, 3, "default roster count kept");
 });
 
+await test("observer: ledger without a config header gets a self-heal hint; with a header it does not", async () => {
+  const dir = makeTempDir("selfheal-header");
+  initGitRepo(dir);
+  fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
+  const observerMod = await import(pathToFileURL(path.join("extensions", "pi-autoresearch", "observer.ts")));
+  const run = (lines) => {
+    fs.writeFileSync(path.join(dir, ".auto", "log.jsonl"), lines.join("\n") + "\n", "utf-8");
+    return observerMod.runObserver({ cwd: dir, direction: "higher", metricName: "dev_gold_f1", metricUnit: "f1" });
+  };
+  const runLines = [
+    JSON.stringify({ run: 1, metric: 0.45, status: "keep", description: "baseline", timestamp: 1700000000 }),
+    JSON.stringify({ run: 2, metric: 0.44, status: "discard", description: "no gain", timestamp: 1700000060 }),
+  ];
+
+  // no header → self-heal hint that forbids asking the owner
+  let steer = run(runLines);
+  assert.ok(steer && steer.includes("NO CONFIG HEADER"), `hint: ${String(steer).slice(0, 120)}`);
+  assert.ok(steer.includes("init_experiment"), "the fix is named");
+  assert.ok(String(steer).includes("Do NOT stop the loop"), "owner escalation forbidden");
+
+  // header present (real name) → no self-heal hint (other triggers may fire)
+  steer = run([
+    JSON.stringify({ type: "config", name: "DPO-3", metric_name: "dev_gold_f1", metric_unit: "f1", direction: "higher" }),
+    ...runLines,
+  ]);
+  assert.ok(!steer || !steer.includes("NO CONFIG HEADER"), "header present → no hint");
+
+  // header with an empty name still counts as a header (check the flag, not truthiness)
+  steer = run([
+    JSON.stringify({ type: "config", name: "", metric_name: "dev_gold_f1", metric_unit: "f1", direction: "higher" }),
+    ...runLines,
+  ]);
+  assert.ok(!steer || !steer.includes("NO CONFIG HEADER"), 'header with name: "" → no hint');
+
+  // empty ledger without a header → no hint (nothing to re-arm yet)
+  steer = run([]);
+  assert.ok(!steer || !steer.includes("NO CONFIG HEADER"), "empty ledger → no hint");
+
+  // adopt: runs first, header appended later → the council resolves it, but the
+  // jsonl layer keeps the runs in the CURRENT segment (no orphaning)
+  const jsonlMod = await import(pathToFileURL(path.join("extensions", "pi-autoresearch", "jsonl.ts")));
+  const adopted = jsonlMod.reconstructJsonlState([...runLines, JSON.stringify({ type: "config", name: "DPO-3", metric_name: "dev_gold_f1", metric_unit: "f1", direction: "higher" })].join("\n"));
+  assert.strictEqual(adopted.hasConfigHeader, true, "header flag set");
+  assert.strictEqual(adopted.currentSegment, 0, "first header does not orphan runs");
+  assert.ok(adopted.results.every((r) => r.segment === 0), "adopted runs keep their segment");
+  assert.strictEqual(adopted.name, "DPO-3", "header data applies");
+
+  // re-init AFTER a header still starts a new segment
+  const reinit = jsonlMod.reconstructJsonlState([
+    JSON.stringify({ type: "config", name: "A", metric_name: "m", metric_unit: "", direction: "lower" }),
+    JSON.stringify({ run: 1, metric: 1, status: "keep", description: "x", timestamp: 1700000000 }),
+    JSON.stringify({ type: "config", name: "B", metric_name: "m", metric_unit: "", direction: "lower" }),
+    JSON.stringify({ run: 2, metric: 2, status: "keep", description: "y", timestamp: 1700000060 }),
+  ].join("\n"));
+  assert.strictEqual(reinit.currentSegment, 1, "second header starts a new segment");
+  assert.strictEqual(reinit.results.find((r) => r.run === 2).segment, 1, "post-reinit run in the new segment");
+});
+
+await test("log_experiment: metrics the harness stopped producing are recorded, not rejected", async () => {
+  const dir = makeTempDir("legacy-secondaries");
+  initGitRepo(dir);
+  const { tool, command, ctx } = await loadExtension(dir);
+  await command("autoresearch").handler("on", ctx);
+  await tool("init_experiment").execute("id", {
+    name: "t", metric_name: "dev_gold_f1", metric_unit: "f1", direction: "higher",
+  }, null, null, ctx);
+
+  // first log establishes the tracked secondaries
+  const first = await tool("log_experiment").execute("id", {
+    metric: 0.40, status: "keep", description: "baseline",
+    metrics: { dense_priced_at: 3, dense_priced_at_gold: 70 },
+    asi: { hypothesis: "base" },
+  }, null, null, ctx);
+  assert.ok(!String(first.content?.[0]?.text).includes("Missing secondary"), `first: ${String(first.content?.[0]?.text).slice(0, 120)}`);
+
+  // second log omits them (harness no longer outputs them) → logged, provenance recorded
+  const second = await tool("log_experiment").execute("id", {
+    metric: 0.41, status: "discard", description: "no dense metrics anymore",
+  }, null, null, ctx);
+  const text = String(second.content?.[0]?.text ?? "");
+  assert.ok(!text.includes("Missing secondary"), `omitted metrics must not be rejected: ${text.slice(0, 160)}`);
+  assert.ok(text.includes("secondary_metrics_not_measured"), `note shown: ${text.slice(0, 200)}`);
+  const entries = fs.readFileSync(path.join(dir, ".auto", "log.jsonl"), "utf-8")
+    .split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l));
+  const secondEntry = entries.find((e) => e.type === "run" || typeof e.run === "number");
+  const droppedEntry = entries.filter((e) => typeof e.run === "number").map((e) => e.asi ?? {}).find((a) => "secondary_metrics_not_measured" in a);
+  assert.ok(droppedEntry, "provenance written to the ledger ASI");
+  assert.strictEqual(droppedEntry.secondary_metrics_not_measured, "dense_priced_at, dense_priced_at_gold", `exact names: ${JSON.stringify(droppedEntry)}`);
+
+  // force:true still adds a brand-new metric
+  const fourth = await tool("log_experiment").execute("id", {
+    metric: 0.43, status: "discard", description: "new metric with force",
+    metrics: { real_probe_tp: 0.9 },
+    force: true,
+  }, null, null, ctx);
+  assert.ok(!String(fourth.content?.[0]?.text).includes("not previously tracked"), `force path: ${String(fourth.content?.[0]?.text).split("\n")[0]}`);
+  const entriesAfter = fs.readFileSync(path.join(dir, ".auto", "log.jsonl"), "utf-8")
+    .split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l));
+  const forceEntry = entriesAfter.filter((e) => typeof e.run === "number").pop();
+  assert.strictEqual(forceEntry.metrics && forceEntry.metrics.real_probe_tp, 0.9, "force-added metric recorded");
+
+  // a brand-new metric without force is still rejected (anti-garbage rule intact)
+  const third = await tool("log_experiment").execute("id", {
+    metric: 0.42, status: "discard", description: "new metric sneak-in",
+    metrics: { brand_new_metric: 1 },
+  }, null, null, ctx);
+  assert.ok(String(third.content?.[0]?.text).includes("not previously tracked"), "new-metric rule intact");
+});
+
 // ─── council-delegation.ts unit tests (fake event bus, no real children) ───
 
 const delegationMod = await import(pathToFileURL(path.join("extensions", "pi-autoresearch", "council-delegation.ts")));

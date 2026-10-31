@@ -32,6 +32,8 @@ export interface ReconstructedRun {
 
 export interface ReconstructedJsonlState {
   name: string | null;
+  /** True once a config header entry has been seen (may hold name: "" — check this flag, not name). */
+  hasConfigHeader: boolean;
   metricName: string;
   metricUnit: string;
   bestDirection: "lower" | "higher";
@@ -98,6 +100,7 @@ function reconstructedState(): ReconstructedJsonlState {
     metricUnit: DEFAULT_METRIC_UNIT,
     bestDirection: DEFAULT_DIRECTION,
     currentSegment: 0,
+    hasConfigHeader: false,
     results: [],
     secondaryMetrics: [],
   };
@@ -180,8 +183,15 @@ export function reconstructJsonlState(jsonlContent: string): ReconstructedJsonlS
     if (!entry) continue;
 
     if (isAutoresearchConfigEntry(entry)) {
+      const firstHeader = !state.hasConfigHeader;
       updateConfig(state, entry);
-      segment = nextSegment(state, segment);
+      state.hasConfigHeader = true;
+      // A header without a preceding header is a completion of a
+      // header-less ledger, not a re-init: its runs must stay in the
+      // current segment instead of being orphaned into an empty old one.
+      if (!firstHeader) {
+        segment = nextSegment(state, segment);
+      }
       state.currentSegment = segment;
       continue;
     }
