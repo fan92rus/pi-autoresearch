@@ -289,12 +289,12 @@ export function persistSlateEntry(councilDirAbs: string, slate: string): string 
 
 // ─── Orchestration: diverge → challenge rounds → chair (+ one corrective fix) ───
 
-const CHILD_TIMEOUT_MS = 420_000; // per-child hard cap (analysts)
+const CHILD_TIMEOUT_MS = 600_000; // per-child hard cap (analysts) — flash models rabbit-hole in the project and were observed still mid-exploration at 420s (lobprobe)
 const CHAIR_TIMEOUT_MS = 540_000;
 // A child that burned the full cap rarely needs another full cap — shrinking
 // retry caps keep one pathological analyst from starving the later phases
 // (observed: glm-flash diverge timed out 3×420s = 21 of 30 council minutes).
-const DIVERGE_RETRY_CAPS_MS = [CHILD_TIMEOUT_MS, 300_000, 180_000];
+const DIVERGE_RETRY_CAPS_MS = [CHILD_TIMEOUT_MS, 360_000, 180_000];
 const CHALLENGE_CAP_MS = 240_000; // verdicts only — observed 10–30s per child
 // Time kept aside for the chair + its potential corrective re-run: diverge
 // retries and extra challenge rounds are stopped while this much remains.

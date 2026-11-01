@@ -56,7 +56,7 @@ export function defaultCouncilConfig(): CouncilConfig {
     stagnationRuns: 10,
     cooldownRuns: 5,
     maxCouncils: Infinity,
-  timeoutMinutes: 30,
+    timeoutMinutes: 45, // default council budget — sized for the larger child caps (worst case: 19min diverge + challenge rounds + 10min chair reserve)
     mode: "auto",
   };
 }
