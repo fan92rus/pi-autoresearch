@@ -408,14 +408,23 @@ export interface SlateValidation {
   experimentCount: number;
 }
 
-const EXP_SECTION_RE = /^#{2,4}\s*EXP\s*[-:]?\s*\d*/gim;
-const EXPECTED_GAIN_RE = /EXPECTED[_ ]GAIN\s*[:=]\s*([-+]?\d+(?:\.\d+)?)/i;
-const KILL_RE = /KILL[_ ]?(?:WHEN|CRITERION)\s*[:=]/i;
+const EXP_SECTION_RE = /^#{2,4}\s*(?:EXP|ЭКСП(?:ЕРИМЕНТ)?)\s*[№:\-]?\s*\d*/gim;
+// Field-label regexes tolerate what real chair models actually emit (lobprobe
+// council #5, 2026-11-01): markdown bold around the label, a parenthetical unit
+// or a Cyrillic label with the Latin token in parens (`УСЛОВИЕ_ОТМЕНЫ
+// (KILL_WHEN):`), fully-Cyrillic aliases, and a comparison symbol before the
+// number (`EXPECTED_GAIN: ≥ 2x noise`). Markdown bold is stripped before
+// matching (see validateSlate).
+const EXPECTED_GAIN_RE =
+  /(?:EXPECTED[_ ]?GAIN|ОЖИДАЕМ(?:ЫЙ|АЯ)[_ ]?(?:ПРИРОСТ|ЭФФЕКТ|ВЫИГРЫШ))[^:=\n]*[:=]\s*[≥≤><~≈]?\s*([-+]?\d+(?:[.,]\d+)?)/i;
+const KILL_RE = /(?:KILL[_ ]?(?:WHEN|CRITERION)|УСЛОВИЕ[_ ]?ОТМЕНЫ|КРИТЕРИЙ[_ ]?ОСТАНОВК[ИИ]|СТОП[_ ]?УСЛОВИЕ)[^:=\n]*[:=]/i;
 
 /** Validate a chair-produced slate: 3–5 EXP sections, each with EXPECTED_GAIN and KILL_WHEN. */
 export function validateSlate(slateText: string, noiseFloor: number | null, minExperiments = 3, maxExperiments = 5): SlateValidation {
   const errors: string[] = [];
-  const text = slateText ?? "";
+  // Bold markers around labels (`**EXPECTED_GAIN:** 5`) break label matching —
+  // strip them; they carry no structural meaning.
+  const text = (slateText ?? "").replace(/\*\*/g, "");
   const sections = [...text.matchAll(EXP_SECTION_RE)].map((m) => m.index ?? 0);
   if (sections.length < minExperiments || sections.length > maxExperiments) {
     errors.push(`Expected ${minExperiments}–${maxExperiments} experiments, found ${sections.length}.`);
@@ -424,7 +433,7 @@ export function validateSlate(slateText: string, noiseFloor: number | null, minE
     const start = sections[i];
     const end = i + 1 < sections.length ? sections[i + 1] : text.length;
     const body = text.slice(start, end);
-    const label = (body.match(/^#{2,4}\s*EXP[^\n]*/im)?.[0] ?? `EXP#${i + 1}`).slice(0, 60);
+    const label = (body.match(/^#{2,4}\s*(?:EXP|ЭКСП)[^\n]*/im)?.[0] ?? `EXP#${i + 1}`).slice(0, 60);
     const gainMatch = EXPECTED_GAIN_RE.exec(body);
     if (!gainMatch) {
       errors.push(`${label}: missing EXPECTED_GAIN line.`);

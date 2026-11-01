@@ -1100,6 +1100,40 @@ await test("slate validator: count, gain threshold, kill criterion", () => {
   assert.strictEqual(validateSlate(good, null).ok, true, "no noise floor — presence checks only");
 });
 
+await test("slate validator: tolerates bold, parenthetical units and Cyrillic label aliases (lobprobe council #5)", () => {
+  const { validateSlate } = councilMod;
+  // The exact shapes observed in a real failed council: fully-Cyrillic labels,
+  // Cyrillic label with the Latin token in parens, bold Latin labels,
+  // comparison symbol before the number.
+  const ru = [
+    "## EXP1: диагностика",
+    "- ОЖИДАЕМЫЙ_ПРИРОСТ: 0 pp f1 (диагностический)",
+    "- УСЛОВИЕ_ОТМЕНЫ: адаптер не сохранён",
+    "## EXP2: замер шума",
+    "- ОЖИДАЕМЫЙ_ПРИРОСТ: ≥ 0.8",
+    "- УСЛОВИЕ_ОТМЕНЫ (KILL_WHEN): σ ≥ 1.9pp — нет порога",
+    "## EXP3: честный рейтинг",
+    "- **EXPECTED_GAIN:** +1.0 pp f1",
+    "- **KILL_WHEN:** f1 < 0.52",
+  ].join("\n");
+  const v = validateSlate(ru, null);
+  assert.strictEqual(v.ok, true, `tolerance failed: ${v.errors.join("; ")}`);
+
+  // Parenthetical unit on a Latin label, threshold still enforced.
+  const units = [
+    "## EXP1: a", "- EXPECTED_GAIN (f1): +0.012", "- KILL_WHEN: x",
+    "## EXP2: b", "- EXPECTED_GAIN (f1): 0.9", "- KILL_WHEN: y",
+    "## EXP3: c", "- EXPECTED_GAIN (f1): 0.9", "- KILL_WHEN: z",
+  ].join("\n");
+  assert.strictEqual(validateSlate(units, 0.005).ok, true, "parenthetical unit accepted");
+  const below = units.replace("EXPECTED_GAIN (f1): +0.012", "EXPECTED_GAIN (f1): 0.004");
+  assert.strictEqual(validateSlate(below, 0.005).ok, false, "threshold still enforced on tolerant forms");
+
+  // Prose instead of a number is still rejected.
+  const prose = ru.replace("- **EXPECTED_GAIN:** +1.0 pp f1", "- **EXPECTED_GAIN:** см. таблицу после замера шума");
+  assert.strictEqual(validateSlate(prose, null).ok, false, "prose gain is not a gain");
+});
+
 await test("roster resolver: models vs personas mode with letter assignment", () => {
   const { resolveRoster, defaultCouncilConfig } = councilMod;
   const cfg = defaultCouncilConfig();
@@ -2033,7 +2067,7 @@ await test("council-delegation: dead analyst gets 3 attempts, is reported UNAVAI
     if (req.nodeId.startsWith("diverge") && self === "AnalystB") return { text: "no hypotheses here" };
     return stdEngine(req);
   });
-  const out = await delegationMod.runCouncilDelegated(pi, baseArgs());
+  const out = await delegationMod.runCouncilDelegated(pi, baseArgs({ deadlineAt: Date.now() + 30 * 60000 }));
   assert.strictEqual(out.ok, true, "council proceeds with 2 analysts");
   assert.deepStrictEqual(out.unavailable, ["AnalystB"], "dead analyst reported UNAVAILABLE");
   const bAttempts = requests.filter((r) => r.nodeId.startsWith("diverge") && selfNameOf(r.task) === "AnalystB");
@@ -2060,6 +2094,61 @@ await test("council-delegation: delegationAvailable gate", async () => {
   assert.strictEqual(delegationMod.delegationAvailable({ events: { on() {}, emit() {} } }), true);
   assert.strictEqual(delegationMod.delegationAvailable({}), false);
   assert.strictEqual(delegationMod.delegationAvailable(null), false);
+});
+
+await test("council-delegation: diverge retry caps shrink across attempts (one slow analyst can't eat the budget)", async () => {
+  const requests = [];
+  const pi = miniPi((req) => {
+    requests.push(req);
+    const self = selfNameOf(req.task);
+    if (req.nodeId.startsWith("diverge") && self === "AnalystB") return { status: "timed_out", error: "no terminal response within timeoutMs" };
+    return stdEngine(req);
+  });
+  const out = await delegationMod.runCouncilDelegated(pi, baseArgs({ deadlineAt: Date.now() + 30 * 60000 }));
+  assert.strictEqual(out.ok, true, "council completes with 2 analysts");
+  assert.deepStrictEqual(out.unavailable, ["AnalystB"]);
+  const bCaps = requests.filter((r) => r.nodeId.startsWith("diverge") && selfNameOf(r.task) === "AnalystB").map((r) => r.timeoutMs);
+  assert.strictEqual(bCaps.length, 3, "three attempts preserved");
+  assert.ok(bCaps[0] > bCaps[1] && bCaps[1] > bCaps[2], `caps shrink across attempts: ${bCaps.join(", ")}`);
+});
+
+await test("council-delegation: chair reserve stops diverge retries on a small budget — chair still runs", async () => {
+  const requests = [];
+  const pi = miniPi((req) => {
+    requests.push(req);
+    const self = selfNameOf(req.task);
+    if (req.nodeId.startsWith("diverge") && self === "AnalystB") return { status: "timed_out" };
+    return stdEngine(req);
+  });
+  // 90s budget: reserve (40%) + 60s floor exceeds what's left → no full-cap retry.
+  const out = await delegationMod.runCouncilDelegated(pi, baseArgs({ deadlineAt: Date.now() + 90_000 }));
+  assert.strictEqual(out.ok, true, "council completes with 2 analysts");
+  const bAttempts = requests.filter((r) => r.nodeId.startsWith("diverge") && selfNameOf(r.task) === "AnalystB");
+  assert.strictEqual(bAttempts.length, 1, `no retry that would starve the chair: got ${bAttempts.length}`);
+  assert.ok(requests.some((r) => r.nodeId.startsWith("chair")), "chair ran");
+});
+
+await test("council-delegation: no corrective chair re-run when the budget cannot sustain it — errors reported honestly", async () => {
+  const requests = [];
+  const invalid = GOOD_SLATE.replace(/KILL_WHEN:[^\n]+/g, "");
+  const pi = miniPi((req) => {
+    requests.push(req);
+    if (req.nodeId.startsWith("chair")) return { text: invalid };
+    const self = selfNameOf(req.task);
+    if (req.nodeId.startsWith("diverge")) return { text: hypFor(self) };
+    if (req.nodeId.startsWith("challenge")) return { text: verdictsFrom(self) };
+    return { status: "failed" };
+  });
+  const out = await delegationMod.runCouncilDelegated(pi, baseArgs({
+    deadlineAt: Date.now() + 30_000,
+    validate: (s) => (String(s).includes("KILL_WHEN")
+      ? { ok: true, errors: [] }
+      : { ok: false, errors: ["missing KILL_WHEN"] }),
+  }));
+  assert.strictEqual(out.ok, false);
+  assert.strictEqual(out.reason, "no-slate");
+  assert.strictEqual(requests.filter((r) => r.nodeId.startsWith("chair")).length, 1, "no doomed fix child launched");
+  assert.ok(out.detail.includes("too small"), `honest detail: ${out.detail.slice(0, 200)}`);
 });
 
 

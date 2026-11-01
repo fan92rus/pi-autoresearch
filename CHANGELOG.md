@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed — council_convene reliability (lobprobe council #5, 2026-11-01)
+
+- **Slate validator tolerates real chair output shapes**: markdown bold around labels (`**EXPECTED_GAIN:**`), parenthetical units (`EXPECTED_GAIN (f1): +0.012`), comparison symbols before the number (`EXPECTED_GAIN: ≥ 0.8`), the Latin token inside a Cyrillic label (`УСЛОВИЕ_ОТМЕНЫ (KILL_WHEN):`), and the fully-Cyrillic aliases the chair actually emitted (`ОЖИДАЕМЫЙ_ПРИРОСТ`, `УСЛОВИЕ_ОТМЕНЫ`). Previously the chair's Russian slate failed mechanical validation twice and the council returned "no slate".
+- **Chair prompt forbids localizing mechanical tokens**: the five field labels (`## EXP<N>:`, `CHANGE:`, `EXPECTED_GAIN:`, `KILL_WHEN:`, `PRIORITY:`) must stay byte-exact Latin; prose may use any language; `EXPECTED_GAIN` must be followed directly by a number.
+- **Council time budget no longer starves the chair**: diverge retries use shrinking caps (420→300→180s), challenge children cap at 240s, and a chair reserve (min 10min/40% of budget) stops diverge retries and extra challenge rounds before they eat the budget. Previously one glm-flash analyst burned 3×420s = 21 of 30 minutes, and the corrective chair re-run was killed by the council deadline after 141s.
+- **Honest skip of a doomed fix pass**: when less than 45s remains, the corrective chair re-run is skipped and the validation errors are reported instead of launching a child that cannot finish.
+
 ### Added — Observer Intelligence & Persistence
 
 - **Pattern classification in stagnation**: replaces generic "change direction" with domain-agnostic result-pattern detection (convergence, repetition, no-info, divergence) based on ASI findings and metric variance.

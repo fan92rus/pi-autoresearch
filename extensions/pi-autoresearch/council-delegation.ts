@@ -264,6 +264,13 @@ function chairTask(briefText: string, note: string | undefined, allProposals: st
     "KILL_WHEN: <observation that makes you abandon it>",
     "PRIORITY: <number> (diagnostics first — a measurement that gates the rest is run first)",
     "",
+    "CRITICAL — the five field labels are MECHANICAL TOKENS parsed by a validator, not prose:",
+    "  `## EXP<N>:`, `CHANGE:`, `EXPECTED_GAIN:`, `KILL_WHEN:`, `PRIORITY:`.",
+    "  Keep them byte-exact: Latin script, uppercase, underscore where shown, colon immediately after the label.",
+    "  NEVER translate, localize, transliterate or bold them (no `ОЖИДАЕМЫЙ_ПРИРОСТ`, no `**EXPECTED_GAIN:**`, no `УСЛОВИЕ_ОТМЕНЫ`).",
+    "  For EXPECTED_GAIN the colon must be followed directly by a plain number (e.g. `EXPECTED_GAIN: 0.012`) — no ≥/≤/~ symbol before it; put qualifiers and units AFTER the number.",
+    "  Write all other prose in any language.",
+    "",
     "Rules: preserve exact computation and output (no benchmark gaming); instrumentation never goes into the benchmarked source; every experiment needs a kill condition.",
     "Reply with ONLY the full slate markdown — no preamble, no file writes.",
   );
@@ -284,6 +291,18 @@ export function persistSlateEntry(councilDirAbs: string, slate: string): string 
 
 const CHILD_TIMEOUT_MS = 420_000; // per-child hard cap (analysts)
 const CHAIR_TIMEOUT_MS = 540_000;
+// A child that burned the full cap rarely needs another full cap — shrinking
+// retry caps keep one pathological analyst from starving the later phases
+// (observed: glm-flash diverge timed out 3×420s = 21 of 30 council minutes).
+const DIVERGE_RETRY_CAPS_MS = [CHILD_TIMEOUT_MS, 300_000, 180_000];
+const CHALLENGE_CAP_MS = 240_000; // verdicts only — observed 10–30s per child
+// Time kept aside for the chair + its potential corrective re-run: diverge
+// retries and extra challenge rounds are stopped while this much remains.
+const CHAIR_RESERVE_MAX_MS = 10 * 60_000;
+const CHAIR_RESERVE_FRAC = 0.4;
+// Below this the corrective chair re-run has no chance — skip it and report
+// the validation errors honestly instead of launching a doomed child.
+const MIN_FIX_SLICE_MS = 45_000;
 
 export async function runCouncilDelegated(pi: DelegationPi, args: CouncilDelegationArgs): Promise<CouncilOutcome> {
   const log = args.onLog ?? (() => {});
@@ -295,6 +314,11 @@ export async function runCouncilDelegated(pi: DelegationPi, args: CouncilDelegat
 
   const remainingMs = () => args.deadlineAt - Date.now();
   const childTimeout = (cap: number) => Math.max(30_000, Math.min(cap, remainingMs()));
+  // Wall-clock budget of the whole council, and the slice protected for the
+  // chair phase (chair + one corrective re-run). Never reserve more than
+  // CHAIR_RESERVE_FRAC of the budget so tiny budgets still run analysts.
+  const budgetMs = Math.max(60_000, args.deadlineAt - Date.now());
+  const chairReserve = Math.min(CHAIR_RESERVE_MAX_MS, Math.floor(budgetMs * CHAIR_RESERVE_FRAC));
 
   try {
     const unavailable: string[] = [];
@@ -305,7 +329,7 @@ export async function runCouncilDelegated(pi: DelegationPi, args: CouncilDelegat
 
     // ── Phase 1 — Diverge (parallel, chat outputs only) ──
     log("phase 1: diverge (" + live.length + " analysts)");
-    const runDivergeBatch = async (batch: DelegationParticipant[], attempt: number) => {
+    const runDivergeBatch = async (batch: DelegationParticipant[], capMs: number) => {
       const ids = nextIds("diverge", batch.length);
       const results = await Promise.all(batch.map((p, i) =>
         client.run({
@@ -316,19 +340,27 @@ export async function runCouncilDelegated(pi: DelegationPi, args: CouncilDelegat
           task: divergeTask(p, args.briefText, args.note),
           model: p.model,
           cwd: args.cwd,
-          timeoutMs: childTimeout(CHILD_TIMEOUT_MS),
+          timeoutMs: childTimeout(capMs),
         }).then((r) => ({ p, text: resultText(r), status: r.status, error: r.error })),
       ));
-      void attempt;
       return results;
     };
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       const absent = live.filter((p) => parseHyps(proposalTexts.get(p.name) || "").length === 0);
       if (absent.length === 0) break;
-      if (attempt > 1) log("diverge retry " + (attempt - 1) + " for: " + absent.map((p) => p.name).join(", "));
+      const cap = DIVERGE_RETRY_CAPS_MS[Math.min(attempt, DIVERGE_RETRY_CAPS_MS.length) - 1];
+      if (attempt > 1) {
+        // The retry may start only if it can run in full while keeping the
+        // chair reserve intact — a partial retry is worse than none.
+        if (remainingMs() - cap - 60_000 < chairReserve) {
+          log("diverge retries stopped — chair time reserve (" + absent.map((p) => p.name).join(", ") + " stay unresolved)");
+          break;
+        }
+        log("diverge retry " + (attempt - 1) + " for: " + absent.map((p) => p.name).join(", "));
+      }
       if (remainingMs() <= 0) break;
-      for (const r of await runDivergeBatch(absent, attempt)) {
+      for (const r of await runDivergeBatch(absent, cap)) {
         if (r.text) proposalTexts.set(r.p.name, r.text);
         if (!r.text) lastStatus.set(r.p.name, r.status + (r.error ? ": " + r.error.slice(0, 120) : ""));
       }
@@ -393,6 +425,10 @@ export async function runCouncilDelegated(pi: DelegationPi, args: CouncilDelegat
         return { ok: false, reason: "deadline", detail: "council deadline hit before challenge rounds finished", unavailable, rounds: roundsUsed, consensus: consensusReport() };
       }
       const othersText = live.map((p) => "### Proposals by " + p.name + ":\n" + (proposalTexts.get(p.name) || "(none)")).join("\n\n");
+      if (round > 1 && remainingMs() - CHALLENGE_CAP_MS - 60_000 < chairReserve) {
+        log("challenge rounds stopped early — chair time reserve; the chair decides best-effort");
+        break;
+      }
       const ids = nextIds("challenge-r" + round, live.length);
       const results = await Promise.all(live.map((p, i) =>
         client.run({
@@ -403,7 +439,7 @@ export async function runCouncilDelegated(pi: DelegationPi, args: CouncilDelegat
           task: challengeTask(p, round, contested, othersText),
           model: p.model,
           cwd: args.cwd,
-          timeoutMs: childTimeout(CHILD_TIMEOUT_MS),
+          timeoutMs: childTimeout(CHALLENGE_CAP_MS),
         }).then((r) => ({ name: p.name, text: resultText(r) })),
       ));
       for (const r of results) {
@@ -428,6 +464,9 @@ export async function runCouncilDelegated(pi: DelegationPi, args: CouncilDelegat
 
     const runChair = async (chairFix?: string): Promise<string> => {
       const [id] = nextIds(chairFix ? "chair-fix" : "chair", 1);
+      // First pass keeps a slice for the potential corrective re-run; the fix
+      // pass may use whatever remains.
+      const fixReserve = chairFix ? 0 : Math.min(300_000, Math.floor(remainingMs() / 3));
       const r = await client.run({
         requestId: id.requestId,
         ownerRunId,
@@ -436,7 +475,7 @@ export async function runCouncilDelegated(pi: DelegationPi, args: CouncilDelegat
         task: chairTask(args.briefText, args.note, allProposals, allVerdicts, chairFix),
         model: args.chairModel,
         cwd: args.cwd,
-        timeoutMs: childTimeout(CHAIR_TIMEOUT_MS),
+        timeoutMs: childTimeout(Math.max(60_000, Math.min(CHAIR_TIMEOUT_MS, remainingMs() - fixReserve))),
       });
       return resultText(r).trim();
     };
@@ -449,8 +488,15 @@ export async function runCouncilDelegated(pi: DelegationPi, args: CouncilDelegat
     let validation = args.validate(slate);
     if (!validation.ok) {
       log("slate failed validation — one corrective chair re-run: " + (validation.errors ?? []).join(" "));
-      if (remainingMs() <= 0) {
-        return { ok: false, reason: "deadline", detail: "council deadline hit before the corrective chair re-run", unavailable, rounds: roundsUsed, consensus };
+      if (remainingMs() < MIN_FIX_SLICE_MS) {
+        return {
+          ok: false,
+          reason: "no-slate",
+          detail: "the slate failed validation and the council budget is too small for a corrective re-run (< " + Math.round(MIN_FIX_SLICE_MS / 1000) + "s left): " + (validation.errors ?? []).join(" "),
+          unavailable,
+          rounds: roundsUsed,
+          consensus,
+        };
       }
       const fixed = await runChair((validation.errors ?? []).join(" "));
       if (fixed && /##\s*EXP/i.test(fixed)) {
