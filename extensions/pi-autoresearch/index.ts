@@ -2472,6 +2472,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\n- " + experimentLimitClause(ctx.cwd) + "\n- " + BENCHMARK_GUARDRAIL +
       "\n- Follow-on user message mid-experiment? Finish the current run_experiment + log_experiment cycle first, address it next iteration." +
       "\n- EVERYTHING within the active goal is PRE-APPROVED — experiments (expensive included), code edits, script fixes, retries after failures: do NOT ask the owner before acting — decide yourself, record assumptions in the hypothesis/ASI, and keep the loop running. Ask the owner ONLY when stepping outside the goal's frame: new external data, foreign resources, goal/metric change, irreversible damage." +
+      "\n\n## Result Findings (route by theme)" +
+      "\nAfter reading raw results (inspect_results), record each finding with record_finding({theme, description, evidence_ref}). evidence_ref must cite a concrete case (path:lines or path#anchor); generalizations without examples are rejected." +
+      "\n- behavior (the model/code does the wrong thing) \u2192 an ordinary hypothesis: propose_hypothesis whose description cites the finding id, then the normal cycle." +
+      "\n- capability (the system cannot do it yet: needs new data, resources or abilities) \u2192 NOT a hypothesis and NOT a run: write it to " + ideasPath + " marked owner-input. It is an owner gate: wait for the owner's go-ahead on resume." +
+      "\n- tradeoff (gaining on one side costs another) \u2192 ask the owner which side to prefer (a goal decision); until answered, track the cost as a secondary metric in log_experiment metrics." +
+      "\n- measurement (the scorer, gold or metric itself is wrong) \u2192 log_measurement_change with mandatory accounting: diff, reproducible rescore artifact with both scores, justification = finding id. The change stays provisional until independently verified. Stage note: this tool arrives in stage S3; until it is among your tools, keep the finding open and do NOT edit the scorer or gold silently." +
       "\n\n## Hypothesis-First Workflow (EVERY iteration)" +
       "\n1. PROFILE FIRST \u2014 node --prof / console.time / --trace-deopt: find where time is actually spent. Do NOT guess. Record findings in the hypothesis." +
       "\n2. propose_hypothesis(description) \u2192 node_id (SimHash + do_not_retry check). hypothesis_id is REQUIRED for all non-baseline runs." +
@@ -2490,7 +2496,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\nYou can convene a council YOURSELF at any time, with no limits, when you feel stuck: the same council_convene tool — one call, it blocks, you execute the returned slate." +
       "\nNEVER hand-roll a council: do not launch analyst subagents yourself, do not run a manual chair, do not track consensus by hand. The only manual path is when council_convene itself returns a manual-protocol message (delegation seam unavailable) — then follow exactly what that message says." +
       "\n\n## Observer Steers" +
-      "\n\U0001f504 STAGNATION \u2014 STOP and REFLECT on the pattern. \U0001f3af MILESTONE \u2014 consider strategic alternatives and orthogonal directions.";
+      "\n\u{1f504} STAGNATION \u2014 STOP and REFLECT on the pattern. \u{1f3af} MILESTONE \u2014 consider strategic alternatives and orthogonal directions.";
 
     if (hasChecks) {
       extra +=
@@ -2501,7 +2507,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
 
     if (hasIdeas) {
-      extra += "\n\n\U0001f4a1 Ideas backlog exists at " + ideasPath + " \u2014 check it for promising experiment paths. Prune stale entries.";
+      extra += "\n\n\u{1f4a1} Ideas backlog exists at " + ideasPath + " \u2014 check it for promising experiment paths. Prune stale entries.";
     }
 
     return {
