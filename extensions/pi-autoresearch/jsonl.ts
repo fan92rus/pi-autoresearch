@@ -216,9 +216,24 @@ export function reconstructJsonlState(jsonlContent: string): ReconstructedJsonlS
       continue;
     }
 
-    // measurement_change records advance the epoch but are not runs.
+    // measurement_change records advance the epoch but are not runs. The
+    // measurement_change_reverted and measurement_change_verified records
+    // (task 2.8) only REFERENCE an already-counted epoch — under the
+    // max-semantics below they must never raise the counter (bd
+    // pi-autoresearch-1wp.3.2; the verified case: a hand-written/forged
+    // verified record with an inflated epoch would lift currentEpoch and let
+    // the next change skip ids), so such records are not observed: the
+    // monotonic counter stays held by the change/run records.
     if (!isAutoresearchRunEntry(entry)) {
-      if (typeof entry.type === "string" && entry.type.startsWith("measurement_change")) observeEpoch(state, entry);
+      const entryType = entry.type;
+      if (
+        typeof entryType === "string" &&
+        entryType.startsWith("measurement_change") &&
+        entryType !== "measurement_change_reverted" &&
+        entryType !== "measurement_change_verified"
+      ) {
+        observeEpoch(state, entry);
+      }
       continue;
     }
 

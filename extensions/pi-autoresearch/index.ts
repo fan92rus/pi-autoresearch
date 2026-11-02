@@ -52,7 +52,6 @@ import {
   nextCouncilDir,
   personaPrompt,
   readCouncilConfig,
-  readNoiseFloor,
   resolveRoster,
   validateSlate,
   writeCouncilState,
@@ -86,11 +85,19 @@ import {
 import { inspectResults } from "./lens-inspect.ts";
 import {
   confidenceSuppressionReason,
+  formatFloorStale,
   formatMeasurementScale,
   logMeasurementChange,
   measurementChangeId,
+  measurementScaleStatus,
   measurementScaleStatusOfDir,
+  measurementVerificationState,
+  measurementVerificationStateOfDir,
+  noiseFloorStatusOfDir,
+  revertMeasurementChange,
+  verifyMeasurementChange,
   type MeasurementScaleStatus,
+  type NoiseFloorStatus,
 } from "./measurement.ts";
 import { tmpdir } from "node:os";
 
@@ -785,7 +792,7 @@ function treeNodeEpochs(tree: ExperimentTree, ledgerText: string): Map<string, n
 
 /** Tree view of the current epoch (task 2.3) with the earlier epoch's best as a cross-epoch reference. */
 export interface EpochTreeView {
-  /** Current epoch: the ledger's scale epoch or the highest node epoch, whichever is higher. */
+  /** Current epoch: the ledger's ACTIVE scale epoch (task 2.8 — the last confirmed epoch, restored after a revert). */
   epoch: number;
   /**
    * Tree restricted to the current epoch: nodes of other epochs are removed and
@@ -799,8 +806,12 @@ export interface EpochTreeView {
 
 export function epochTreeView(tree: ExperimentTree, ledgerText: string): EpochTreeView {
   const epochs = treeNodeEpochs(tree, ledgerText);
-  let epoch = reconstructJsonlState(ledgerText).currentEpoch;
-  for (const nodeEpoch of epochs.values()) epoch = Math.max(epoch, nodeEpoch);
+  // Task 2.8 (revert): the current epoch is the ACTIVE scale epoch from the
+  // measurement fold — the last confirmed epoch, restored after a refuted
+  // change. The old max(reconstruct.currentEpoch, node epochs) resurrected the
+  // rejected scale: its nodes (incomparable runs) would re-scope the view onto
+  // the epoch that was just reverted instead of staying outside of it.
+  const epoch = measurementVerificationState(ledgerText).active_epoch;
 
   const ids = Object.keys(tree.nodes);
   const inScope = (id: string): boolean => id === tree.rootId || (epochs.get(id) ?? 1) === epoch;
@@ -861,6 +872,10 @@ interface AutoresearchConfig {
   workingDir?: string;
   /** Per-project cap for a single experiment's timeout_seconds, in minutes. Unset = no cap. */
   experiment_max_minutes?: number;
+  /** Calibrated noise floor as a fraction (0.04 = ±4%); written by the loop's calibration (task: floor). */
+  noiseFloor?: number;
+  /** Scale epoch the floor was calibrated on (task 2.5, single floor source in measurement.ts). */
+  noiseFloorEpoch?: number;
 }
 
 /** Read the config file (.auto/config.json, legacy autoresearch.config.json) from the given directory (always ctx.cwd) */
@@ -1306,7 +1321,11 @@ async function recordTreeNode(
           // simply is not persisted there.
           if (readCampaignConfig(workDir).status !== "unparseable") {
             const cfg = readConfig(workDir);
-            writeConfig(workDir, { ...cfg, noiseFloor: nf });
+            // Task 2.5: the floor is calibrated ON a scale — stamp the current
+            // epoch (single epoch source: noiseFloorStatusOfDir → jsonl.ts
+            // reconstruct) next to the value, so a later measurement_change
+            // marks the floor stale and a re-calibration lifts the mark.
+            writeConfig(workDir, { ...cfg, noiseFloor: nf, noiseFloorEpoch: noiseFloorStatusOfDir(workDir).epoch });
           } else {
             console.warn("[autoresearch] noise floor not persisted: config.json is unparseable and must not be rewritten");
           }
@@ -1604,7 +1623,8 @@ export function renderDashboardLines(
   th: Theme,
   maxRows: number = 6,
   headerHints: string[] = [],
-  scale: MeasurementScaleStatus | null = null
+  scale: MeasurementScaleStatus | null = null,
+  floor: NoiseFloorStatus | null = null
 ): string[] {
   const lines: string[] = [];
 
@@ -1624,9 +1644,19 @@ export function renderDashboardLines(
   // An epoch with no runs yet has no baseline of its own (shown as —). The
   // Runs-line confidence stays as computed for the last epoch with runs (2.4
   // contract: shown unless rescore_pending) until the epoch's first run lands.
+  // Task 2.8 (revert): with the scale fold available, the current epoch IS the
+  // ACTIVE scale epoch — after a refuted change it is restored BELOW the runs'
+  // max epoch, and the old max(runsEpoch, scale.epoch) would resurrect the
+  // rejected scale (its runs stamped as current, the restored epoch dimmed).
+  // The epoch COUNTER for new change ids keeps max semantics inside
+  // measurement.ts/jsonl.ts — this line is about which scale is in force.
   const runsEpoch = segmentEpoch(st.results, st.currentSegment);
-  const epoch = Math.max(runsEpoch, scale?.epoch ?? runsEpoch);
-  const epochOpenWithoutRuns = epoch > runsEpoch;
+  const epoch = scale !== null ? scale.epoch : runsEpoch;
+  // «Epoch open without runs» generalizes (task 2.8): NO run of THIS epoch in
+  // the current segment — the restored epoch can sit below the runs' max epoch
+  // while its own runs are absent from the segment (old `epoch > runsEpoch`
+  // only covered the epoch-above case and was wrong after a revert).
+  const epochOpenWithoutRuns = epochResults(st.results, st.currentSegment, epoch).length === 0;
 
   const baseline = epochOpenWithoutRuns ? null : st.bestMetric;
   const baselineRunNumber = findBaselineRunNumber(st.results, st.currentSegment, epoch);
@@ -1649,10 +1679,15 @@ export function renderDashboardLines(
   }
 
   // Runs summary. Confidence is SUPPRESSED while a measurer rescore is pending
-  // (task 2.4): the number would mix the old and new scales, so an honest
-  // marker replaces it (keep is never blocked — the scale line below explains).
-  const confSuffix = scale !== null && scale.rescore_pending
-    ? `  ${th.fg("warning", "(conf: suppressed — rescore_pending)")}`
+  // (task 2.4) or the noise floor is stale (task 2.5): the number would mix the
+  // scales / rest on an outdated floor, so an honest marker replaces it (keep
+  // is never blocked — the scale/floor marks in log_experiment explain).
+  const confSuppressedReason =
+    scale !== null && scale.rescore_pending ? "rescore_pending"
+    : floor !== null && floor.stale ? "floor_stale"
+    : null;
+  const confSuffix = confSuppressedReason !== null
+    ? `  ${th.fg("warning", `(conf: suppressed — ${confSuppressedReason})`)}`
     : st.confidence !== null
     ? (() => {
         const confStr = st.confidence!.toFixed(1);
@@ -2368,7 +2403,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     let loadedFromJsonl = false;
     try {
       if (hasPersistedLog) {
-        const reconstructed = reconstructJsonlState(fs.readFileSync(jsonlPath, "utf-8"));
+        const ledgerText = fs.readFileSync(jsonlPath, "utf-8");
+        const reconstructed = reconstructJsonlState(ledgerText);
         state.name = reconstructed.name;
         state.metricName = reconstructed.metricName;
         state.metricUnit = reconstructed.metricUnit;
@@ -2382,8 +2418,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
         if (state.results.length > 0) {
           loadedFromJsonl = true;
-          state.bestMetric = findBaselineMetric(state.results, state.currentSegment);
-          state.confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection);
+          // Active scale epoch (task 2.8): after a revert the restored epoch sits
+          // BELOW the runs' max epoch — the default segmentEpoch() would compute
+          // the restored state's baseline/confidence over the REJECTED epoch's runs.
+          const activeEpoch = measurementScaleStatus(ledgerText).epoch;
+          state.bestMetric = findBaselineMetric(state.results, state.currentSegment, activeEpoch);
+          state.confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection, activeEpoch);
         }
       }
     } catch {
@@ -2537,7 +2577,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               theme,
               rows,
               dashboardHintVariants(),
-              measurementScaleStatusOfDir(resolveWorkDir(ctx.cwd))
+              measurementScaleStatusOfDir(resolveWorkDir(ctx.cwd)),
+              noiseFloorStatusOfDir(resolveWorkDir(ctx.cwd))
             ),
           ];
         },
@@ -3448,6 +3489,130 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   });
 
   // -----------------------------------------------------------------------
+  // verify_measurement_change / revert_measurement_change tools (openspec
+  // add-result-reflection, task 2.8): the independent check's verdicts, next
+  // to log_measurement_change behind the same gates. Without this surface the
+  // needs_verification / provisional marks could never lift in a live campaign
+  // (review blocker B2).
+  // -----------------------------------------------------------------------
+
+  const VerifyMeasurementChangeParams = Type.Object({
+    change_ref: Type.Optional(Type.String({
+      description: 'The change being verified ("e2" or bare "2").',
+    })),
+    proof_ref: Type.Optional(Type.String({
+      description:
+        'Path to the proof artifact inside .auto/measurement/ (JSON: {"anchor", "commands", "outputs", "old_scale_score", "new_scale_score"}): the re-run of the SAME commands/inputs with their outputs and the reproduced scores. Scores are machine-checked against the ledger — a mismatch is a refutation, not a confirmation.',
+    })),
+  });
+
+  registerGatedTool({
+    name: "verify_measurement_change",
+    label: "Verify Measurement Change",
+    description:
+      "Record the independent CONFIRMATION of a measurer change: re-run the rescore of the anchor set " +
+      "(same commands/inputs), save the proof artifact (commands, outputs, reproduced scores) in .auto/measurement/ " +
+      "and append the measurement_change_verified ledger record — needs_verification and the provisional mark lift. " +
+      "Anchor, commands and scores are machine-checked against the change's rescore artifact; refuted scores are rejected here — use revert_measurement_change instead.",
+    promptSnippet: "Record the independent confirmation of a measurer change (needs_verification lifted)",
+    promptGuidelines: [
+      "A measurer change stays provisional (needs_verification: true) until independently verified: re-run the rescore of the anchor set with the SAME commands, write the proof (commands, outputs, reproduced scores) to .auto/measurement/ and call verify_measurement_change {change_ref, proof_ref}.",
+      "The proof is machine-checked: same anchor, same commands, and scores equal to the change's ledger scores — otherwise the tool refuses (different scores mean the change is refuted: call revert_measurement_change, not verify).",
+    ],
+    parameters: VerifyMeasurementChangeParams,
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
+      const workDirError = validateWorkDir(ctx.cwd);
+      if (workDirError) {
+        return { content: [{ type: "text", text: `❌ ${workDirError}` }], details: {} };
+      }
+      const workDir = resolveWorkDir(ctx.cwd);
+      const res = verifyMeasurementChange(workDir, params);
+      if (!res.ok) {
+        return { content: [{ type: "text", text: `❌ verify_measurement_change rejected:\n  ${res.errors.join("\n  ")}` }], details: {} };
+      }
+      const record = res.value;
+      const scaleStatus = measurementScaleStatusOfDir(workDir);
+      const verification = measurementVerificationStateOfDir(workDir);
+      return {
+        content: [{
+          type: "text",
+          text: `✅ Measurement change ${record.change_ref} verified (epoch ${record.epoch}, needs_verification lifted; proof: ${record.proof_ref}).\n📏 ${formatMeasurementScale(scaleStatus, verification)}`,
+        }],
+        details: {
+          change_ref: record.change_ref,
+          epoch: record.epoch,
+          proof_ref: record.proof_ref,
+          verified: true,
+        },
+      };
+    },
+  });
+
+  const RevertMeasurementChangeParams = Type.Object({
+    change_ref: Type.Optional(Type.String({
+      description: 'The change being refuted ("e2" or bare "2") — must be the latest change.',
+    })),
+    rescore_ref: Type.Optional(Type.String({
+      description:
+        'Path to the counter-rescore artifact inside .auto/measurement/ (JSON with anchor, commands, old_scale_score, new_scale_score): the re-run of the SAME commands/inputs whose scores DIFFER from the change\'s.',
+    })),
+    justification: Type.Optional(Type.String({
+      description: 'The refuting finding id (e.g. "f9") or the reason in words.',
+    })),
+  });
+
+  registerGatedTool({
+    name: "revert_measurement_change",
+    label: "Revert Measurement Change",
+    description:
+      "Record the independent REFUTATION of a measurer change: re-run the rescore of the anchor set " +
+      "(same commands/inputs), save the counter-rescore artifact (scores that differ) in .auto/measurement/ and append " +
+      "the compensating measurement_change_reverted ledger record — the active scale is restored to the last confirmed epoch, " +
+      "the rejected epoch's runs become incomparable (cross-epoch) and its id is never reused.",
+    promptSnippet: "Record the independent refutation of a measurer change (scale restored, runs of the rejected epoch incomparable)",
+    promptGuidelines: [
+      "When the independent re-run of a measurer change's rescore yields DIFFERENT scores, the change is refuted: save the counter-rescore in .auto/measurement/ and call revert_measurement_change {change_ref, rescore_ref, justification} — original records are never rewritten and the epoch id is never reused.",
+      "The counter-rescore is machine-checked: same anchor, same commands, scores different from the change's ledger scores — matching scores mean the change is CONFIRMED: call verify_measurement_change, not revert.",
+    ],
+    parameters: RevertMeasurementChangeParams,
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
+      const workDirError = validateWorkDir(ctx.cwd);
+      if (workDirError) {
+        return { content: [{ type: "text", text: `❌ ${workDirError}` }], details: {} };
+      }
+      const workDir = resolveWorkDir(ctx.cwd);
+      const res = revertMeasurementChange(workDir, params);
+      if (!res.ok) {
+        return { content: [{ type: "text", text: `❌ revert_measurement_change rejected:\n  ${res.errors.join("\n  ")}` }], details: {} };
+      }
+      const record = res.value;
+      const scaleStatus = measurementScaleStatusOfDir(workDir);
+      const verification = measurementVerificationStateOfDir(workDir);
+      return {
+        content: [{
+          type: "text",
+          text: `↩️ Measurement change ${record.change_ref} reverted (epoch ${record.epoch} refuted — active scale restored to epoch ${scaleStatus.epoch}; ` +
+            `runs of epoch ${record.epoch} are incomparable).\n📏 ${formatMeasurementScale(scaleStatus, verification)}`,
+        }],
+        details: {
+          change_ref: record.change_ref,
+          epoch: record.epoch,
+          rescore_ref: record.rescore_ref,
+          active_epoch: scaleStatus.epoch,
+          rejected_epochs: verification.rejected_epochs,
+          reverted: true,
+        },
+      };
+    },
+  });
+
+  // -----------------------------------------------------------------------
   // run_experiment tool
   // -----------------------------------------------------------------------
 
@@ -4343,8 +4508,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Measurement epoch of this run (task 2.3): every run logged now carries the
       // ledger's current scale epoch, so a later measurement_change never leaves it
       // to the epoch-1 default. Read once; the dual-scale block below reuses it.
+      // The floor status (task 2.5) comes from the same single sources (ledger
+      // epoch via measurement.ts, floor + stamp from .auto/config.json) and feeds
+      // the keep-verdict mark, the confidence gate and the noise-floor warning.
       const scaleStatus = measurementScaleStatusOfDir(workDir);
       const runEpoch = scaleStatus.epoch;
+      const floorStatus = noiseFloorStatusOfDir(workDir);
 
       const experiment: ExperimentResult = {
         commit: (params.commit ?? "").slice(0, 7),
@@ -4375,11 +4544,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
-      // Baseline = first run in current segment
-      state.bestMetric = findBaselineMetric(state.results, state.currentSegment);
+      // Baseline = first run of the ACTIVE epoch in the current segment (task
+      // 2.8: the epoch is passed EXPLICITLY — the default segmentEpoch() max
+      // would pick the rejected epoch's first run after a revert).
+      state.bestMetric = findBaselineMetric(state.results, state.currentSegment, runEpoch);
 
       // Compute confidence score (best improvement as multiple of noise floor)
-      state.confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection);
+      state.confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection, runEpoch);
       experiment.confidence = state.confidence;
 
       // Build response text
@@ -4408,7 +4579,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // Show secondary metrics
       if (Object.keys(secondaryMetrics).length > 0) {
-        const baselines = findBaselineSecondary(state.results, state.currentSegment, state.secondaryMetrics);
+        const baselines = findBaselineSecondary(state.results, state.currentSegment, state.secondaryMetrics, runEpoch);
         const parts: string[] = [];
         for (const [name, value] of Object.entries(secondaryMetrics)) {
           const def = state.secondaryMetrics.find((m) => m.name === name);
@@ -4446,27 +4617,36 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (scaleStatus.change_ref !== null) {
         text += `\n📏 ${formatMeasurementScale(scaleStatus)}`;
       }
-      const confidenceSuppression = confidenceSuppressionReason(scaleStatus);
+      // Floor re-evaluation (task 2.5, spec scenario «keep без свежего floor»):
+      // a stamped floor older than the current scale epoch is stale — the keep
+      // verdict carries the EXPLICIT mark (keep is accepted, never blocked) and
+      // the confidence score below stays suppressed until the floor is
+      // re-measured on the new scale (noiseFloor + noiseFloorEpoch updated).
+      if (params.status === "keep" && floorStatus.stale) {
+        text += `\n⚠️ ${formatFloorStale(floorStatus)}`;
+      }
+      const confidenceSuppression = confidenceSuppressionReason(scaleStatus, floorStatus);
 
       // Show confidence score (T5: context-aware — different message for keep vs discard)
       if (confidenceSuppression !== null) {
         text +=
           `\n⚠️ Confidence suppressed: ${confidenceSuppression}. ` +
-          `This ${params.status} is recorded, but the improvement is not confirmed until the rescore completes ` +
-          `(finish it with log_measurement_change {change_ref: "${scaleStatus.change_ref}", rescore_ref: <full artifact>}).`;
+          `This ${params.status} is recorded — the number stays hidden until the scale state is resolved.`;
+        if (scaleStatus.rescore_pending) {
+          text += ` Finish the rescore with log_measurement_change {change_ref: "${scaleStatus.change_ref}", rescore_ref: <full artifact>}.`;
+        }
       } else if (state.confidence !== null) {
         const confStr = state.confidence.toFixed(1);
         const isKeep = params.status === "keep";
         // Find the run number where the current best was set
-        const bestRunNum = findBestRunNumber(state.results, state.currentSegment, state.bestDirection);
+        const bestRunNum = findBestRunNumber(state.results, state.currentSegment, state.bestDirection, runEpoch);
 
         // Noise floor warning for keep: check if improvement is within calibrated noise
+        // (task 2.5: the floor VALUE comes from the single floor source, noiseFloorStatusOfDir)
         if (isKeep) {
           try {
-            const workDirNf = resolveWorkDir(ctx.cwd);
-            const nfCfg = readConfig(workDirNf);
-            const nf = (nfCfg as Record<string, unknown>).noiseFloor;
-            if (typeof nf === "number" && nf > 0 && state.results.length >= 2) {
+            const nf = floorStatus.floor;
+            if (nf !== null && state.results.length >= 2) {
               const prevBest = state.results
                 .filter((r) => r.segment === state.currentSegment && resultEpoch(r) === runEpoch && r.status === "keep" && r.runNumber !== experiment.runNumber)
                 .reduce((best, r) => {
@@ -4847,7 +5027,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }, 80);
 
       const buildOverlayContent = (renderWidth: number): string[] => {
-        const content = renderDashboardLines(state, renderWidth, theme, 0, [], measurementScaleStatusOfDir(resolveWorkDir(ctx.cwd)));
+        const content = renderDashboardLines(state, renderWidth, theme, 0, [], measurementScaleStatusOfDir(resolveWorkDir(ctx.cwd)), noiseFloorStatusOfDir(resolveWorkDir(ctx.cwd)));
         if (runtime.runningExperiment) {
           const elapsed = formatElapsed(Date.now() - runtime.runningExperiment.startedAt);
           const frame = SPINNER[spinnerFrame % SPINNER.length];
@@ -5497,8 +5677,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       timestamp: Date.now(), segment: state.currentSegment, epoch: phaseEpoch, confidence: null,
     });
     runtime.experimentsThisSession++;
-    state.bestMetric = findBaselineMetric(state.results, state.currentSegment);
-    state.confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection);
+    state.bestMetric = findBaselineMetric(state.results, state.currentSegment, phaseEpoch);
+    state.confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection, phaseEpoch);
     try {
       const jsonlPath = autoresearchJsonlPath(resolveWorkDir(ctx.cwd));
       ensureParentDir(jsonlPath);
@@ -6098,7 +6278,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         seq = next.seq;
         councilDirAbs = next.dir;
         councilDirRel = path.relative(workDir, next.dir).split(path.sep).join("/");
-        const noiseFloor = readNoiseFloor(workDir);
+        const noiseFloor = noiseFloorStatusOfDir(workDir).floor;
         buildBrief(workDir, next.dir, {
           seq,
           noiseFloor,
@@ -6129,7 +6309,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // the validated slate returns). Falls back to the manual facilitator protocol
       // only when the seam is unavailable.
       if (delegationAvailable(pi)) {
-        const floor = readNoiseFloor(workDir);
+        const floor = noiseFloorStatusOfDir(workDir).floor;
         const validate = (slate: string) => validateSlate(slate, floor);
         const deadlineAt = Date.now() + cfg.timeoutMinutes * 60_000;
         const outcome = await runCouncilDelegated(pi, {
