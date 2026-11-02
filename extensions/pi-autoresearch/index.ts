@@ -39,6 +39,7 @@ import { spawn } from "node:child_process";
 import { getBashSpawnOptions, killTree } from "./bash-shell.ts";
 import { markIdeaTried } from "./observer.ts";
 import { registerCouncilTools } from "./council-tools.ts";
+import { registerAssessPrecedentsTool } from "./precedent-assess.ts";
 import { registerSearchPrecedentsTool } from "./precedent-report.ts";
 import {
   buildBrief,
@@ -81,6 +82,7 @@ import {
   updateFinding,
 } from "./findings.ts";
 import { inspectResults } from "./lens-inspect.ts";
+import { logMeasurementChange, measurementChangeId } from "./measurement.ts";
 import { tmpdir } from "node:os";
 
 import {
@@ -3122,6 +3124,88 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   });
 
   // -----------------------------------------------------------------------
+  // log_measurement_change tool (openspec add-result-reflection, task 2.1)
+  // -----------------------------------------------------------------------
+
+  const LogMeasurementChangeParams = Type.Object({
+    diff_ref: Type.Optional(Type.String({
+      description:
+        "New change: path to the diff, inside .auto/measurement/ (e.g. .auto/measurement/e2_gold_v16.diff). The diff must exist there — it is what survives a revert.",
+    })),
+    rescore_ref: Type.Optional(Type.String({
+      description:
+        'Path to the rescore artifact inside .auto/measurement/ (JSON: {"anchor", "commands", "old_scale_score", "new_scale_score"}). The scores are parsed FROM this file — they are never accepted as tool arguments.',
+    })),
+    justification: Type.Optional(Type.String({
+      description: 'New change: the finding id this fixes (e.g. "f7") or the reason in words.',
+    })),
+    rescore_pending: Type.Optional(Type.Boolean({
+      description:
+        "New change: true when the rescore has not run yet — the artifact must exist (anchor + commands) but may lack the scores; the new scale stays provisional until completed.",
+    })),
+    change_ref: Type.Optional(Type.String({
+      description:
+        'Completion of a pending change: its id ("e2" or bare "2"). Requires rescore_ref pointing at a FULL artifact (both scores); appends measurement_change_completed in the SAME epoch.',
+    })),
+  });
+
+  registerGatedTool({
+    name: "log_measurement_change",
+    label: "Log Measurement Change",
+    description:
+      "Register a change of the measurer itself (gold, scorer or metric) in the measurement ledger: a new change " +
+      "{diff_ref, rescore_ref, justification, rescore_pending?} opens the next scale epoch with the scores parsed from the rescore artifact; " +
+      "a pending change is completed later with {change_ref, rescore_ref} (same epoch, scores from the full artifact). " +
+      "The change stays needs_verification until independently verified.",
+    promptSnippet: "Register a measurer change (gold/scorer/metric) with mandatory accounting",
+    promptGuidelines: [
+      "NEVER edit the scorer, gold or metric silently in the model track: a measurer change without a log_measurement_change record is benchmark gaming — the ledger would compare numbers from different scales.",
+      'A finding with theme "measurement" is resolved through log_measurement_change: the diff and a reproducible rescore artifact go to .auto/measurement/, justification = the finding id; the change stays provisional (needs_verification: true) until independently verified.',
+      "Scores are never arguments: write old_scale_score/new_scale_score into the rescore artifact file and the tool parses them from there — ledger numbers stay as reproducible as the artifact.",
+    ],
+    parameters: LogMeasurementChangeParams,
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
+      const workDirError = validateWorkDir(ctx.cwd);
+      if (workDirError) {
+        return { content: [{ type: "text", text: `❌ ${workDirError}` }], details: {} };
+      }
+      const workDir = resolveWorkDir(ctx.cwd);
+      const res = logMeasurementChange(workDir, params);
+      if (!res.ok) {
+        return { content: [{ type: "text", text: `❌ log_measurement_change rejected:\n  ${res.errors.join("\n  ")}` }], details: {} };
+      }
+      const record = res.value;
+      if (record.type === "measurement_change") {
+        const scores = record.old_scale_score !== undefined && record.new_scale_score !== undefined
+          ? `: ${record.old_scale_score} → ${record.new_scale_score}`
+          : ", rescore pending — the new scale is provisional";
+        return {
+          content: [{
+            type: "text",
+            text: `📏 Measurement change ${measurementChangeId(record.epoch)} recorded (epoch ${record.epoch}${scores}, needs_verification: true).`,
+          }],
+          details: { change_ref: measurementChangeId(record.epoch), epoch: record.epoch, needs_verification: record.needs_verification },
+        };
+      }
+      return {
+        content: [{
+          type: "text",
+          text: `📏 Measurement change ${record.change_ref} completed (epoch ${record.epoch}: ${record.old_scale_score} → ${record.new_scale_score}).`,
+        }],
+        details: {
+          change_ref: record.change_ref,
+          epoch: record.epoch,
+          old_scale_score: record.old_scale_score,
+          new_scale_score: record.new_scale_score,
+        },
+      };
+    },
+  });
+
+  // -----------------------------------------------------------------------
   // run_experiment tool
   // -----------------------------------------------------------------------
 
@@ -5661,6 +5745,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // Precedent search is standalone: no campaign or autoresearch-mode gate;
   // it reads only existing local .auto/ sources.
   registerSearchPrecedentsTool(pi, resolveWorkDir);
+
+  // Precedent assessment is standalone too: it appends agent assessments to an
+  // existing search report under .auto/precedents and never writes history sources.
+  registerAssessPrecedentsTool(pi, resolveWorkDir);
 
   // Self-service council: the campaign agent convenes it whenever it feels
   // stuck — no stagnation threshold, no cooldown, no cap (only council.enabled
