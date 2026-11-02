@@ -52,6 +52,8 @@ Then start the loop inside pi:
 | `explore_from` | Backtrack to any tree node and explore from there |
 | `restore_main` | Return to main branch after `explore_from` |
 | `compose` | Merge orthogonal improvements from two different branches |
+| `search_precedents` | Searches this project's past ledger, tree, ideas and council archives for similar problems (memory only when the host provides it); returns candidates with per-source coverage. See [Research precedents](#research-precedents). |
+| `assess_precedents` | Records the agent's assessment (`supports` or `contradicts` with references, plus an action) of a candidate in a search report |
 
 ### `/autoresearch` command
 
@@ -333,6 +335,41 @@ Set or clear the experiment time limit without editing the config by hand:
 **Floor detection untried-ideas guard.** Floor detection now checks `.auto/ideas/` before claiming a structural limit: if ≥2 untried idea files remain, it downgrades to a nudge ("try the ideas before concluding the limit is structural") instead of the full floor-reached block. This is consistent with the finalize trigger's untried-ideas check.
 
 **File-per-idea tracking.** Ideas are stored as individual `.md` files in `.auto/ideas/` (e.g. `cache-ast.md`, `bit-packed.md`). Each file can contain rich content — title, explanation, code snippets, multi-line notes. When you test an idea, add `"idea_id": "filename"` (with or without `.md` extension) to the `asi` parameter of `log_experiment`; the idea file is automatically deleted so the untried count stays accurate. The ideas directory is cleared on new segment (`init_experiment` re-init) and on `/autoresearch clear`.
+
+### Research precedents
+
+Before choosing a new direction, especially on stagnation, search this project's own history for earlier solutions and failures to the same problem. The observer's stagnation steer asks for this search; it is not required after every run.
+
+```
+search_precedents({ problem: "<current problem, 1-2 sentences>", keywords: ["up to 5"], finding_ref: "<optional finding id>" })
+assess_precedents({ report_id, primary_ref, claim: "supports" | "contradicts", follow_up_ref, action })
+```
+
+- **Sources (local, current project only):** `.auto/log.jsonl` (or legacy `autoresearch.jsonl` when the current ledger is absent), `.auto/tree.json`, `.auto/ideas/` and `.auto/councils/`. Paths outside the project root are never opened. Other projects and sessions are never scanned automatically.
+- **Memory:** a memory source is used only when the host passes a memory adapter. Otherwise it is reported as `unavailable`, not as searched. The agent may run its own session memory search and cite the references in its report.
+- **Coverage:** each source is `searched`, `unavailable` (an optional source is missing, or memory is not configured), `error` or `truncated`. The outcome is `matches`, `no-matches` (only with complete coverage) or `incomplete` (an error, truncation or missing ledger). `incomplete` is never "nothing found".
+- **Limits per search:** 10 seconds, 10 MiB read, 2000 files and directory entries, at most 20 candidates and 8 KiB of output. Exceeding a limit is reported as `truncated`.
+- **Candidates are leads, not evidence.** Each candidate is `supported`, `contradicted`, `conflicting` or `unknown`. The default is `unknown`, including for old `keep` records: a keep is not a success, and no found refutation is not validity. Text similarity is never proof. Later ledger records are found by run, node id and commit references, and shown with up to 10 neighbouring records on each side.
+- **Assessment:** the agent reads the original and the later records and records them with `assess_precedents`. The tool checks that the references exist and are in range, not that the interpretation is correct. Actions are `reuse`, `adapt-and-test`, `avoid` or `insufficient-evidence`. A metric delta is never computed across unequal or unknown scales.
+- **Reports:** `.auto/precedents/<id>.json` (versioned). A report is current only while the normalized query, the segment and the hashes of the fully read sources are unchanged. A `stale` or `unknown` report must be searched again before it is relied on. Old logs and trees are not modified.
+
+#### Precedent privacy and the council
+
+- **Default (metadata only):** the council brief gets the report id, outcome, source statuses and candidate counts per status. Candidate texts, source paths and the agent's judgments are withheld.
+- **Opt-in:** `.auto/config.json`:
+
+  ```json
+  {
+    "council": {
+      "share_precedent_details": true
+    }
+  }
+  ```
+
+  With `true`, record text, source paths and assessments enter council briefs, and the council's models are external providers. Enable it only for data you are allowed to share.
+- **Secrets:** the problem text and keywords go to the local search only. Do not put secrets into them: the extension cannot reliably remove secrets from arbitrary text.
+- **Untrusted content:** text found in the history is data. The extension never executes commands from it, never follows links and never uses it as tool arguments.
+- **Advisor:** the stagnation and reflection steers ask the agent to put the report id, its freshness (`current`, `stale` or `unknown`) and statuses into its own advisor message, with the same metadata-only default. A stale or unknown report is not current evidence. The extension does not control the context of the advisor plugin.
 
 ### Long-running loops and context
 
