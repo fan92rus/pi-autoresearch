@@ -80,6 +80,7 @@ import {
   recordFinding,
   updateFinding,
 } from "./findings.ts";
+import { inspectResults } from "./lens-inspect.ts";
 import { tmpdir } from "node:os";
 
 import {
@@ -3073,6 +3074,44 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         content: [{ type: "text", text: `🔎 Finding ${res.value.id}: ${res.value.from} → ${res.value.status}.` }],
         details: { id: res.value.id, from: res.value.from, status: res.value.status },
       };
+    },
+  });
+
+  const InspectResultsParams = Type.Object({
+    run: Type.Optional(Type.Number({
+      description: "Run number to inspect. Default: the best keep run of the current epoch.",
+      minimum: 1,
+    })),
+    extractor: Type.Optional(Type.String({
+      description: "Extractor: metric | errors | timing | delta | raw, or a name from analysis.extractors. Default: all generic extractors plus the campaign extractors.",
+    })),
+    page: Type.Optional(Type.Number({
+      description: "Page of the response (200 content lines / 8 KiB per page). Default 1.",
+      minimum: 1,
+    })),
+  });
+
+  registerGatedTool({
+    name: "inspect_results",
+    label: "Inspect Results",
+    description:
+      "Inspect a persisted run output from .auto/runs/<n>/ (ledger and run files only): METRIC lines, error/warn lines, timing top-N, delta against the best keep of the same epoch, and campaign extractors. Response is bounded to 200 lines / 8 KiB per page; use page for the rest.",
+    promptSnippet: "Inspect a persisted run output (best keep by default) with bounded pages",
+    promptGuidelines: [
+      "Use inspect_results before recording a finding: read the concrete examples it shows, then record_finding with evidence_ref pointing at them.",
+    ],
+    parameters: InspectResultsParams,
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
+      const workDirError = validateWorkDir(ctx.cwd);
+      if (workDirError) {
+        return { content: [{ type: "text", text: `❌ ${workDirError}` }], details: {} };
+      }
+      const workDir = resolveWorkDir(ctx.cwd);
+      const res = inspectResults(workDir, params);
+      return { content: [{ type: "text", text: res.text }], details: res.details };
     },
   });
 
