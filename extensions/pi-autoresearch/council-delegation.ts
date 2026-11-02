@@ -233,7 +233,8 @@ export function extractOpenFindingsSection(briefText: string): string | null {
   return text.length > 0 ? text : null;
 }
 
-function challengeTask(p: DelegationParticipant, round: number, contested: string[], othersText: string, findingsSection?: string | null): string {
+/** Exported for tests (brief-text assertions); used verbatim by the challenge rounds. */
+export function challengeTask(p: DelegationParticipant, round: number, contested: string[], othersText: string, findingsSection?: string | null): string {
   const lines = [
     "You are " + p.name + " (hypothesis letter " + p.letter + ") in CHALLENGE round " + round + " of a hypothesis council.",
   ];
@@ -261,6 +262,7 @@ function challengeTask(p: DelegationParticipant, round: number, contested: strin
     scope,
     "VERDICT H-<letter><n>: accept — <reason>   (or reject / refine)",
     "Base verdicts on facts: expected effect vs noise floor, cost, risk, kill condition. Do not accept because it sounds confident; do not reject to disagree. For refine, name exactly what must change.",
+    "A measurement experiment (a section with its own `TRACK: measurement` line) has NO expected-gain number — verdict on its accounting plan instead: DIFF (path to the recorded diff), RESCORE (anchor set + how the old and new measurers are compared), JUSTIFY (measurement finding or reason). A plan missing any of the three fields is a reject.",
     "You may look at the project yourself when a verdict hinges on code reality — look around freely, just don't rabbit-hole; never run builds or benchmarks, never write files.",
     "codex_search is fair game when a verdict hinges on prior art or external facts — again, without rabbit-holing.",
     "",
@@ -269,7 +271,8 @@ function challengeTask(p: DelegationParticipant, round: number, contested: strin
   return lines.join("\n");
 }
 
-function chairTask(briefText: string, note: string | undefined, allProposals: string, allVerdicts: string, chairFix?: string): string {
+/** Exported for tests (brief-text assertions); used verbatim by the chair phase. */
+export function chairTask(briefText: string, note: string | undefined, allProposals: string, allVerdicts: string, chairFix?: string): string {
   const lines = [
     "You are the CHAIR of a hypothesis council. You read the whole record and compose the final slate.",
     "",
@@ -289,15 +292,26 @@ function chairTask(briefText: string, note: string | undefined, allProposals: st
   }
   lines.push(
     "Compose the slate: 3–5 experiments distilled from the hypotheses that reached consensus (merge duplicates into one experiment; drop rejected ones).",
-    "Each experiment section MUST look like:",
+    "Each MODEL experiment section MUST look like:",
     "## EXP<N>: <title> (source hypotheses)",
     "CHANGE: <what exactly changes in the code>",
     "EXPECTED_GAIN: <number> <unit> (must be >= 2x the noise floor; if the brief has no noise floor, gate this experiment on measuring it first and say so)",
     "KILL_WHEN: <observation that makes you abandon it>",
     "PRIORITY: <number> (diagnostics first — a measurement that gates the rest is run first)",
     "",
-    "CRITICAL — the five field labels are MECHANICAL TOKENS parsed by a validator, not prose:",
-    "  `## EXP<N>:`, `CHANGE:`, `EXPECTED_GAIN:`, `KILL_WHEN:`, `PRIORITY:`.",
+    "A MEASUREMENT experiment (correcting the measurer itself — gold set, scorer/matcher, timer, reference data; usually from a measurement finding) uses the alternative contract:",
+    "## EXP<N>: <title> (source hypotheses)",
+    "CHANGE: <what exactly changes in the measurement setup>",
+    "TRACK: measurement   (own line inside the section — switches the contract; never in the header)",
+    "DIFF: <path to the recorded diff of the change> (record the diff under .auto/measurement/)",
+    "RESCORE: <anchor set (run/dataset id) and how to rescore it with the old and the new measurer>",
+    "JUSTIFY: <measurement finding id or the reason for the change>",
+    "KILL_WHEN: <observation that makes you abandon it>",
+    "PRIORITY: <number>",
+    "A measurement section carries NO numeric EXPECTED_GAIN — the DIFF/RESCORE/JUSTIFY plan replaces it; a section with an incomplete plan fails validation by the missing field's name.",
+    "",
+    "CRITICAL — the field labels are MECHANICAL TOKENS parsed by a validator, not prose:",
+    "  `## EXP<N>:`, `CHANGE:`, `EXPECTED_GAIN:`, `TRACK:`, `DIFF:`, `RESCORE:`, `JUSTIFY:`, `KILL_WHEN:`, `PRIORITY:`.",
     "  Keep them byte-exact: Latin script, uppercase, underscore where shown, colon immediately after the label.",
     "  NEVER translate, localize, transliterate or bold them (no `ОЖИДАЕМЫЙ_ПРИРОСТ`, no `**EXPECTED_GAIN:**`, no `УСЛОВИЕ_ОТМЕНЫ`).",
     "  For EXPECTED_GAIN the colon must be followed directly by a plain number (e.g. `EXPECTED_GAIN: 0.012`) — no ≥/≤/~ symbol before it; put qualifiers and units AFTER the number.",

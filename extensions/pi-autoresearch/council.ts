@@ -499,7 +499,29 @@ const EXPECTED_GAIN_RE =
   /(?:EXPECTED[_ ]?GAIN|ОЖИДАЕМ(?:ЫЙ|АЯ)[_ ]?(?:ПРИРОСТ|ЭФФЕКТ|ВЫИГРЫШ))[^:=\n]*[:=]\s*[≥≤><~≈]?\s*([-+]?\d+(?:[.,]\d+)?)/i;
 const KILL_RE = /(?:KILL[_ ]?(?:WHEN|CRITERION)|УСЛОВИЕ[_ ]?ОТМЕНЫ|КРИТЕРИЙ[_ ]?ОСТАНОВК[ИИ]|СТОП[_ ]?УСЛОВИЕ)[^:=\n]*[:=]/i;
 
-/** Validate a chair-produced slate: 3–5 EXP sections, each with EXPECTED_GAIN and KILL_WHEN. */
+// Measurement-EXP contract (add-result-reflection, spec measurement-track:
+// "Measurement-EXP в слейте совета"). A section declares the class with its
+// own `TRACK: measurement` line INSIDE the section — never in the section
+// header — and replaces the numeric EXPECTED_GAIN with a three-field
+// accounting plan: DIFF (recorded diff path), RESCORE (anchor set + how the
+// old and new measurers are compared), JUSTIFY (finding or reason). The
+// line-anchored prefixes allow a markdown sub-heading, a list marker and
+// (already-stripped) bold, but a token glued into the EXP header line
+// (`## EXP2: ... TRACK: measurement`) does not match and does not switch the
+// contract. Plan fields must carry content after the colon — a bare label is
+// treated as missing.
+const MEAS_LINE_PREFIX = "^[ \\t]*(?:#{1,6}[ \\t]+)?(?:[-*][ \\t]+)?";
+const TRACK_MEASUREMENT_RE = new RegExp(MEAS_LINE_PREFIX + "TRACK[ \\t]*[:=][ \\t]*measurement\\b", "im");
+const DIFF_RE = new RegExp(MEAS_LINE_PREFIX + "DIFF[ \\t]*[:=][ \\t]*\\S", "im");
+const RESCORE_RE = new RegExp(MEAS_LINE_PREFIX + "RESCORE[ \\t]*[:=][ \\t]*\\S", "im");
+const JUSTIFY_RE = new RegExp(MEAS_LINE_PREFIX + "JUSTIFY[ \\t]*[:=][ \\t]*\\S", "im");
+
+/**
+ * Validate a chair-produced slate: 3–5 EXP sections. A model EXP needs
+ * EXPECTED_GAIN ≥ 2× noise floor and a KILL_WHEN line; a measurement EXP
+ * (own `TRACK: measurement` line) needs the DIFF/RESCORE/JUSTIFY accounting
+ * plan (no expected-gain number) and a KILL_WHEN line.
+ */
 export function validateSlate(slateText: string, noiseFloor: number | null, minExperiments = 3, maxExperiments = 5): SlateValidation {
   const errors: string[] = [];
   // Bold markers around labels (`**EXPECTED_GAIN:** 5`) break label matching —
@@ -514,13 +536,22 @@ export function validateSlate(slateText: string, noiseFloor: number | null, minE
     const end = i + 1 < sections.length ? sections[i + 1] : text.length;
     const body = text.slice(start, end);
     const label = (body.match(/^#{2,4}\s*(?:EXP|ЭКСП)[^\n]*/im)?.[0] ?? `EXP#${i + 1}`).slice(0, 60);
-    const gainMatch = EXPECTED_GAIN_RE.exec(body);
-    if (!gainMatch) {
-      errors.push(`${label}: missing EXPECTED_GAIN line.`);
-    } else if (noiseFloor !== null && noiseFloor > 0) {
-      const gain = Math.abs(Number(gainMatch[1]));
-      if (gain < 2 * noiseFloor) {
-        errors.push(`${label}: EXPECTED_GAIN ${gain} is below 2× noise floor (${(2 * noiseFloor).toFixed(4)}).`);
+    if (TRACK_MEASUREMENT_RE.test(body)) {
+      // Measurement-EXP: the accounting plan replaces the numeric EXPECTED_GAIN.
+      const plan: [string, RegExp][] = [["DIFF", DIFF_RE], ["RESCORE", RESCORE_RE], ["JUSTIFY", JUSTIFY_RE]];
+      const missingPlan = plan.filter(([, re]) => !re.test(body)).map(([name]) => name);
+      if (missingPlan.length > 0) {
+        errors.push(`${label}: incomplete measurement plan — missing ${missingPlan.join(", ")} field${missingPlan.length > 1 ? "s" : ""}.`);
+      }
+    } else {
+      const gainMatch = EXPECTED_GAIN_RE.exec(body);
+      if (!gainMatch) {
+        errors.push(`${label}: missing EXPECTED_GAIN line.`);
+      } else if (noiseFloor !== null && noiseFloor > 0) {
+        const gain = Math.abs(Number(gainMatch[1]));
+        if (gain < 2 * noiseFloor) {
+          errors.push(`${label}: EXPECTED_GAIN ${gain} is below 2× noise floor (${(2 * noiseFloor).toFixed(4)}).`);
+        }
       }
     }
     if (!KILL_RE.test(body)) {
@@ -657,7 +688,10 @@ function participantTask(name: string, letter: string, model: string, persona: C
     "VERDICT H-<letter><n>: accept — <reason>   (or reject / refine)",
     "Base verdicts on the brief's facts: expected effect vs noise floor, cost, risk, kill condition. " +
       "Do not accept something merely because it sounds confident; do not reject merely to disagree. " +
-      "For refine verdicts, name exactly what must change.",
+      "For refine verdicts, name exactly what must change. A measurement experiment (a section with its own " +
+      "TRACK: measurement line) has no expected-gain number — verdict on its accounting plan instead: DIFF " +
+      "(path to the recorded diff), RESCORE (anchor set and rescore method), JUSTIFY (measurement finding or reason); " +
+      "a plan missing a field is a reject.",
     "You may also look at the project yourself when a verdict hinges on code reality rather than brief facts — look around freely, just don't rabbit-hole; and never run builds or benchmarks or write files (that's the campaign's job).",
     "codex_search is fair game too when a verdict hinges on prior art or external facts about a technique — again, without rabbit-holing.",
     "You may also append 1 improvement paragraph per hypothesis you refined.",
@@ -680,6 +714,19 @@ function chairTask(input: FacilitatorInput): string {
     `- EXPECTED_GAIN: <number in the campaign's metric units> (must be ≥ 2× the noise floor from the brief)`,
     "- KILL_WHEN: <the observation that makes you abandon this experiment>",
     "- COMPLEXITY: low | medium | high",
+    "",
+    "Alternative contract — a measurement experiment (correcting the measurer itself: gold set, scorer/matcher, timer, " +
+      "reference data; usually grounded in a measurement finding from the brief's Open findings):",
+    "## EXP2: <short title>",
+    "- TRACK: measurement   (this line, on its own line inside the section, switches the contract — never in the header)",
+    "- HYPOTHESIS: <one sentence>",
+    "- WHY: <evidence from the brief and the analysts' verdicts>",
+    "- DIFF: <path to the recorded diff of the measurement change> (keep the diff under .auto/measurement/)",
+    "- RESCORE: <anchor set (run/dataset id) and how to rescore it with the old and the new measurer>",
+    "- JUSTIFY: <measurement finding id from the brief, or the reason>",
+    "- KILL_WHEN: <the observation that makes you abandon this experiment>",
+    "- COMPLEXITY: low | medium | high",
+    "A measurement section carries NO numeric EXPECTED_GAIN — the DIFF/RESCORE/JUSTIFY plan replaces it; a section with an incomplete plan fails validation by the missing field's name.",
     "",
     "Only include hypotheses that reached council consensus (accept-majority, no open refines). If fewer than 3 survived, " +
       "include the strongest contested ones but mark them 'CONTESTED: <reason>'.",
@@ -736,8 +783,9 @@ export function composeFacilitatorMessage(input: FacilitatorInput): string {
     "## Phase 3 — Chair composes the slate",
     "Spawn ONE subagent (the chair):",
     `  Chair: ${JSON.stringify(chairTask(input))}`,
-    "Then read the slate entry (the only entry with phase \"slate\") and validate it: 3–5 EXP sections, each with " +
-      `EXPECTED_GAIN ≥ 2× noise floor and a KILL_WHEN line. If invalid → one retry with the chair asking to fix the listed problems.`,
+    "Then read the slate entry (the only entry with phase \"slate\") and validate it: 3–5 EXP sections; every model EXP has " +
+      `EXPECTED_GAIN ≥ 2× noise floor and a KILL_WHEN line; every measurement EXP (own TRACK: measurement line) has the ` +
+      "DIFF/RESCORE/JUSTIFY plan and a KILL_WHEN line. If invalid → one retry with the chair asking to fix the listed problems.",
     "",
     "## Phase 4 — Execute",
     "Register each slate experiment with propose_hypothesis (SimHash will drop duplicates of already-tried ideas — " +
