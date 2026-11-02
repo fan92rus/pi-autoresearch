@@ -527,7 +527,15 @@ test("shared budget: versioning and search together visit at most 2000 items", a
   // The search gets 998 items: the ledger (1), then 997 of the 1000 entries.
   for (let i = 0; i < 1000; i++) writeRel(root, `.auto/ideas/n${i}.md`, "идея\n");
 
-  const { report } = await searchPrecedentReport(root, input("дрейф сенсора"));
+  // The children are real, but the deadline runs on a frozen fake clock: it never
+  // advances, so the 10 s deadline cannot fire and the 2000-item budget is always
+  // reached in full, however loaded the machine is (fake clock, spec 1.2).
+  const clock = fakeClock();
+  const { report } = await searchPrecedentReport(root, input("дрейф сенсора"), {
+    clock: () => clock.now(),
+    versions: { deps: { setTimer: clock.setTimer, clearTimer: clock.clearTimer } },
+    search: { deps: { setTimer: clock.setTimer, clearTimer: clock.clearTimer } },
+  });
 
   assert.equal(report.search.budget.itemsSpent, 2000);
   assert.equal(report.search.sources.find((s) => s.source === "ideas").status, "truncated");
