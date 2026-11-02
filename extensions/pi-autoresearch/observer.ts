@@ -16,6 +16,9 @@ import { performance } from "node:perf_hooks";
 import { parseJsonlEntry, reconstructJsonlState, type ReconstructedRun } from "./jsonl.ts";
 import { treeExists, loadTree, getPath, failedStreakSinceLastKeep } from "./parallel/tree.ts";
 import { checkCouncilTrigger } from "./council.ts";
+import { loadFindings, type FindingView } from "./findings.ts";
+import { runsRootPath } from "./lens.ts";
+import { formatMeasurementHealth, measurementHealthSummary } from "./measurement.ts";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -678,12 +681,20 @@ function checkTimeLimitStruggles(state: ObserverState): string | null {
 
 // ─── Trigger: Stagnation ───────────────────────────────────────────────────────
 
-function checkStagnation(
+/**
+ * ctx.lensDone: true when the lens inspection is handled for this segment (or
+ * the campaign has no persisted runs) — the requirement is not repeated.
+ * ctx.measurementHealth: rendered "Measurement health: …" line — the stagnation
+ * message is one of the periodic messages too, and it is where meter health
+ * matters most (floor claims, measurement-change epochs). Absent = omitted.
+ */
+export function checkStagnation(
   state: ObserverState,
   asi: AsiFlags,
   payload: ObserverPayload,
   cwd: string,
   oc: ObserverConfig,
+  ctx: PeriodicContext = {},
 ): string | null {
   if (state.streak < oc.stagnationThreshold) return null;
   if (state.streak % oc.stagnationThreshold !== 0) return null;
@@ -844,6 +855,11 @@ Write your analysis to ${ideasPath}, then try the most fundamentally different a
   // with no limits, so the stagnation steer always mentions that door.
   const councilHint = `\n🏛 COUNCIL: If self-reflection is not enough, convene a hypothesis council yourself — no limits, any time: council_convene({ note: "why you are stuck and what to focus on" }). It is autonomous and BLOCKING: the tool spawns the analysts, runs the cross-examination and the chair itself, and returns a vetted experiment slate.`;
 
+  // Task 1.7 (spec findings): the stagnation trigger demands a result inspection
+  // BEFORE the council advice — when the current segment has no findings yet.
+  const lensHint = ctx.lensDone ? "" : LENS_BEFORE_COUNCIL;
+  const healthLine = ctx.measurementHealth ? `\n${ctx.measurementHealth}` : "";
+
   return `🔄 STAGNATION: No metric improvement in ${state.streak} runs.
 
 ${patternHint}
@@ -851,9 +867,87 @@ ${patternHint}
 Recent runs (none beat best ${bestStr}):
 ${recentFormatted}
 ${escalation}
-${treeHint}
+${treeHint}${lensHint}${healthLine}
 ${councilHint}
 ${reflectQuestions}${advisorHint}`;
+}
+
+// ─── Result lens + measurement health (add-result-reflection, task 1.7) ──────
+// The reflection checkpoint, the progress milestone and the stagnation trigger
+// get a result-lens nudge and a measurement-health line. The health data comes
+// exclusively from measurement.ts (measurementHealthSummary's parts); the lens
+// "done" signal is the spec's: findings already reference runs of the current
+// segment. Campaigns without persisted run dirs (.auto/runs, i.e. campaigns
+// from before the lens existed) are never nudged — compat with old campaigns.
+
+/**
+ * Extra context for the periodic observer messages and the stagnation trigger.
+ * Both fields are optional, and absence is NOT the pre-task-1.7 behavior:
+ * absent `lensDone` (undefined → falsy) keeps the RESULT LENS nudge visible
+ * (pre-1.7 messages had no nudge at all), while an absent `measurementHealth`
+ * merely omits the health line.
+ */
+export interface PeriodicContext {
+  /** True when the lens inspection is handled: findings already reference
+   *  current-segment runs (via the optional `run` field or the evidence_ref
+   *  path — see findingTargetsSegment), or the campaign has no persisted runs
+   *  to inspect (no .auto/runs) and must not be nudged. */
+  lensDone?: boolean;
+  /** Rendered "Measurement health: …" line (measurement.ts); null/absent = omit. */
+  measurementHealth?: string | null;
+}
+
+/** The checkpoint nudge text (spec findings: "Нуджи observer'а на инспекцию результатов"). */
+const LENS_NUDGE =
+  "🔎 RESULT LENS: before advising, read the raw results of the current best run — " +
+  "inspect_results (no arguments = best keep of the current epoch) — and record new findings with " +
+  "record_finding (evidence from .auto/runs/<n>/output.txt). A conclusion drawn without reading raw results is a guess.";
+
+/** The stagnation requirement (spec findings: inspection BEFORE convening the council). */
+const LENS_BEFORE_COUNCIL =
+  "\n🔎 RESULT LENS: before you convene the council (or write any new hypothesis), inspect the raw results first: " +
+  "inspect_results (no arguments = best keep of the current epoch), then record findings via record_finding. " +
+  "Advice offered without reading raw results is a guess.";
+
+/** Matches `.auto/runs/<n>/…` in an evidence_ref path (backslashes and a leading `./` normalized). */
+const EVIDENCE_RUN_PATTERN = /^\.auto\/runs\/(\d+)\//;
+
+/**
+ * A finding belongs to the current segment when its optional `run` field is
+ * one of the segment's run numbers, OR when its `evidence_ref` (with `\\`
+ * normalized to `/` and a leading `./` stripped) points into a `.auto/runs/<n>/`
+ * artifact of the segment.
+ * `record_finding` never derives `run` from `evidence_ref`, so the evidence
+ * path is the reliable binding: a finding recorded from the segment's runs
+ * must suppress the duplicate lens nudge (spec scenario «checkpoint без
+ * повторной инспекции»). Exported for tests.
+ */
+export function findingTargetsSegment(finding: FindingView, segmentRunNumbers: Set<number>): boolean {
+  if (finding.run !== undefined && segmentRunNumbers.has(finding.run)) return true;
+  const evidencePath = finding.evidence_ref.replaceAll("\\", "/").replace(/^\.\//, "");
+  const match = EVIDENCE_RUN_PATTERN.exec(evidencePath);
+  return match !== null && segmentRunNumbers.has(Number(match[1]));
+}
+
+/**
+ * Build the periodic context for runObserver: lens suppression flag plus the
+ * rendered measurement-health line. Old campaigns (no .auto/runs) are never
+ * nudged (lensDone=true), and a ledger without measurement_change records
+ * renders the healthy state — neither mechanism can break them. The health
+ * line comes from measurement.ts's measurementHealthSummary — the single spec
+ * source (it reads the ledger and the findings store from disk itself); the
+ * store is additionally read here once for the lens signal, and an unreadable
+ * store counts as none.
+ */
+function buildPeriodicContext(cwd: string, segRuns: ReconstructedRun[]): PeriodicContext {
+  const loaded = loadFindings(cwd);
+  const findings = loaded.ok ? loaded.value : null;
+  const segmentRunNumbers = new Set(segRuns.map((r) => r.run));
+  const hasSegmentFindings = findings !== null
+    && [...findings.findings.values()].some((f) => findingTargetsSegment(f, segmentRunNumbers));
+  const lensDone = !fs.existsSync(runsRootPath(cwd)) || hasSegmentFindings;
+  const measurementHealth = formatMeasurementHealth(measurementHealthSummary(cwd));
+  return { lensDone, measurementHealth };
 }
 
 // ─── Trigger: Reflection checkpoint ─────────────────────────────────────
@@ -862,6 +956,8 @@ ${reflectQuestions}${advisorHint}`;
 // the run COUNT regardless of outcome, so flat/grinding campaigns still get
 // a periodic step-back. Checked after floor/stagnation so alarm triggers
 // keep priority; before progress so the 5-run milestone doesn't shadow it.
+// Task 1.7: carries the result-lens item (unless findings for this segment
+// already exist) and the Measurement health line.
 // ─── Advisor argue protocol (Anthropic reconciliation pattern, adapted) ─────
 // Advice gets weight; ledger evidence wins; a contested point is settled by a
 // discriminating experiment, never by rhetoric. pi-advisor gotcha (source:
@@ -871,7 +967,12 @@ ${reflectQuestions}${advisorHint}`;
 const ADVISOR_ARGUE =
   `If your ledger evidence contradicts the advice: quote the disputed advice verbatim in your message and re-consult ONCE ("Ledger shows X, you suggest Y — which constraint breaks the tie?"). Still contested → settle it with a discriminating experiment, not words, and record the outcome in ASI (learned / next_action_hint).`;
 
-function checkReflection(state: ObserverState, payload: ObserverPayload, oc: ObserverConfig): string | null {
+export function checkReflection(
+  state: ObserverState,
+  payload: ObserverPayload,
+  oc: ObserverConfig,
+  ctx: PeriodicContext = {},
+): string | null {
   const decidedRuns = state.improvements + state.streak;
   if (decidedRuns <= 0 || decidedRuns % oc.reflectionIntervalRuns !== 0) return null;
 
@@ -881,6 +982,9 @@ function checkReflection(state: ObserverState, payload: ObserverPayload, oc: Obs
     `2. What do the last ~5 discards share? (tree_status detail=full for the list)`,
     `3. What will you try next — and why is it NOT a repeat of an existing discard?`,
   ];
+  if (!ctx.lensDone) {
+    lines.push(LENS_NUDGE);
+  }
   if (payload.advisorAvailable) {
     lines.push(
       `Then consult advisor({ stage: "recovery" }) with these 3 answers, the best-so-far metric and your untried ideas — ask it to challenge the plan before you spend the next 10 runs.`,
@@ -889,12 +993,21 @@ function checkReflection(state: ObserverState, payload: ObserverPayload, oc: Obs
   } else {
     lines.push(`Answer in 3 short lines, then continue with the strongest candidate.`);
   }
+  if (ctx.measurementHealth) {
+    lines.push(ctx.measurementHealth);
+  }
   return lines.join("\n");
 }
 
 // ─── Trigger: Progress milestone ─────────────────────────────────────────────
 
-function checkProgress(state: ObserverState, payload: ObserverPayload, cwd: string, oc: ObserverConfig): string | null {
+export function checkProgress(
+  state: ObserverState,
+  payload: ObserverPayload,
+  cwd: string,
+  oc: ObserverConfig,
+  ctx: PeriodicContext = {},
+): string | null {
   if (state.streak !== 0) return null;
   if (state.improvements <= 0) return null;
   if (state.improvements % oc.progressMilestone !== 0) return null;
@@ -927,7 +1040,7 @@ function checkProgress(state: ObserverState, payload: ObserverPayload, cwd: stri
 
   return `🎯 MILESTONE: ${state.improvements} improvements made.
    Progression: ${progression}${unit}
-   ${trendMsg}
+   ${trendMsg}${ctx.measurementHealth ? `\n   ${ctx.measurementHealth}` : ""}
 
 STEP BACK and think strategically:
 1. OVERFITTING CHECK: Are these gains real or specific to this benchmark? Would they generalize?
@@ -978,6 +1091,12 @@ export function runObserver(payload: ObserverPayload): string | null {
   const ideasPath = path.join(cwd, ".auto", "ideas");
   const asi = parseAsiFlags(segRuns, ideasPath);
 
+  // Result lens + measurement health context (add-result-reflection, task 1.7):
+  // lens nudges only fire when .auto/runs exists (old campaigns are never
+  // nudged); the health line comes from measurementHealthSummary — the single
+  // source for the "Measurement health" data (spec findings).
+  const periodic = buildPeriodicContext(cwd, segRuns);
+
   // ── Trigger order: actionable first, finalize as fallback (P0-1) ──
   // Rationale: concrete advice (BestOfN, reflection) is more useful than an
   // abstract "stop" recommendation. Finalize is the lowest-priority fallback
@@ -1026,7 +1145,7 @@ export function runObserver(payload: ObserverPayload): string | null {
   if (councilSteer) return councilSteer;
 
   // 4. Stagnation (actionable: reflection + escalation hints)
-  const stagnationSteer = checkStagnation(state, asi, payload, cwd, oc);
+  const stagnationSteer = checkStagnation(state, asi, payload, cwd, oc, periodic);
   if (stagnationSteer) return stagnationSteer;
 
   // 5. Floor detection (objective limit — now checks untried ideas, P1-2)
@@ -1036,11 +1155,11 @@ export function runObserver(payload: ObserverPayload): string | null {
   }
 
   // 5b. Reflection checkpoint (periodic structured review; advisor-aware)
-  const reflectionSteer = checkReflection(state, payload, oc);
+  const reflectionSteer = checkReflection(state, payload, oc, periodic);
   if (reflectionSteer) return reflectionSteer;
 
   // 6. Progress milestone (positive reinforcement — always useful)
-  const progressSteer = checkProgress(state, payload, cwd, oc);
+  const progressSteer = checkProgress(state, payload, cwd, oc, periodic);
   if (progressSteer) return progressSteer;
 
   // 7. Finalize (fallback — lowest priority; agent self-assessment)
