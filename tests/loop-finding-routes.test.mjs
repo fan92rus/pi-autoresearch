@@ -18,8 +18,10 @@ import { createFakePi, makeCtx } from "./fake-pi.ts";
 
 // Size budget for the whole "## Autoresearch Mode" section. The section was
 // 4373 chars before task 1.9 (measured on the same harness); the finding routes
-// add ~1270 chars, so the budget keeps headroom for a short follow-up only.
-const AUTORESEARCH_SECTION_MAX_CHARS = 6000;
+// add ~1270 chars, and the precedent-search guidance (agent-guidance.test.mjs)
+// adds ~1100 more. The budget is chosen by the implementation, not the spec:
+// it stays a hard upper bound that is checked on every run.
+const AUTORESEARCH_SECTION_MAX_CHARS = 7000;
 // Budget for the finding-routes block alone (short lines, per design.md).
 const FINDING_ROUTES_MAX_CHARS = 1400;
 
