@@ -28,9 +28,13 @@
  * line number).
  *
  * Epoch: records without an `epoch` belong to epoch 1 (runEpoch). The current
- * epoch is the highest epoch among logged runs, so the default run is the best
- * keep of that epoch. The delta baseline is the best keep of the INSPECTED
- * run's epoch; cross-epoch deltas are never computed.
+ * epoch has ONE source: jsonl.ts's `reconstructJsonlState().currentEpoch`, read
+ * from the raw ledger text (review fix for 2.2) — run records AND
+ * measurement_change* records advance it, so the default run is the best keep
+ * of the epoch the campaign is actually in, including a fresh epoch opened by
+ * a measurer change before any run is logged in it. The delta baseline is the
+ * best keep of the INSPECTED run's epoch; cross-epoch deltas are never
+ * computed.
  */
 
 import * as fs from "node:fs";
@@ -299,10 +303,18 @@ export function ledgerAnalysisHeader(ledgerText: string): unknown {
   return undefined;
 }
 
-/** Current epoch: the highest epoch among logged runs (DEFAULT_EPOCH when there are none). */
-export function currentEpochOf(metas: readonly RunMeta[]): number {
+/**
+ * Current epoch, read from the SINGLE source (review fix for 2.2): pass the
+ * raw ledger text and this is `reconstructJsonlState(text).currentEpoch` —
+ * run records AND measurement_change* records count, so a fresh epoch opened
+ * by a measurer change is current before its first run is logged. A RunMeta
+ * array sees run records only; it stays accepted for legacy direct callers
+ * (and tests) and folds to the highest epoch among the metas.
+ */
+export function currentEpochOf(source: readonly RunMeta[] | string): number {
+  if (typeof source === "string") return reconstructJsonlState(source).currentEpoch;
   let epoch = DEFAULT_EPOCH;
-  for (const meta of metas) epoch = Math.max(epoch, metaEpoch(meta));
+  for (const meta of source) epoch = Math.max(epoch, metaEpoch(meta));
   return epoch;
 }
 
@@ -314,13 +326,16 @@ function describeRuns(metas: readonly RunMeta[]): string {
 
 /**
  * Pick the inspected run. An explicit run must be in the ledger. Without one,
- * the best keep of the current epoch is used; when there is none, the result
- * is an explicit error asking for a run number (no silent fallback).
+ * the best keep of the current epoch is used (`currentEpoch` — the jsonl.ts
+ * reconstruct value in the tool path; legacy direct callers may omit it and
+ * get the metas-only fold); when there is none, the result is an explicit
+ * error asking for a run number (no silent fallback).
  */
 export function selectInspectRun(
   metas: readonly RunMeta[],
   requested: number | undefined,
   direction: Direction,
+  currentEpoch: number = currentEpochOf(metas),
 ): RunSelection {
   if (metas.length === 0) {
     return {
@@ -328,7 +343,7 @@ export function selectInspectRun(
       error: "в леджере (.auto/log.jsonl) нет записанных прогонов, инспектировать нечего. Запустите замер через run_experiment и log_experiment.",
     };
   }
-  const epoch = currentEpochOf(metas);
+  const epoch = currentEpoch;
   if (requested !== undefined) {
     const meta = metas.find((m) => m.run === requested);
     if (!meta) {
@@ -877,7 +892,9 @@ export function inspectResults(workDir: string, args: InspectArgs): InspectRespo
 
   const metas = ledgerRunMetas(ledgerText);
   const direction = ledgerDirection(ledgerText);
-  const selection = selectInspectRun(metas, parsed.value.run, direction);
+  // Single current-epoch source (review fix for 2.2): jsonl.ts reconstruct
+  // over the raw ledger text, so measurement_change* epochs count too.
+  const selection = selectInspectRun(metas, parsed.value.run, direction, currentEpochOf(ledgerText));
   if (!selection.ok) return failure(selection.error);
   const { meta } = selection;
   const outputPath = `${AUTO_DIR}/runs/${meta.run}/${OUTPUT_FILE}`;

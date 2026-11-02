@@ -82,7 +82,14 @@ import {
   updateFinding,
 } from "./findings.ts";
 import { inspectResults } from "./lens-inspect.ts";
-import { logMeasurementChange, measurementChangeId } from "./measurement.ts";
+import {
+  confidenceSuppressionReason,
+  formatMeasurementScale,
+  logMeasurementChange,
+  measurementChangeId,
+  measurementScaleStatusOfDir,
+  type MeasurementScaleStatus,
+} from "./measurement.ts";
 import { tmpdir } from "node:os";
 
 import {
@@ -176,6 +183,8 @@ interface ExperimentResult {
   timestamp: number;
   /** Segment index — increments on each config header. Current segment = highest. */
   segment: number;
+  /** Measurement epoch (task 2.3). Absent or broken = epoch 1 (see resultEpoch). */
+  epoch?: number;
   /** Session-level confidence score at the time this result was logged. null if insufficient data. */
   confidence: number | null;
   /** Actionable Side Information — structured diagnostics for this run */
@@ -649,12 +658,15 @@ function sortedMedian(values: number[]): number {
  * Returns null when there are fewer than 3 data points (insufficient data)
  * or when MAD is 0 (all values identical — no measurable noise).
  */
-function computeConfidence(
+export function computeConfidence(
   results: ExperimentResult[],
   segment: number,
-  direction: "lower" | "higher"
+  direction: "lower" | "higher",
+  epoch: number = segmentEpoch(results, segment),
 ): number | null {
-  const cur = currentResults(results, segment).filter((r) => r.metric > 0);
+  // Within one epoch only (task 2.3): MAD and baseline of another scale would
+  // make the noise-floor multiple meaningless.
+  const cur = epochResults(results, segment, epoch).filter((r) => r.metric > 0);
   if (cur.length < 3) return null;
 
   const values = cur.map((r) => r.metric);
@@ -664,7 +676,7 @@ function computeConfidence(
 
   if (mad === 0) return null;
 
-  const baseline = findBaselineMetric(results, segment);
+  const baseline = findBaselineMetric(results, segment, epoch);
   if (baseline === null) return null;
 
   // Find best kept metric in current segment
@@ -685,6 +697,161 @@ function computeConfidence(
 /** Get results in the current segment only */
 function currentResults(results: ExperimentResult[], segment: number): ExperimentResult[] {
   return results.filter((r) => r.segment === segment);
+}
+
+/**
+ * Measurement epoch of a run (task 2.3). Records without a valid `epoch` belong
+ * to epoch 1 — the same contract as jsonl.ts reconstruct, so a broken epoch on a
+ * run joins epoch 1 and is never compared with a later epoch's best.
+ */
+function resultEpoch(result: { epoch?: number }): number {
+  const epoch = result.epoch;
+  return typeof epoch === "number" && Number.isSafeInteger(epoch) && epoch >= 1 ? epoch : 1;
+}
+
+/** Highest epoch among the segment's runs (1 when the segment has none). */
+function segmentEpoch(results: ExperimentResult[], segment: number): number {
+  let epoch = 1;
+  for (const r of currentResults(results, segment)) epoch = Math.max(epoch, resultEpoch(r));
+  return epoch;
+}
+
+/**
+ * Runs of one segment that belong to `epoch` (default: the segment's current
+ * epoch). Best, baseline and confidence are computed ONLY over one epoch — a
+ * delta across epochs would compare two different scales (spec measurement-track,
+ * «Эпохи шкалы и блокировка поперечных сравнений»).
+ */
+function epochResults(
+  results: ExperimentResult[],
+  segment: number,
+  epoch: number = segmentEpoch(results, segment),
+): ExperimentResult[] {
+  return currentResults(results, segment).filter((r) => resultEpoch(r) === epoch);
+}
+
+/**
+ * Best keep of the nearest EARLIER epoch of the segment. It is a cross-epoch
+ * reference only: both values are shown, the delta is never computed. null when
+ * no earlier epoch has a keep run.
+ */
+export function priorEpochBest(
+  results: ExperimentResult[],
+  segment: number,
+  epoch: number,
+  direction: "lower" | "higher",
+): { epoch: number; metric: number; runNumber: number } | null {
+  let best: { epoch: number; metric: number; runNumber: number } | null = null;
+  const seg = currentResults(results, segment);
+  for (let i = 0; i < seg.length; i++) {
+    const r = seg[i];
+    const e = resultEpoch(r);
+    if (e >= epoch || r.status !== "keep" || r.metric <= 0) continue;
+    if (best === null || e > best.epoch || (e === best.epoch && isBetter(r.metric, best.metric, direction))) {
+      best = { epoch: e, metric: r.metric, runNumber: i + 1 };
+    }
+  }
+  return best;
+}
+
+/**
+ * Epoch of each tree node (task 2.3): the epoch of its run in the ledger (runRef).
+ * A node without a ledger run inherits its parent's epoch; the root defaults to 1.
+ */
+function treeNodeEpochs(tree: ExperimentTree, ledgerText: string): Map<string, number> {
+  const runEpochs = new Map<number, number>();
+  for (const run of reconstructJsonlState(ledgerText).results) runEpochs.set(run.run, run.epoch);
+
+  const epochs = new Map<string, number>();
+  const epochOf = (id: string): number => {
+    const known = epochs.get(id);
+    if (known !== undefined) return known;
+    epochs.set(id, 1); // provisional value also terminates a parent cycle in a corrupted tree
+    const node = tree.nodes[id];
+    let epoch = 1;
+    if (node?.runRef !== undefined && runEpochs.has(node.runRef)) {
+      epoch = runEpochs.get(node.runRef) ?? 1;
+    } else if (node?.parentId && tree.nodes[node.parentId]) {
+      epoch = epochOf(node.parentId);
+    }
+    epochs.set(id, epoch);
+    return epoch;
+  };
+  for (const id of Object.keys(tree.nodes)) epochOf(id);
+  return epochs;
+}
+
+/** Tree view of the current epoch (task 2.3) with the earlier epoch's best as a cross-epoch reference. */
+export interface EpochTreeView {
+  /** Current epoch: the ledger's scale epoch or the highest node epoch, whichever is higher. */
+  epoch: number;
+  /**
+   * Tree restricted to the current epoch: nodes of other epochs are removed and
+   * their children re-attach to the nearest in-epoch ancestor (the root stays).
+   * ★ best and every delta in the tree view are computed on this tree only.
+   */
+  scoped: ExperimentTree;
+  /** Best keep experiment of the nearest earlier epoch (reference only), or null. */
+  prior: { epoch: number; node: TreeNode } | null;
+}
+
+export function epochTreeView(tree: ExperimentTree, ledgerText: string): EpochTreeView {
+  const epochs = treeNodeEpochs(tree, ledgerText);
+  let epoch = reconstructJsonlState(ledgerText).currentEpoch;
+  for (const nodeEpoch of epochs.values()) epoch = Math.max(epoch, nodeEpoch);
+
+  const ids = Object.keys(tree.nodes);
+  const inScope = (id: string): boolean => id === tree.rootId || (epochs.get(id) ?? 1) === epoch;
+  const kept = new Set(ids.filter(inScope));
+
+  const nodes: Record<string, TreeNode> = {};
+  for (const id of kept) nodes[id] = { ...tree.nodes[id], parentId: null, children: [] };
+  for (const id of kept) {
+    if (id === tree.rootId) continue;
+    let parentId = tree.nodes[id].parentId;
+    for (let hops = 0; parentId !== null && !kept.has(parentId) && hops <= ids.length; hops++) {
+      parentId = tree.nodes[parentId]?.parentId ?? null;
+    }
+    if (parentId !== null && kept.has(parentId)) {
+      nodes[id].parentId = parentId;
+      nodes[parentId].children.push(id);
+    }
+  }
+
+  // Baseline of the scoped tree (task 2.3). Epoch 1 keeps the root baseline. A later
+  // epoch takes the metric of its first run in the tree: the root's epoch-1 value would
+  // turn every delta of the epoch's body and node cards into a cross-epoch percentage.
+  let baselineMetric = tree.baselineMetric;
+  if (epoch > 1) {
+    baselineMetric = 0;
+    let firstRunRef = Infinity;
+    for (const id of kept) {
+      const node = nodes[id];
+      if (id === tree.rootId || node.runRef === undefined || node.runRef >= firstRunRef) continue;
+      firstRunRef = node.runRef;
+      baselineMetric = node.metric;
+    }
+  }
+
+  let prior: { epoch: number; node: TreeNode } | null = null;
+  for (const node of Object.values(tree.nodes)) {
+    const nodeEpoch = epochs.get(node.id) ?? 1;
+    if (nodeEpoch >= epoch) continue;
+    if ((node.nodeType !== "experiment" && node.nodeType !== "compose") || node.status !== "keep" || node.metric <= 0) continue;
+    if (prior === null || nodeEpoch > prior.epoch || (nodeEpoch === prior.epoch && isBetter(node.metric, prior.node.metric, tree.direction))) {
+      prior = { epoch: nodeEpoch, node };
+    }
+  }
+
+  return { epoch, scoped: { ...tree, nodes, baselineMetric }, prior };
+}
+
+/** One-line cross-epoch reference for tree views; null when no earlier epoch has a keep. */
+function epochReferenceLine(view: EpochTreeView): string | null {
+  if (view.prior === null) return null;
+  const { node } = view.prior;
+  const label = node.hypothesisLabel || node.hypothesis || node.id;
+  return `\u2194 e${view.prior.epoch} best: ${label} (${node.metric}) \u2014 other scale, not compared with epoch ${view.epoch}`;
 }
 
 interface AutoresearchConfig {
@@ -983,19 +1150,24 @@ function validateWorkDir(ctxCwd: string): string | null {
   return null;
 }
 
-/** Baseline = first experiment in current segment */
-function findBaselineMetric(results: ExperimentResult[], segment: number): number | null {
-  const cur = currentResults(results, segment);
+/** Baseline = first experiment of the current epoch in the current segment */
+export function findBaselineMetric(
+  results: ExperimentResult[],
+  segment: number,
+  epoch: number = segmentEpoch(results, segment),
+): number | null {
+  const cur = epochResults(results, segment, epoch);
   return cur.length > 0 ? cur[0].metric : null;
 }
 
-/** Best = optimal metric across kept experiments in current segment (min for lower, max for higher) */
-function findBestMetric(
+/** Best = optimal metric across kept experiments of the current epoch (min for lower, max for higher) */
+export function findBestMetric(
   results: ExperimentResult[],
   segment: number,
   direction: "lower" | "higher",
+  epoch: number = segmentEpoch(results, segment),
 ): number | null {
-  const kept = currentResults(results, segment)
+  const kept = epochResults(results, segment, epoch)
     .filter((r) => r.status === "keep")
     .map((r) => r.metric);
   if (kept.length === 0) return null;
@@ -1007,11 +1179,13 @@ function findBestRunNumber(
   results: ExperimentResult[],
   segment: number,
   direction: "lower" | "higher",
+  epoch: number = segmentEpoch(results, segment),
 ): number {
   const seg = currentResults(results, segment);
   let bestIdx = -1;
   let bestVal: number | null = null;
   for (let i = 0; i < seg.length; i++) {
+    if (resultEpoch(seg[i]) !== epoch) continue;
     if (seg[i].status !== "keep" || seg[i].metric === 0) continue;
     const m = seg[i].metric;
     if (bestVal === null || (direction === "lower" ? m < bestVal : m > bestVal)) {
@@ -1250,8 +1424,12 @@ async function finalizeExistingNode(
   return warning;
 }
 
-function findBaselineRunNumber(results: ExperimentResult[], segment: number): number | null {
-  const index = results.findIndex((result) => result.segment === segment);
+function findBaselineRunNumber(
+  results: ExperimentResult[],
+  segment: number,
+  epoch: number = segmentEpoch(results, segment),
+): number | null {
+  const index = results.findIndex((result) => result.segment === segment && resultEpoch(result) === epoch);
   return index >= 0 ? index + 1 : null;
 }
 
@@ -1263,9 +1441,10 @@ function findBaselineRunNumber(results: ExperimentResult[], segment: number): nu
 function findBaselineSecondary(
   results: ExperimentResult[],
   segment: number,
-  knownMetrics?: MetricDef[]
+  knownMetrics?: MetricDef[],
+  epoch: number = segmentEpoch(results, segment),
 ): Record<string, number> {
-  const cur = currentResults(results, segment);
+  const cur = epochResults(results, segment, epoch);
   const base: Record<string, number> = cur.length > 0
     ? { ...(cur[0].metrics ?? {}) }
     : {};
@@ -1412,15 +1591,18 @@ function createRuntimeStore() {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Dashboard table renderer (pure function, no UI deps)
+// Dashboard table renderer (pure function, no UI deps). `scale` (task 2.4) is
+// the dual-scale status folded from the ledger by the caller — measurement.ts
+// owns the fold; null = caller did not fetch it (line absent, legacy behavior).
 // ---------------------------------------------------------------------------
 
-function renderDashboardLines(
+export function renderDashboardLines(
   st: ExperimentState,
   width: number,
   th: Theme,
   maxRows: number = 6,
-  headerHints: string[] = []
+  headerHints: string[] = [],
+  scale: MeasurementScaleStatus | null = null
 ): string[] {
   const lines: string[] = [];
 
@@ -1435,17 +1617,26 @@ function renderDashboardLines(
   const crashed = cur.filter((r) => r.status === "crash").length;
   const checksFailed = cur.filter((r) => r.status === "checks_failed").length;
 
-  const baseline = st.bestMetric;
-  const baselineRunNumber = findBaselineRunNumber(st.results, st.currentSegment);
-  const baselineSec = findBaselineSecondary(st.results, st.currentSegment, st.secondaryMetrics);
+  // Current epoch (task 2.3): the highest of the runs' epochs and the ledger's
+  // scale epoch — a measurement_change opens its epoch before the first run.
+  // An epoch with no runs yet has no baseline of its own (shown as —). The
+  // Runs-line confidence stays as computed for the last epoch with runs (2.4
+  // contract: shown unless rescore_pending) until the epoch's first run lands.
+  const runsEpoch = segmentEpoch(st.results, st.currentSegment);
+  const epoch = Math.max(runsEpoch, scale?.epoch ?? runsEpoch);
+  const epochOpenWithoutRuns = epoch > runsEpoch;
 
-  // Find best kept primary metric and its run number (current segment only)
+  const baseline = epochOpenWithoutRuns ? null : st.bestMetric;
+  const baselineRunNumber = findBaselineRunNumber(st.results, st.currentSegment, epoch);
+  const baselineSec = findBaselineSecondary(st.results, st.currentSegment, st.secondaryMetrics, epoch);
+
+  // Find best kept primary metric and its run number (current epoch of the current segment only)
   let bestPrimary: number | null = null;
   let bestSecondary: Record<string, number> = {};
   let bestRunNum = 0;
   for (let i = st.results.length - 1; i >= 0; i--) {
     const r = st.results[i];
-    if (r.segment !== st.currentSegment) continue;
+    if (r.segment !== st.currentSegment || resultEpoch(r) !== epoch) continue;
     if (r.status === "keep" && r.metric > 0) {
       if (bestPrimary === null || isBetter(r.metric, bestPrimary, st.bestDirection)) {
         bestPrimary = r.metric;
@@ -1455,8 +1646,12 @@ function renderDashboardLines(
     }
   }
 
-  // Runs summary
-  const confSuffix = st.confidence !== null
+  // Runs summary. Confidence is SUPPRESSED while a measurer rescore is pending
+  // (task 2.4): the number would mix the old and new scales, so an honest
+  // marker replaces it (keep is never blocked — the scale line below explains).
+  const confSuffix = scale !== null && scale.rescore_pending
+    ? `  ${th.fg("warning", "(conf: suppressed — rescore_pending)")}`
+    : st.confidence !== null
     ? (() => {
         const confStr = st.confidence!.toFixed(1);
         const confColor: Parameters<typeof th.fg>[0] = st.confidence! >= 2.0 ? "success" : st.confidence! >= 1.0 ? "warning" : "error";
@@ -1474,6 +1669,14 @@ function renderDashboardLines(
       width
     )
   );
+
+  // Dual-scale line (task 2.4): both scale scores side by side, with the
+  // rescore_pending / preliminary (needs_verification) marks.
+  if (scale !== null) {
+    const scaleColor: Parameters<typeof th.fg>[0] =
+      scale.rescore_pending ? "warning" : scale.provisional ? "muted" : "success";
+    lines.push(truncateToWidth(`  ${th.fg(scaleColor, formatMeasurementScale(scale))}`, width));
+  }
 
   // Baseline: first run's primary metric
   const baselineSuffix = baselineRunNumber === null ? "" : ` #${baselineRunNumber}`;
@@ -1541,6 +1744,18 @@ function renderDashboardLines(
         }
       }
     }
+  }
+
+  // Cross-epoch reference (task 2.3): the earlier epoch's best is shown with its
+  // scale mark, but no delta is computed against it.
+  const priorBest = priorEpochBest(st.results, st.currentSegment, epoch, st.bestDirection);
+  if (priorBest !== null) {
+    lines.push(
+      truncateToWidth(
+        `  ${th.fg("muted", "Cross-epoch:")} ${th.fg("dim", `e${priorBest.epoch} best ★ ${st.metricName}: ${formatNum(priorBest.metric, st.metricUnit)} #${priorBest.runNumber} — other scale, delta not computed`)}`,
+        width
+      )
+    );
   }
 
   lines.push("");
@@ -1616,11 +1831,12 @@ function renderDashboardLines(
   );
 
   // Baseline values for delta display (current segment only)
-  const baselinePrimary = findBaselineMetric(st.results, st.currentSegment);
+  const baselinePrimary = epochOpenWithoutRuns ? null : findBaselineMetric(st.results, st.currentSegment, epoch);
   const baselineSecondary = findBaselineSecondary(
     st.results,
     st.currentSegment,
-    st.secondaryMetrics
+    st.secondaryMetrics,
+    epoch
   );
 
   // Show max 6 recent runs, with a note about hidden earlier ones
@@ -1633,14 +1849,19 @@ function renderDashboardLines(
     );
   }
 
-  const baselineIndex = st.results.findIndex((x) => x.segment === st.currentSegment);
+  const baselineIndex = st.results.findIndex((x) => x.segment === st.currentSegment && resultEpoch(x) === epoch);
 
   for (let i = startIdx; i < st.results.length; i++) {
     const r = st.results[i];
     const isOld = r.segment !== st.currentSegment;
     const isBaseline = !isOld && i === baselineIndex;
+    // Earlier epoch of the same segment: other scale, rendered dim, never colored against the current baseline.
+    const isPriorEpoch = !isOld && resultEpoch(r) < epoch;
+    if (i > startIdx && resultEpoch(st.results[i - 1]) !== resultEpoch(r)) {
+      lines.push(truncateToWidth(`  ${th.fg("dim", `── epoch ${resultEpoch(r)} ──`)}`, width));
+    }
 
-    const color = isOld
+    const color = isOld || isPriorEpoch
       ? "dim"
       : r.status === "keep"
         ? "success"
@@ -1650,8 +1871,8 @@ function renderDashboardLines(
 
     // Primary metric with color coding
     const primaryStr = formatNum(r.metric, st.metricUnit);
-    let primaryColor: Parameters<typeof th.fg>[0] = isOld ? "dim" : "text";
-    if (!isOld) {
+    let primaryColor: Parameters<typeof th.fg>[0] = isOld || isPriorEpoch ? "dim" : "text";
+    if (!isOld && !isPriorEpoch) {
       if (isBaseline) {
         primaryColor = "text"; // baseline row — normal text
       } else if (
@@ -2284,8 +2505,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             if (!tree) {
               return [theme.fg("dim", "🌳 Failed to load tree")];
             }
-            const treeStr = renderTree(tree, 60, 3, 7);
-            return treeStr.split("\n").map((line) => truncateToWidth(line, safeWidth, "…", true));
+            const view = epochTreeView(tree, readJsonlLines(workDir).join("\n"));
+            const epochLines = view.epoch > 1 ? [`Epoch ${view.epoch} (current): best and deltas within this epoch only`] : [];
+            const referenceLine = epochReferenceLine(view);
+            const treeStr = renderTree(view.scoped, 60, 3, 7);
+            return [...epochLines, ...(referenceLine ? [referenceLine] : []), ...treeStr.split("\n")]
+              .map((line) => truncateToWidth(line, safeWidth, "…", true));
           }
 
           const title = truncateDisplayText(
@@ -2309,7 +2534,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               safeWidth,
               theme,
               rows,
-              dashboardHintVariants()
+              dashboardHintVariants(),
+              measurementScaleStatusOfDir(resolveWorkDir(ctx.cwd))
             ),
           ];
         },
@@ -3185,9 +3411,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return {
           content: [{
             type: "text",
-            text: `📏 Measurement change ${measurementChangeId(record.epoch)} recorded (epoch ${record.epoch}${scores}, needs_verification: true).`,
+            text: `📏 Measurement change ${measurementChangeId(record.epoch)} recorded (epoch ${record.epoch}${scores}, needs_verification: true).\n${formatMeasurementScale(measurementScaleStatusOfDir(workDir))}`,
           }],
-          details: { change_ref: measurementChangeId(record.epoch), epoch: record.epoch, needs_verification: record.needs_verification },
+          details: {
+            change_ref: measurementChangeId(record.epoch),
+            epoch: record.epoch,
+            needs_verification: record.needs_verification,
+            rescore_pending: record.rescore_pending === true,
+            provisional: true,
+          },
         };
       }
       return {
@@ -4027,7 +4259,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         try {
           const jsonlPath = autoresearchJsonlPath(workDir);
           ensureParentDir(jsonlPath);
-          fs.appendFileSync(jsonlPath, JSON.stringify({ run: state.results.length + 1, commit: params.commit, metric: params.metric, status: "explore", description: params.description, segment: state.currentSegment, phaseStep: phase.stepsTaken }) + "\n");
+          fs.appendFileSync(jsonlPath, JSON.stringify({ run: state.results.length + 1, commit: params.commit, metric: params.metric, status: "explore", description: params.description, segment: state.currentSegment, epoch: measurementScaleStatusOfDir(workDir).epoch, phaseStep: phase.stepsTaken }) + "\n");
         } catch { /* best-effort */ }
         persistPhase(runtime.phaseStore, workDir);
 
@@ -4098,6 +4330,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         Math.max(readLedgerMaxRun(workDir), highestRunDirNumber(workDir)) + 1;
       runtime.lastRunNumber = null;
 
+      // Measurement epoch of this run (task 2.3): every run logged now carries the
+      // ledger's current scale epoch, so a later measurement_change never leaves it
+      // to the epoch-1 default. Read once; the dual-scale block below reuses it.
+      const scaleStatus = measurementScaleStatusOfDir(workDir);
+      const runEpoch = scaleStatus.epoch;
+
       const experiment: ExperimentResult = {
         commit: (params.commit ?? "").slice(0, 7),
         metric: params.metric,
@@ -4106,6 +4344,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         description: params.description,
         timestamp: Date.now(),
         segment: state.currentSegment,
+        epoch: runEpoch,
         confidence: null,
         asi: mergedASI,
       };
@@ -4139,12 +4378,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       if (state.bestMetric !== null) {
         text += `\nBaseline ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}`;
-        if (segmentCount > 1 && params.status === "keep" && params.metric > 0) {
+        // Delta only against the baseline of THIS epoch (task 2.3): a single run of a new epoch has nothing to compare with yet.
+        const epochRunCount = epochResults(state.results, state.currentSegment, runEpoch).length;
+        if (epochRunCount > 1 && params.status === "keep" && params.metric > 0) {
           const delta = params.metric - state.bestMetric;
           const pct = ((delta / state.bestMetric) * 100).toFixed(1);
           const sign = delta > 0 ? "+" : "";
           text += ` | this: ${formatNum(params.metric, state.metricUnit)} (${sign}${pct}%)`;
         }
+      }
+      const priorBest = priorEpochBest(state.results, state.currentSegment, runEpoch, state.bestDirection);
+      if (priorBest !== null) {
+        text += `\nCross-epoch: e${priorBest.epoch} best ${formatNum(priorBest.metric, state.metricUnit)} (run #${priorBest.runNumber}) is on another scale than epoch ${runEpoch} \u2014 delta not computed`;
       }
 
       if (droppedMissing.length > 0) {
@@ -4183,8 +4428,23 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
+      // Dual-scale accounting (task 2.4): the LEDGER decides the scale state.
+      // A measurer change adds the scale line (both scores, provisional mark);
+      // while its rescore is pending the confidence score is SUPPRESSED with an
+      // honest reason — keep is never blocked, the mark just says the numbers
+      // are not comparable yet.
+      if (scaleStatus.change_ref !== null) {
+        text += `\n📏 ${formatMeasurementScale(scaleStatus)}`;
+      }
+      const confidenceSuppression = confidenceSuppressionReason(scaleStatus);
+
       // Show confidence score (T5: context-aware — different message for keep vs discard)
-      if (state.confidence !== null) {
+      if (confidenceSuppression !== null) {
+        text +=
+          `\n⚠️ Confidence suppressed: ${confidenceSuppression}. ` +
+          `This ${params.status} is recorded, but the improvement is not confirmed until the rescore completes ` +
+          `(finish it with log_measurement_change {change_ref: "${scaleStatus.change_ref}", rescore_ref: <full artifact>}).`;
+      } else if (state.confidence !== null) {
         const confStr = state.confidence.toFixed(1);
         const isKeep = params.status === "keep";
         // Find the run number where the current best was set
@@ -4198,7 +4458,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             const nf = (nfCfg as Record<string, unknown>).noiseFloor;
             if (typeof nf === "number" && nf > 0 && state.results.length >= 2) {
               const prevBest = state.results
-                .filter((r) => r.segment === state.currentSegment && r.status === "keep" && r.runNumber !== experiment.runNumber)
+                .filter((r) => r.segment === state.currentSegment && resultEpoch(r) === runEpoch && r.status === "keep" && r.runNumber !== experiment.runNumber)
                 .reduce((best, r) => {
                   if (state.bestDirection === "lower") return best === null || r.metric < best ? r.metric : best;
                   return best === null || r.metric > best ? r.metric : best;
@@ -4508,8 +4768,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (s.bestMetric !== null) {
         // Find the actual best kept metric in the current segment
         let best = s.bestMetric;
+        const bestEpoch = segmentEpoch(s.results, s.currentSegment);
         for (const r of s.results) {
-          if (r.segment === s.currentSegment && r.status === "keep" && r.metric > 0) {
+          if (r.segment === s.currentSegment && resultEpoch(r) === bestEpoch && r.status === "keep" && r.metric > 0) {
             if (isBetter(r.metric, best, s.bestDirection)) best = r.metric;
           }
         }
@@ -4576,7 +4837,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }, 80);
 
       const buildOverlayContent = (renderWidth: number): string[] => {
-        const content = renderDashboardLines(state, renderWidth, theme, 0);
+        const content = renderDashboardLines(state, renderWidth, theme, 0, [], measurementScaleStatusOfDir(resolveWorkDir(ctx.cwd)));
         if (runtime.runningExperiment) {
           const elapsed = formatElapsed(Date.now() - runtime.runningExperiment.startedAt);
           const frame = SPINNER[spinnerFrame % SPINNER.length];
@@ -5220,9 +5481,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const state = runtime.state;
     const workDir = resolveWorkDir(ctx.cwd);
     const head = (await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: resolveRepoRoot(workDir), timeout: 5000 })).stdout.trim() || "0000000";
+    const phaseEpoch = measurementScaleStatusOfDir(workDir).epoch;
     state.results.push({
       commit: head.slice(0, 7), metric, metrics: {}, status, description,
-      timestamp: Date.now(), segment: state.currentSegment, confidence: null,
+      timestamp: Date.now(), segment: state.currentSegment, epoch: phaseEpoch, confidence: null,
     });
     runtime.experimentsThisSession++;
     state.bestMetric = findBaselineMetric(state.results, state.currentSegment);
@@ -5230,7 +5492,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     try {
       const jsonlPath = autoresearchJsonlPath(resolveWorkDir(ctx.cwd));
       ensureParentDir(jsonlPath);
-      fs.appendFileSync(jsonlPath, JSON.stringify({ run: state.results.length, commit: head.slice(0, 7), metric, status, description, segment: state.currentSegment, source: "phase" }) + "\n");
+      fs.appendFileSync(jsonlPath, JSON.stringify({ run: state.results.length, commit: head.slice(0, 7), metric, status, description, segment: state.currentSegment, epoch: phaseEpoch, source: "phase" }) + "\n");
       broadcastDashboardUpdate(resolveWorkDir(ctx.cwd));
     } catch { /* best-effort */ }
   }
@@ -5676,7 +5938,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       const detailMode = params.detail || "summary";
       const activeNode = tree.nodes[tree.activeNodeId];
-      const bestId = findBestNodeId(tree);
+      // Epoch view (task 2.3): ★ best, deltas and the tree body cover the current epoch only.
+      const view = epochTreeView(tree, readJsonlLines(workDir).join("\n"));
+      const bestId = findBestNodeId(view.scoped);
       const nodeCount = Object.keys(tree.nodes).length;
       const failStreak = failedStreakSinceLastKeep(tree, tree.activeNodeId);
 
@@ -5696,7 +5960,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
       text += "\n";
 
-      text += renderTree(tree, 60, 3, 7);
+      if (view.epoch > 1) text += `Epoch ${view.epoch} (current): best and deltas within this epoch only\n`;
+      const referenceLine = epochReferenceLine(view);
+      if (referenceLine) text += `${referenceLine}\n`;
+
+      text += renderTree(view.scoped, 60, 3, 7);
 
       // Failure streak since last keep (NOT the total — flat trees accumulate
       // the whole campaign on the root and the total always looks catastrophic)
@@ -5708,8 +5976,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (detailMode === "full") {
         text += `\n${"═".repeat(80)}\n`;
         text += `Node Details:\n\n`;
-        for (const node of Object.values(tree.nodes)) {
-          text += renderNodeDetail(tree, node) + "\n";
+        for (const node of Object.values(view.scoped.nodes)) {
+          text += renderNodeDetail(view.scoped, node) + "\n";
         }
       }
 

@@ -47,12 +47,22 @@
  * SAME epoch (no re-bump), scores again parsed from the full artifact; the
  * original record is never rewritten. The four-field health summary above is
  * untouched and keeps its contract.
+ *
+ * Task 2.4 (measurement track) adds the dual-scale view on top of the records:
+ * `measurementScaleStatus()` folds the latest change (both scores, rescore
+ * pending, provisional-until-verified), `formatMeasurementScale()` renders the
+ * dashboard line the widget and the tool responses share, and
+ * `confidenceSuppressionReason()` is the honest confidence gate — suppressed
+ * while a rescore is pending, keep never blocked. The epoch of every fold here
+ * comes from jsonl.ts's `reconstructJsonlState().currentEpoch` — the SINGLE
+ * currentEpoch source shared with index/dashboard and lens-inspect (review
+ * fix for 2.2), so a reverted record and a broken epoch behave identically
+ * everywhere.
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { parseJsonlEntry } from "./jsonl.ts";
-import { DEFAULT_EPOCH } from "./lens-extractors.ts";
+import { parseJsonlEntry, reconstructJsonlState } from "./jsonl.ts";
 import { loadFindings, type FindingView, type FindingsState } from "./findings.ts";
 import { AUTO_DIR } from "./paths.ts";
 
@@ -74,7 +84,7 @@ export interface MeasurementHealthSummary {
 
 /** Measurement-track facts folded from the raw ledger text. */
 export interface MeasurementLedgerFacts {
-  /** Current scale epoch (DEFAULT_EPOCH when no entry carries an epoch). */
+  /** Current scale epoch (jsonl.ts reconstruct's currentEpoch — 1 when no entry carries an epoch). */
   epoch: number;
   /** Number of `measurement_change` records in the ledger. */
   measurement_change_count: number;
@@ -87,22 +97,21 @@ export interface MeasurementLedgerFacts {
 // ──────────────────────────────────────────────────────────────────────────
 
 /**
- * Fold ledger text into measurement-track facts. Every non-empty line is
- * parsed leniently (malformed lines are skipped); any entry carrying a valid
- * `epoch` (integer >= 1) counts toward the current epoch, matching the
- * task-2.2 contract «записи без epoch = эпоха 1».
+ * Fold ledger text into measurement-track facts. The epoch is NOT re-derived
+ * here: it comes from jsonl.ts's `reconstructJsonlState().currentEpoch` — the
+ * single currentEpoch source that index, the dashboard, lens-inspect and this
+ * module all read (review fix for 2.2), so run records and measurement_change*
+ * records advance the epoch identically everywhere and the task-2.2 contract
+ * «записи без epoch = эпоха 1» holds once, not per consumer. Only the change
+ * count is folded locally (it feeds floor_stale; malformed lines are skipped).
  */
 export function measurementLedgerFacts(ledgerText: string): MeasurementLedgerFacts {
-  let epoch: number = DEFAULT_EPOCH;
+  const epoch = reconstructJsonlState(ledgerText).currentEpoch;
   let changeCount = 0;
   for (const line of ledgerText.split("\n")) {
     if (line.trim().length === 0) continue;
     const entry = parseJsonlEntry(line);
-    if (!entry) continue;
-    if (typeof entry.epoch === "number" && Number.isSafeInteger(entry.epoch) && entry.epoch >= 1) {
-      epoch = Math.max(epoch, entry.epoch);
-    }
-    if (entry.type === "measurement_change") changeCount++;
+    if (entry !== null && entry.type === "measurement_change") changeCount++;
   }
   return { epoch, measurement_change_count: changeCount, floor_stale: changeCount > 0 };
 }
@@ -221,6 +230,166 @@ export function formatMeasurementHealth(summary: MeasurementHealthSummary): stri
   );
   parts.push(`top_impact: ${summary.top_impact ?? "—"}`);
   return `Measurement health: ${parts.join("; ")}`;
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Scale status — dual-scale accounting (task 2.4; spec measurement-track:
+// «Обязательный учёт обеих шкал», сценарии «обе шкалы известны» и
+// «рескор отложен»)
+// ──────────────────────────────────────────────────────────────────
+
+/**
+ * Dual-scale state of the campaign, folded from the ledger. Consumed by the
+ * dashboard (index.ts renderDashboardLines), the log_experiment response and
+ * the log_measurement_change tool response — one fold, one rendering, so the
+ * marks cannot drift between the surfaces.
+ */
+export interface MeasurementScaleStatus {
+  /** Current scale epoch — jsonl.ts reconstruct's currentEpoch (single source). */
+  epoch: number;
+  /** Reference of the latest measurement_change ("e2"); null = no changes yet. */
+  change_ref: string | null;
+  /**
+   * The latest change is pending and not completed yet: the new scale has no
+   * scores, and the confidence score stays suppressed until the rescore lands.
+   */
+  rescore_pending: boolean;
+  /**
+   * The new scale is not yet independently verified (needs_verification, or
+   * the rescore is pending) — honest «предварительная» mark for the dashboard.
+   * Task 2.8's verified/reverted records will refine this fold in place.
+   */
+  provisional: boolean;
+  /** Old-scale score of the latest change, parsed from its artifact (null = absent). */
+  old_scale_score: number | null;
+  /** New-scale score of the latest change, parsed from its artifact (null = absent). */
+  new_scale_score: number | null;
+}
+
+function finiteScoreOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+interface LatestChangeFold {
+  epoch: number;
+  pending: boolean;
+  needsVerification: boolean;
+  old: number | null;
+  new: number | null;
+}
+
+/**
+ * Pure fold of the ledger text into the dual-scale status. Follows the LAST
+ * `measurement_change` record (each change resets the completion state — a
+ * completion of an older change never completes the newer one); a
+ * `measurement_change_completed` for it resolves the pending flag and fills
+ * whichever score the change record itself lacks. Records without a usable
+ * epoch are ignored; malformed lines are skipped. Never throws.
+ */
+export function measurementScaleStatus(ledgerText: string): MeasurementScaleStatus {
+  // Single currentEpoch source (review fix for 2.2): jsonl.ts reconstruct.
+  const epoch = reconstructJsonlState(ledgerText).currentEpoch;
+
+  let change: LatestChangeFold | null = null;
+  let completedForChange = false;
+  let completedScores: { old: number | null; new: number | null } | null = null;
+
+  for (const line of ledgerText.split("\n")) {
+    if (line.trim().length === 0) continue;
+    const entry = parseJsonlEntry(line);
+    if (entry === null) continue;
+    if (entry.type === "measurement_change" && typeof entry.epoch === "number" && entry.epoch >= 1) {
+      change = {
+        epoch: entry.epoch,
+        pending: entry.rescore_pending === true,
+        needsVerification: entry.needs_verification === true,
+        old: finiteScoreOrNull(entry.old_scale_score),
+        new: finiteScoreOrNull(entry.new_scale_score),
+      };
+      completedForChange = false;
+      completedScores = null;
+      continue;
+    }
+    if (
+      entry.type === "measurement_change_completed" && change !== null &&
+      entry.change_ref === measurementChangeId(change.epoch)
+    ) {
+      completedForChange = true;
+      completedScores = {
+        old: finiteScoreOrNull(entry.old_scale_score),
+        new: finiteScoreOrNull(entry.new_scale_score),
+      };
+    }
+  }
+
+  if (change === null) {
+    return {
+      epoch,
+      change_ref: null,
+      rescore_pending: false,
+      provisional: false,
+      old_scale_score: null,
+      new_scale_score: null,
+    };
+  }
+
+  const pending = change.pending && !completedForChange;
+  return {
+    epoch,
+    change_ref: measurementChangeId(change.epoch),
+    rescore_pending: pending,
+    provisional: pending || change.needsVerification,
+    old_scale_score: change.old ?? completedScores?.old ?? null,
+    new_scale_score: change.new ?? completedScores?.new ?? null,
+  };
+}
+
+/**
+ * Disk entry point for the dashboard and the tool responses (same ledger
+ * resolution as measurementHealthSummary). Missing/unreadable ledger degrades
+ * to the healthy status — never throws.
+ */
+export function measurementScaleStatusOfDir(workDir: string): MeasurementScaleStatus {
+  return measurementScaleStatus(readLedgerText(workDir));
+}
+
+/** Render a score as ledger text: the JSON number as-is, «—» when absent. */
+function formatScaleScore(score: number | null): string {
+  return score === null ? "—" : String(score);
+}
+
+/**
+ * One-line dashboard rendering of the dual-scale state («Шкала: …»), shared by
+ * the widget dashboard, the log_experiment response and the
+ * log_measurement_change response. With known scores both numbers are shown
+ * side by side («дашборд показывает оба числа рядом»); a pending rescore shows
+ * the honest pending mark instead, and an unverified scale is marked
+ * предварительная. The healthy state names its absence of changes.
+ */
+export function formatMeasurementScale(status: MeasurementScaleStatus): string {
+  if (status.change_ref === null) {
+    return `Шкала: эпоха ${status.epoch} · изменений измерителя не зарегистрировано`;
+  }
+  const parts: string[] = [];
+  if (status.rescore_pending) {
+    parts.push(`rescore_pending (${status.change_ref}: рескор не завершён — шкалы появятся после рескора)`);
+  } else {
+    parts.push(`old_scale_score ${formatScaleScore(status.old_scale_score)} → new_scale_score ${formatScaleScore(status.new_scale_score)}`);
+  }
+  if (status.provisional) {
+    parts.push("шкала предварительная (needs_verification)");
+  }
+  return `Шкала: эпоха ${status.epoch} · ${parts.join(" · ")}`;
+}
+
+/**
+ * Honest reason to suppress the confidence score (spec «рескор отложен»:
+ * confidence score подавляется до завершения рескора), or null when the score
+ * may be shown. Suppression is a MARK, not a gate — keep is never blocked.
+ */
+export function confidenceSuppressionReason(status: MeasurementScaleStatus): string | null {
+  if (!status.rescore_pending) return null;
+  return `рескор изменения ${status.change_ref} не завершён (rescore_pending) — оценки старой и новой шкалы ещё не сопоставлены`;
 }
 
 // ──────────────────────────────────────────────────────────────────
