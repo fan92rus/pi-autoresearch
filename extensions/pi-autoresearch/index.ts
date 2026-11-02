@@ -58,8 +58,14 @@ import {
   persistSlateEntry,
   runCouncilDelegated,
 } from "./council-delegation.ts";
-import { createWriteStream } from "node:fs";
-import { randomBytes } from "node:crypto";
+import {
+  allocateRunArtifacts,
+  disabledRunOutputSink,
+  highestRunDirNumber,
+  openRunOutputSink,
+  type RunArtifacts,
+  type RunOutputSink,
+} from "./lens.ts";
 import { tmpdir } from "node:os";
 
 import {
@@ -274,6 +280,8 @@ interface AutoresearchRuntime {
   lastLogFlag: string | null;
   /** What run_experiment actually measured last: parsed primary metric (or null if no METRIC line) + wall-clock fallback. Reset to null on init/compact. Read by log_experiment to flag agent-claimed metrics. */
   lastMeasurement: { primary: number | null; wallClockSeconds: number } | null;
+  /** Run number minted by the last run_experiment — also its .auto/runs/<n> artifact directory number. Consumed by the next log_experiment so the ledger entry binds to the right artifacts; null when no run precedes the log. */
+  lastRunNumber: number | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -461,18 +469,6 @@ function formatNum(value: number | null, unit: string): string {
   if (value === Math.round(value)) return fmtNum(value) + u;
   // Fractional: 2 decimal places
   return fmtNum(value, 2) + u;
-}
-
-/** Lazy temp file allocator — returns the same path on subsequent calls */
-function createTempFileAllocator(): () => string {
-  let p: string | undefined;
-  return () => {
-    if (!p) {
-      const id = randomBytes(8).toString("hex");
-      p = path.join(tmpdir(), `pi-experiment-${id}.log`);
-    }
-    return p;
-  };
 }
 
 /** Format elapsed milliseconds as "Xm XXs" or "XXs" */
@@ -1306,6 +1302,7 @@ function createSessionRuntime(): AutoresearchRuntime {
     consecutiveDriftResumes: 0,
     lastLogFlag: null,
     lastMeasurement: null,
+    lastRunNumber: null,
   };
 }
 
@@ -1912,6 +1909,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return null;
   };
 
+  // Highest run number in .auto/log.jsonl (0 when there is no ledger yet).
+  // This — not the number of entries — is what run numbers must stay above:
+  // ledgers can hold gaps (runs that were never logged) and pre-lens history
+  // (logged runs whose .auto/runs directories do not exist).
+  const readLedgerMaxRun = (workDir: string): number => {
+    let max = 0;
+    for (const line of readJsonlLines(workDir)) {
+      const entry = parseJsonlEntry(line);
+      if (isAutoresearchRunEntry(entry) && entry.run > max) max = entry.run;
+    }
+    return max;
+  };
+
   const buildSessionSnapshot = (state: ExperimentState): SessionSnapshot => ({
     metric_name: state.metricName,
     metric_unit: state.metricUnit,
@@ -1995,6 +2005,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     runtime.experimentsThisSession = 0;
     runtime.autoResumeTurns = 0;
     runtime.lastMeasurement = null;
+    runtime.lastRunNumber = null;
     runtime.state = createExperimentState();
 
     let state = runtime.state;
@@ -2490,8 +2501,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       state.metricName = params.metric_name;
       state.metricUnit = params.metric_unit ?? "";
       // New segment = new measurement lineage: stale lastMeasurement must not
-      // bless the next baseline log as "measured".
+      // bless the next baseline log as "measured". Same for the minted run
+      // number: a new segment never inherits the previous segment's binding.
       runtime.lastMeasurement = null;
+      runtime.lastRunNumber = null;
       if (params.direction === "lower" || params.direction === "higher") {
         state.bestDirection = params.direction;
       }
@@ -2846,7 +2859,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     name: "run_experiment",
     label: "Run Experiment",
     description:
-      `Run a shell command as an experiment. Times wall-clock duration, captures output, detects pass/fail via exit code. Output is truncated to last ${EXPERIMENT_MAX_LINES} lines or ${EXPERIMENT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Use for any autoresearch experiment.`,
+      `Run a shell command as an experiment. Times wall-clock duration, captures output, detects pass/fail via exit code. Output is truncated to last ${EXPERIMENT_MAX_LINES} lines or ${EXPERIMENT_MAX_BYTES / 1024}KB (whichever is hit first). Full output is always saved to .auto/runs/<n>/output.txt (the path is in the response). Use for any autoresearch experiment.`,
     promptSnippet:
       "Run a timed experiment command (captures duration, output, exit code)",
     promptGuidelines: [
@@ -3045,6 +3058,39 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
 
+      // Full output goes to .auto/runs/<n>/output.txt from the first byte, so a
+      // crash, timeout or abort keeps whatever was printed before it. The run
+      // number is minted here and reused by log_experiment, so the ledger entry
+      // for this run always names the directory holding its output
+      // (inspect_results reads .auto/runs/<run>/ by the ledger number). The
+      // ledger floor covers campaigns that predate .auto/runs (their run
+      // numbers are far ahead of the dirs) and unlogged runs (dirs ahead of the
+      // ledger); the exclusive mkdir above the highest dir prevents overwrite.
+      // Artifacts are best-effort by contract (spec result-lens: missing or
+      // unwritable artifacts are logged, never fatal): if `.auto/runs` cannot
+      // be created/opened the run still executes, persistence is simply off
+      // and the reason surfaces in the response. A ledger-safe number is
+      // minted either way so log_experiment never collides with old numbers.
+      let runArtifacts: RunArtifacts | null = null;
+      let outputSink: RunOutputSink = disabledRunOutputSink("artifact persistence not attempted");
+      try {
+        runArtifacts = allocateRunArtifacts(workDir, readLedgerMaxRun(workDir) + 1);
+        runtime.lastRunNumber = runArtifacts.runNumber;
+        outputSink = openRunOutputSink(runArtifacts.outputPath);
+      } catch (e) {
+        if (runArtifacts === null) {
+          runtime.lastRunNumber = Math.max(readLedgerMaxRun(workDir), highestRunDirNumber(workDir)) + 1;
+        } else {
+          // Directory allocated but the sink could not be opened: the number
+          // stays (the ledger binds to it), but no path is reported — nothing
+          // readable is guaranteed to exist under it.
+          runArtifacts = null;
+        }
+        outputSink = disabledRunOutputSink(
+          `run artifacts unavailable: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+
       // TODO(/tree): replace compaction-based resume with a checkpoint-per-iteration model.
       runtime.runningExperiment = { startedAt: Date.now(), command: params.command };
       // Ledger marker BEFORE the spawn (goal-x discipline: events before action).
@@ -3061,7 +3107,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       try {
         const jsonlPath = autoresearchJsonlPath(workDir);
         ensureParentDir(jsonlPath);
-        fs.appendFileSync(jsonlPath, JSON.stringify({ type: "run_started", node_id: runNodeId, command: params.command, started_at: runStartedAt }) + "\n");
+        fs.appendFileSync(jsonlPath, JSON.stringify({ type: "run_started", run_dir: runArtifacts?.runNumber, node_id: runNodeId, command: params.command, started_at: runStartedAt }) + "\n");
       } catch { /* best-effort — the run itself matters more than its marker */ }
       updateWidget(ctx);
       if (overlayTui) overlayTui.requestRender();
@@ -3069,13 +3115,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const t0 = Date.now();
 
       // Spawn the process directly (like the bash tool) for streaming output
-      const getTempFile = createTempFileAllocator();
-      const { exitCode, killed: timedOut, output, tempFilePath: streamTempFile, actualTotalBytes } = await new Promise<{
+      const { exitCode, killed: timedOut, output } = await new Promise<{
         exitCode: number | null;
         killed: boolean;
         output: string;
-        tempFilePath: string | undefined;
-        actualTotalBytes: number;
       }>((resolve, reject) => {
         let processTimedOut = false;
 
@@ -3096,11 +3139,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const chunks: Buffer[] = [];
         let chunksBytes = 0;
         const maxChunksBytes = DEFAULT_MAX_BYTES * 2;
-
-        // Temp file for full output when it overflows
-        let tempFilePath: string | undefined;
-        let tempFileStream: ReturnType<typeof createWriteStream> | undefined;
-        let totalBytes = 0;
 
         // Cache for Buffer.concat — only rebuild when chunks change
         let chunksGeneration = 0;
@@ -3128,26 +3166,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               phase: "running",
               elapsed,
               truncation: trunc.truncated ? trunc : undefined,
-              fullOutputPath: tempFilePath,
+              fullOutputPath: runArtifacts?.outputPath,
             },
           });
         }, 1000);
 
         const handleData = (data: Buffer) => {
-          totalBytes += data.length;
-
-          // Start writing to temp file once we exceed the threshold
-          if (totalBytes > DEFAULT_MAX_BYTES && !tempFilePath) {
-            tempFilePath = getTempFile();
-            tempFileStream = createWriteStream(tempFilePath);
-            for (const chunk of chunks) {
-              tempFileStream.write(chunk);
-            }
-          }
-
-          if (tempFileStream) {
-            tempFileStream.write(data);
-          }
+          outputSink.write(data);
 
           // Keep rolling buffer of recent data
           chunks.push(data);
@@ -3209,7 +3234,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           clearInterval(timerInterval);
           if (timeoutHandle) clearTimeout(timeoutHandle);
           if (signal) signal.removeEventListener("abort", onAbort);
-          if (tempFileStream) tempFileStream.end();
           reject(err);
         });
 
@@ -3217,8 +3241,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           clearInterval(timerInterval);
           if (timeoutHandle) clearTimeout(timeoutHandle);
           if (signal) signal.removeEventListener("abort", onAbort);
-          if (tempFileStream) tempFileStream.end();
-
           if (signal?.aborted) {
             reject(new Error("aborted"));
             return;
@@ -3229,11 +3251,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             exitCode: code,
             killed: processTimedOut,
             output: fullBuffer.toString("utf-8"),
-            tempFilePath,
-            actualTotalBytes: totalBytes,
           });
         });
       }).finally(() => {
+        outputSink.close();
         runtime.runningExperiment = null;
         updateWidget(ctx);
         if (overlayTui) overlayTui.requestRender();
@@ -3275,13 +3296,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       const passed = benchmarkPassed && (checksPass === null || checksPass);
 
-      // Reuse streaming temp file if it exists, otherwise create one for large output
-      let fullOutputPath: string | undefined = streamTempFile;
-      const totalLines = output.split("\n").length;
-      if (!fullOutputPath && (actualTotalBytes > EXPERIMENT_MAX_BYTES || totalLines > EXPERIMENT_MAX_LINES)) {
-        fullOutputPath = getTempFile();
-        fs.writeFileSync(fullOutputPath, output);
-      }
+      const fullOutputPath = runArtifacts?.outputPath;
 
       // Wider truncation for TUI display (details.tailOutput)
       const displayTruncation = truncateTail(output, {
@@ -3298,7 +3313,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Matching ledger marker AFTER the spawn resolves (exit/timeout/kill alike).
       try {
         const jsonlPath = autoresearchJsonlPath(workDir);
-        fs.appendFileSync(jsonlPath, JSON.stringify({ type: "run_result", started_at: runStartedAt, node_id: runNodeId, exit_code: exitCode, killed: timedOut, duration_seconds: Number(durationSeconds.toFixed(1)) }) + "\n");
+        fs.appendFileSync(jsonlPath, JSON.stringify({ type: "run_result", run_dir: runArtifacts?.runNumber, started_at: runStartedAt, node_id: runNodeId, exit_code: exitCode, killed: timedOut, duration_seconds: Number(durationSeconds.toFixed(1)) }) + "\n");
       } catch { /* best-effort */ }
 
       // Parse structured METRIC lines from output
@@ -3393,6 +3408,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           text += ` Full output: ${fullOutputPath}`;
         }
         text += `]`;
+      } else if (fullOutputPath) {
+        text += `\n\nFull output: ${fullOutputPath}`;
+      }
+      if (outputSink.error !== null) {
+        text += runArtifacts === null
+          ? `\n⚠ ${outputSink.error}`
+          : `\n⚠ Full output was not completely persisted: ${outputSink.error}`;
       }
 
       if (checksPass === false) {
@@ -3694,6 +3716,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
       const mergedASI = Object.keys(asiRecord).length > 0 ? asiRecord : undefined;
 
+      // The run number minted by run_experiment — the same number as its
+      // .auto/runs/<n> artifact directory, so inspect_results(run=N) reads
+      // THIS run's output. Falls back to above-both numbering only when a
+      // log has no preceding run_experiment in this session: the ledger max
+      // (gaps, pre-lens history) and the highest orphan run directory both
+      // matter, so a fallback entry never collides with an earlier number.
+      // Consumed on use: a second log without a new run must not re-bind it.
+      const runNumber =
+        runtime.lastRunNumber ??
+        Math.max(readLedgerMaxRun(workDir), highestRunDirNumber(workDir)) + 1;
+      runtime.lastRunNumber = null;
+
       const experiment: ExperimentResult = {
         commit: (params.commit ?? "").slice(0, 7),
         metric: params.metric,
@@ -3731,7 +3765,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // Build response text
       const segmentCount = currentResults(state.results, state.currentSegment).length;
-      let text = `Logged #${state.results.length}: ${experiment.status} — ${experiment.description}`;
+      let text = `Logged #${runNumber}: ${experiment.status} — ${experiment.description}`;
 
       if (state.bestMetric !== null) {
         text += `\nBaseline ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}`;
@@ -3895,7 +3929,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       const jsonlEntry: Record<string, unknown> = {
-        run: state.results.length,
+        run: runNumber,
         ...experiment,
       };
       if (!mergedASI) delete jsonlEntry.asi;
