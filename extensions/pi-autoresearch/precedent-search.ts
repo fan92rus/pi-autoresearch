@@ -19,20 +19,37 @@
  *     4. The parent fits the report into 8 KiB by dropping the lowest-ranked
  *        candidates; `output.truncated` reports the omission.
  *
+ *   5. Identifier follow-up (task 1.3, precedent-context.ts): the child then
+ *      searches the ledger once more by the identifiers of the kept candidates
+ *      (run+segment, commit, tree node id, literal ideas/councils path). It has
+ *      its own budget (10 MiB / 2000 items) and its own coverage in `followUp`;
+ *      it contributes context links with ±10 neighbouring ledger records and
+ *      conflicts, never a conclusion (classification stays `unknown`).
+ *
  * Coverage: `complete` is true only when the ledger (log) was searched and each
- * optional source (tree/ideas/councils) was searched or is absent. Memory has
- * no supported adapter in this module and is always `unavailable`; it is not
- * counted as searched. Candidates are matches, not evidence: each carries its
- * source reference and the record text as `untrusted_content`.
+ * optional source (tree/ideas/councils) was searched or is absent. The follow-up
+ * pass is reported separately and does not change `complete` or `outcome`.
+ * Memory has no supported adapter in this module and is always `unavailable`;
+ * it is not counted as searched. Candidates are matches, not evidence: each
+ * carries its source reference and the record text as `untrusted_content`.
  *
  * Read-only: the child only reads; nothing is written, moved or executed from
- * the record text. Non-goals (later tasks): follow-up identifier search (1.3),
- * report persistence and tool registration (2.x).
+ * the record text. Non-goals (later tasks): report persistence and tool
+ * registration (2.x).
  */
 
 import { spawn as nodeSpawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
+import {
+  candidateIdentity,
+  emptyFollowUpReport,
+  LedgerTracker,
+  runFollowUpPass,
+  type CandidateIdentity,
+  type FollowUpCandidate,
+  type FollowUpReport,
+} from "./precedent-context.ts";
 import {
   LOCAL_PRECEDENT_SOURCES,
   compareNatural,
@@ -92,9 +109,14 @@ export interface PrecedentCandidate {
   matched_terms: string[];
   /** Record text, labelled as untrusted data: never executed, never used as tool arguments. */
   untrusted_content: { label: "untrusted-source-text"; text: string };
+  /** Identifier follow-up of this candidate (task 1.3); present only in snapshots of searchLocalSourcesWithFollowUp. */
+  follow_up?: FollowUpCandidate;
 }
 
-/** Cumulative state of one local search run; `done` is true after the last source. */
+/**
+ * Cumulative state of one local search run. `done` is true only after the last
+ * pass: the text search alone (searchLocalSources) ends with done = true too.
+ */
 export interface LocalSearchSnapshot {
   done: boolean;
   sources: SearchSourceReport[];
@@ -102,6 +124,8 @@ export interface LocalSearchSnapshot {
   matchesTotal: number;
   bytesSpent: number;
   itemsSpent: number;
+  /** Identifier follow-up report; present only after searchLocalSourcesWithFollowUp. */
+  followUp?: FollowUpReport;
 }
 
 export interface LocalSearchOptions {
@@ -111,6 +135,11 @@ export interface LocalSearchOptions {
   maxCandidates?: number;
   /** Called after every source (and once more at the end with done = true). */
   onSnapshot?: (snapshot: LocalSearchSnapshot) => void;
+}
+
+export interface LocalSearchWithFollowUpOptions extends LocalSearchOptions {
+  /** Budget of the identifier follow-up pass; defaults to its own 10 MiB / 2000 items. */
+  followUpBudget?: SourceBudget;
 }
 
 export interface SearchChildProcess {
@@ -163,6 +192,8 @@ export interface PrecedentSearchReport {
   deadline: { ms: number; hit: boolean };
   budget: { maxBytes: number; maxItems: number; bytesSpent: number; itemsSpent: number };
   sources: SearchSourceReport[];
+  /** Identifier follow-up over the ledger (task 1.3): own status and budget, separate from `sources`. */
+  followUp: FollowUpReport;
   memory: { status: "unavailable"; reason: string };
   candidates: PrecedentCandidate[];
   /** Candidate-count accounting; the byte limit itself is a constant and is not echoed (keeps size a function of content). */
@@ -255,6 +286,16 @@ export function compareCandidates(a: PrecedentCandidate, b: PrecedentCandidate):
   return compareNatural(a.ref.pointer ?? "", b.ref.pointer ?? "");
 }
 
+/**
+ * Identity keys of each matched record, kept outside the candidate objects so
+ * the candidate shape of the text search stays unchanged.
+ */
+const candidateIdentities = new WeakMap<PrecedentCandidate, CandidateIdentity>();
+
+function identityOf(candidate: PrecedentCandidate): CandidateIdentity {
+  return candidateIdentities.get(candidate) ?? { keys: [], scale: null };
+}
+
 /** Keeps the best `limit` candidates and counts every match. */
 class TopCandidates {
   private readonly kept: PrecedentCandidate[] = [];
@@ -324,18 +365,23 @@ export async function searchLocalSources(
     itemsSpent: budget.itemsSpent(),
   });
 
+  // Visits every ledger record in order, so each candidate learns its segment and scale.
+  const ledger = new LedgerTracker();
   for (const adapter of LOCAL_PRECEDENT_SOURCES) {
     const result = await adapter.read(
       rootReal,
       (record) => {
+        const position = record.ref.source === "log" ? ledger.observe(record.data) : null;
         const match = matchRecord(record.data, queryTerms);
         if (match) {
-          top.add({
+          const candidate: PrecedentCandidate = {
             ref: record.ref,
             score: match.matched.length,
             matched_terms: match.matched,
             untrusted_content: { label: "untrusted-source-text", text: match.snippet },
-          });
+          };
+          candidateIdentities.set(candidate, candidateIdentity(record.ref, record.data, position));
+          top.add(candidate);
         }
         return true;
       },
@@ -345,6 +391,40 @@ export async function searchLocalSources(
     options.onSnapshot?.(snapshot());
   }
   return snapshot();
+}
+
+/**
+ * Both passes of the local search. Pass 1 is searchLocalSources (text search);
+ * pass 2 searches the ledger by the identifiers of the pass-1 candidates with its
+ * own budget and coverage. Intermediate snapshots carry done = false; the last
+ * one carries done = true, `followUp` and every candidate's `follow_up`.
+ */
+export async function searchLocalSourcesWithFollowUp(
+  rootReal: string | null,
+  problem: string,
+  options: LocalSearchWithFollowUpOptions = {},
+): Promise<LocalSearchSnapshot> {
+  const first = await searchLocalSources(rootReal, problem, {
+    budget: options.budget,
+    maxCandidates: options.maxCandidates,
+    onSnapshot: (snap) => options.onSnapshot?.({ ...snap, done: false }),
+  });
+  const followUp = await runFollowUpPass(
+    rootReal,
+    first.candidates.map((candidate) => ({ ref: candidate.ref, identity: identityOf(candidate) })),
+    { budget: options.followUpBudget },
+  );
+  const final: LocalSearchSnapshot = {
+    done: true,
+    sources: first.sources,
+    candidates: first.candidates.map((candidate, index) => ({ ...candidate, follow_up: followUp.candidates[index] })),
+    matchesTotal: first.matchesTotal,
+    bytesSpent: first.bytesSpent,
+    itemsSpent: first.itemsSpent,
+    followUp: followUp.report,
+  };
+  options.onSnapshot?.(final);
+  return final;
 }
 
 // ─── Child process ───────────────────────────────────────────────────────────
@@ -518,8 +598,18 @@ function invalidBase(reason: "empty" | "no-terms" | "too-long", deadlineMs: numb
     deadline: { ms: deadlineMs, hit: false },
     budget: { maxBytes: SEARCH_MAX_BYTES, maxItems: SEARCH_MAX_ITEMS, bytesSpent: 0, itemsSpent: 0 },
     sources: [],
+    followUp: emptyFollowUpReport("not-run", { reason: "no-candidates" }),
     memory: { status: "unavailable", reason: "no supported memory adapter in this runtime" },
   };
+}
+
+/**
+ * Follow-up report when the child delivered no final snapshot: the pass did not
+ * finish before the deadline, or the child failed.
+ */
+function missingFollowUpReport(run: SearchChildRun): FollowUpReport {
+  if (run.deadlineHit) return emptyFollowUpReport("truncated", { truncatedBy: "deadline" });
+  return emptyFollowUpReport("error", { error: run.error ?? "identifier follow-up produced no report" });
 }
 
 /**
@@ -566,6 +656,7 @@ export async function searchPrecedents(
       itemsSpent: snapshot?.itemsSpent ?? 0,
     },
     sources,
+    followUp: snapshot?.followUp ?? missingFollowUpReport(run),
     memory: { status: "unavailable", reason: "no supported memory adapter in this runtime" },
   };
   return assembleReport(base, snapshot?.candidates.slice(0, SEARCH_MAX_CANDIDATES) ?? [], matchesTotal, maxOutputBytes);
@@ -594,7 +685,7 @@ async function runChildMain(): Promise<void> {
   try {
     const input = parseChildInput(await readAllStdin());
     const rootReal = resolveSourceRoot(input.workDir);
-    await searchLocalSources(rootReal, input.problem, {
+    await searchLocalSourcesWithFollowUp(rootReal, input.problem, {
       onSnapshot: (snap) => emit({ type: "snapshot", ...snap }),
     });
   } catch (err) {
