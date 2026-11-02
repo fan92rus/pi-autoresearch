@@ -83,6 +83,7 @@ import {
   updateFinding,
 } from "./findings.ts";
 import { inspectResults } from "./lens-inspect.ts";
+import { buildReport } from "./report.ts";
 import {
   confidenceSuppressionReason,
   formatFloorStale,
@@ -1087,6 +1088,26 @@ function resolveWorkDir(ctxCwd: string): string {
   return path.isAbsolute(config.workingDir)
     ? config.workingDir
     : path.resolve(ctxCwd, config.workingDir);
+}
+
+/**
+ * Build the campaign report (report.ts, task 3.1) and write it to
+ * `.auto/report.md` (task 3.2: finalize_research hook + /autoresearch report).
+ *
+ * Atomic: temp file in the same directory, then rename (same pattern as
+ * parallel/tree.ts saveTree). Idempotent: every call overwrites the file from
+ * fresh campaign data — buildReport output is timestamp-free and derived only
+ * from on-disk state, so repeated calls never accumulate duplicates.
+ * Returns the absolute report path; throws on write errors (callers degrade).
+ */
+function writeCampaignReport(workDir: string): string {
+  const reportPath = path.join(workDir, AUTO_DIR, "report.md");
+  ensureParentDir(reportPath);
+  const report = buildReport(workDir);
+  const tmpPath = `${reportPath}.${process.pid}.tmp`;
+  fs.writeFileSync(tmpPath, report, "utf-8");
+  fs.renameSync(tmpPath, reportPath);
+  return reportPath;
 }
 
 function canonicalPath(existingPath: string): string {
@@ -6567,6 +6588,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return { content: [{ type: "text", text: `❌ Failed to write finalize entry: ${e instanceof Error ? e.message : String(e)}` }], details: {} };
       }
 
+      // Task 3.2 (add-result-reflection): finalize builds the campaign report
+      // and persists it as .auto/report.md. A report failure must not fail
+      // the finalize signal — degrade to a note in the response.
+      let reportPath: string | null = null;
+      let reportNote = "";
+      try {
+        reportPath = writeCampaignReport(workDir);
+        reportNote = `\n📄 Campaign report: ${reportPath}`;
+      } catch (e) {
+        reportNote = `\n⚠️ Campaign report failed: ${e instanceof Error ? e.message : String(e)}`;
+      }
+
       // Send completion steer to the agent
       pi.sendUserMessage(
         `🏁 FINALIZE SIGNAL: Agent reports optimization complete.\n` +
@@ -6574,14 +6607,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         `   Confidence: ${(conf * 100).toFixed(0)}%\n` +
         (params.evidence ? `   Evidence: ${params.evidence.slice(0, 200)}\n` : "") +
         `   Best ${state.metricName}: ${state.bestMetric !== null ? formatNum(state.bestMetric, state.metricUnit) : "?"}\n` +
-        `   Total runs: ${state.results.length}\n\n` +
+        `   Total runs: ${state.results.length}\n` +
+        reportNote + `\n\n` +
         `   Run /autoresearch off to finalize, or continue if you disagree.`,
         { deliverAs: "steer" }
       );
 
       return {
-        content: [{ type: "text", text: `🏁 Finalize signal recorded (confidence=${conf}). The observer will now recommend /autoresearch off in its steers.` }],
-        details: { finalized: true, confidence: conf, bestMetric: state.bestMetric },
+        content: [{ type: "text", text: `🏁 Finalize signal recorded (confidence=${conf}). The observer will now recommend /autoresearch off in its steers.${reportNote}` }],
+        details: { finalized: true, confidence: conf, bestMetric: state.bestMetric, reportPath },
       };
     },
   });
@@ -6633,7 +6667,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   }
 
   pi.registerCommand("autoresearch", {
-    description: "Start, stop, finalize, clear, export, configure, or open dashboards for autoresearch mode",
+    description: "Start, stop, finalize, report, clear, export, configure, or open dashboards for autoresearch mode",
     getArgumentCompletions: (argumentPrefix: string) => {
       return filterSubcommands(argumentPrefix).map(function (s) {
         return { value: s.value, label: s.label, description: s.description };
@@ -6660,6 +6694,24 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       if (command === "finalize") {
         await finalizeAutoresearch(ctx);
+        return;
+      }
+
+      if (command === "report") {
+        // Task 3.2: intermediate campaign report on demand (spec campaign-report
+        // «Идемпотентность и ручной вызов»): same generator as finalize_research,
+        // fresh overwrite of .auto/report.md from the current ledger/tree/findings
+        // state — available with the loop on or off, even before finalize.
+        const reportWorkDir = resolveWorkDir(ctx.cwd);
+        try {
+          const reportPath = writeCampaignReport(reportWorkDir);
+          ctx.ui.notify(`Campaign report written to ${reportPath}`, "info");
+        } catch (error) {
+          ctx.ui.notify(
+            `Failed to write campaign report: ${error instanceof Error ? error.message : String(error)}`,
+            "error",
+          );
+        }
         return;
       }
 
