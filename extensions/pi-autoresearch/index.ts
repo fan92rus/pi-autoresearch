@@ -39,6 +39,7 @@ import { spawn } from "node:child_process";
 import { getBashSpawnOptions, killTree } from "./bash-shell.ts";
 import { markIdeaTried } from "./observer.ts";
 import { registerCouncilTools } from "./council-tools.ts";
+import { registerSearchPrecedentsTool } from "./precedent-report.ts";
 import {
   buildBrief,
   checkCouncilTrigger,
@@ -5611,6 +5612,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // ── Council blackboard tools (NOT mode-gated: council participants are
   // separate headless sessions with no autoresearch mode of their own) ──
   registerCouncilTools(pi);
+
+  // Precedent search is standalone: no campaign or autoresearch-mode gate;
+  // it reads only existing local .auto/ sources.
+  registerSearchPrecedentsTool(pi, resolveWorkDir);
 
   // Self-service council: the campaign agent convenes it whenever it feels
   // stuck — no stagnation threshold, no cooldown, no cap (only council.enabled

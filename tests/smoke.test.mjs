@@ -70,7 +70,7 @@ const EXPECTED_TOOLS = [
   "init_experiment", "propose_hypothesis", "run_experiment", "log_experiment",
   "tree_status", "finalize_research",
   "council_write_entry", "council_read_index", "council_read_entry", "council_check_consensus",
-  "council_convene", "record_finding", "update_finding",
+  "council_convene", "record_finding", "update_finding", "search_precedents",
 ];
 
 // Disabled tool groups (both flags false):
@@ -95,7 +95,7 @@ await test("registers all 13 tools (parallel + branching disabled)", async () =>
   for (const expected of EXPECTED_TOOLS) {
     assert.ok(names.includes(expected), `Missing tool: ${expected}`);
   }
-  assert.strictEqual(names.length, 13, `Expected 13 tools, got ${names.length}: ${names.join(", ")}`);
+  assert.strictEqual(names.length, 14, `Expected 14 tools, got ${names.length}: ${names.join(", ")}`);
 });
 
 await test("registers all 11 hooks", async () => {
