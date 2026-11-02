@@ -43,10 +43,12 @@ import { registerAssessPrecedentsTool } from "./precedent-assess.ts";
 import { registerSearchPrecedentsTool } from "./precedent-report.ts";
 import {
   buildBrief,
+  buildPrecedentSupplement,
   checkCouncilTrigger,
   composeConveneNudge,
   composeFacilitatorMessage,
   findUnfinishedCouncil,
+  loadLatestPrecedentDigest,
   nextCouncilDir,
   personaPrompt,
   readCouncilConfig,
@@ -6071,17 +6073,26 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // ── Resume or create the council dir (shared by both paths) ──
       const roster = resolveRoster(cfg);
 
+      // Precedent summary (research-precedent-search, "Потребление агентом и советом"):
+      // the newest evaluated report feeds the fresh brief; on resume it becomes the
+      // supplement. Null → the brief states `not-searched` explicitly.
+      const precedents = await loadLatestPrecedentDigest(workDir);
+
       // A pending (brief written, no slate yet) council is resumed, never re-sequenced.
       const pending = findUnfinishedCouncil(workDir);
       let seq: number;
       let councilDirAbs: string;
       let councilDirRel: string;
       let briefAbsPath: string;
+      // Resume supplement (spec "Возобновление совета"): written beside the unchanged
+      // 00-brief.md and carried to every child task (delegated or facilitator).
+      let supplementText: string | undefined;
       if (pending) {
         seq = pending.seq;
         councilDirAbs = pending.dir;
         councilDirRel = path.relative(workDir, pending.dir).split(path.sep).join("/");
         briefAbsPath = path.join(pending.dir, "00-brief.md");
+        supplementText = buildPrecedentSupplement(workDir, councilDirAbs, precedents).text;
       } else {
         const next = nextCouncilDir(workDir);
         seq = next.seq;
@@ -6098,6 +6109,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           bestMetric: state.bestMetric ?? null,
           goal: state.goal || state.name || "",
           agentNote: params.note,
+          precedents,
         });
         writeCouncilState(workDir, { councilsRun: seq, lastCouncilRun: state.results.length });
         briefAbsPath = path.join(next.dir, "00-brief.md");
@@ -6128,6 +6140,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           maxChallengeRounds: 5,
           minExperiments: 3,
           note: params.note && params.note.trim() ? params.note : undefined,
+          supplementText,
           cwd: workDir,
           deadlineAt,
           validate,
@@ -6147,6 +6160,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               roster,
               maxChallengeRounds: 5,
               minExperiments: 3,
+              supplementText,
             }),
           ].join("\n");
           return {
@@ -6188,6 +6202,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           roster,
           maxChallengeRounds: 5,
           minExperiments: 3,
+          supplementText,
         }),
       ].join("\n");
 

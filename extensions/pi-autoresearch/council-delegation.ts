@@ -14,6 +14,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { resumeSupplementLines } from "./council.ts";
 
 // ─── Minimal structural types (no pi-coding-agent import — keeps council.ts's no-pi rule) ───
 
@@ -41,6 +42,8 @@ export interface CouncilDelegationArgs {
   maxChallengeRounds: number;
   minExperiments: number;
   note?: string;
+  /** Resume supplement (precedent summary added at resume): passed to every child as a separate block; briefText is never changed. */
+  supplementText?: string;
   cwd: string;
   /** Absolute wall-clock deadline for the whole council. */
   deadlineAt: number;
@@ -182,7 +185,7 @@ export function parseVerdicts(text: string, speaker: string): VerdictRecord[] {
 
 // ─── Child task builders (ported verbatim; brief/note interpolated) ───
 
-function divergeTask(p: DelegationParticipant, briefText: string, note?: string): string {
+function divergeTask(p: DelegationParticipant, briefText: string, note?: string, supplement?: string): string {
   const lines = [
     "You are " + p.name + " (hypothesis letter " + p.letter + ") in a hypothesis council for an optimization campaign.",
     "Your lens: " + p.personaPrompt,
@@ -191,6 +194,7 @@ function divergeTask(p: DelegationParticipant, briefText: string, note?: string)
     "<<<BRIEF",
     briefText,
     "BRIEF>>>",
+    ...resumeSupplementLines(supplement),
   ];
   if (note) lines.push("", "Context from the lead agent (its own assessment, not evidence): " + note);
   lines.push(
@@ -234,7 +238,7 @@ export function extractOpenFindingsSection(briefText: string): string | null {
 }
 
 /** Exported for tests (brief-text assertions); used verbatim by the challenge rounds. */
-export function challengeTask(p: DelegationParticipant, round: number, contested: string[], othersText: string, findingsSection?: string | null): string {
+export function challengeTask(p: DelegationParticipant, round: number, contested: string[], othersText: string, findingsSection?: string | null, supplement?: string): string {
   const lines = [
     "You are " + p.name + " (hypothesis letter " + p.letter + ") in CHALLENGE round " + round + " of a hypothesis council.",
   ];
@@ -245,6 +249,7 @@ export function challengeTask(p: DelegationParticipant, round: number, contested
       findingsSection,
     );
   }
+  lines.push(...resumeSupplementLines(supplement));
   lines.push(
     "",
     "The analysts' proposals follow (verbatim).",
@@ -272,12 +277,13 @@ export function challengeTask(p: DelegationParticipant, round: number, contested
 }
 
 /** Exported for tests (brief-text assertions); used verbatim by the chair phase. */
-export function chairTask(briefText: string, note: string | undefined, allProposals: string, allVerdicts: string, chairFix?: string): string {
+export function chairTask(briefText: string, note: string | undefined, allProposals: string, allVerdicts: string, chairFix?: string, supplement?: string): string {
   const lines = [
     "You are the CHAIR of a hypothesis council. You read the whole record and compose the final slate.",
     "",
     "=== CAMPAIGN BRIEF ===",
     briefText,
+    ...resumeSupplementLines(supplement),
   ];
   if (note && !chairFix) lines.push("=== LEAD AGENT'S NOTE (its own assessment, not evidence) ===", note);
   lines.push(
@@ -383,7 +389,7 @@ export async function runCouncilDelegated(pi: DelegationPi, args: CouncilDelegat
           ownerRunId,
           nodeId: ids[i].nodeId,
           agent: "delegate",
-          task: divergeTask(p, args.briefText, args.note),
+          task: divergeTask(p, args.briefText, args.note, args.supplementText),
           model: p.model,
           cwd: args.cwd,
           timeoutMs: childTimeout(capMs),
@@ -486,7 +492,7 @@ export async function runCouncilDelegated(pi: DelegationPi, args: CouncilDelegat
           ownerRunId,
           nodeId: ids[i].nodeId,
           agent: "delegate",
-          task: challengeTask(p, round, contested, othersText, findingsSection),
+          task: challengeTask(p, round, contested, othersText, findingsSection, args.supplementText),
           model: p.model,
           cwd: args.cwd,
           timeoutMs: childTimeout(CHALLENGE_CAP_MS),
@@ -522,7 +528,7 @@ export async function runCouncilDelegated(pi: DelegationPi, args: CouncilDelegat
         ownerRunId,
         nodeId: id.nodeId,
         agent: "delegate",
-        task: chairTask(args.briefText, args.note, allProposals, allVerdicts, chairFix),
+        task: chairTask(args.briefText, args.note, allProposals, allVerdicts, chairFix, args.supplementText),
         model: args.chairModel,
         cwd: args.cwd,
         timeoutMs: childTimeout(Math.max(60_000, Math.min(CHAIR_TIMEOUT_MS, remainingMs() - fixReserve))),
