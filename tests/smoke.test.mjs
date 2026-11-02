@@ -70,7 +70,7 @@ const EXPECTED_TOOLS = [
   "init_experiment", "propose_hypothesis", "run_experiment", "log_experiment",
   "tree_status", "finalize_research",
   "council_write_entry", "council_read_index", "council_read_entry", "council_check_consensus",
-  "council_convene",
+  "council_convene", "record_finding", "update_finding",
 ];
 
 // Disabled tool groups (both flags false):
@@ -88,14 +88,14 @@ const EXPECTED_HOOKS = [
   "before_agent_start", "tool_execution_end", "tool_call",
 ];
 
-await test("registers all 10 tools (parallel + branching disabled)", async () => {
+await test("registers all 13 tools (parallel + branching disabled)", async () => {
   const dir = makeTempDir("reg");
   const { pi } = await loadExtension(dir);
   const names = pi.tools.map((t) => t.name);
   for (const expected of EXPECTED_TOOLS) {
     assert.ok(names.includes(expected), `Missing tool: ${expected}`);
   }
-  assert.strictEqual(names.length, 11, `Expected 11 tools, got ${names.length}: ${names.join(", ")}`);
+  assert.strictEqual(names.length, 13, `Expected 13 tools, got ${names.length}: ${names.join(", ")}`);
 });
 
 await test("registers all 11 hooks", async () => {

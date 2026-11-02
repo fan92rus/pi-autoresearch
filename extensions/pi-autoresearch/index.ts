@@ -73,6 +73,12 @@ import {
   serializeAnalysisConfig,
   type AnalysisConfig,
 } from "./lens-config.ts";
+import {
+  FINDING_STATUSES,
+  FINDING_THEMES,
+  recordFinding,
+  updateFinding,
+} from "./findings.ts";
 import { tmpdir } from "node:os";
 
 import {
@@ -2970,6 +2976,102 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     renderResult(result, _options, _theme) {
       const t = result.content[0];
       return new Text(t?.type === "text" ? t.text : "", 0, 0);
+    },
+  });
+
+  // -----------------------------------------------------------------------
+  // Findings store (openspec add-result-reflection, task 1.6)
+  // -----------------------------------------------------------------------
+
+  const RecordFindingParams = Type.Object({
+    theme: Type.String({
+      description: `Finding theme: ${FINDING_THEMES.join(" | ")}.`,
+    }),
+    description: Type.String({
+      description: "What the results show, stated concretely (not a generalisation without examples).",
+    }),
+    evidence_ref: Type.Optional(Type.String({
+      description:
+        "REQUIRED. A checkable example: 'path:start-end' (e.g. '.auto/runs/45/output.txt:120-134') or 'path#anchor' (literal substring of the file).",
+    })),
+    estimated_impact: Type.Optional(Type.String({
+      description: "Optional scale estimate, e.g. '~14% of errors'.",
+    })),
+    run: Type.Optional(Type.Number({
+      description: "Optional run number the finding comes from.",
+      minimum: 1,
+    })),
+  });
+
+  registerGatedTool({
+    name: "record_finding",
+    label: "Record Finding",
+    description:
+      "Record a finding from the results into .auto/findings.jsonl (append-only). Status starts as open. " +
+      "Rejected without a concrete evidence_ref.",
+    promptSnippet: "Record a result finding backed by a concrete example",
+    promptGuidelines: [
+      "Every finding needs evidence_ref pointing at a concrete case: path:start-end or path#anchor.",
+    ],
+    parameters: RecordFindingParams,
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
+      const workDirError = validateWorkDir(ctx.cwd);
+      if (workDirError) {
+        return { content: [{ type: "text", text: `❌ ${workDirError}` }], details: {} };
+      }
+      const workDir = resolveWorkDir(ctx.cwd);
+      const res = recordFinding(workDir, params);
+      if (!res.ok) {
+        return { content: [{ type: "text", text: `❌ record_finding rejected:\n  ${res.errors.join("\n  ")}` }], details: {} };
+      }
+      return {
+        content: [{ type: "text", text: `🔎 Finding ${res.value.id} recorded (theme: ${res.value.theme}, status: open).` }],
+        details: { id: res.value.id, status: res.value.status },
+      };
+    },
+  });
+
+  const UpdateFindingParams = Type.Object({
+    id: Type.String({ description: "Finding id, e.g. f1." }),
+    status: Type.String({
+      description: `Target status: ${FINDING_STATUSES.join(" | ")}. Transitions are restricted (open→verified|revised|deferred, revised→verified|deferred, deferred→open, verified→revised).`,
+    }),
+    evidence_ref: Type.Optional(Type.String({
+      description: "Required for verified and revised: 'path:start-end' or 'path#anchor' pointing at the verification or counterexample.",
+    })),
+    note: Type.Optional(Type.String({ description: "Optional short note." })),
+  });
+
+  registerGatedTool({
+    name: "update_finding",
+    label: "Update Finding",
+    description:
+      "Change a finding's status (append-only transition in .auto/findings.jsonl). verified and revised require evidence_ref.",
+    promptSnippet: "Move a finding through open/verified/revised/deferred",
+    promptGuidelines: [
+      "verified requires evidence_ref to an independent check; revised requires evidence_ref to a counterexample.",
+    ],
+    parameters: UpdateFindingParams,
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
+      const workDirError = validateWorkDir(ctx.cwd);
+      if (workDirError) {
+        return { content: [{ type: "text", text: `❌ ${workDirError}` }], details: {} };
+      }
+      const workDir = resolveWorkDir(ctx.cwd);
+      const res = updateFinding(workDir, params);
+      if (!res.ok) {
+        return { content: [{ type: "text", text: `❌ update_finding rejected:\n  ${res.errors.join("\n  ")}` }], details: {} };
+      }
+      return {
+        content: [{ type: "text", text: `🔎 Finding ${res.value.id}: ${res.value.from} → ${res.value.status}.` }],
+        details: { id: res.value.id, from: res.value.from, status: res.value.status },
+      };
     },
   });
 
