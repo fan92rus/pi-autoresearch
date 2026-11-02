@@ -20,6 +20,13 @@
  * Any other transition is rejected with the list of allowed ones. `verified`
  * and `revised` always require an `evidence_ref`.
  *
+ * needs_verification (spec "Пометка аудитов на верификацию"): a finding whose
+ * description claims unreachability / zero coverage (see
+ * VERIFICATION_CLAIM_PATTERNS) is flagged on creation and re-flagged on every
+ * status transition. The flag is advisory: it never blocks a write and never
+ * requires an owner. It is never cleared; the verification itself is recorded
+ * as the evidence_ref of the transition that follows.
+ *
  * evidence_ref formats (spec "Обязательность доказательной базы"):
  *   `путь:строки`  — `.auto/runs/45/output.txt:120-134` or `…:120` (1-based, inclusive)
  *   `путь#якорь`   — anchor is a literal substring that must occur in the file
@@ -51,6 +58,26 @@ export const FINDING_TRANSITIONS: Readonly<Record<FindingStatus, readonly Findin
 /** Statuses whose transition must carry an evidence_ref (verification or counterexample). */
 const EVIDENCE_REQUIRED_STATUSES: readonly FindingStatus[] = ["verified", "revised"];
 
+/**
+ * Claims that trigger needs_verification (spec findings "Пометка аудитов на
+ * верификацию"). Applied to the description of any finding. The list is closed:
+ * exactly the patterns the spec names.
+ *  - "recall 0" is not a prefix match: "recall 0.85" must not flag.
+ *  - "0/N" needs a standalone 0 ratio: "10/87" must not flag.
+ */
+export const VERIFICATION_CLAIM_PATTERNS: readonly { label: string; pattern: RegExp }[] = [
+  { label: "unreachable", pattern: /\bunreachable/i },
+  { label: "impossible", pattern: /\bimpossible/i },
+  { label: "никогда не", pattern: /(?<!\p{L})никогда\s+не(?!\p{L})/iu },
+  { label: "recall 0", pattern: /\brecall\s+0(?:[.,]0+)?(?!\d|[.,]\d)/i },
+  { label: "0/N", pattern: /(?<![\d.])0\/\d+(?!\d)/ },
+];
+
+/** True when the description makes an unreachability / zero-coverage claim. */
+export function needsVerificationClaim(description: string): boolean {
+  return VERIFICATION_CLAIM_PATTERNS.some(({ pattern }) => pattern.test(description));
+}
+
 /** Shown verbatim in rejections so the agent sees a concrete, correct example. */
 export const EVIDENCE_REF_EXAMPLE =
   '".auto/runs/45/output.txt:120-134" (строки) или ".auto/runs/45/output.txt#MISMATCH gold=" (якорная подстрока)';
@@ -73,6 +100,7 @@ export interface FindingRecord {
   evidence_ref: string;
   estimated_impact?: string;
   status: "open";
+  needs_verification?: true;
   created: string;
 }
 
@@ -84,6 +112,7 @@ export interface FindingTransitionRecord {
   status: FindingStatus;
   evidence_ref?: string;
   note?: string;
+  needs_verification?: true;
   updated: string;
 }
 
@@ -96,6 +125,8 @@ export interface FindingView {
   evidence_ref: string;
   estimated_impact?: string;
   status: FindingStatus;
+  /** Set on creation or on any transition when the description makes a verification-needing claim. */
+  needs_verification: boolean;
   created: string;
   /** Timestamp of the latest status change (absent while still open). */
   updated?: string;
@@ -356,6 +387,7 @@ export function loadFindings(workDir: string): FindingResult<FindingsState> {
         description: r["description"],
         evidence_ref: r["evidence_ref"],
         status: "open",
+        needs_verification: r["needs_verification"] === true,
         created: r["created"],
       };
       if (typeof r["run"] === "number") view.run = r["run"];
@@ -384,6 +416,7 @@ export function loadFindings(workDir: string): FindingResult<FindingsState> {
         return;
       }
       current.status = r["status"];
+      if (r["needs_verification"] === true) current.needs_verification = true;
       current.updated = r["updated"];
       return;
     }
@@ -485,6 +518,7 @@ export function recordFinding(
     evidence_ref: evidenceRef,
     ...(estimatedImpact !== undefined ? { estimated_impact: estimatedImpact } : {}),
     status: "open",
+    ...(needsVerificationClaim(description) ? { needs_verification: true as const } : {}),
     created: now.toISOString(),
   };
   appendLine(workDir, record);
@@ -569,6 +603,7 @@ export function updateFinding(
     status: target,
     ...(evidenceRef !== undefined ? { evidence_ref: evidenceRef } : {}),
     ...(note !== undefined ? { note } : {}),
+    ...(needsVerificationClaim(finding.description) ? { needs_verification: true as const } : {}),
     updated: now.toISOString(),
   };
   appendLine(workDir, record);
