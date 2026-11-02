@@ -98,13 +98,31 @@
  * takes it as an optional second argument to render the verified/reverted
  * lines. The floor folds (floor_stale, noiseFloorStatus) compare against the
  * ACTIVE epoch: a floor calibrated on the restored scale is fresh again.
+ *
+ * Task 2.7 (measurement track) watches the DECLARED measurer files
+ * (`analysis.measurement_files`): each run manifest carries their sha16
+ * (lens.ts), and `measurerControlOfDir()` compares those hashes between
+ * consecutive runs and with the current file on disk. A change is ACCOUNTED
+ * when a `measurement_change` record is logged after the run whose hash is the
+ * older reference (window accounting — the record is not matched to the diff
+ * by content); otherwise it is an unaccounted change. An undeclared or invalid
+ * analysis section, a declared file that is missing or unreadable, are
+ * reported as explicit limits, never as a clean state. The four-field summary
+ * stays unchanged; `measurementHealthLine()` adds the control to it and is the
+ * one health line the observer and the council brief share. Limit of the
+ * method: a change that is reverted between two runs leaves identical hashes
+ * and stays invisible (manifests are per run).
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { parseJsonlEntry, reconstructJsonlState } from "./jsonl.ts";
+import { createHash } from "node:crypto";
+import { isAutoresearchRunEntry, parseJsonlEntry, reconstructJsonlState } from "./jsonl.ts";
 import { loadFindings, type FindingView, type FindingsState } from "./findings.ts";
 import { AUTO_DIR, sessionFilePath } from "./paths.ts";
+import { runsRootPath } from "./lens.ts";
+import { parseAnalysisConfig } from "./lens-config.ts";
+import { ledgerAnalysisHeader } from "./lens-inspect.ts";
 
 // ──────────────────────────────────────────────────────────────────────────
 // Types
@@ -254,6 +272,20 @@ export function measurementLedgerPath(workDir: string): string | null {
  * Missing or unreadable files degrade to the healthy defaults — never throws.
  */
 export function measurementHealthSummary(workDir: string): MeasurementHealthSummary {
+  return measurementHealthWithLedger(workDir).summary;
+}
+
+/**
+ * The "Measurement health: …" line for the observer's periodic messages and the
+ * council brief (task 2.7 adds the measurer-file control to the summary's four
+ * fields). One ledger read feeds both the summary and the control.
+ */
+export function measurementHealthLine(workDir: string): string {
+  const { summary, ledgerText } = measurementHealthWithLedger(workDir);
+  return formatMeasurementHealth(summary, measurerControlOfDir(workDir, ledgerText));
+}
+
+function measurementHealthWithLedger(workDir: string): { summary: MeasurementHealthSummary; ledgerText: string } {
   let ledgerText = "";
   const ledgerPath = measurementLedgerPath(workDir);
   if (ledgerPath !== null) {
@@ -267,10 +299,11 @@ export function measurementHealthSummary(workDir: string): MeasurementHealthSumm
   // Single floor source (task 2.5): the summary's floor_stale respects the
   // floor's epoch stamp — a re-evaluated floor (stamped at the current epoch)
   // is fresh again; an unstamped config keeps the v1 mark.
-  return measurementHealthFromFacts(
+  const summary = measurementHealthFromFacts(
     measurementLedgerFacts(ledgerText, readNoiseFloorConfig(workDir).epoch),
     loaded.ok ? loaded.value : null,
   );
+  return { summary, ledgerText };
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -284,11 +317,17 @@ export function measurementHealthSummary(workDir: string): MeasurementHealthSumm
  * the whole summary, the same field set the council brief consumes). The
  * healthy state (no measurement_change registered — see module docs) adds the
  * annotation «изменений измерителя не зарегистрировано (здоровое состояние)»
- * in front of the fields; it never replaces them.
+ * in front of the fields; it never replaces them. `measurer` (task 2.7, from
+ * measurerControlOfDir) appends the measurer-file control after them; absent
+ * (legacy callers) the line is the pre-2.7 one.
  */
-export function formatMeasurementHealth(summary: MeasurementHealthSummary): string {
+export function formatMeasurementHealth(summary: MeasurementHealthSummary, measurer?: MeasurerControl): string {
   const parts: string[] = [];
-  if (summary.epoch <= 1 && !summary.floor_stale) {
+  // «Здоровое состояние» is an assessment: an unaccounted or unavailable
+  // measurer file contradicts it, so the annotation is withheld then.
+  const measurerProblem = measurer !== undefined
+    && (measurer.unaccounted.length > 0 || measurer.unavailable.length > 0);
+  if (summary.epoch <= 1 && !summary.floor_stale && !measurerProblem) {
     parts.push("изменений измерителя не зарегистрировано (здоровое состояние)");
   }
   parts.push(`epoch ${summary.epoch}`);
@@ -298,7 +337,254 @@ export function formatMeasurementHealth(summary: MeasurementHealthSummary): stri
     ` (open_measurement_count: ${summary.open_measurement_count})`,
   );
   parts.push(`top_impact: ${summary.top_impact ?? "—"}`);
+  parts.push(...measurerControlParts(measurer));
   return `Measurement health: ${parts.join("; ")}`;
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Measurer file control — declared measurement files (task 2.7; spec
+// measurement-track: «Граница с подгонкой бенчмарка», сценарий «попытка тихой
+// правки метрики»)
+// ──────────────────────────────────────────────────────────────────
+
+/** How the campaign's measurer-file control stands (see evaluateMeasurerControl). */
+export interface MeasurerControl {
+  /**
+   * "undeclared": no `analysis.measurement_files` — the measurer's changes are
+   * not watched at all; "invalid": the analysis header does not validate (the
+   * manifests carry no measurer hashes either); "watching": declared files are
+   * hash-controlled.
+   */
+  state: "undeclared" | "invalid" | "watching";
+  /** Declared files changed without a measurement_change accounting the change: "path — detail". */
+  unaccounted: string[];
+  /** Declared files that cannot be hashed now or at the last run: "path — detail". */
+  unavailable: string[];
+}
+
+/** One run manifest's `measurement_files` entry (lens.ts writes it; read here as JSON). */
+export interface ManifestMeasurerEntry {
+  sha16?: string;
+  missing?: boolean;
+  read_error?: string;
+}
+
+/** Hash-control input of one run: its manifest entries keyed by the declared path. */
+export interface RunMeasurerHashes {
+  run: number;
+  files: ReadonlyMap<string, ManifestMeasurerEntry>;
+}
+
+/** Current on-disk state of a declared file. */
+export type CurrentMeasurerHash =
+  | { kind: "hash"; sha16: string }
+  | { kind: "missing" }
+  | { kind: "error"; message: string };
+
+/** Inputs of the pure comparison; disk reads and the ledger fold are injected. */
+export interface MeasurerControlInput {
+  declared: readonly string[];
+  /** Run manifests that carry measurer hashes, ascending by run number. */
+  runs: readonly RunMeasurerHashes[];
+  current: (declared: string) => CurrentMeasurerHash;
+  /** True when a measurement_change is recorded after the run's ledger window (the change is accounted). */
+  accounted: (run: number) => boolean;
+}
+
+/**
+ * Hash comparison (pure). For each declared file, every change between two
+ * consecutive manifests that carry a hash is checked — an unaccounted change
+ * stays visible in later runs until a measurement_change accounts for it — and
+ * the current file hash is compared with the last run's. A last manifest entry
+ * without a hash is reported as unavailable at that run.
+ */
+export function evaluateMeasurerControl(input: MeasurerControlInput): MeasurerControl {
+  const control: MeasurerControl = { state: "watching", unaccounted: [], unavailable: [] };
+  for (const declared of input.declared) {
+    const current = input.current(declared);
+    if (current.kind === "missing") {
+      control.unavailable.push(`${declared} — файл не найден`);
+    } else if (current.kind === "error") {
+      control.unavailable.push(`${declared} — не читается (${current.message})`);
+    }
+
+    const hashed: { run: number; entry: ManifestMeasurerEntry }[] = [];
+    for (const run of input.runs) {
+      const entry = run.files.get(declared);
+      if (entry !== undefined) hashed.push({ run: run.run, entry });
+    }
+    if (hashed.length === 0) continue;
+
+    const last = hashed[hashed.length - 1];
+    if (last.entry.sha16 === undefined) {
+      const reason = last.entry.missing === true
+        ? " (файл отсутствовал)"
+        : last.entry.read_error !== undefined ? ` (${last.entry.read_error})` : "";
+      control.unavailable.push(`${declared} — недоступен при прогоне ${last.run}${reason}`);
+    }
+
+    const details: string[] = [];
+    let previous: { run: number; entry: ManifestMeasurerEntry } | undefined;
+    for (const item of hashed) {
+      if (item.entry.sha16 === undefined) continue;
+      if (previous !== undefined && previous.entry.sha16 !== item.entry.sha16 && !input.accounted(previous.run)) {
+        details.push(`sha16 ${previous.entry.sha16}→${item.entry.sha16} между прогонами ${previous.run} и ${item.run}`);
+      }
+      previous = item;
+    }
+    if (
+      last.entry.sha16 !== undefined
+      && current.kind === "hash"
+      && current.sha16 !== last.entry.sha16
+      && !input.accounted(last.run)
+    ) {
+      details.push(`sha16 ${last.entry.sha16}→${current.sha16} после прогона ${last.run}`);
+    }
+    if (details.length > 0) control.unaccounted.push(`${declared} — ${details.join("; ")}`);
+  }
+  return control;
+}
+
+/**
+ * Ledger window accounting for measurer changes. A run's window starts after the
+ * last ledger run entry whose run number is <= that run (-1 when none); a change
+ * is accounted when a `measurement_change` line lies after the window start.
+ * Runs without a ledger entry (dir created, log not written yet) fall back to the
+ * nearest earlier entry, so a change logged later still accounts for them.
+ */
+function measurementChangeAccounting(ledgerText: string): (run: number) => boolean {
+  const runEntries: { run: number; line: number }[] = [];
+  const changeLines: number[] = [];
+  const lines = ledgerText.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim().length === 0) continue;
+    const entry = parseJsonlEntry(lines[i]);
+    if (entry === null) continue;
+    if (entry.type === "measurement_change") changeLines.push(i);
+    else if (isAutoresearchRunEntry(entry)) runEntries.push({ run: entry.run, line: i });
+  }
+  return (run: number): boolean => {
+    let start = -1;
+    for (const r of runEntries) {
+      if (r.run <= run && r.line > start) start = r.line;
+    }
+    return changeLines.some((line) => line > start);
+  };
+}
+
+/** Streamed sha256 of a file, first 16 hex chars — the same digest lens.ts writes into manifests. */
+function fileSha16(filePath: string): string {
+  const hash = createHash("sha256");
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const chunk = Buffer.alloc(1024 * 1024);
+    for (;;) {
+      const read = fs.readSync(fd, chunk, 0, chunk.length, null);
+      if (read === 0) break;
+      hash.update(chunk.subarray(0, read));
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return hash.digest("hex").slice(0, 16);
+}
+
+/** Current hash of one declared file, resolved against the campaign dir like lens.ts does. */
+function currentMeasurerHash(workDir: string, declared: string): CurrentMeasurerHash {
+  const absolute = path.resolve(workDir, declared);
+  let stats: fs.Stats;
+  try {
+    stats = fs.statSync(absolute);
+  } catch {
+    return { kind: "missing" };
+  }
+  if (!stats.isFile()) return { kind: "error", message: "не обычный файл" };
+  try {
+    return { kind: "hash", sha16: fileSha16(absolute) };
+  } catch (e) {
+    return { kind: "error", message: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/** Measurer hashes of every run manifest in `.auto/runs/` that lists measurement files, ascending. */
+function readRunMeasurerHashes(workDir: string): RunMeasurerHashes[] {
+  const root = runsRootPath(workDir);
+  let names: string[];
+  try {
+    names = fs.readdirSync(root);
+  } catch {
+    return [];
+  }
+  const runs: RunMeasurerHashes[] = [];
+  for (const name of names) {
+    if (!/^\d+$/.test(name)) continue;
+    let manifest: unknown;
+    try {
+      manifest = JSON.parse(fs.readFileSync(path.join(root, name, "manifest.json"), "utf-8"));
+    } catch {
+      continue;
+    }
+    if (typeof manifest !== "object" || manifest === null) continue;
+    const list = (manifest as { measurement_files?: unknown }).measurement_files;
+    if (!Array.isArray(list)) continue;
+    const files = new Map<string, ManifestMeasurerEntry>();
+    for (const item of list) {
+      if (typeof item !== "object" || item === null) continue;
+      const record = item as ManifestMeasurerEntry & { path?: unknown };
+      if (typeof record.path !== "string") continue;
+      files.set(record.path, { sha16: record.sha16, missing: record.missing, read_error: record.read_error });
+    }
+    runs.push({ run: Number(name), files });
+  }
+  runs.sort((a, b) => a.run - b.run);
+  return runs;
+}
+
+/**
+ * Measurer-file control for the campaign in `workDir` (task 2.7). The declared
+ * list comes from the LAST config header of the ledger (the same source the run
+ * manifest uses). Undeclared → `undeclared` (no hashes are pinned, the limit is
+ * reported); an invalid header → `invalid`; otherwise the hash comparison runs.
+ * Never throws: unreadable run dirs simply contribute no hashes.
+ */
+export function measurerControlOfDir(workDir: string, ledgerText: string): MeasurerControl {
+  const parsed = parseAnalysisConfig(ledgerAnalysisHeader(ledgerText));
+  if (parsed.status === "invalid") return { state: "invalid", unaccounted: [], unavailable: [] };
+  const declared = parsed.status === "ok" ? parsed.config.measurementFiles : [];
+  if (declared.length === 0) return { state: "undeclared", unaccounted: [], unavailable: [] };
+  return evaluateMeasurerControl({
+    declared,
+    runs: readRunMeasurerHashes(workDir),
+    current: (file) => currentMeasurerHash(workDir, file),
+    accounted: measurementChangeAccounting(ledgerText),
+  });
+}
+
+/** Rendered parts of the control state for the health line (empty when there is nothing to say). */
+function measurerControlParts(control: MeasurerControl | undefined): string[] {
+  if (control === undefined) return [];
+  if (control.state === "undeclared") {
+    return [
+      "контроль измерителя ограничен: analysis.measurement_files не объявлен — изменения файлов измерителя " +
+      "не отслеживаются, полнота контроля не гарантирована",
+    ];
+  }
+  if (control.state === "invalid") {
+    return ["контроль измерителя недоступен: секция analysis не разобрана — полнота контроля не гарантирована"];
+  }
+  const parts: string[] = [];
+  if (control.unaccounted.length > 0) {
+    parts.push(
+      `неучтённое изменение измерителя (без measurement_change): ${control.unaccounted.join(" | ")} — ` +
+      "зарегистрируйте через log_measurement_change",
+    );
+  }
+  if (control.unavailable.length > 0) {
+    parts.push(
+      `объявленный файл измерителя недоступен, его изменения не контролируются: ${control.unavailable.join(" | ")}`,
+    );
+  }
+  return parts;
 }
 
 // ──────────────────────────────────────────────────────────────────

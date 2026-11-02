@@ -18,7 +18,7 @@ import { treeExists, loadTree, getPath, failedStreakSinceLastKeep } from "./para
 import { checkCouncilTrigger } from "./council.ts";
 import { loadFindings, type FindingView } from "./findings.ts";
 import { runsRootPath } from "./lens.ts";
-import { formatMeasurementHealth, measurementHealthSummary } from "./measurement.ts";
+import { measurementHealthLine } from "./measurement.ts";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -937,8 +937,9 @@ export function findingTargetsSegment(finding: FindingView, segmentRunNumbers: S
  * rendered measurement-health line. Old campaigns (no .auto/runs) are never
  * nudged (lensDone=true), and a ledger without measurement_change records
  * renders the healthy state — neither mechanism can break them. The health
- * line comes from measurement.ts's measurementHealthSummary — the single spec
- * source (it reads the ledger and the findings store from disk itself); the
+ * line comes from measurement.ts's measurementHealthLine — the single spec
+ * source (it reads the ledger, the findings store and the measurer-file hashes
+ * from disk itself); the
  * store is additionally read here once for the lens signal, and an unreadable
  * store counts as none.
  */
@@ -949,7 +950,7 @@ function buildPeriodicContext(cwd: string, segRuns: ReconstructedRun[]): Periodi
   const hasSegmentFindings = findings !== null
     && [...findings.findings.values()].some((f) => findingTargetsSegment(f, segmentRunNumbers));
   const lensDone = !fs.existsSync(runsRootPath(cwd)) || hasSegmentFindings;
-  const measurementHealth = formatMeasurementHealth(measurementHealthSummary(cwd));
+  const measurementHealth = measurementHealthLine(cwd);
   return { lensDone, measurementHealth };
 }
 

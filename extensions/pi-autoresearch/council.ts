@@ -16,7 +16,7 @@ import * as path from "node:path";
 import { reconstructJsonlState, isAutoresearchRunEntry, parseJsonlEntry } from "./jsonl.ts";
 import { treeExists, loadTree, getPath, type TreeNode } from "./parallel/tree.ts";
 import { loadFindings, FINDING_THEMES, type FindingView } from "./findings.ts";
-import { measurementHealthSummary, formatMeasurementHealth } from "./measurement.ts";
+import { measurementHealthLine } from "./measurement.ts";
 import { runsRootPath } from "./lens.ts";
 import { loadPrecedentReport, refEquals, type AssessedPrecedentReport } from "./precedent-assess.ts";
 import { checkPrecedentReportFreshness, type ReportFreshness } from "./precedent-report.ts";
@@ -650,7 +650,7 @@ export function buildBrief(workDir: string, councilDir: string, input: BriefInpu
   // Measurement health (spec findings: the brief's health line has exactly one
   // source — measurement.ts's measurementHealthSummary, rendered by the same
   // function the observer's periodic messages use).
-  sections.push("## Measurement health", formatMeasurementHealth(measurementHealthSummary(workDir)), "");
+  sections.push("## Measurement health", measurementHealthLine(workDir), "");
 
   if (treeExists(workDir)) {
     const tree = loadTree(workDir);
