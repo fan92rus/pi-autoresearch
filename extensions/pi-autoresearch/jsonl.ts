@@ -26,6 +26,8 @@ export interface ReconstructedRun {
   description: string;
   timestamp: number;
   segment: number;
+  /** Measurement epoch of the run; records without a valid `epoch` belong to epoch 1. */
+  epoch: number;
   confidence: number | null;
   asi?: Record<string, unknown>;
 }
@@ -38,6 +40,11 @@ export interface ReconstructedJsonlState {
   metricUnit: string;
   bestDirection: "lower" | "higher";
   currentSegment: number;
+  /**
+   * Highest valid epoch seen in run and measurement_change records (1 when none).
+   * Epochs are monotonic and are not reset by config headers (segments).
+   */
+  currentEpoch: number;
   results: ReconstructedRun[];
   secondaryMetrics: ReconstructedMetricDef[];
 }
@@ -45,6 +52,7 @@ export interface ReconstructedJsonlState {
 const DEFAULT_METRIC_NAME = "metric";
 const DEFAULT_METRIC_UNIT = "";
 const DEFAULT_DIRECTION = "lower" as const;
+const DEFAULT_EPOCH = 1;
 
 function isObjectRecord(value: unknown): value is JsonlEntry {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -93,6 +101,11 @@ function asiFrom(value: unknown): Record<string, unknown> | undefined {
   return isObjectRecord(value) ? value : undefined;
 }
 
+/** A usable epoch is a positive safe integer; anything else is treated as absent. */
+function validEpochFrom(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 ? value : null;
+}
+
 function reconstructedState(): ReconstructedJsonlState {
   return {
     name: null,
@@ -100,6 +113,7 @@ function reconstructedState(): ReconstructedJsonlState {
     metricUnit: DEFAULT_METRIC_UNIT,
     bestDirection: DEFAULT_DIRECTION,
     currentSegment: 0,
+    currentEpoch: DEFAULT_EPOCH,
     hasConfigHeader: false,
     results: [],
     secondaryMetrics: [],
@@ -119,6 +133,11 @@ function nextSegment(state: ReconstructedJsonlState, segment: number): number {
   return segment + 1;
 }
 
+function observeEpoch(state: ReconstructedJsonlState, entry: JsonlEntry): void {
+  const epoch = validEpochFrom(entry.epoch);
+  if (epoch !== null) state.currentEpoch = Math.max(state.currentEpoch, epoch);
+}
+
 function runFrom(entry: AutoresearchRunEntry, segment: number): ReconstructedRun {
   return {
     run: typeof entry.run === "number" ? entry.run : 0,
@@ -129,6 +148,7 @@ function runFrom(entry: AutoresearchRunEntry, segment: number): ReconstructedRun
     description: typeof entry.description === "string" ? entry.description : "",
     timestamp: typeof entry.timestamp === "number" ? entry.timestamp : 0,
     segment,
+    epoch: validEpochFrom(entry.epoch) ?? DEFAULT_EPOCH,
     confidence: typeof entry.confidence === "number" ? entry.confidence : null,
     asi: asiFrom(entry.asi),
   };
@@ -196,10 +216,15 @@ export function reconstructJsonlState(jsonlContent: string): ReconstructedJsonlS
       continue;
     }
 
-    if (!isAutoresearchRunEntry(entry)) continue;
+    // measurement_change records advance the epoch but are not runs.
+    if (!isAutoresearchRunEntry(entry)) {
+      if (typeof entry.type === "string" && entry.type.startsWith("measurement_change")) observeEpoch(state, entry);
+      continue;
+    }
 
     const run = runFrom(entry, segment);
     state.results.push(run);
+    observeEpoch(state, entry);
     registerSecondaryMetrics(state, run.metrics);
   }
 
