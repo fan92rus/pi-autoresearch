@@ -4,6 +4,52 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added — Result reflection: result lens and findings (openspec add-result-reflection)
+
+- **Run outputs are kept**: every `run_experiment` writes the complete combined output to `.auto/runs/<n>/output.txt`, including crashed, timed-out and aborted runs. The response to the agent stays tail-truncated. Run directories are numbered above every existing one and never overwritten.
+- **Declared artifacts and `manifest.json`**: files listed in `analysis.artifacts` are copied into the run directory. The manifest records paths, sizes, `sha16`, `missing` entries and `size_only` entries (files over `copy_limit_mb`, default 32).
+- **`analysis` config section** in `.auto/config.json`: `artifacts`, `measurement_files`, `extractors` (`regex`, `json_path` or `timing_line`, with `sample`/`top`) and `copy_limit_mb`. It is validated at `init_experiment`: an invalid section, including a regex that does not compile, fails `init_experiment` with every error listed; a `config.json` that cannot be parsed keeps the campaign in generic mode with a warning. Without the section nothing changes.
+- **Generic extractors**: METRIC lines, error/warn lines, timing top-N, delta against the best keep of the same epoch, and a raw head/tail fallback.
+- **`inspect_results` tool**: reads persisted run files only, by run, extractor and page. Pages are at most 200 lines / 8 KiB.
+- **`record_finding` and `update_finding` tools**: findings in `.auto/findings.jsonl` (append-only) with themes `measurement`, `behavior`, `capability`, `tradeoff` and statuses `open`, `verified`, `revised`, `deferred`. Transitions follow a fixed map; `verified` and `revised` require `evidence_ref`. An `evidence_ref` (`path:start-end` or `path#anchor`) is checked against the file: the path must stay inside the project, the lines must exist, the anchor must occur.
+- **`needs_verification` flag**: a finding that claims unreachability or zero coverage (`unreachable`, `impossible`, `никогда не`, `recall 0`, a standalone `0/N`) is flagged. The flag is advisory and never blocks a write.
+- **Observer and loop**: a result-lens reminder in reflection checkpoints, a request to inspect results on stagnation, measurement health in periodic messages. The loop prompt routes findings by theme (behavior → hypothesis, capability → owner-input idea, tradeoff → owner question, measurement → `log_measurement_change`).
+- **Council brief**: an `## Open findings` section (grouped by theme, with impact and the `needs_verification` highlight) and a `lens: not done` marker when no raw results were inspected in the segment. Open findings are challenge input.
+
+### Added — Result reflection: measurement track
+
+- **`log_measurement_change` tool** registers a change of the gold set, scorer or metric. The diff and a rescore artifact must be files in `.auto/measurement/`. The scores are parsed from the artifact, never taken as arguments. A change opens a new scale epoch with `needs_verification: true`; a pending rescore (`rescore_pending`) keeps the new scale provisional until a completion record (`change_ref`) arrives in the same epoch.
+- **`verify_measurement_change` tool** records an independent confirmation. The proof artifact is checked against the change's ledger scores; a mismatch is a refutation, not a confirmation.
+- **`revert_measurement_change` tool** records a refutation with a counter-rescore. The active scale returns to the last confirmed epoch; runs of the refuted epoch become incomparable; the epoch id is never reused.
+- **Epochs**: `epoch` is part of the ledger. Entries without `epoch` are epoch 1, so existing logs read unchanged. Confidence scores and best deltas are not computed across epochs; the tree view shows the current epoch and an earlier epoch's best only as a labelled cross-epoch reference. A measurement change marks the noise floor stale, and confidence is suppressed while a rescore is pending.
+- **Measurer control**: hashes of `analysis.measurement_files` are stored in each run manifest. A change that no later `measurement_change` accounts for is reported as unaccounted; an undeclared or unreadable measurer is reported as an explicit limit.
+- **Council slates**: a measurement experiment is marked `TRACK: measurement` and carries a `DIFF` / `RESCORE` / `JUSTIFY` plan instead of an `EXPECTED_GAIN` number. The chair instructions and challenge briefs use the same format; an incomplete plan is rejected with the name of the missing field.
+
+### Added — Campaign report
+
+- **`.auto/report.md`** with seven sections: runs and metrics (with an artifact inventory), findings by theme, measurement track, noise and confidence, ideas and dead ends, limits and owner-input gates, summary. Empty sections are marked explicitly; a campaign without the lens is marked «линза не применялась». Measurement findings awaiting verification form their own queue, separate from owner-input gates.
+- **`finalize_research`** writes the report after the finalize record. A report failure is reported in the response and does not fail the finalize.
+- **`/autoresearch report`** writes the report on demand, with the loop on or off. Each call overwrites the file from the current state, so repeated calls do not duplicate content.
+
+### Added — Research precedents
+
+- **`search_precedents` tool** searches the project's own history for earlier attempts at the same problem: `.auto/log.jsonl` (or the legacy `autoresearch.jsonl`), `.auto/tree.json`, `.auto/ideas/` and `.auto/councils/`. Results are candidates with per-source coverage (`searched`, `unavailable`, `error`, `truncated`) and an outcome (`matches`, `no-matches`, `incomplete`). Limits per search: 10 s, 10 MiB read, 2000 files, 20 candidates, 8 KiB output. Other projects are never scanned.
+- **`assess_precedents` tool** records the agent's assessment of a candidate (`supports` or `contradicts`, with references and an action). The tool checks that the references exist and are in range; it does not judge the interpretation.
+- **Optional memory adapter**: a memory source is used only when the host provides one; otherwise it is reported as `unavailable`, never as searched.
+- **Council privacy**: the council brief gets only report metadata by default (id, outcome, source statuses, candidate counts). Candidate texts, paths and assessments are shared only with `council.share_precedent_details: true`.
+- **Steers and loop prompt**: the stagnation steer asks for a precedent search before a new direction, and advisor messages carry the report id and its freshness (`current`, `stale`, `unknown`).
+- **End-to-end tests** (`tests/e2e-precedents.test.mjs`) cover search → assessment → council digest, the empty campaign, a memory-unavailable run and a search deadline.
+
+### Changed — `/autoresearch report` is a reserved subcommand
+
+- `/autoresearch report` writes the campaign report. Previously the text `report` was a free-text goal: with the loop off it started a research session with the goal "report", and with the loop running it was rejected with "Autoresearch already active". A goal of exactly `report` no longer starts a session; phrase it differently (for example, "report on the parser").
+- `report` is listed in `/autoresearch` completions and in the help text.
+
+### Changed — epoch semantics for the measurement track
+
+- Ledger entries carry an `epoch`; entries without one are epoch 1, so existing campaigns keep their numbers.
+- A measurement change starts a new epoch. Confidence scores and best deltas are not computed across epochs, and runs of a refuted epoch are incomparable. Epoch ids are monotonic and never reused.
+
 ### Fixed — council_convene reliability (lobprobe council #5, 2026-11-01)
 
 - **Slate validator tolerates real chair output shapes**: markdown bold around labels (`**EXPECTED_GAIN:**`), parenthetical units (`EXPECTED_GAIN (f1): +0.012`), comparison symbols before the number (`EXPECTED_GAIN: ≥ 0.8`), the Latin token inside a Cyrillic label (`УСЛОВИЕ_ОТМЕНЫ (KILL_WHEN):`), and the fully-Cyrillic aliases the chair actually emitted (`ОЖИДАЕМЫЙ_ПРИРОСТ`, `УСЛОВИЕ_ОТМЕНЫ`). Previously the chair's Russian slate failed mechanical validation twice and the council returned "no slate".

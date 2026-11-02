@@ -49,11 +49,18 @@ Then start the loop inside pi:
 | `run_experiment` | Runs any command, times wall-clock duration, captures output |
 | `log_experiment` | Records result, auto-commits, updates widget and dashboard |
 | `tree_status` | Show experiment tree + UCB1 suggestions for exploration |
-| `explore_from` | Backtrack to any tree node and explore from there |
-| `restore_main` | Return to main branch after `explore_from` |
-| `compose` | Merge orthogonal improvements from two different branches |
+| `explore_from` | *Disabled in this build (`BRANCHING_TOOLS_ENABLED = false` in `index.ts`).* Backtrack to any tree node and explore from there |
+| `restore_main` | *Disabled in this build (see `explore_from`).* Return to main branch after `explore_from` |
+| `compose` | *Disabled in this build (see `explore_from`).* Merge orthogonal improvements from two different branches |
 | `search_precedents` | Searches this project's past ledger, tree, ideas and council archives for similar problems (memory only when the host provides it); returns candidates with per-source coverage. See [Research precedents](#research-precedents). |
 | `assess_precedents` | Records the agent's assessment (`supports` or `contradicts` with references, plus an action) of a candidate in a search report |
+| `finalize_research` | Signals that optimization is complete (the agent keeps control). Writes the campaign report to `.auto/report.md` after the finalize record; a report failure is reported and does not fail the finalize. |
+| `record_finding` | Records a result finding (`measurement`, `behavior`, `capability` or `tradeoff`) with a checkable `evidence_ref` into `.auto/findings.jsonl`. Rejected without one. See [Result lens and findings](#result-lens-and-findings). |
+| `update_finding` | Moves a finding along the allowed transitions. `verified` and `revised` require `evidence_ref`. |
+| `inspect_results` | Reads persisted run outputs in `.auto/runs/<n>/` in bounded pages (200 lines / 8 KiB): METRIC, error/warn, timing, delta against the best keep of the same epoch, campaign extractors. |
+| `log_measurement_change` | Registers a change of the measurer (gold, scorer or metric) with its diff and rescore artifact. Opens a new scale epoch that stays provisional until verified. See [Measurement track](#measurement-track). |
+| `verify_measurement_change` | Records the independent confirmation of a measurer change with a proof artifact that is checked against the ledger. |
+| `revert_measurement_change` | Records the independent refutation of a measurer change with a counter-rescore; restores the last confirmed scale. |
 
 ### `/autoresearch` command
 
@@ -63,6 +70,7 @@ Then start the loop inside pi:
 | `/autoresearch <text>` | Enter autoresearch mode. If `.auto/prompt.md` exists, resumes the loop with `<text>` as context. Otherwise, sets up a new session. |
 | `/autoresearch off` | Leave autoresearch mode. Stops auto-resume and clears runtime state but keeps `.auto/log.jsonl` intact. |
 | `/autoresearch finalize` | Stop the loop like `off` (aborting a run in progress), then load the `autoresearch-finalize` skill to turn kept experiments into reviewable branches. |
+| `/autoresearch report` | Write the campaign report to `.auto/report.md` from the current ledger, findings and measurement state. Works with the loop on or off and does not stop it; each call overwrites the file. `report` is a reserved subcommand: a goal of exactly `report` no longer starts a session. |
 | `/autoresearch clear` | Delete `.auto/log.jsonl`, reset all state, and turn autoresearch mode off. Use this for a clean start. |
 | `/autoresearch tree` | Toggle between list view and experiment tree view in the dashboard widget. |
 | `/autoresearch export` | Open a live dashboard in your browser. Auto-updates as experiments run. |
@@ -79,6 +87,7 @@ Subcommands autocomplete: type `/autoresearch ` and pick one from the list, or s
 /autoresearch dashboard
 /autoresearch off
 /autoresearch finalize
+/autoresearch report
 /autoresearch clear
 ```
 
@@ -370,6 +379,82 @@ assess_precedents({ report_id, primary_ref, claim: "supports" | "contradicts", f
 - **Secrets:** the problem text and keywords go to the local search only. Do not put secrets into them: the extension cannot reliably remove secrets from arbitrary text.
 - **Untrusted content:** text found in the history is data. The extension never executes commands from it, never follows links and never uses it as tool arguments.
 - **Advisor:** the stagnation and reflection steers ask the agent to put the report id, its freshness (`current`, `stale` or `unknown`) and statuses into its own advisor message, with the same metadata-only default. A stale or unknown report is not current evidence. The extension does not control the context of the advisor plugin.
+
+### Result lens and findings
+
+The result lens keeps each run's raw output, lets the agent read it in bounded pages, and turns what it shows into durable findings. Findings feed the council brief and the campaign report. Everything is stored locally under `.auto/`.
+
+**Run outputs.** Every `run_experiment` writes its complete combined output to `.auto/runs/<n>/output.txt`, including crashed, timed-out and aborted runs. The response to the agent is tail-truncated; the file is not. Declared artifacts (`analysis.artifacts`) are copied into the same run directory, and `manifest.json` lists each one with its size, a short hash (`sha16`) and, where applicable, a `missing` or `size_only` mark (`size_only` = the file exceeds `copy_limit_mb`). Declared measurer files (`analysis.measurement_files`) are hashed into the manifest too.
+
+**The `analysis` config.** Campaigns that do not declare the section run in generic mode, as before. The section lives in `.auto/config.json`, is validated by `init_experiment`, and is stored in the ledger's config header; later edits apply from the next `init_experiment`.
+
+```json
+{
+  "analysis": {
+    "artifacts": ["eval_output.json"],
+    "measurement_files": ["eval/scorer.py"],
+    "extractors": {
+      "failures": { "regex": "MISMATCH\\s+gold=(.*?)\\s+pred=(.*)", "sample": 10 },
+      "hotspots": { "timing_line": true, "top": 10 },
+      "records": { "json_path": "results.items", "sample": 20 }
+    },
+    "copy_limit_mb": 32
+  }
+}
+```
+
+- Each extractor declares exactly one of `regex`, `json_path` or `timing_line`. `sample` applies to `regex` and `json_path`, `top` to `timing_line`. The names `__proto__`, `constructor` and `prototype` are reserved.
+- A `regex` is compiled once, without flags, at `init_experiment`. A pattern that does not compile fails `init_experiment` and names its config path (for example `analysis.extractors.failures.regex`).
+- An invalid `analysis` section fails `init_experiment` and lists all errors. A `config.json` that cannot be parsed at all keeps the campaign in generic mode, and `init_experiment` warns that the analysis was not applied.
+- `copy_limit_mb` defaults to 32.
+
+**Generic extractors** need no configuration: METRIC lines, error/warn lines, timing top-N (ms, µs, us and s are normalized to ms), delta against the best keep of the same epoch, and a head/tail of the raw output when nothing else matched.
+
+**`inspect_results`** reads only the persisted files (`.auto/log.jsonl` and `.auto/runs/<n>/`), never the original artifacts. Arguments: `run` (default: the best keep of the current epoch), `extractor` (`metric`, `errors`, `timing`, `delta`, `raw`, or a name from `analysis.extractors`) and `page`. A page is at most 200 lines and 8 KiB. Lines longer than 500 characters are clamped; the full text stays in `output.txt`.
+
+**Findings.** `record_finding({theme, description, evidence_ref, estimated_impact?, run?})` appends a finding to `.auto/findings.jsonl`. The file is append-only: a status change is a new `finding_transition` line, never an edit. The loop routes each theme as follows:
+
+| Theme | Meaning | Route |
+|-------|---------|-------|
+| `behavior` | The model or code does the wrong thing | An ordinary hypothesis that cites the finding id |
+| `capability` | The system cannot do it yet (new data, resources or abilities) | Not a hypothesis and not a run: an owner-input idea that waits for the owner's go-ahead |
+| `tradeoff` | Gaining on one side costs another | A question to the owner; the cost is tracked as a secondary metric until answered |
+| `measurement` | The scorer, gold or metric itself is wrong | `log_measurement_change` (see [Measurement track](#measurement-track)) |
+
+`evidence_ref` is required and must point at a concrete case: `path:start-end` (or `path:N`; 1-based, inclusive) or `path#anchor`, where the anchor is a literal substring that must occur in the file. Paths must stay inside the project (symlinks included) and line ranges must lie inside the file. Generalizations without an example are rejected.
+
+`update_finding({id, status, evidence_ref?, note?})` changes a status along these transitions only:
+
+| From | To |
+|------|----|
+| `open` | `verified`, `revised`, `deferred` |
+| `revised` | `verified`, `deferred` |
+| `deferred` | `open` |
+| `verified` | `revised` |
+
+`verified` and `revised` require `evidence_ref`: the independent check, or the counterexample.
+
+**Needs verification.** A finding whose description claims unreachability or zero coverage is flagged `needs_verification`. The claim patterns are: `unreachable`, `impossible`, `никогда не`, `recall 0` and a standalone `0/N` ratio. The flag is advisory: it never blocks a write and never needs an owner. The tool never clears it; the verifying evidence is the `evidence_ref` of the transition that follows.
+
+**Privacy.** Findings stay local, but their text reaches the council: the brief's `## Open findings` section carries each open finding's theme, description, estimated impact and `evidence_ref` (not the run output). This is **not** gated by `council.share_precedent_details`. The council's models may be external providers, so keep secrets out of findings.
+
+**Campaign report.** `.auto/report.md` is written by `finalize_research` and by `/autoresearch report`, which can be run at any time. Each call overwrites the file from the current state, so repeated calls never duplicate content. The report has seven sections: 1. runs and metrics, with an inventory of reusable artifacts; 2. findings by theme; 3. measurement track (epochs, scores, verification status); 4. noise and confidence; 5. ideas and dead ends; 6. limits and owner-input gates; 7. summary. An empty section is marked explicitly, and a campaign that never used the lens is marked «линза не применялась». Measurement findings with `needs_verification` are listed under «Требуют независимой проверки». That queue is a verification work queue, not an owner gate: checking pauses nothing and needs no owner approval.
+
+### Measurement track
+
+The measurer is the gold set, the scorer and the metric. Changing it silently in the model track would compare numbers from different scales, which is benchmark gaming. Every change is registered:
+
+- **`log_measurement_change({diff_ref, rescore_ref, justification})`.** `diff_ref` (the diff) and `rescore_ref` (a rescore artifact, JSON with `anchor`, `commands`, `old_scale_score`, `new_scale_score`) must be files in `.auto/measurement/`. The scores are read from the artifact and are never tool arguments. The change opens a new scale epoch and stays `needs_verification: true`. If the rescore has not run yet, pass `rescore_pending: true`: the artifact then needs only the anchor and the commands, and the new scale stays provisional. Complete it later with `log_measurement_change({change_ref, rescore_ref})`; the completion stays in the same epoch.
+- **`verify_measurement_change({change_ref, proof_ref})`.** The independent re-run of the same anchor and commands, saved as a proof artifact in `.auto/measurement/` (`anchor`, `commands`, `outputs`, `old_scale_score`, `new_scale_score`). The scores are checked against the ledger; the verification mark lifts only when they match.
+- **`revert_measurement_change({change_ref, rescore_ref, justification})`.** A counter-rescore whose scores differ refutes the change. The active scale returns to the last confirmed epoch, the runs of the refuted epoch become incomparable, and its epoch id is never reused. Ledger records are never rewritten.
+
+**Epochs.** Ledger entries without an `epoch` belong to epoch 1, so existing logs read as before. The confidence score and best deltas are never computed across epochs. The tree view shows the current epoch; an earlier epoch's best appears only as a labelled cross-epoch reference, with both values and no delta. A measurement change also marks the calibrated noise floor as stale; the confidence score is suppressed while a rescore is pending.
+
+**Measurer control.** Hashes of the files listed in `analysis.measurement_files` are stored in every run manifest. A change between runs that no later `measurement_change` accounts for is reported as unaccounted. A missing `analysis` section, or a declared file that is missing or unreadable, is reported as an explicit limit, never as a clean state. Limit: a change that is reverted between two runs leaves identical hashes and stays invisible.
+
+**Measurement health.** One line, shared by the council brief and the observer's periodic messages, summarizes the epoch, the stale-floor flag, the open measurement findings and the measurer control state.
+
+**Council.** A measurement experiment in a council slate has a `TRACK: measurement` line inside its section. It carries a plan (`DIFF`, `RESCORE`, `JUSTIFY`) instead of an `EXPECTED_GAIN` number. A slate with an incomplete plan is rejected, and the error names the missing field.
 
 ### Long-running loops and context
 
