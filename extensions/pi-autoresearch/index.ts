@@ -63,6 +63,7 @@ import {
   disabledRunOutputSink,
   highestRunDirNumber,
   openRunOutputSink,
+  writeRunManifest,
   type RunArtifacts,
   type RunOutputSink,
 } from "./lens.ts";
@@ -70,6 +71,7 @@ import {
   parseAnalysisConfig,
   readCampaignConfig,
   serializeAnalysisConfig,
+  type AnalysisConfig,
 } from "./lens-config.ts";
 import { tmpdir } from "node:os";
 
@@ -734,6 +736,29 @@ function analysisHeadersEqual(a: unknown, b: unknown): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * The campaign's analysis config for run-artifact persistence (task 1.3):
+ * re-parsed from the LAST config header (set at init — design.md decision 5:
+ * "правила «что читать» — часть «как измеряем», mid-campaign правки не
+ * предполагаются"). parseAnalysisConfig accepted exactly this serialized
+ * shape when the header was written, so a header produced by
+ * serializeAnalysisConfig re-validates clean; a hand-edited or foreign
+ * header that no longer validates degrades to null (no manifest) instead of
+ * failing a run — artifact persistence is best-effort by contract.
+ * null also when no section: without a declared list no manifest is written
+ * at all (spec result-lens + measurement-track) — silently, that is the
+ * generic campaign. An invalid header is NOT silent: it is reported with a
+ * warning, because the manifest the campaign asked for is being skipped.
+ */
+function readRunAnalysisConfig(workDir: string): AnalysisConfig | null {
+  const parsed = parseAnalysisConfig(readLastConfigHeaderAnalysis(autoresearchJsonlPath(workDir)));
+  if (parsed.status === "ok") return parsed.config;
+  if (parsed.status === "invalid") {
+    console.warn("[autoresearch] run manifest skipped: invalid analysis header in ledger");
+  }
+  return null;
 }
 
 /** Read the per-project experiment time cap (minutes) from .auto/config.json; null = no cap. */
@@ -3188,6 +3213,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         );
       }
 
+      // Task 1.3: declared-artifact copying + the run manifest are driven by
+      // the analysis header (init-time config, see readRunAnalysisConfig).
+      // Read once before the spawn; the manifest itself is written when the
+      // run settles, in the spawn's finally below, so aborted, crashed and
+      // timed-out runs keep their artifacts too.
+      const runAnalysisConfig = readRunAnalysisConfig(workDir);
+
       // TODO(/tree): replace compaction-based resume with a checkpoint-per-iteration model.
       runtime.runningExperiment = { startedAt: Date.now(), command: params.command };
       // Ledger marker BEFORE the spawn (goal-x discipline: events before action).
@@ -3352,6 +3384,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         });
       }).finally(() => {
         outputSink.close();
+        // Task 1.3: manifest AFTER the sink close — output.txt must be
+        // complete before it is hashed, and this runs on every settle path
+        // (exit, crash, timeout, abort). Best-effort by contract:
+        // writeRunManifest never throws and writes nothing when nothing is
+        // declared; a missing or garbled manifest must not fail a finished
+        // run.
+        if (runArtifacts !== null && runAnalysisConfig !== null) {
+          writeRunManifest(workDir, runArtifacts, runAnalysisConfig);
+        }
         runtime.runningExperiment = null;
         updateWidget(ctx);
         if (overlayTui) overlayTui.requestRender();
