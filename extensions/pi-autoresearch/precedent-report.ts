@@ -26,7 +26,13 @@
  * Output is data, not instructions: candidate text stays under `untrusted_content` (see
  * precedent-search.ts); nothing from the report is executed or used as tool arguments.
  *
- * Non-goals (later tasks): assessments (2.2), memory adapter (2.3), council/observer wiring (3.x).
+ * Memory (task 2.3, precedent-memory.ts): an optional host adapter runs first, in a worker thread
+ * under its own cap of the deadline, and its spend comes off the shared budget before the local
+ * search. Without one, memory is `unavailable` (with the fallback instruction) and the report stays
+ * complete; a configured adapter that failed or was truncated makes it incomplete. A configured memory
+ * source has no stable version, so the report is never fresh.
+ *
+ * Non-goals (later tasks): council/observer wiring (3.x).
  */
 
 import { createHash, randomBytes } from "node:crypto";
@@ -38,6 +44,15 @@ import { fileURLToPath } from "node:url";
 import { parseJsonlEntry } from "./jsonl.ts";
 import { LedgerTracker } from "./precedent-context.ts";
 import {
+  MEMORY_DEADLINE_MS,
+  fitMemorySection,
+  memorySection,
+  runMemorySearch,
+  unavailableMemorySection,
+  type MemorySection,
+  type PrecedentMemoryAdapter,
+} from "./precedent-memory.ts";
+import {
   SEARCH_DEADLINE_MS,
   SEARCH_MAX_BYTES,
   SEARCH_MAX_ITEMS,
@@ -46,6 +61,7 @@ import {
   searchLocalSourcesWithFollowUp,
   searchPrecedents,
   type PrecedentSearchOptions,
+  type PrecedentSearchOutcome,
   type PrecedentSearchReport,
   type SearchChildDeps,
   type SearchChildProcess,
@@ -127,6 +143,9 @@ export interface PrecedentInput {
   finding_ref?: string;
 }
 
+/** The search report with the memory section of task 2.3 (its own `memory` field is always unavailable). */
+export type PrecedentReportSearch = Omit<PrecedentSearchReport, "memory"> & { memory: MemorySection };
+
 export interface PrecedentReport {
   schema: typeof REPORT_SCHEMA;
   id: string;
@@ -134,7 +153,7 @@ export interface PrecedentReport {
   query: PrecedentInput;
   fingerprint: PrecedentFingerprint;
   versions: SourceVersion[];
-  search: PrecedentSearchReport;
+  search: PrecedentReportSearch;
   persisted: { path: string; saved: boolean };
 }
 
@@ -177,6 +196,8 @@ export interface PrecedentReportOptions {
   clock?: () => number;
   versions?: Omit<VersionChildOptions, "deadlineMs" | "deadlineAt" | "clock" | "budget">;
   search?: Omit<PrecedentSearchOptions, "deadlineMs" | "maxOutputBytes" | "args">;
+  /** Host memory adapter (task 2.3). Absent: memory is `unavailable`. */
+  memory?: PrecedentMemoryAdapter;
   now?: () => Date;
 }
 
@@ -707,6 +728,16 @@ function totalsGrowthBytes(deadlineMs: number): number {
   return (digits(SEARCH_MAX_BYTES) - 1) + (digits(SEARCH_MAX_ITEMS) - 1) + (digits(deadlineMs) - 1) + 1;
 }
 
+/** The report with its first `keep` candidates; `output` counts them as assembleReport does. */
+function keepCandidates(search: PrecedentReportSearch, keep: number): PrecedentReportSearch {
+  const matchesTotal = search.output.matchesTotal;
+  return {
+    ...search,
+    candidates: search.candidates.slice(0, keep),
+    output: { matchesTotal, returned: keep, omitted: matchesTotal - keep, truncated: matchesTotal - keep > 0 },
+  };
+}
+
 /** Arguments of the budgeted search child: the remaining limits travel on the command line. */
 function searchChildArgs(limits: BudgetLimits): string[] {
   return [
@@ -758,9 +789,25 @@ export async function searchPrecedentReport(
   // is the head size plus the search JSON, so the search may use the rest of the 8 KiB.
   const persistedFalse = { path: relPath, saved: false };
   const overhead = Buffer.byteLength(JSON.stringify({ ...head, persisted: persistedFalse, search: null }), "utf8") - "null".length;
+  const rootReal = resolveSourceRoot(workDir);
+  // The memory call runs first, under its own cap of the deadline. Its spend comes off the shared budget
+  // before the local search takes the remainder, so the two never spend the same bytes or items twice.
+  const adapter = options.memory;
+  const call =
+    adapter === undefined
+      ? null
+      : await runMemorySearch(adapter, queryText(input), {
+          deadlineMs: Math.min(remainingMs(), MEMORY_DEADLINE_MS),
+          maxBytes: SEARCH_MAX_BYTES - versionSpent.bytes,
+          maxItems: SEARCH_MAX_ITEMS - versionSpent.items,
+        });
+  const memorySpent = call?.spent ?? { bytes: 0, items: 0 };
+  const memoryInitial =
+    call !== null && adapter !== undefined ? memorySection(call, adapter.name, rootReal) : unavailableMemorySection();
+
   const searchLimits: BudgetLimits = {
-    maxBytes: SEARCH_MAX_BYTES - versionSpent.bytes,
-    maxItems: SEARCH_MAX_ITEMS - versionSpent.items,
+    maxBytes: Math.max(0, SEARCH_MAX_BYTES - versionSpent.bytes - memorySpent.bytes),
+    maxItems: Math.max(0, SEARCH_MAX_ITEMS - versionSpent.items - memorySpent.items),
   };
   const searched = await searchPrecedents(workDir, queryText(input), {
     ...options.search,
@@ -769,22 +816,44 @@ export async function searchPrecedentReport(
     deps: searchChildDeps(options.search?.deps, deadlineAt, clock),
     maxOutputBytes: SEARCH_MAX_OUTPUT_BYTES - overhead - totalsGrowthBytes(deadlineMs),
   });
-  // The report shows the shared operation totals and the operation deadline.
-  const search: PrecedentSearchReport = {
-    ...searched,
-    budget: {
-      maxBytes: SEARCH_MAX_BYTES,
-      maxItems: SEARCH_MAX_ITEMS,
-      bytesSpent: versionSpent.bytes + searched.budget.bytesSpent,
-      itemsSpent: versionSpent.items + searched.budget.itemsSpent,
-    },
-    deadline: { ms: deadlineMs, hit: searched.deadline.hit || versionRun.deadlineHit },
+
+  // The report shows the shared operation totals (version, memory and search spend) and the operation
+  // deadline. Memory decides completeness: a configured source that failed or was truncated is incomplete.
+  const budget = {
+    maxBytes: SEARCH_MAX_BYTES,
+    maxItems: SEARCH_MAX_ITEMS,
+    bytesSpent: versionSpent.bytes + memorySpent.bytes + searched.budget.bytesSpent,
+    itemsSpent: versionSpent.items + memorySpent.items + searched.budget.itemsSpent,
   };
+  const searchWith = (memory: MemorySection): PrecedentReportSearch => {
+    if (searched.outcome === "invalid-query") return { ...searched, memory, budget };
+    const complete = searched.complete && (memory.status === "unavailable" || memory.status === "searched");
+    const outcome: PrecedentSearchOutcome = !complete
+      ? "incomplete"
+      : searched.output.matchesTotal > 0 || memory.returned > 0
+        ? "matches"
+        : "no-matches";
+    return {
+      ...searched,
+      outcome,
+      complete,
+      memory,
+      budget,
+      deadline: { ms: deadlineMs, hit: searched.deadline.hit || versionRun.deadlineHit },
+    };
+  };
+  // Output fit (8 KiB): memory entries go first (secondary evidence), then the lowest-ranked local candidates.
+  const fitsOutput = (candidate: PrecedentReportSearch): boolean =>
+    Buffer.byteLength(JSON.stringify({ ...head, persisted: persistedFalse, search: candidate }), "utf8") <= SEARCH_MAX_OUTPUT_BYTES;
+  let search = searchWith(fitMemorySection(memoryInitial, (memory) => fitsOutput(searchWith(memory))));
+  while (!fitsOutput(search) && search.candidates.length > 0) {
+    search = keepCandidates(search, search.candidates.length - 1);
+  }
 
   const draft = (saved: boolean): PrecedentReport => ({ ...head, persisted: { path: relPath, saved }, search });
   let report = draft(true);
   let text = JSON.stringify(report);
-  const persist = persistReport(resolveSourceRoot(workDir), id, text);
+  const persist = persistReport(rootReal, id, text);
   let persistError: string | undefined;
   if (!persist.saved) {
     persistError = persist.reason;
@@ -804,7 +873,10 @@ export async function checkPrecedentReportFreshness(
   options: VersionChildOptions = {},
 ): Promise<{ freshness: ReportFreshness; reusable: boolean }> {
   const current = computeFingerprint(report.query, snapshotOrUnknown(await runVersionChild(workDir, options)));
-  const freshness = evaluateFreshness(report.fingerprint, current);
+  // A configured memory source has no stable version to compare, and a failed or truncated one leaves the
+  // coverage incomplete (task 2.3): either way the freshness is unknown, whatever the local sources say.
+  const freshness: ReportFreshness =
+    report.search.memory.status === "unavailable" ? evaluateFreshness(report.fingerprint, current) : "unknown";
   return { freshness, reusable: freshness === "fresh" && report.search.complete };
 }
 
@@ -863,6 +935,7 @@ export function registerSearchPrecedentsTool(
           id: report.id,
           outcome: report.search.outcome,
           complete: report.search.complete,
+          memory: report.search.memory.status,
           fingerprint: report.fingerprint.value,
           persisted: report.persisted,
           ...(result.persistError === undefined ? {} : { persistError: result.persistError }),
