@@ -211,14 +211,46 @@ function divergeTask(p: DelegationParticipant, briefText: string, note?: string)
   return lines.join("\n");
 }
 
-function challengeTask(p: DelegationParticipant, round: number, contested: string[], othersText: string): string {
+// ─── Open findings as challenge input (add-result-reflection, task 1.8) ───
+
+/**
+ * Extract the "## Open findings" section (buildBrief layout) from a campaign
+ * brief. Returns the section body without the header line, or null when the
+ * brief carries none (campaigns without findings.jsonl). The challenge phase
+ * feeds this to every analyst so verdicts are grounded in the recorded
+ * findings, with [needs_verification] claims highlighted as unverified.
+ */
+export function extractOpenFindingsSection(briefText: string): string | null {
+  const lines = String(briefText ?? "").split("\n");
+  const start = lines.findIndex((l) => l.startsWith("## Open findings"));
+  if (start === -1) return null;
+  const body: string[] = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    if (lines[i].startsWith("## ")) break;
+    body.push(lines[i]);
+  }
+  const text = body.join("\n").trim();
+  return text.length > 0 ? text : null;
+}
+
+function challengeTask(p: DelegationParticipant, round: number, contested: string[], othersText: string, findingsSection?: string | null): string {
   const lines = [
     "You are " + p.name + " (hypothesis letter " + p.letter + ") in CHALLENGE round " + round + " of a hypothesis council.",
+  ];
+  if (findingsSection) {
+    lines.push(
+      "",
+      "=== OPEN FINDINGS (recorded campaign knowledge — base verdicts on them; the flag [needs_verification] marks a claim NOT yet independently verified: demand its verification or refute it before accepting a hypothesis that leans on it) ===",
+      findingsSection,
+    );
+  }
+  lines.push(
+    "",
     "The analysts' proposals follow (verbatim).",
     "",
     othersText,
     "",
-  ];
+  );
   if (round > 1 && contested.length) {
     lines.push("This round addresses ONLY the still-contested hypotheses: " + contested.join(", ") + ".", "");
   }
@@ -392,6 +424,10 @@ export async function runCouncilDelegated(pi: DelegationPi, args: CouncilDelegat
     }
 
     // ── Phase 2 — Challenge rounds (verdicts in chat, consensus mechanical) ──
+    // Findings recorded in the brief are input to every challenge round
+    // (task 1.8): analysts verdict against them, unverified claims highlighted.
+    const findingsSection = extractOpenFindingsSection(args.briefText);
+    if (findingsSection) log("challenge input: open findings included");
     const verdictRecords: VerdictRecord[] = [];
     const consensusReport = (): ConsensusReport => {
       const latest: Record<string, Record<string, string>> = {};
@@ -436,7 +472,7 @@ export async function runCouncilDelegated(pi: DelegationPi, args: CouncilDelegat
           ownerRunId,
           nodeId: ids[i].nodeId,
           agent: "delegate",
-          task: challengeTask(p, round, contested, othersText),
+          task: challengeTask(p, round, contested, othersText, findingsSection),
           model: p.model,
           cwd: args.cwd,
           timeoutMs: childTimeout(CHALLENGE_CAP_MS),

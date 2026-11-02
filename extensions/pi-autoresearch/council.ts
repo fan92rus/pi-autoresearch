@@ -15,6 +15,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { reconstructJsonlState, isAutoresearchRunEntry, parseJsonlEntry } from "./jsonl.ts";
 import { treeExists, loadTree, getPath, type TreeNode } from "./parallel/tree.ts";
+import { loadFindings, FINDING_THEMES, type FindingView } from "./findings.ts";
+import { measurementHealthSummary, formatMeasurementHealth } from "./measurement.ts";
+import { runsRootPath } from "./lens.ts";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -296,6 +299,41 @@ function previousCouncils(workDir: string, currentSeq: number): { dir: string; s
   return out.slice(-3);
 }
 
+// ─── Findings in the brief (add-result-reflection, task 1.8) ────────────────
+// The brief consumes the durable findings store (spec findings: "Секции
+// находок в брифе совета", "Мягкий маркер линзы в брифе совета"). Campaigns
+// without findings.jsonl simply get no findings section; every step is
+// best-effort so an unreadable store degrades to "none" instead of throwing.
+
+const FINDING_DESCRIPTION_LIMIT = 220;
+const FINDING_EVIDENCE_LIMIT = 140;
+const FINDING_IMPACT_LIMIT = 60;
+
+/** Collapse whitespace and clip to a limit (ellipsis marks the cut). */
+function clipFindingText(s: string, limit: number): string {
+  const one = s.replace(/\s+/g, " ").trim();
+  return one.length <= limit ? one : one.slice(0, limit - 1) + "…";
+}
+
+/** Findings grouped by theme (FINDING_THEMES order), one bullet per finding. */
+function renderOpenFindings(findings: readonly FindingView[]): string[] {
+  const lines: string[] = [];
+  for (const theme of FINDING_THEMES) {
+    const group = findings.filter((f) => f.theme === theme);
+    if (group.length === 0) continue;
+    lines.push(`### ${theme} (${group.length})`);
+    for (const f of group) {
+      const flag = f.needs_verification ? " [needs_verification]" : "";
+      const impact = f.estimated_impact ? ` (${clipFindingText(f.estimated_impact, FINDING_IMPACT_LIMIT)})` : "";
+      lines.push(
+        `- ${f.id}${flag}${impact} ${clipFindingText(f.description, FINDING_DESCRIPTION_LIMIT)}` +
+        ` — evidence: ${clipFindingText(f.evidence_ref, FINDING_EVIDENCE_LIMIT)}`,
+      );
+    }
+  }
+  return lines;
+}
+
 /** Build the mechanical campaign digest and write it as 00-brief.md in the council dir. */
 export function buildBrief(workDir: string, councilDir: string, input: BriefInput): { path: string; text: string } {
   const sections: string[] = [];
@@ -312,7 +350,9 @@ export function buildBrief(workDir: string, councilDir: string, input: BriefInpu
     "",
   );
 
-  // Recent runs from the ledger
+  // Recent runs from the ledger. Current-segment run numbers also feed the
+  // result-lens marker below (same segment rule as the observer's nudges).
+  let segmentRunNumbers: Set<number> = new Set();
   try {
     const jsonlPath = path.join(workDir, ".auto", "log.jsonl");
     const legacyPath = path.join(workDir, "autoresearch.jsonl");
@@ -320,6 +360,9 @@ export function buildBrief(workDir: string, councilDir: string, input: BriefInpu
     if (logPath) {
       const content = fs.readFileSync(logPath, "utf-8");
       const reconstructed = reconstructJsonlState(content);
+      segmentRunNumbers = new Set(
+        reconstructed.results.filter((r) => r.segment === reconstructed.currentSegment).map((r) => r.run),
+      );
       const runs = reconstructed.results.slice(-15);
       const lines = runs.map((r) => {
         const finding = r.asi && typeof r.asi.finding === "string" ? ` — finding: ${r.asi.finding.slice(0, 100)}` : "";
@@ -336,6 +379,43 @@ export function buildBrief(workDir: string, councilDir: string, input: BriefInpu
   } catch {
     /* ledger section is best-effort */
   }
+
+  // Result-lens marker (spec findings: "Мягкий маркер линзы в брифе совета"):
+  // shown when the current segment has no recorded findings — hypotheses are
+  // then proposed without any raw-result inspection. Same "nothing to inspect"
+  // rule as the observer: campaigns without persisted run dirs (.auto/runs)
+  // count as inspected and are never marked.
+  const loadedFindings = loadFindings(workDir);
+  const allFindings = loadedFindings.ok ? [...loadedFindings.value.findings.values()] : [];
+  const inspectedThisSegment = allFindings.some((f) => f.run !== undefined && segmentRunNumbers.has(f.run));
+  const lensDone = !fs.existsSync(runsRootPath(workDir)) || inspectedThisSegment;
+  if (!lensDone) {
+    sections.push(
+      "## Result lens",
+      "- lens: not done — no raw-result inspection recorded in the current segment; hypotheses proposed without " +
+        "reading raw results are guesses. Read the best run via inspect_results and record findings (record_finding) " +
+        "before trusting the advice below.",
+      "",
+    );
+  }
+
+  // Open findings (spec findings: "Секции находок в брифе совета"): every open
+  // finding, grouped by theme, with impact and the needs_verification highlight.
+  const openFindings = allFindings.filter((f) => f.status === "open");
+  if (openFindings.length > 0) {
+    sections.push(
+      "## Open findings (durable campaign knowledge — ground hypotheses in these; do not re-derive them)",
+      "A finding marked [needs_verification] states an unverified claim (unreachable / zero-coverage style) — " +
+        "treat it as a hypothesis to check, not as a fact.",
+      ...renderOpenFindings(openFindings),
+      "",
+    );
+  }
+
+  // Measurement health (spec findings: the brief's health line has exactly one
+  // source — measurement.ts's measurementHealthSummary, rendered by the same
+  // function the observer's periodic messages use).
+  sections.push("## Measurement health", formatMeasurementHealth(measurementHealthSummary(workDir)), "");
 
   if (treeExists(workDir)) {
     const tree = loadTree(workDir);
