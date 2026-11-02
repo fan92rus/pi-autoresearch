@@ -66,6 +66,11 @@ import {
   type RunArtifacts,
   type RunOutputSink,
 } from "./lens.ts";
+import {
+  parseAnalysisConfig,
+  readCampaignConfig,
+  serializeAnalysisConfig,
+} from "./lens-config.ts";
 import { tmpdir } from "node:os";
 
 import {
@@ -696,6 +701,41 @@ function readMaxExperiments(cwd: string): number | null {
     : null;
 }
 
+/**
+ * The `analysis` value of the LAST `type: "config"` header in the ledger
+ * (undefined when the ledger has no header yet or carries no analysis key).
+ * Used to detect an analysis-section change on re-init without re-parsing the
+ * whole ledger state (jsonl.ts stays unaware of the section).
+ */
+function readLastConfigHeaderAnalysis(jsonlPath: string): unknown {
+  try {
+    if (!fs.existsSync(jsonlPath)) return undefined;
+    const lines = fs.readFileSync(jsonlPath, "utf-8").split("\n").filter(Boolean);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const entry = JSON.parse(lines[i]) as { type?: string; analysis?: unknown };
+        if (entry && entry.type === "config") return entry.analysis;
+      } catch { continue; }
+    }
+  } catch { /* unreadable ledger — treat as no previous analysis */ }
+  return undefined;
+}
+
+/**
+ * Compare planned vs persisted analysis-header values. Both sides are produced
+ * by serializeAnalysisConfig (deterministic key order), so JSON string
+ * equality is exact; undefined on both sides = generic mode on both sides.
+ */
+function analysisHeadersEqual(a: unknown, b: unknown): boolean {
+  if (a === undefined && b === undefined) return true;
+  if (a === undefined || b === undefined) return false;
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
+}
+
 /** Read the per-project experiment time cap (minutes) from .auto/config.json; null = no cap. */
 function readExperimentMaxMinutes(cwd: string): number | null {
   const config = readConfig(cwd);
@@ -1050,8 +1090,15 @@ async function recordTreeNode(
       try {
         const nf = await calibrateNoiseFloor(execFn, workDir, info.experiment.metric);
         if (nf !== null && nf > 0) {
-          const cfg = readConfig(workDir);
-          writeConfig(workDir, { ...cfg, noiseFloor: nf });
+          // An unparseable config.json is never rewritten (B3/BL2 invariant:
+          // broken configs warn, they never get clobbered) — the noise floor
+          // simply is not persisted there.
+          if (readCampaignConfig(workDir).status !== "unparseable") {
+            const cfg = readConfig(workDir);
+            writeConfig(workDir, { ...cfg, noiseFloor: nf });
+          } else {
+            console.warn("[autoresearch] noise floor not persisted: config.json is unparseable and must not be rewritten");
+          }
           console.warn(`[autoresearch] noise floor calibrated: ±${(nf * 100).toFixed(1)}%`);
         }
       } catch { /* best-effort */ }
@@ -2463,34 +2510,79 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
 
-      // Set module-level workDir override for ALL tools
+      // Task 1.2 (add-result-reflection): read + validate the `analysis`
+      // section of .auto/config.json BEFORE any writes — the params.cwd block
+      // below is init's first write (writeConfig + _customWorkDir), and a
+      // failing init must leave both untouched. The config is read from
+      // ctx.cwd (convention: the campaign config always lives in ctx.cwd, like
+      // readConfig/readMaxExperiments) — NOT from resolveWorkDir(ctx.cwd):
+      // workingDir redirects where the LEDGER goes, not where the config
+      // declaring `analysis` is.
+      const campaignCfg = readCampaignConfig(ctx.cwd);
+      // Variant (b), uniform across branches: an unparseable config.json never
+      // blocks init (spec: generic mode when no valid config). The file is
+      // never rewritten here either — writeConfig would destroy its content.
+      // In the params.cwd branch workingDir simply is not persisted, and the
+      // warning names it.
+      const configWarning = campaignCfg.status === "unparseable"
+        ? params.cwd
+          ? `⚠️ config.json не распарсился — analysis не применена; workingDir не сохранён в config.json, файл не тронут (${campaignCfg.error})`
+          : `⚠️ config.json не распарсился — analysis не применена (${campaignCfg.error})`
+        : null;
+      const rawAnalysis = campaignCfg.status === "ok" ? campaignCfg.config["analysis"] : undefined;
+      const analysis = parseAnalysisConfig(rawAnalysis);
+      if (analysis.status === "invalid") {
+        return {
+          content: [{
+            type: "text",
+            text: `❌ Invalid analysis section in .auto/config.json:\n${analysis.errors.map((e) => `- ${e}`).join("\n")}`,
+          }],
+          details: {},
+        };
+      }
+      const plannedAnalysisHeader = analysis.status === "ok"
+        ? serializeAnalysisConfig(analysis.config)
+        : undefined;
+
+      // Set module-level workDir override for ALL tools. First write of init —
+      // reached only when the analysis config validated clean above.
       if (params.cwd) {
         _customWorkDir = effectiveCwd;
-        // Persist to config so it survives pi restart
-        const existingCfg = readConfig(ctx.cwd);
-        writeConfig(ctx.cwd, { ...existingCfg, workingDir: effectiveCwd });
+        // Persist to config so it survives pi restart. Skipped for an
+        // unparseable config.json: rewriting it would destroy its content —
+        // the warning above says so instead.
+        if (campaignCfg.status !== "unparseable") {
+          const existingCfg = readConfig(ctx.cwd);
+          writeConfig(ctx.cwd, { ...existingCfg, workingDir: effectiveCwd });
+        }
       }
 
       const isReinit = state.results.length > 0;
+      const workDir = resolveWorkDir(ctx.cwd);
+      const previousAnalysis = readLastConfigHeaderAnalysis(autoresearchJsonlPath(workDir));
 
       // Same-config re-init = RESUME, not a new segment. Appending another
       // config header would split the ledger's segment and orphan the whole
       // history from the observer (council/stagnation hints only see the
       // current segment — an empty one right after the split). A genuine
       // target change (different name/metric/workload) still re-segments.
+      // The analysis section is part of "how we measure" (design.md, decision 5),
+      // so a changed section counts as a target change too — resuming silently
+      // with the old rules would be exactly the silence this spec forbids.
       if (isReinit) {
         const requestedDirection = params.direction === "lower" || params.direction === "higher" ? params.direction : state.bestDirection;
         const sameConfig =
           state.name === params.name &&
           state.metricName === params.metric_name &&
           (state.metricUnit ?? "") === (params.metric_unit ?? "") &&
-          state.bestDirection === requestedDirection;
+          state.bestDirection === requestedDirection &&
+          analysisHeadersEqual(previousAnalysis, plannedAnalysisHeader);
         if (sameConfig) {
           broadcastDashboardUpdate(resolveWorkDir(ctx.cwd));
           return {
             content: [{
               type: "text",
-              text: "ℹ️ Session is already initialized with this exact config (name/metric/unit/direction) — continuing the current segment without re-segmentation. History and streaks stay intact. Call init_experiment again only to change the optimization target (different name/metric/workload); that starts a new segment.",
+              text: `ℹ️ Session is already initialized with this exact config (name/metric/unit/direction) — continuing the current segment without re-segmentation. History and streaks stay intact. Call init_experiment again only to change the optimization target (different name/metric/workload); that starts a new segment.${configWarning !== null ? `\n${configWarning}` : ""}`,
             }],
             details: { resumed: true, segment: state.currentSegment, bestMetric: state.bestMetric },
           };
@@ -2524,17 +2616,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       state.maxExperiments = readMaxExperiments(ctx.cwd);
 
       // Write config header to jsonl (append for re-init, create for first)
-      const workDir = resolveWorkDir(ctx.cwd);
       try {
         const jsonlPath = autoresearchJsonlPath(workDir);
         ensureParentDir(jsonlPath);
-        const config = JSON.stringify({
+        const configHeader: Record<string, unknown> = {
           type: "config",
           name: state.name,
           metricName: state.metricName,
           metricUnit: state.metricUnit,
           bestDirection: state.bestDirection,
-        });
+        };
+        if (plannedAnalysisHeader !== undefined) configHeader.analysis = plannedAnalysisHeader;
+        const config = JSON.stringify(configHeader);
         if (fs.existsSync(jsonlPath)) {
           fs.appendFileSync(jsonlPath, config + "\n");
         } else {
@@ -2599,6 +2692,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const reinitNote = isReinit ? " (re-initialized — previous results archived, new baseline needed)" : "";
       const limitNote = state.maxExperiments !== null ? `\nMax iterations: ${state.maxExperiments} (from .auto/config.json)` : "";
       const workDirNote = workDir !== ctx.cwd ? `\nWorking directory: ${workDir}` : "";
+      const analysisNote = analysis.status === "ok"
+        ? `\nAnalysis config: ${analysis.config.artifacts.length} artifacts, ${analysis.config.measurementFiles.length} measurement files, ${analysis.config.extractors.length} extractors (from .auto/config.json)`
+        : "";
+      const configWarningNote = configWarning !== null ? `${configWarning}\n` : "";
 
       // Load cross-session dead-ends warning
       let deadEndsNote = "";
@@ -2610,7 +2707,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       return {
         content: [{
           type: "text",
-          text: `✅ Experiment initialized: "${state.name}"${reinitNote}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)${limitNote}${workDirNote}${deadEndsNote}\nConfig written to .auto/log.jsonl. Now run the baseline with run_experiment.`,
+          text: `${configWarningNote}✅ Experiment initialized: "${state.name}"${reinitNote}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)${limitNote}${analysisNote}${workDirNote}${deadEndsNote}\nConfig written to .auto/log.jsonl. Now run the baseline with run_experiment.`,
         }],
         details: { state: cloneExperimentState(state) },
       };
