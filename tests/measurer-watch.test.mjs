@@ -17,6 +17,11 @@
  *  - revert БЕЗ предшествующего measurement_change (сценарий R4 того же ревью):
  *    change_ref не указывает на существующую запись — учётом отката не
  *    является, тихие переходы вокруг него остаются предупреждениями;
+ *  - revert со ссылкой на ДРУГУЮ СУЩЕСТВУЮЩУЮ эпоху (bd pi-autoresearch-0uj,
+ *    минор ревью s1m): change_ref называет e2, зарегистрированную ПРЕДШЕСТВУЮЩИМ
+ *    measurement_change, но не последнее изменение (после неё открыта e3) —
+ *    проверка существования (changeEpochsSoFar по порядку скана) засчитывает
+ *    такую запись как учёт отката: переход-откат закрывается без ложной тревоги;
  *  - изменение после последнего прогона (текущий файл ≠ манифест) — то же правило;
  *  - отсутствие объявления (analysis.measurement_files пуст / секции нет) и
  *    невалидная секция — явное ограничение контроля, не «здоровое состояние»;
@@ -331,6 +336,33 @@ test("revert without a preceding measurement_change is not accounting — silent
   assert.ok(line.includes(`неучтённое изменение измерителя (без measurement_change): ${expected12}`), line);
   assert.ok(line.includes(expected23), line);
   assert.doesNotMatch(line, /здоровое состояние/, "a contradicted healthy claim is withheld");
+});
+
+test("revert referencing ANOTHER EXISTING epoch (e2 registered, newer e3 open) still accounts the rollback transition", () => {
+  // bd pi-autoresearch-0uj (review minor of s1m): the revert's change_ref names
+  // an epoch that EXISTS in the ledger (e2 — a preceding measurement_change)
+  // but is NOT the latest change (e3 was registered after it). The accounting
+  // check is existence-based (changeEpochsSoFar in scan order), not
+  // latest-change-based: such a revert still closes the rollback transition.
+  // The revert_measurement_change tool itself refuses to revert a non-latest
+  // change, so this record is a manual/foreign ledger edit — the test pins
+  // that it does not manufacture a false alarm.
+  const dir = campaign("revert-foreign-existing-epoch", { measurement_files: [SCORER] });
+  writeScorer(dir, "gold v1");
+  recordRun(dir, 1);
+  appendLine(dir, changeRecord(2));
+  appendLine(dir, changeRecord(3)); // a newer change — e2 is now "another existing epoch"
+  writeScorer(dir, "gold v2");
+  recordRun(dir, 2);
+  appendLine(dir, revertRecord(2)); // change_ref "e2": exists, but not the latest change (e3)
+  writeScorer(dir, "gold v1"); // the file is returned to the pre-change content
+  recordRun(dir, 3);
+
+  // The 2→3 transition (sha16 v2→v1) has window start = run 2's entry; after
+  // it lies ONLY the revert — no change line. It is accounted because "e2"
+  // resolves to an existing preceding measurement_change (existence check).
+  const line = healthOf(dir);
+  assert.doesNotMatch(line, /неучтённое/);
 });
 
 test("file edited after the last run, not yet run → unaccounted warning (current ≠ last manifest)", () => {
