@@ -324,6 +324,40 @@ test("дашборд: без изменений измерителя — здо�
   assert.match(legacy.find((l) => l.includes("Runs:")), /\(conf: 1\.5×\)/);
 });
 
+test("дашборд: пустое состояние показывает строку шкалы (минор ревью 2.4)", () => {
+  // measurement_change может открыть эпоху до первого прогона — пустой дашборд
+  // не должен скрывать активную шкалу.
+  const empty = { ...dashboardState(), results: [] };
+  const withScale = renderDashboardLines(
+    empty, 240, stubTheme, 6, [],
+    measurementScaleStatusOfDir(makeFullChangeDir("dash-empty")),
+  );
+  assert.equal(withScale[0], "  No experiments yet.");
+  const scaleLine = withScale.find((l) => l.includes("Шкала: эпоха"));
+  assert.notEqual(scaleLine, undefined, "строка шкалы присутствует в пустом состоянии");
+  assert.match(scaleLine, /old_scale_score 0\.5598 → new_scale_score 0\.6383/);
+  assert.match(scaleLine, /шкала предварительная \(needs_verification\)/);
+
+  // Pending-шкала тоже видна: честная пометка вместо тихого отсутствия.
+  const pendingDir = makeWorkDir("dash-empty-pending");
+  seedLedger(pendingDir, [{ type: "config", name: "bench", metricName: "ms" }]);
+  const changeRes = logMeasurementChange(pendingDir, {
+    diff_ref: writeDiff(pendingDir),
+    rescore_ref: writeRescore(pendingDir, PENDING_ARTIFACT),
+    justification: "scorer fix, rescore not run yet",
+    rescore_pending: true,
+  }, FIXED_NOW);
+  assert.equal(changeRes.ok, true, changeRes.ok ? "" : changeRes.errors.join("; "));
+  const pendingLines = renderDashboardLines(
+    empty, 240, stubTheme, 6, [], measurementScaleStatusOfDir(pendingDir),
+  );
+  assert.match(pendingLines.find((l) => l.includes("Шкала: эпоха")), /rescore_pending \(e2/);
+
+  // Legacy-вызов без статуса — как прежде, только плейсхолдер.
+  const legacy = renderDashboardLines(empty, 240, stubTheme, 6);
+  assert.deepEqual(legacy, ["  No experiments yet."]);
+});
+
 // ---------------------------------------------------------------------------
 // Wiring: keep при rescore_pending не блокируется, ответ честно помечен
 // ---------------------------------------------------------------------------

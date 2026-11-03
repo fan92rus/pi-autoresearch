@@ -1649,8 +1649,19 @@ export function renderDashboardLines(
 ): string[] {
   const lines: string[] = [];
 
+  // Dual-scale line (task 2.4): both scale scores side by side, with the
+  // rescore_pending / preliminary (needs_verification) marks. Shown in the
+  // empty state too (minor review 2.4): a measurement_change can open its
+  // epoch before the first run lands — the empty dashboard must not hide it.
+  const scaleLine = (s: MeasurementScaleStatus): string => {
+    const scaleColor: Parameters<typeof th.fg>[0] =
+      s.rescore_pending ? "warning" : s.provisional ? "muted" : "success";
+    return truncateToWidth(`  ${th.fg(scaleColor, formatMeasurementScale(s))}`, width);
+  };
+
   if (st.results.length === 0) {
     lines.push(`  ${th.fg("dim", "No experiments yet.")}`);
+    if (scale !== null) lines.push(scaleLine(scale));
     return lines;
   }
 
@@ -1731,9 +1742,7 @@ export function renderDashboardLines(
   // Dual-scale line (task 2.4): both scale scores side by side, with the
   // rescore_pending / preliminary (needs_verification) marks.
   if (scale !== null) {
-    const scaleColor: Parameters<typeof th.fg>[0] =
-      scale.rescore_pending ? "warning" : scale.provisional ? "muted" : "success";
-    lines.push(truncateToWidth(`  ${th.fg(scaleColor, formatMeasurementScale(scale))}`, width));
+    lines.push(scaleLine(scale));
   }
 
   // Baseline: first run's primary metric
