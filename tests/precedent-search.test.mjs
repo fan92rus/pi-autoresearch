@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -7,6 +8,7 @@ import test from "node:test";
 
 import {
   SEARCH_DEADLINE_MS,
+  SEARCH_KILL_GRACE_MS,
   SEARCH_MAX_CANDIDATES,
   SEARCH_MAX_OUTPUT_BYTES,
   assembleReport,
@@ -77,6 +79,7 @@ class FakeChild extends EventEmitter {
     this.stdout = new EventEmitter();
     this.stdinText = null;
     this.killCount = 0;
+    this.signals = [];
     this.stdin = {
       end: (data) => {
         this.stdinText = data;
@@ -85,8 +88,9 @@ class FakeChild extends EventEmitter {
     };
   }
 
-  kill() {
+  kill(signal) {
     this.killCount++;
+    this.signals.push(signal);
     return true;
   }
 
@@ -214,6 +218,51 @@ test("a problem of exactly 1000 characters is searched; 1001 is refused as too l
 });
 
 // ─── Deadline: exactly 10 s with fake clocks ─────────────────────────────────
+
+test("a child that ignores SIGTERM is sent SIGKILL exactly one grace period after the deadline", async () => {
+  const clock = fakeClock();
+  const child = new FakeChild();
+  const { deps } = fakeDeps(clock, child);
+  const pending = searchPrecedents("/unused", "ошибка", { deps });
+
+  clock.advance(SEARCH_DEADLINE_MS);
+  assert.deepEqual(child.signals, ["SIGTERM"]);
+  clock.advance(SEARCH_KILL_GRACE_MS - 1);
+  assert.deepEqual(child.signals, ["SIGTERM"], "no SIGKILL before the grace period ends");
+  clock.advance(1);
+  assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+  assert.equal((await pending).deadline.hit, true);
+});
+
+test("a child that exits within the grace period after SIGTERM is not sent SIGKILL", async () => {
+  const clock = fakeClock();
+  const child = new FakeChild();
+  const { deps } = fakeDeps(clock, child);
+  const pending = searchPrecedents("/unused", "ошибка", { deps });
+
+  clock.advance(SEARCH_DEADLINE_MS);
+  child.emit("close", null);
+  clock.advance(SEARCH_KILL_GRACE_MS);
+  assert.deepEqual(child.signals, ["SIGTERM"]);
+  assert.equal((await pending).deadline.hit, true);
+});
+
+test("a real child that ignores SIGTERM is killed with SIGKILL at the deadline", { timeout: 60000, skip: process.platform === "win32" }, async (t) => {
+  const { root } = makeRoot(t);
+  let child;
+  const script = 'process.on("SIGTERM", () => {}); process.stdout.write("ready\\n"); setInterval(() => {}, 1000);';
+  const pending = runSearchChild(root, "ошибка", {
+    deadlineMs: 5000,
+    deps: { spawn: (command, args, options) => (child = spawn(command, args, options)) },
+    command: process.execPath,
+    args: ["-e", script],
+  });
+  await new Promise((resolve) => child.stdout.once("data", resolve));
+  const exited = new Promise((resolve) => child.once("exit", (code, signal) => resolve(signal)));
+  const run = await pending;
+  assert.equal(run.deadlineHit, true);
+  assert.equal(await exited, "SIGKILL");
+});
 
 test("the child is spawned with a 10 s timer and killed exactly at the deadline", async () => {
   const clock = fakeClock();
@@ -461,6 +510,25 @@ test("default output limit: 20 long Cyrillic candidates never exceed 8 KiB and t
   assert.equal(report.output.truncated, true);
   assert.equal(report.candidates.length, report.output.returned);
   assert.deepEqual(report.candidates.map((c) => c.ref.line), Array.from({ length: report.output.returned }, (_, i) => i + 1));
+});
+
+test("string leaves nested deeper than 8 levels are searched, not silently skipped", async (t) => {
+  const { root, rootReal } = makeRoot(t);
+  let payload = "ошибка глубоко";
+  for (let level = 0; level < 12; level++) payload = { next: payload };
+  writeRel(root, LEDGER_REL, ledgerLine({ type: "run", payload }));
+  const snap = await inProcessSnapshot(rootReal, "ошибка");
+  assert.equal(snap.matchesTotal, 1);
+  assert.equal(snap.candidates[0].untrusted_content.text, "ошибка глубоко");
+});
+
+test("a record nested 5000 levels deep is searched without overflowing the stack", async (t) => {
+  const { root, rootReal } = makeRoot(t);
+  const depth = 5000;
+  writeRel(root, LEDGER_REL, '{"type":"run","payload":' + "[".repeat(depth) + '"ошибка"' + "]".repeat(depth) + "}\n");
+  const snap = await inProcessSnapshot(rootReal, "ошибка");
+  assert.equal(snap.sources[0].status, "searched");
+  assert.equal(snap.matchesTotal, 1);
 });
 
 test("long snippets are capped at 160 characters with an explicit ellipsis", async (t) => {

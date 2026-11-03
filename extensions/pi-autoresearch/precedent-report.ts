@@ -538,10 +538,18 @@ function forceKill(child: SearchChildProcess): void {
   }
 }
 
-/** The search child is run by precedent-search.ts, which kills with its default signal; this makes that kill a SIGKILL. */
+/**
+ * The search child is run by precedent-search.ts, which sends SIGTERM and then, after its grace period, SIGKILL.
+ * This makes the first kill a SIGKILL and ignores the later escalation, so the child receives exactly one signal.
+ */
 function forceKillable(child: SearchChildProcess): SearchChildProcess {
   const kill = child.kill.bind(child);
-  child.kill = () => kill("SIGKILL");
+  let killed = false;
+  child.kill = () => {
+    if (killed) return true;
+    killed = true;
+    return kill("SIGKILL");
+  };
   return child;
 }
 

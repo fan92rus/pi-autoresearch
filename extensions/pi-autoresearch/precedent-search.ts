@@ -8,7 +8,8 @@
  *        problems are refused without starting any search.
  *     2. Runs the search in a SEPARATE node process (this file in child mode).
  *        The parent enforces a wall-clock deadline (10 s): at the deadline the
- *        child is killed, the report keeps the snapshots received so far, and
+ *        child gets SIGTERM and, if it is still running after a grace period, SIGKILL;
+ *        the report keeps the snapshots received so far, and
  *        every source the child did not finish is reported `truncated`
  *        (truncatedBy "deadline"). The child streams a cumulative snapshot after
  *        every source; a half-written line is never parsed.
@@ -67,6 +68,8 @@ import {
 // ─── Limits ──────────────────────────────────────────────────────────────────
 
 export const SEARCH_DEADLINE_MS = 10_000;
+/** Time a child gets to exit after SIGTERM before it is sent SIGKILL. */
+export const SEARCH_KILL_GRACE_MS = 1_000;
 export const SEARCH_MAX_BYTES = 10 * 1048576;
 export const SEARCH_MAX_ITEMS = 2000;
 export const SEARCH_MAX_CANDIDATES = 20;
@@ -76,7 +79,6 @@ export const SEARCH_MAX_PROBLEM_CHARS = 1000;
 const SNIPPET_MAX_CHARS = 160;
 const FIELD_MAX_CHARS = 512;
 const ERROR_MAX_CHARS = 200;
-const TEXT_MAX_DEPTH = 8;
 const TOKEN_RE = /[\p{L}\p{M}\p{N}]+/gu;
 const SCHEMA = "precedent-search/1";
 const CHILD_FLAG = "--precedent-search-child";
@@ -225,23 +227,27 @@ function capChars(text: string, max: number): string {
   return chars.length > max ? chars.slice(0, max).join("") : text;
 }
 
-/** Physical lines of a record's text: a whole file/markdown string, or every string/number leaf of a JSON record. */
+/**
+ * Physical lines of a record's text: a whole file/markdown string, or every string/number leaf of a JSON record
+ * at any depth. Iterative (explicit stack, source order kept): nesting depth is bounded only by the record size.
+ */
 function collectTextLines(data: PrecedentRecordData): string[] {
   const lines: string[] = [];
   const addText = (text: string): void => {
     for (const line of text.split(/\r?\n/)) lines.push(line);
   };
-  const walk = (value: unknown, depth: number): void => {
-    if (depth > TEXT_MAX_DEPTH) return;
+  const pending: unknown[] = [data];
+  while (pending.length > 0) {
+    const value = pending.pop();
     if (typeof value === "string") addText(value);
     else if (typeof value === "number" && Number.isFinite(value)) lines.push(String(value));
     else if (Array.isArray(value)) {
-      for (const item of value) walk(item, depth + 1);
+      for (let i = value.length - 1; i >= 0; i--) pending.push(value[i]);
     } else if (isRecord(value)) {
-      for (const key of Object.keys(value)) walk(value[key], depth + 1);
+      const keys = Object.keys(value);
+      for (let i = keys.length - 1; i >= 0; i--) pending.push(value[keys[i]]);
     }
-  };
-  walk(data, 0);
+  }
   return lines;
 }
 
@@ -483,6 +489,7 @@ export function runSearchChild(
     let settled = false;
     let latest: LocalSearchSnapshot | null = null;
     let timer: unknown;
+    let killTimer: unknown = null;
     let pending = "";
     const decoder = new StringDecoder("utf8");
 
@@ -501,12 +508,24 @@ export function runSearchChild(
       return;
     }
 
-    timer = deps.setTimer(() => {
+    const terminate = (): void => {
       try {
-        child.kill();
+        child.kill("SIGTERM");
       } catch {
         // Already exited.
       }
+      // A child may ignore or handle SIGTERM; SIGKILL cannot be caught, so it follows after the grace period.
+      killTimer = deps.setTimer(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Already exited.
+        }
+      }, SEARCH_KILL_GRACE_MS);
+    };
+
+    timer = deps.setTimer(() => {
+      terminate();
       settle({ snapshot: latest, deadlineHit: true });
     }, deadlineMs);
 
@@ -524,9 +543,10 @@ export function runSearchChild(
       }
     });
     child.on("error", (err) => settle({ snapshot: latest, deadlineHit: false, error: errorText(err) }));
-    child.on("close", (code) =>
-      settle({ snapshot: latest, deadlineHit: false, error: `search process exited before completion (code ${code})` }),
-    );
+    child.on("close", (code) => {
+      if (killTimer !== null) deps.clearTimer(killTimer);
+      settle({ snapshot: latest, deadlineHit: false, error: `search process exited before completion (code ${code})` });
+    });
     child.stdin.on?.("error", () => {
       // The child may exit before reading its input; the close/deadline path reports it.
     });
