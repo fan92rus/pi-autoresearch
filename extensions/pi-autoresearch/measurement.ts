@@ -105,7 +105,12 @@
  * consecutive runs and with the current file on disk. A change is ACCOUNTED
  * when a `measurement_change` record is logged after the run whose hash is the
  * older reference (window accounting — the record is not matched to the diff
- * by content); otherwise it is an unaccounted change. An undeclared or invalid
+ * by content); otherwise it is an unaccounted change. A registered revert
+ * (measurement_change_reverted, task 2.8) accounts the rollback transition the
+ * same way — only while its change_ref points at a preceding
+ * `measurement_change` record; a dangling revert (manual ledger edit) is not
+ * accounting and the silent transitions around it keep warning (review
+ * Minor-1 R4). An undeclared or invalid
  * analysis section, a declared file that is missing or unreadable, are
  * reported as explicit limits, never as a clean state. The four-field summary
  * stays unchanged; `measurementHealthLine()` adds the control to it and is the
@@ -449,26 +454,42 @@ export function evaluateMeasurerControl(input: MeasurerControlInput): MeasurerCo
  * Ledger window accounting for measurer changes. A run's window starts after the
  * last ledger run entry whose run number is <= that run (-1 when none); a change
  * is accounted when a `measurement_change` line lies after the window start.
+ * A `measurement_change_reverted` record (task 2.8) accounts the same way — but
+ * ONLY when its change_ref resolves (the same "e2"/"2" semantics task 2.8 uses:
+ * the revert refers to its change via change_ref) to a `measurement_change`
+ * record PRECEDING it in the ledger: the rollback transition (the file back at
+ * the pre-change hash) is closed by a revert OF a registered change. A dangling
+ * revert without one — possible only via manual ledger edits, the tool refuses
+ * to write it (resolveChangeForVerdict) — is not accounting: the silent
+ * transitions around it keep the «неучтённое изменение» warning (bd
+ * pi-autoresearch-s1m, review Minor-1 R4).
  * Runs without a ledger entry (dir created, log not written yet) fall back to the
  * nearest earlier entry, so a change logged later still accounts for them.
  */
 function measurementChangeAccounting(ledgerText: string): (run: number) => boolean {
   const runEntries: { run: number; line: number }[] = [];
   const changeLines: number[] = [];
+  const revertLines: number[] = [];
   const lines = ledgerText.split("\n");
+  const changeEpochsSoFar = new Set<number>();
   for (let i = 0; i < lines.length; i++) {
     if (lines[i].trim().length === 0) continue;
     const entry = parseJsonlEntry(lines[i]);
     if (entry === null) continue;
-    if (entry.type === "measurement_change") changeLines.push(i);
-    else if (isAutoresearchRunEntry(entry)) runEntries.push({ run: entry.run, line: i });
+    if (entry.type === "measurement_change") {
+      changeLines.push(i);
+      if (typeof entry.epoch === "number") changeEpochsSoFar.add(entry.epoch);
+    } else if (entry.type === "measurement_change_reverted") {
+      const refEpoch = typeof entry.change_ref === "string" ? parseChangeRef(entry.change_ref) : null;
+      if (refEpoch !== null && changeEpochsSoFar.has(refEpoch)) revertLines.push(i);
+    } else if (isAutoresearchRunEntry(entry)) runEntries.push({ run: entry.run, line: i });
   }
   return (run: number): boolean => {
     let start = -1;
     for (const r of runEntries) {
       if (r.run <= run && r.line > start) start = r.line;
     }
-    return changeLines.some((line) => line > start);
+    return changeLines.some((line) => line > start) || revertLines.some((line) => line > start);
   };
 }
 

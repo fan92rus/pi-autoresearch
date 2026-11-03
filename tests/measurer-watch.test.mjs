@@ -9,6 +9,14 @@
  *  - изменение хеша: хеш в манифесте последнего прогона отличается от
  *    предыдущего манифеста → предупреждение «неучтённое изменение»; учёт через
  *    measurement_change после более раннего прогона снимает предупреждение;
+ *  - зарегистрированный откат (measurement_change + measurement_change_reverted,
+ *    2.8; bd pi-autoresearch-s1m, ревью 2.7 Minor-1): переход хеша v2→v1 между
+ *    прогонами закрывается revert-записью — без постоянного ложного
+ *    «неучтённого изменения»; новое неучтённое изменение ПОСЛЕ отката
+ *    предупреждает как прежде (откат не учитывает «наперёд»);
+ *  - revert БЕЗ предшествующего measurement_change (сценарий R4 того же ревью):
+ *    change_ref не указывает на существующую запись — учётом отката не
+ *    является, тихие переходы вокруг него остаются предупреждениями;
  *  - изменение после последнего прогона (текущий файл ≠ манифест) — то же правило;
  *  - отсутствие объявления (analysis.measurement_files пуст / секции нет) и
  *    невалидная секция — явное ограничение контроля, не «здоровое состояние»;
@@ -86,6 +94,11 @@ function recordRun(dir, run, declared = [SCORER]) {
 
 function changeRecord(epoch) {
   return { type: "measurement_change", epoch, diff_ref: ".auto/measurement/e2.diff", rescore_ref: ".auto/measurement/e2/rescore.md", justification: "finding f1", needs_verification: true };
+}
+
+/** The compensating record of revert_measurement_change (task 2.8): the change is refuted. */
+function revertRecord(epoch) {
+  return { type: "measurement_change_reverted", change_ref: `e${epoch}`, epoch, rescore_ref: ".auto/measurement/e2-counter/rescore.md", justification: "verification refuted the change", timestamp: 1 };
 }
 
 const healthOf = (dir) => measurementHealthLine(dir);
@@ -254,6 +267,70 @@ test("hash changed between runs without measurement_change → unaccounted warni
   appendLine(dir, changeRecord(2));
   line = healthOf(dir);
   assert.doesNotMatch(line, /неучтённое/);
+});
+
+test("registered revert (change + reverted, file restored) closes the v2→v1 transition → no unaccounted warning", () => {
+  const dir = campaign("revert-accounted", { measurement_files: [SCORER] });
+  writeScorer(dir, "gold v1");
+  recordRun(dir, 1);
+  appendLine(dir, changeRecord(2));
+  writeScorer(dir, "gold v2");
+  recordRun(dir, 2);
+  appendLine(dir, revertRecord(2));
+  writeScorer(dir, "gold v1"); // the file is returned to the pre-change content
+  recordRun(dir, 3);
+
+  // Without the revert accounting the 2→3 transition (sha16 v2→v1) has window
+  // start = run 2, the revert record is invisible → a PERMANENT false alarm.
+  const line = healthOf(dir);
+  assert.doesNotMatch(line, /неучтённое/);
+});
+
+test("after a revert a NEW unaccounted change (v1→v3) still warns — the revert does not blanket-account", () => {
+  const dir = campaign("revert-then-new-change", { measurement_files: [SCORER] });
+  writeScorer(dir, "gold v1");
+  recordRun(dir, 1);
+  appendLine(dir, changeRecord(2));
+  writeScorer(dir, "gold v2");
+  recordRun(dir, 2);
+  appendLine(dir, revertRecord(2));
+  writeScorer(dir, "gold v1"); // reverted
+  recordRun(dir, 3);
+  writeScorer(dir, "gold v3 — silent edit"); // new change, no accounting
+  recordRun(dir, 4);
+
+  // Exactly the new transition warns: the closed 2→3 rollback transition must
+  // NOT be reported alongside (the exact-string match pins that).
+  const expected = `${SCORER} — sha16 ${sha16("gold v1")}→${sha16("gold v3 — silent edit")} между прогонами 3 и 4`;
+  const line = healthOf(dir);
+  assert.ok(line.includes(`неучтённое изменение измерителя (без measurement_change): ${expected}`), line);
+});
+
+test("revert without a preceding measurement_change is not accounting — silent transitions keep warning", () => {
+  // R4 (bd pi-autoresearch-s1m, review Minor-1): the ledger carries only a
+  // measurement_change_reverted whose change_ref points at NO existing
+  // preceding measurement_change. The tool refuses to write such a record
+  // (resolveChangeForVerdict), so this is a manual/foreign ledger edit — and it
+  // must NOT open an accounting window: both silent transitions (v1→v2 before
+  // it, v2→v3 after it) keep the unaccounted warning instead of a healthy claim.
+  const dir = campaign("dangling-revert", { measurement_files: [SCORER] });
+  writeScorer(dir, "gold v1");
+  recordRun(dir, 1);
+  writeScorer(dir, "gold v2 — silent edit"); // silent change, no measurement_change
+  recordRun(dir, 2);
+  appendLine(dir, revertRecord(2)); // change_ref "e2" — no measurement_change e2 precedes it
+  writeScorer(dir, "gold v3 — silent edit"); // silent change again
+  recordRun(dir, 3);
+
+  const expected12 = `${SCORER} — sha16 ${sha16("gold v1")}→${sha16("gold v2 — silent edit")} между прогонами 1 и 2`;
+  // Per-file details are joined with "; " inside ONE unaccounted entry, so the
+  // second transition carries no second "${SCORER} — " prefix (see the exact
+  // line format in measurerControlParts/evaluateMeasurerControl).
+  const expected23 = `sha16 ${sha16("gold v2 — silent edit")}→${sha16("gold v3 — silent edit")} между прогонами 2 и 3`;
+  const line = healthOf(dir);
+  assert.ok(line.includes(`неучтённое изменение измерителя (без measurement_change): ${expected12}`), line);
+  assert.ok(line.includes(expected23), line);
+  assert.doesNotMatch(line, /здоровое состояние/, "a contradicted healthy claim is withheld");
 });
 
 test("file edited after the last run, not yet run → unaccounted warning (current ≠ last manifest)", () => {
