@@ -77,7 +77,7 @@ Observer SHALL добавлять в reflection checkpoint (раз в N прог
 - **THEN** маркер отсутствует, находки включены в бриф
 
 ### Requirement: Секции находок в брифе совета
-Бриф совета SHALL включать секцию «Open findings» с находками, сгруппированными по темам (тема, краткое описание, ссылка на доказательство, estimated_impact), и строку «Measurement health». Единственный источник данных для строки «Measurement health» — сводка `measurementHealthSummary()` (модуль `measurement.ts`): поля `epoch` (текущая эпоха шкалы), `floor_stale` (флаг устаревшего noise floor), `open_measurement_count` (число открытых measurement-находок), `top_impact` (максимальная estimated_impact среди них). Один и тот же набор полей потребляют: бриф совета и периодические сообщения observer'а.
+Бриф совета SHALL включать секцию «Open findings» с находками, сгруппированными по темам (тема, краткое описание, ссылка на доказательство, estimated_impact), и строку «Measurement health». Единственный источник строки «Measurement health» — функция `measurementHealthLine(workDir)` (модуль `measurement.ts`): она читает ledger и findings store с диска и формирует строку из сводки `measurementHealthSummary()` с полями `epoch` (текущая эпоха шкалы), `floor_stale` (флаг устаревшего noise floor), `open_measurement_count` (число открытых measurement-находок), `top_impact` (максимальная estimated_impact среди них), к которым добавляется контроль файлов измерителя (`measurerControlOfDir`). Одну и ту же строку `measurementHealthLine()` потребляют: бриф совета (`council.ts`) и периодические сообщения observer'а (`observer.ts`).
 
 #### Scenario: находки в брифе
 - **WHEN** есть открытые находки и созывается совет
