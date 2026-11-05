@@ -402,6 +402,13 @@ const InitParams = Type.Object({
   ),
 });
 
+/**
+ * Optional activity label of a logged run (research-map D-RM-03, FR-01.5). A label
+ * only: it never changes status, keep/discard, git, best, streak or epoch. `unknown`
+ * is a reader value for legacy rows, never an input (rejected at input validation).
+ */
+const ACTIVITY_TYPES = ["measurement", "intermediate", "verification", "attribution"] as const;
+
 export const LogParams = Type.Object({
   commit: Type.Optional(Type.String({ description: "Git commit hash (short, 7 chars). Optional for explore/budget_exceeded statuses." })),
   metric: Type.Number({
@@ -424,6 +431,12 @@ export const LogParams = Type.Object({
       additionalProperties: Type.Number(),
       description:
         'Additional metrics to track as { name: value } pairs, e.g. { "compile_µs": 4200, "render_µs": 9800 }. These are shown alongside the primary metric for tradeoff monitoring.',
+    })
+  ),
+  activity_type: Type.Optional(
+    StringEnum(ACTIVITY_TYPES, {
+      description:
+        "Optional label of what this run did: measurement, intermediate, verification or attribution. Omit when no label applies. It is recorded in the ledger only; it never changes status, keep/discard, git, best or the epoch.",
     })
   ),
   force: Type.Optional(
@@ -4396,6 +4409,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const runtime = getRuntime(ctx);
       const state = runtime.state;
 
+      // Input validation for the optional activity label (D-RM-03): rejected before
+      // any side effect, so the ledger, git and the pending run number stay untouched.
+      if (params.activity_type !== undefined && !(ACTIVITY_TYPES as readonly string[]).includes(params.activity_type)) {
+        return {
+          content: [{ type: "text", text: `❌ Invalid activity_type "${String(params.activity_type)}". Allowed: ${ACTIVITY_TYPES.join(", ")}. Omit the parameter when no label applies.` }],
+          details: {},
+        };
+      }
+
       // Validate working directory exists
       const workDirError = validateWorkDir(ctx.cwd);
       if (workDirError) {
@@ -4464,7 +4486,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         try {
           const jsonlPath = autoresearchJsonlPath(workDir);
           ensureParentDir(jsonlPath);
-          fs.appendFileSync(jsonlPath, JSON.stringify({ run: state.results.length + 1, commit: params.commit, metric: params.metric, status: "explore", description: params.description, segment: state.currentSegment, epoch: measurementScaleStatusOfDir(workDir).epoch, phaseStep: phase.stepsTaken }) + "\n");
+          fs.appendFileSync(jsonlPath, JSON.stringify({ run: state.results.length + 1, commit: params.commit, metric: params.metric, status: "explore", description: params.description, segment: state.currentSegment, epoch: measurementScaleStatusOfDir(workDir).epoch, phaseStep: phase.stepsTaken, ...(params.activity_type !== undefined ? { activity_type: params.activity_type } : {}) }) + "\n");
         } catch { /* best-effort */ }
         persistPhase(runtime.phaseStore, workDir);
 
@@ -4783,6 +4805,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         ...experiment,
       };
       if (!mergedASI) delete jsonlEntry.asi;
+      // Optional label: written only when supplied, so an absent parameter leaves the row unchanged.
+      if (params.activity_type !== undefined) jsonlEntry.activity_type = params.activity_type;
       if (metricProvenance && metricProvenance !== "measured") {
         jsonlEntry.mprov = metricProvenance;
         // Re-injection flag (goal-x [AUDITOR REJECTION] pattern): every resume
