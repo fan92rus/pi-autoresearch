@@ -245,6 +245,46 @@ test("T7: two calls without a key write two lines and report dedup none", async 
   assert.equal(linesOf(project.observations).length, 2);
 });
 
+test("§6.3 recovery: an explicit linked_run retry after a linked_run:'last' conflict returns already_recorded with the same obs_id", async (t) => {
+  const project = makeProject(t, { runs: [1, 2] });
+  const first = await logObservation(project.autoDir, { outcome: "success", description: "teacher generation", idempotency_key: "tg-1" });
+  assert.equal(first.status, "appended");
+  assert.equal(first.observed_run, 1);
+
+  fs.appendFileSync(project.log, [startMarker(2, STARTED_2), resultMarker(2, STARTED_2, 41), ""].join("\n"));
+
+  const moved = await logObservation(project.autoDir, { outcome: "success", description: "teacher generation", idempotency_key: "tg-1" });
+  assert.equal(moved.status, "error");
+  assert.equal(moved.code, "idempotency_conflict");
+
+  const retry = await logObservation(project.autoDir, { outcome: "success", description: "teacher generation", linked_run: 1, idempotency_key: "tg-1" });
+  assert.equal(retry.status, "already_recorded");
+  assert.equal(retry.obs_id, first.obs_id);
+  assert.equal(retry.observed_run, 1);
+  assert.equal(linesOf(project.observations).length, 1);
+});
+
+test("§6.3: an explicit linked_run original retried with 'last' after a newer run settles stays idempotency_conflict", async (t) => {
+  const project = makeProject(t, { runs: [1, 2] });
+  const first = await logObservation(project.autoDir, { outcome: "success", description: "teacher generation", linked_run: 1, idempotency_key: "tg-2" });
+  assert.equal(first.status, "appended");
+
+  fs.appendFileSync(project.log, [startMarker(2, STARTED_2), resultMarker(2, STARTED_2, 41), ""].join("\n"));
+
+  const retry = await logObservation(project.autoDir, { outcome: "success", description: "teacher generation", idempotency_key: "tg-2" });
+  assert.equal(retry.status, "error");
+  assert.equal(retry.code, "idempotency_conflict");
+  assert.equal(linesOf(project.observations).length, 1);
+});
+
+test("§6.3: 'last' retried with the same key and no new run gives already_recorded", async (t) => {
+  const project = makeProject(t);
+  const first = await logObservation(project.autoDir, { outcome: "success", description: "prep", idempotency_key: "last-1" });
+  const retry = await logObservation(project.autoDir, { outcome: "success", description: "prep", idempotency_key: "last-1" });
+  assert.equal(retry.status, "already_recorded");
+  assert.equal(retry.obs_id, first.obs_id);
+});
+
 // ---------------------------------------------------------------------------
 // T8, T9: torn tail, fault injection, retry after interruption
 // ---------------------------------------------------------------------------
@@ -517,6 +557,62 @@ test("binding: missing run directory gives artifacts_missing for both modes", as
   const explicit = await logObservation(project.autoDir, { outcome: "success", description: "x", linked_run: 7 });
   assert.equal(explicit.code, "artifacts_missing");
   assert.equal(fs.existsSync(project.observations), false);
+});
+
+// ---------------------------------------------------------------------------
+// epoch_at_record = active scale (D-RM-09, measurementScaleStatusOfDir(workDir).epoch)
+// ---------------------------------------------------------------------------
+
+const CHANGE_EPOCH_2 = JSON.stringify({ type: "measurement_change", epoch: 2, needs_verification: true, timestamp: "2026-11-05T12:00:00.000Z" });
+const REVERT_EPOCH_2 = JSON.stringify({
+  type: "measurement_change_reverted",
+  change_ref: "e2",
+  epoch: 2,
+  rescore_ref: "rescore-e2.json",
+  justification: "counter-rescore differs",
+  timestamp: "2026-11-05T12:30:00.000Z",
+});
+
+test("D-RM-09: epoch_at_record is the active scale: 2 after a change, 1 after change(2)+revert while the max counter is 2", async (t) => {
+  const changed = makeProject(t, { ledger: [CONFIG_LINE, startMarker(1, STARTED_1), resultMarker(1, STARTED_1), CHANGE_EPOCH_2, ""].join("\n") });
+  const afterChange = await logObservation(changed.autoDir, params({ description: "after change" }));
+  assert.equal(afterChange.status, "appended");
+  assert.equal(afterChange.epoch_at_record, 2);
+
+  const reverted = makeProject(t, {
+    ledger: [CONFIG_LINE, startMarker(1, STARTED_1), resultMarker(1, STARTED_1), CHANGE_EPOCH_2, REVERT_EPOCH_2, ""].join("\n"),
+  });
+  assert.equal(reconstructJsonlState(fs.readFileSync(reverted.log, "utf8")).currentEpoch, 2);
+  const afterRevert = await logObservation(reverted.autoDir, params({ description: "after revert" }));
+  assert.equal(afterRevert.status, "appended");
+  assert.equal(afterRevert.epoch_at_record, 1);
+  assert.equal(afterRevert.warnings.includes("epoch_source_unavailable"), false);
+  const [row] = linesOf(reverted.observations).map((line) => JSON.parse(line));
+  assert.equal(row.epoch_at_record, 1);
+});
+
+test("D-RM-09: an unavailable measurement ledger falls back with epoch_source_unavailable and never throws", async (t) => {
+  const project = makeProject(t);
+  const cjsFs = createRequire(import.meta.url)("node:fs");
+  const originalAccess = cjsFs.accessSync;
+  cjsFs.accessSync = (first, ...rest) => {
+    if (String(first).endsWith("log.jsonl")) throw Object.assign(new Error("EACCES: injected"), { code: "EACCES" });
+    return originalAccess(first, ...rest);
+  };
+  syncBuiltinESMExports();
+  let response;
+  try {
+    response = await logObservation(project.autoDir, params());
+  } finally {
+    cjsFs.accessSync = originalAccess;
+    syncBuiltinESMExports();
+  }
+
+  assert.equal(response.status, "appended");
+  assert.equal(response.epoch_at_record, 1);
+  assert.ok(response.warnings.includes("epoch_source_unavailable"));
+  const [row] = linesOf(project.observations).map((line) => JSON.parse(line));
+  assert.equal(row.epoch_at_record, 1);
 });
 
 // ---------------------------------------------------------------------------

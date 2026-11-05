@@ -25,6 +25,7 @@ import { createHash, randomBytes as cryptoRandomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { parseJsonlEntry, reconstructJsonlState } from "./jsonl.ts";
+import { measurementLedgerPath, measurementScaleStatusOfDir } from "./measurement.ts";
 import {
   JOURNAL_RECORD_MAX_BYTES,
   journalTarget,
@@ -929,7 +930,8 @@ function inputIdentity(
     metric: params.metric,
     metrics: params.metrics,
     asi: params.asi,
-    linked_run: params.linked_run,
+    // "last" is hashed as the run it resolved to, so a retry with explicit N (the §6.3 recovery) matches.
+    linked_run: link.observed_run,
     observed_run: link.observed_run,
     run_started_at: link.run_started_at,
     passport_identity:
@@ -1056,6 +1058,25 @@ function appendRecordLocked(file: string, record: Buffer, ops: JournalFs): Locke
 // logObservation (§5.3)
 // ---------------------------------------------------------------------------
 
+/**
+ * Active scale epoch at record time (D-RM-09): `measurementScaleStatusOfDir(workDir).epoch`, where
+ * workDir is the parent of `.auto`. The maximum epoch counter is not used here. When the measurement
+ * ledger is missing or unreadable, or the fold throws, the reconstructed `fallbackEpoch` is recorded
+ * with the `epoch_source_unavailable` warning. Never throws.
+ */
+function activeScaleEpochOf(autoDir: string, fallbackEpoch: number): { epoch: number; warnings: string[] } {
+  const workDir = path.dirname(autoDir);
+  const unavailable = { epoch: fallbackEpoch, warnings: ["epoch_source_unavailable"] };
+  try {
+    const ledgerPath = measurementLedgerPath(workDir);
+    if (ledgerPath === null) return unavailable;
+    fs.accessSync(ledgerPath, fs.constants.R_OK);
+    return { epoch: measurementScaleStatusOfDir(workDir).epoch, warnings: [] };
+  } catch {
+    return unavailable;
+  }
+}
+
 function errorResponse(code: string, message: string): LogObservationError {
   return { status: "error", code, message };
 }
@@ -1121,6 +1142,7 @@ export async function logObservation(
 
   const state = reconstructJsonlState(ledger.text);
   const provenance = metricProvenanceOf(autoDir, params.metric, link, state.metricName);
+  const epochSource = activeScaleEpochOf(autoDir, state.currentEpoch);
   const inputSha256 = sha256Hex(canonicalJson(inputIdentity(params, link, passport)));
 
   const ops = journalFs(options);
@@ -1135,7 +1157,7 @@ export async function logObservation(
     ...(params.idempotency_key !== undefined ? { idempotency_key: params.idempotency_key } : {}),
     input_sha256: inputSha256,
     segment_at_record: state.currentSegment,
-    epoch_at_record: state.currentEpoch,
+    epoch_at_record: epochSource.epoch,
     run_segment: null,
     run_epoch: null,
     run_epoch_basis: link.run_epoch_basis,
@@ -1207,7 +1229,7 @@ export async function logObservation(
   const releaseWarnings = locked.warnings.map((warning) => warning.code);
   const outcome = locked.value;
   const dedup: "key" | "none" = params.idempotency_key !== undefined ? "key" : "none";
-  const warnings = [...link.warnings, ...provenance.warnings, ...releaseWarnings];
+  const warnings = [...link.warnings, ...provenance.warnings, ...epochSource.warnings, ...releaseWarnings];
   if (link.run_epoch_basis !== "proven") warnings.push("run_epoch_unknown");
 
   if (outcome.kind === "error") return errorResponse(outcome.code, outcome.message);
