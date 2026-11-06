@@ -11,7 +11,10 @@ Autonomous experiment loop: try ideas, keep what works, discard what doesn't, ne
 
 - **`init_experiment`** — configure session (name, metric, unit, direction). Call again to re-initialize with a new baseline when the optimization target changes.
 - **`run_experiment`** — runs command, times it, captures output. If the project sets `experiment_max_minutes` in `.auto/config.json`, `timeout_seconds` must fit that cap — bigger values are rejected with a reminder to adapt the experiment (smaller fixture, fewer iterations, a BENCH_MODE=quick subset), never to raise the timeout.
-- **`log_experiment`** — records result. `keep` auto-commits. `discard`/`crash`/`checks_failed` auto-reverts code changes (autoresearch files preserved). Always include secondary `metrics` dict. Dashboard: ctrl+shift+t.
+- **`log_experiment`** — records result. `keep` auto-commits. `discard`/`crash`/`checks_failed` auto-reverts code changes (autoresearch files preserved). Always include secondary `metrics` dict. Optional `activity_type` (`measurement` | `intermediate` | `verification` | `attribution`) labels what the run did; it is stored in the ledger only and never changes status, keep/discard, git, best or the epoch. Omit it when no label applies. Dashboard: ctrl+shift+t.
+- **`log_observation`** — records a preparation, diagnostic or infrastructure event about a run (warm-up pass, measurer check, OOM during teacher generation) as a separate observation. It is not a run: it never touches git, best, streak or `log.jsonl`. Outcome is `success` | `technical_failure` | `unknown`.
+- **`record_analysis`** — appends an analysis record to `.auto/analysis.jsonl`: `prereg` (before the candidate run), `comparison`, `attribution` or `supplement`. Records never change runs, git or best.
+- **`direction_review`** — takes no arguments and writes one document to `.auto/reviews/direction-<UTC>.md`. It runs no experiment, chooses no direction and performs no automatic action.
 - **`council_write_entry` / `council_read_index` / `council_read_entry` / `council_check_consensus`** — blackboard for stagnation councils (the analysts' workspace). When the observer convenes a STAGNATION COUNCIL — or whenever you feel stuck — call `council_convene({ note })` (below); it runs the whole council itself and returns the finished slate. Register every slate experiment via `propose_hypothesis` and run it through the normal loop. You may write only objective-facts entries yourself (`phase: "facts"`) — never judge hypotheses.
 - **`council_convene({ note })`** — convene a council yourself at any time, with no limits (no threshold/cooldown/cap), when you feel stuck. ONE-STEP: the tool convenes the whole council itself (analysts, fileless dispute, chair), blocks for several minutes, validates the slate (3–5 EXP, EXPECTED_GAIN ≥ 2× noise floor, KILL_WHEN), persists it to the blackboard and returns it. Then register and execute the slate experiments. Put where you are stuck and what to focus on into `note` — it lands verbatim in the brief the analysts read.
 
@@ -24,6 +27,10 @@ All session files live in a single `.auto/` subfolder at the working directory r
 | `.auto/prompt.md` | Experiment prompt / playbook (heart of the session) |
 | `.auto/measure.sh` | Benchmark script — emits `METRIC name=value` lines |
 | `.auto/log.jsonl` | Append-only result log (written by the tools) |
+| `.auto/observations.jsonl` | Observations about preparation and diagnostic events (written by `log_observation`) |
+| `.auto/analysis.jsonl` | Analysis records: prereg, comparison, attribution, supplement (written by `record_analysis`) |
+| `.auto/run-links.jsonl` | Confirmed links between ledger rows and run directories (written by `log_experiment`; do not edit by hand) |
+| `.auto/reviews/` | Direction-review documents (written by `direction_review`) |
 | `.auto/ideas/` | Ideas backlog — one `.md` file per idea (optional) |
 | `.auto/checks.sh` | Correctness checks (optional) |
 | `.auto/config.json` | Session config (optional) |
@@ -143,6 +150,7 @@ pnpm typecheck 2>&1 | grep -i error || true
 - **Primary metric is king.** Improved → `keep`. Worse/equal → `discard`. Secondary metrics rarely affect this.
 - **Benchmark only via `run_experiment`.** A bash-run benchmark does not exist: it never enters the ledger, corrupts the noise floor, and its edits are lost on the next revert. Log EVERY run via `log_experiment` immediately — an unlogged run is wasted compute. Log the parsed METRIC value, not a hand-copied number (deviations are flagged as manual provenance).
 - **Annotate every run with `asi`.** Record what you learned — not what you did. What would help the next iteration or a fresh agent resuming this session?
+- **Not every event is a run.** Preparation, diagnostic or infrastructure events (warm-up pass, measurer check, environment failure before a candidate starts) go to `log_observation`. Do not record them as fake `crash` or `explore` rows in `log_experiment`. Runs are candidate measurements.
 - **Watch the confidence score.** After 3+ runs, `log_experiment` reports a confidence score (best improvement as a multiple of the session noise floor). ≥2.0× means the improvement is likely real. <1.0× means it's within noise — consider re-running to confirm before keeping. The score is advisory — it never auto-discards.
 - **Simpler is better.** Removing code for equal perf = keep. Ugly complexity for tiny gain = probably discard.
 - **Don't thrash.** Repeatedly reverting the same idea? Try something structurally different.
@@ -168,6 +176,20 @@ A sequential `edit → measure → keep/revert` loop is the default. Switch to p
 See `skill://autoresearch-parallel` for detailed flows and tool usage.
 
 **Rule of thumb**: if you're about to try 3+ variations of the same idea, use Best-of-N instead of sequential runs. It's cheaper (flash-model workers) and faster (parallel worktrees).
+
+## Research map (observations, analysis, direction review)
+
+Full contract and data formats: `docs/research-map.md` in the pi-autoresearch repository.
+
+- **Observations.** `log_observation({outcome, description, ...})` — `linked_run` defaults to `"last"`, the last run marker of the shared ledger. With concurrent sessions, or when the last run is not yours, pass an integer `linked_run`. `activity_type` is `intermediate` (default) or `attribution`. Reuse an `idempotency_key` when retrying the same call. Read `binding` in the response: without a proven run link the observation has no trusted epoch.
+- **Passport.** Optional `passport.components` (`weights`, `prompt`, `dataset`, `measurer`, `code_ref`) holds your declarations: `ref` (a relative project path) and `declared_sha256`. A supplied component is stored as `declared` with `verified: false`. The system never reads or hashes those files. Leave a component out when you do not know it: it stays `unknown`, and you must not infer it from other fields.
+- **Pre-registration.** Call `record_analysis({kind: "prereg", ...})` BEFORE the candidate run. A prereg written after results is post-hoc; the ordering is checked against the ledger and the analysis file, not against timestamps. A `prereg` with `exhaustion_rule` needs `noise_band` and `noise_basis_ref` for the exhaustion signal to be assessed.
+- **Comparisons and claims.** `comparison` declares `purpose`, `baseline_run`, `candidate_run` and `changed_components`. Control is a declaration, not proof. `attribution` states a `claim` with `evidence_refs` (typed `{run, artifact, lines, anchor}` references under `.auto/runs/<N>/`; file paths are rejected). Its status starts `unknown` and is computed on read.
+- **Supplements.** `supplement` fills a missing field of an earlier record or declares it `absent` with a reason. It never overwrites. `absent` is not zero and not "nothing changed".
+- **Hints.** A response may end with a `💡` line that proposes `direction_review` (S_stag, S_ser, S_exh or S_exh_adv). A hint is advisory: it never says a direction is exhausted and never runs an experiment. Every hint carries its disclaimer, verbatim: for S_stag, S_ser and S_exh «Исчерпание направления и полная сопоставимость результатов не подтверждены.» (exhaustion of the direction and full comparability of results are not confirmed); for S_exh_adv «Исчерпание направления и сопоставимость результатов не подтверждены.» (exhaustion and comparability are not confirmed). Quote the disclaimer when you cite a hint. `unknown` is not failure and not `false`.
+- **Direction review.** Call `direction_review` when a hint appears or when you want a strategy overview. Read the document; it lists facts, unknowns, signals, alternatives and what is not proven. It recommends nothing you must do.
+- **Ambiguous links.** A run link that is `ambiguous` (for example, after a torn or unreadable line in `run-links.jsonl`) fails closed: no epoch, no delta, no trusted exhaustion for that run. Do not repair `run-links.jsonl` by hand. Report it to the owner; archiving the file is an owner decision. The `run_links_corrupt` code is produced by the reader but not yet printed in tool responses, so check the file when a run that should be proven shows as unknown.
+- **Privacy.** A `keep` commit runs `git add -A`, so `.auto/` (observations, analysis, run-links, reviews) enters git history. Never put secrets, tokens or private data in `description`, `asi`, `metrics`, `claim`, `meaning`, `purpose_text` or `absent.note`.
 
 ## Ideas Backlog
 

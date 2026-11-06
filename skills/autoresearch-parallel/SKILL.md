@@ -133,6 +133,8 @@ Override globally in `.auto/config.json`:
 
 - **Workers never call `log_experiment`** — only the parent writes the canonical log and mutates main.
 - **Workers never call `BestOfN`/`SpaceSearch`/`subagent`** — anti-recursion (enforced in the worker allowlist).
+- **Round-level events are observations, not candidate rows.** Warm-up passes, measurer checks and infrastructure failures of a round are recorded by the parent with `log_observation` (`outcome`: `success` | `technical_failure` | `unknown`). They never change best, streak or git.
+- **Pre-register before the round when it will be compared.** If the candidates of a round will feed an exhaustion or comparison analysis, the parent records the `prereg` with `record_analysis` before the first candidate run. A prereg written after results is post-hoc and does not count as pre-registered.
 - **Selection-bias correction is mandatory** — the winner is cascade re-measured in `full` in its worktree before `keep`; never trust the single `quick` measurement.
 - **Main workdir is never touched during measurement** — only after cascade confirmation.
 - **`budget_exceeded` is a steer, not a failure to escalate** — fix `measure.sh`, don't throw a stronger model at a slow script.

@@ -86,3 +86,5 @@ After the script finishes, report to the user:
 - **Only 1 kept experiment**: One branch is fine — don't force splits.
 - **Overlapping files between groups**: The script fails with an error naming the file. Merge the overlapping groups and retry.
 - **Non-experiment commits** on the branch: Skip them — only process kept experiments from the jsonl.
+- **Research-map records are not experiments.** `log_observation` records (`.auto/observations.jsonl`), analysis records (`.auto/analysis.jsonl`), run links (`.auto/run-links.jsonl`) and direction reviews (`.auto/reviews/`) are not kept experiments and never form a group. An `activity_type` label on a kept row is informational: do not use it to split or merge groups.
+- **Free text in kept commits.** A `keep` commit runs `git add -A`, so these `.auto/` files may already be inside the kept commits. Their free-text fields (`description`, `asi`, `claim`, `meaning`) are not scanned for secrets. Check them before pushing a finalized branch.

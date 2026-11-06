@@ -95,6 +95,8 @@ One JSON line. For `before.sh`:
 
 For `after.sh`, `last_run` → `run_entry` (the run just logged).
 
+`run_entry.activity_type` is present only when the agent passed the optional `activity_type` label to `log_experiment` (`measurement`, `intermediate`, `verification` or `attribution`). Hooks fire on `log_experiment` and on activation (`/autoresearch on`). `log_observation`, `record_analysis` and `direction_review` do not fire hooks. The research-map hint lines are part of the tool response text, not steer messages, so a hook cannot see them.
+
 ### Output contract
 
 - **Stdout** (up to 8 KB) → steer message. Empty = silent.

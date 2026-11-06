@@ -61,6 +61,9 @@ Then start the loop inside pi:
 | `log_measurement_change` | Registers a change of the measurer (gold, scorer or metric) with its diff and rescore artifact. Opens a new scale epoch that stays provisional until verified. See [Measurement track](#measurement-track). |
 | `verify_measurement_change` | Records the independent confirmation of a measurer change with a proof artifact that is checked against the ledger. |
 | `revert_measurement_change` | Records the independent refutation of a measurer change with a counter-rescore; restores the last confirmed scale. |
+| `log_observation` | Records a preparation, diagnostic or infrastructure event about a run (`success`, `technical_failure`, `unknown`) in `.auto/observations.jsonl`. Not a run: no git, best, streak or ledger change. See [Research map](#research-map). |
+| `record_analysis` | Appends a `prereg`, `comparison`, `attribution` or `supplement` record to `.auto/analysis.jsonl`. Never changes runs, git or best. See [Research map](#research-map). |
+| `direction_review` | Writes one document to `.auto/reviews/direction-<UTC>.md` with facts, unknowns, signals, alternatives and what is not proven. Runs no experiment and chooses no direction. |
 
 ### `/autoresearch` command
 
@@ -164,6 +167,10 @@ All session files live in a single `.auto/` subfolder at the working-directory r
 | `.auto/log.jsonl` | Append-only log of every run (written by the tools). |
 | `.auto/checks.sh` | *(optional)* Backpressure checks — tests, types, lint. Runs after each passing benchmark. Failures block `keep`. |
 | `.auto/hooks/` | *(optional)* Executable scripts (`before.sh`, `after.sh`) that fire around iterations. Stdout is delivered to the agent as a steer message. |
+| `.auto/observations.jsonl` | *(optional)* Observations about preparation and diagnostic events, written by `log_observation`. |
+| `.auto/analysis.jsonl` | *(optional)* Analysis records (prereg, comparison, attribution, supplement), written by `record_analysis`. |
+| `.auto/run-links.jsonl` | *(optional)* Confirmed links between ledger rows and run directories, written by `log_experiment`. Do not edit by hand. |
+| `.auto/reviews/` | *(optional)* Direction-review documents, written by `direction_review`. |
 
 ---
 
@@ -459,6 +466,27 @@ The measurer is the gold set, the scorer and the metric. Changing it silently in
 ### Long-running loops and context
 
 The loop is designed to run unattended across context limits. When pi's [auto-compaction](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/compaction.md) summarizes the older portion of the conversation, autoresearch detects the resulting idle and re-prompts the agent to re-read `.auto/prompt.md`, the tail of `.auto/log.jsonl`, `.auto/ideas/`, and `git log` before continuing. All progress is persisted in those files, so the post-summary turn rehydrates from the source of truth instead of relying on whatever survived compaction. No tuning required — if pi's auto-compaction is enabled (the default), this just works.
+
+---
+
+## Research map
+
+Research map adds tools for the parts of a campaign that are not plain runs: preparation and diagnostic events, comparison records and direction reviews. Everything is stored locally under `.auto/`, and every read recomputes its state from the files, so a restart gives the same answers. The full contract, data formats, limits and example calls are in [docs/research-map.md](docs/research-map.md).
+
+- **`log_observation`** records a preparation, diagnostic or infrastructure event about a run. Use it instead of a fake `crash` or `explore` run. Outcome is `success`, `technical_failure` or `unknown`. `linked_run` defaults to the last run marker in the ledger; pass an integer when sessions run concurrently.
+- **`record_analysis`** records a `prereg` before a candidate run (branches, an optional exhaustion rule, a noise band with a reference), then `comparison` (purpose, baseline, candidate, declared changed components), `attribution` (a claim with typed references into `.auto/runs/<N>/`) and `supplement` (fills a missing field or declares it absent; never overwrites). A comparison written after results is never a prereg.
+- **`direction_review`** takes no arguments and writes a document. It proposes, it does not decide.
+- **`log_experiment` `activity_type`** is an optional label (`measurement`, `intermediate`, `verification`, `attribution`). It is stored in the ledger only and never changes status, keep/discard, git, best or the epoch.
+
+**Hints.** Some `log_experiment` and `record_analysis` responses end with a 💡 line that proposes `direction_review`: no best improvement for 8 runs in a segment, 3 improvements in a row, or a stage rise of a direction's exhaustion signal. Hints are advisory. They never say that a direction is exhausted, never run an experiment, and always state that exhaustion and comparability are not confirmed. `unknown` means not assessed, never failure.
+
+**Passport.** Observations can carry declared components (`weights`, `prompt`, `dataset`, `measurer`, `code_ref`) as a relative `ref` and an optional `declared_sha256`. They are stored as declared with `verified: false`. The system never reads or hashes the referenced files.
+
+**Run links.** An observation or a comparison is tied to a run only through a proven link recorded in `.auto/run-links.jsonl`. A torn or unreadable line in that file makes the affected links `ambiguous`: no trusted epoch, no delta, and no trusted exhaustion for those runs. The system never repairs the file; archiving it is a manual step.
+
+**Privacy.** A `keep` commit runs `git add -A`, so `.auto/` (observations, analysis, run links, reviews) is committed with the run. Free-text fields are not scanned for secrets. The tools copy no artifact content into their records.
+
+**Compatibility.** Existing `log.jsonl` files are read as before, and the new tools never write to it. Rows without `activity_type` read as `unknown`. The new data files are separate; `/autoresearch clear` removes the ledger only.
 
 ---
 
