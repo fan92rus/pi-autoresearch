@@ -37,7 +37,7 @@ import { createServer, type Server, type ServerResponse } from "node:http";
 
 import { spawn } from "node:child_process";
 import { getBashSpawnOptions, killTree } from "./bash-shell.ts";
-import { markIdeaTried } from "./observer.ts";
+import { computeState, markIdeaTried } from "./observer.ts";
 import { registerCouncilTools } from "./council-tools.ts";
 import { registerAssessPrecedentsTool } from "./precedent-assess.ts";
 import { registerSearchPrecedentsTool } from "./precedent-report.ts";
@@ -89,6 +89,7 @@ import {
   formatFloorStale,
   formatMeasurementScale,
   logMeasurementChange,
+  measurementHealthLine,
   measurementChangeId,
   measurementScaleStatus,
   measurementScaleStatusOfDir,
@@ -109,11 +110,41 @@ import {
   isRunNumber,
   recordPendingMarker,
   resetRunIdentities,
+  runLinkOf,
+  scanLedgerForLinks,
+  type RunLinkVerdict,
   type RunLinksRuntime,
 } from "./run-links.ts";
 import {
+  ANALYSIS_REF_BUDGET_PER_CALL,
+  buildLedgerModel,
+  computeAttributionStatus,
+  computeComparisonControl,
+  evaluateBranches,
+  classifyPreregOrder,
   journalPrefixSnapshot,
+  readAnalysis,
   type JournalFs,
+  type StoredAnalysisRecord,
+} from "./research-analysis.ts";
+import {
+  computeExhaustionState,
+  exhaustionHintsBetween,
+  ADVISORY_DISCLAIMER,
+  ADVISORY_THRESHOLDS,
+  EXHAUSTION_DISCLAIMER,
+  type ExhaustionHint,
+  type ExhaustionState,
+} from "./exhaustion-hints.ts";
+import {
+  createLogObservationTool,
+  LOG_OBSERVATION_PARAMETERS,
+  readObservations,
+  type ObservationRecord,
+} from "./research-observations.ts";
+import {
+  createRecordAnalysisTool,
+  RECORD_ANALYSIS_PARAMETERS,
 } from "./research-analysis.ts";
 import {
   journalTarget,
@@ -4631,6 +4662,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const workDir = resolveWorkDir(ctx.cwd);
       const secondaryMetrics = params.metrics ?? {};
 
+      // §12.4 hint trigger: the file state BEFORE this ledger row. The hint is
+      // delivered in the RESPONSE only on a permitted transition; nothing is
+      // persisted (no hint state file, no observer involvement).
+      const preResearchMap = researchMapPreState(workDir);
+
       // Honest-metric provenance (goal-x pattern: agent claims are untrusted,
       // the run_experiment measurement is the evidence). Only statuses that
       // carry a real measurement are checked; crash/budget/explore are exempt.
@@ -5083,6 +5119,21 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         text += `\n${runLinkWarning}`;
       }
 
+      // §12.4 direction-review hint (E-22): computed from files after the ledger
+      // row and the sidecar attempt; at most one line (§12.3b); never on a plain
+      // success without a transition; delivered in this response string only.
+      // Owner decision (spec rev.): explore rows are excluded from the S_stag/S_ser
+      // counters upstream (researchMapPreState / researchMapLogHint), so an explore
+      // row can no longer cause a transition by itself. The params.status check
+      // below is kept only as a defensive no-op (it can never suppress a hint that
+      // the counters would have fired on a non-explore row).
+      try {
+        const hintLine = preResearchMap !== null && params.status !== "explore"
+          ? researchMapLogHint(workDir, preResearchMap)
+          : null;
+        if (hintLine !== null) text += hintLine;
+      } catch { /* hint never fails the log */ }
+
       // ── Experiment tree: update or create node ──
       // New flow: if hypothesis_id is provided, or a running node exists in tree,
       // finalize the existing hypothesis node. Old flow: for baseline runs
@@ -5296,6 +5347,779 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       return new Text(text, 0, 0);
+    },
+  });
+
+  // =======================================================================
+  // research-map: shared helpers (§8.1 passport view, §12.4 hint delivery)
+  // =======================================================================
+
+  /** Component names of the §8.1 minimum passport. */
+  const PASSPORT_COMPONENTS = ["weights", "prompt", "dataset", "measurer", "code_ref"] as const;
+
+  /**
+   * §8.1/D-RM-06 passport view for an ordinary run. Components come ONLY from
+   * passport-bearing observations of the run, and only while the CURRENTLY
+   * recomputed link of the run (§5.2 runLinkOf, passed in as `verdict`) is
+   * proven — stored run_link snapshots are never trusted (§8.1: the link and
+   * epoch are recomputed at every read). The run id comes from the ledger, the
+   * run epoch from the verdict (proven basis only, else unknown). Unknown
+   * fields stay unknown; refs are declared, never verified; no file reads for
+   * refs (I-12). Pure over its inputs.
+   */
+  function runPassportView(
+    verdict: RunLinkVerdict,
+    observations: readonly ObservationRecord[],
+    runNumber: number,
+  ): {
+    run: number;
+    run_epoch: number | null;
+    run_epoch_basis: RunLinkVerdict["runEpochBasis"];
+    components: Record<string, { state: "declared" | "unknown"; ref: string | null; declared_sha256: string | null; verified: false; note: string | null; conflict?: "passport_conflict" }>;
+  } {
+    const components: Record<string, { state: "declared" | "unknown"; ref: string | null; declared_sha256: string | null; verified: false; note: string | null; conflict?: "passport_conflict" }> = {};
+    const eligible = verdict.link === "proven"
+      ? observations.filter((record) => record.observed_run === runNumber && record.passport !== undefined)
+      : [];
+    for (const name of PASSPORT_COMPONENTS) {
+      // §8.1: incompatible declarations are never guessed away. Collect the
+      // distinct declared (ref, declared_sha256) pairs over ALL eligible
+      // observations; the component resolves only when they agree.
+      const pairs = new Set<string>();
+      let single: { ref: string | null; declared_sha256: string | null } | null = null;
+      for (const record of eligible) {
+        const component = record.passport!.components[name];
+        if (component === undefined || component.state !== "declared") continue;
+        const key = `${JSON.stringify(component.ref)}\u0000${JSON.stringify(component.declared_sha256)}`;
+        pairs.add(key);
+        if (pairs.size === 1) single = { ref: component.ref, declared_sha256: component.declared_sha256 };
+      }
+      if (pairs.size === 0) {
+        components[name] = { state: "unknown", ref: null, declared_sha256: null, verified: false, note: "not_provided" };
+      } else if (pairs.size === 1 && single !== null) {
+        components[name] = { state: "declared", ref: single.ref, declared_sha256: single.declared_sha256, verified: false, note: null };
+      } else {
+        // §8.2 note enum is closed (not_provided | invalid_ref | non_local_ref
+        // | denied_by_policy), so the conflict stays note:"not_provided"; the
+        // incompatible-declaration case is carried by a separate VIEW-ONLY key
+        // on this response component (never written to stored records).
+        // OPEN QUESTION for the spec owner: §8.2 does not yet define this
+        // response-view key.
+        components[name] = { state: "unknown", ref: null, declared_sha256: null, verified: false, note: "not_provided", conflict: "passport_conflict" };
+      }
+    }
+    return {
+      run: runNumber,
+      run_epoch: verdict.runEpoch,
+      run_epoch_basis: verdict.runEpochBasis,
+      components,
+    };
+  }
+
+  /**
+   * One merged hint line per response (§12.3b): ALL causes join into ONE line —
+   * each cause segment keeps its own code (already inside its text), and the
+   * shared disclaimer(s) close the line exactly once. Dropping hints[1..] would
+   * lose one-shot transitions (S_stag / S_ser fire only on the crossing), so
+   * no cause is ever discarded.
+   */
+  function formatExhaustionHintLine(hints: readonly ExhaustionHint[]): string | null {
+    if (hints.length === 0) return null;
+    const causes = hints.map((hint) =>
+      hint.text
+        .split(EXHAUSTION_DISCLAIMER).join(" ")
+        .split(ADVISORY_DISCLAIMER).join(" ")
+        .replace(/\s{2,}/g, " ")
+        .trim(),
+    );
+    // Trusted causes carry the exhaustion disclaimer, advisory causes the
+    // advisory one (§12.3b) — each appended once, at the end of the line.
+    const shared: string[] = [];
+    if (hints.some((hint) => hint.kind !== "S_exh_adv")) shared.push(EXHAUSTION_DISCLAIMER);
+    if (hints.some((hint) => hint.kind === "S_exh_adv")) shared.push(ADVISORY_DISCLAIMER);
+    return `\n💡 ${causes.join(" | ")} ${shared.join(" ")}`;
+  }
+
+  /**
+   * §12.4 log_experiment hint: S_stag / S_ser transitions plus trusted S_exh
+   * rises (12.4a lifecycle). Computed from the files before and after the
+   * ledger row; nothing is persisted. At most one hint line (§12.3b).
+   * `before` is the pre-append snapshot from researchMapPreState (null when
+   * the pre-state could not be read: an unknown value never yields a hint).
+   * A torn before-state (§5.2: a non-empty line parseJsonlEntry cannot parse —
+   * unterminated fragment or complete-but-invalid line alike) makes the
+   * pre-append state unknown (§12.4a), and §12.4 forbids a hint when either
+   * value is unknown → no hint of any kind (M-a fix).
+   */
+  function researchMapLogHint(
+    workDir: string,
+    before: { exhaustion: ExhaustionState | null; stagAfter: boolean; serAfter: boolean; torn: boolean } | null,
+  ): string | null {
+    if (before === null || before.torn) return null;
+    const autoDir = path.join(workDir, AUTO_DIR);
+    try {
+      const after = computeExhaustionState(autoDir);
+      const hints: ExhaustionHint[] = [];
+      // S_exh trusted stage rises (before = the pre-append file state).
+      if (before.exhaustion !== null) {
+        hints.push(...exhaustionHintsBetween(before.exhaustion, after));
+      }
+      // S_stag / S_ser over the current segment (§12.4: same counters as
+      // computeState). A torn/incomplete ledger tail makes the states unknown
+      // (12.4a: «неполная строка после последнего маркера → unknown») — no hint.
+      if (!ledgerTailTorn(workDir)) {
+        try {
+          const ledgerText = fs.readFileSync(autoresearchJsonlPath(workDir), "utf-8");
+          const reconstructed = reconstructJsonlState(ledgerText);
+          // Owner decision: explore rows are excluded from the S_stag/S_ser
+          // counters entirely (neither increment nor reset) — see K_STAG_RUNS.
+          const segRuns = reconstructed.results.filter((r) => r.segment === reconstructed.currentSegment && r.status !== "explore");
+          const stateAfter = computeState(segRuns, reconstructed.bestDirection);
+          const trailingAfter = trailingBestImprovements(segRuns, reconstructed.bestDirection);
+          if (before.stagAfter === false && stateAfter.runsSinceBestImprovement >= K_STAG_RUNS) {
+            hints.push({
+              kind: "S_stag",
+              axis: "",
+              key: null,
+              stage: null,
+              threshold: null,
+              n: stateAfter.runsSinceBestImprovement,
+              text:
+                `Предлагается обзор направлений (S_stag): это документ, а не действие. ${EXHAUSTION_DISCLAIMER} ` +
+                "Для документа вызовите `direction_review`. Эксперименты не запускались.",
+            });
+          }
+          if (before.serAfter === false && trailingAfter >= K_SER_RUNS) {
+            hints.push({
+              kind: "S_ser",
+              axis: "",
+              key: null,
+              stage: null,
+              threshold: null,
+              n: stateAfter.streak,
+              text:
+                `Предлагается обзор направлений (S_ser): это документ, а не действие. ${EXHAUSTION_DISCLAIMER} ` +
+                "Для документа вызовите `direction_review`. Эксперименты не запускались.",
+            });
+          }
+        } catch { /* ledger read failed: S_stag/S_ser stay unknown — no hint */ }
+      }
+      return formatExhaustionHintLine(hints);
+    } catch { /* engine failure never fails the log */ }
+    return null;
+  }
+
+  /**
+   * §12.4 trigger thresholds (DRAFT DQ-01; K_SER counts best-improving runs).
+   * OWNER DECISION (spec rev. in progress): ledger rows with status "explore"
+   * are EXCLUDED from the S_stag and S_ser counters entirely — they neither
+   * increment nor reset them. The design §12.4a is being amended accordingly.
+   */
+  const K_STAG_RUNS = 8;
+  const K_SER_RUNS = 3;
+
+  /**
+   * §12.4 S_ser value: trailing consecutive best-improving runs of the segment
+   * (DQ-05). Uses computeState's isBetter criterion (keep, metric ≠ 0, strictly
+   * better than the running best) — NOT computeState.streak, which counts
+   * non-improvements.
+   */
+  function trailingBestImprovements(runs: { status: string; metric: number }[], direction: "lower" | "higher"): number {
+    let best: number | null = null;
+    const flags: boolean[] = [];
+    for (const r of runs) {
+      // Owner decision: explore rows are invisible to the counter — they
+      // neither increment nor reset it (see K_STAG_RUNS comment).
+      if (r.status === "explore") continue;
+      const isKeep = r.status === "keep" && r.metric !== 0;
+      const isBetter = isKeep && (best === null || (direction === "lower" ? r.metric < best : r.metric > best));
+      flags.push(isBetter);
+      if (isBetter) best = r.metric;
+    }
+    let trailing = 0;
+    for (let i = flags.length - 1; i >= 0 && flags[i]; i--) trailing++;
+    return trailing;
+  }
+
+  /**
+   * Snapshot of the pre-append ledger for the next log's transition check.
+   * A torn tail (§5.2: a non-empty line parseJsonlEntry cannot parse — the
+   * spec does not distinguish an unterminated fragment from a
+   * complete-but-invalid line; both are torn) makes S_stag/S_ser unknown
+   * (§12.4a/T93) and therefore yields NO hint at all (§12.4: any unknown →
+   * no hint). The torn flag is carried on the snapshot so researchMapLogHint
+   * can refuse to fire over a torn before-state (M-a fix).
+   */
+  function researchMapPreState(workDir: string): { exhaustion: ExhaustionState | null; stagAfter: boolean; serAfter: boolean; torn: boolean } | null {
+    try {
+      const ledgerText = fs.readFileSync(autoresearchJsonlPath(workDir), "utf-8");
+      const reconstructed = reconstructJsonlState(ledgerText);
+      // Owner decision: explore rows are excluded from the S_stag/S_ser
+      // counters entirely (neither increment nor reset) — see K_STAG_RUNS.
+      const segRuns = reconstructed.results.filter((r) => r.segment === reconstructed.currentSegment && r.status !== "explore");
+      const state = computeState(segRuns, reconstructed.bestDirection);
+      let exhaustion: ExhaustionState | null = null;
+      try {
+        exhaustion = computeExhaustionState(path.join(workDir, AUTO_DIR));
+      } catch { /* exhaustion stays unknown; S_stag/S_ser still checked */ }
+      return {
+        exhaustion,
+        stagAfter: state.runsSinceBestImprovement >= K_STAG_RUNS,
+        serAfter: trailingBestImprovements(segRuns, reconstructed.bestDirection) >= K_SER_RUNS,
+        torn: ledgerTailTorn(workDir),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * §12.3b/§12.4 statement trigger: `review_requested: true` on a comparison
+   * proposes a cautious direction review, only when the record is the FIRST
+   * valid statement of its axis in the current analysis segment. The decision
+   * is deterministic from readAnalysis alone: any torn/invalid line makes the
+   * segment unknown → no hint (§12.3b conservative reading). Returns null
+   * when no statement hint is due.
+   */
+  function reviewRequestedStatementHint(
+    autoDir: string,
+    params: unknown,
+    details: Record<string, unknown>,
+  ): ExhaustionHint | null {
+    const p = (params ?? {}) as { kind?: unknown; axis?: unknown; review_requested?: unknown };
+    if (p.review_requested !== true || p.kind !== "comparison" || typeof p.axis !== "string") return null;
+    if (details.kind !== "comparison" || typeof details.id !== "string") return null;
+    try {
+      const text = fs.readFileSync(journalTarget(autoDir, "analysis").file, "utf8");
+      const read = readAnalysis(text);
+      // Torn/invalid history → unknown segment → never a hint.
+      if (read.torn_lines > 0 || read.invalid > 0) return null;
+      const axis = p.axis;
+      const earlierStatement = read.records.some((record) =>
+        record.id !== details.id &&
+        record.kind === "comparison" &&
+        record.axis === axis &&
+        record.review_requested === true,
+      );
+      if (earlierStatement) return null;
+      const n = read.records.filter((record) => record.kind === "comparison" && record.axis === axis).length;
+      return {
+        kind: "S_exh_adv",
+        axis,
+        key: null,
+        stage: null,
+        threshold: null,
+        n,
+        text:
+          `Предлагается обзор направлений (S_exh_adv, ось ${axis}): заявление review_requested по записи ${details.id}. ` +
+          "Сигнал не является доказательством исчерпания и не подтверждает метрическую дельту. " +
+          `${ADVISORY_DISCLAIMER} Для документа вызовите \`direction_review\`. Эксперименты не запускались.`,
+      };
+    } catch { /* unreadable analysis → unknown → no hint */ }
+    return null;
+  }
+
+  /**
+   * True when the last non-empty ledger line is not a JSON object (incomplete
+   * tail, §12.4 unknown for S_stag/S_ser). Missing ledger is not torn.
+   */
+  function ledgerTailTorn(workDir: string): boolean {
+    try {
+      const lines = fs.readFileSync(autoresearchJsonlPath(workDir), "utf-8").split("\n").filter((l) => l.trim() !== "");
+      const last = lines[lines.length - 1];
+      return last !== undefined && parseJsonlEntry(last) === null;
+    } catch {
+      return false;
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // log_observation tool (§7.3) and record_analysis tool (§7.4): registered
+  // wrappers around the module factories, bound to the session .auto directory.
+  // -----------------------------------------------------------------------
+
+  registerGatedTool({
+    name: "log_observation",
+    label: "Log observation",
+    description:
+      "Record a preparation or diagnostic step as a separate observation about a run. It is not a run: " +
+      "it never touches git, best, streak or the ledger, and it is stored in .auto/observations.jsonl. " +
+      "Outcome is success, technical_failure or unknown. Supports a state passport (§8).",
+    promptSnippet: "Record a preparation/diagnostic observation (not a run)",
+    promptGuidelines: [
+      "Use for preparation and diagnostics (warm-up runs, measurer checks): pass outcome success|technical_failure|unknown.",
+      "Observations never change best, streak, git or the ledger — they are not runs.",
+      "Passport fields (weights, prompt, dataset, measurer, code_ref) are declarations with optional declared_sha256 — never verified by the system.",
+    ],
+    parameters: LOG_OBSERVATION_PARAMETERS,
+
+    async execute(toolCallId: string, params: unknown, _signal, _onUpdate, ctx: ExtensionContext) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
+      const workDirError = validateWorkDir(ctx.cwd);
+      if (workDirError) {
+        return { content: [{ type: "text", text: `❌ ${workDirError}` }], details: {} };
+      }
+      const workDir = resolveWorkDir(ctx.cwd);
+      const autoDir = path.join(workDir, AUTO_DIR);
+      const tool = createLogObservationTool(autoDir);
+      const result = await tool.execute(toolCallId, params);
+      // D-RM-06 read-only passport view of the linked run in the response
+      // (§8.1): computed from proven-linked observations at read time; unknown
+      // fields stay unknown; no file reads for refs (I-12).
+      const details = (result.details ?? {}) as Record<string, unknown>;
+      let text = result.content[0]?.type === "text" ? result.content[0].text : "";
+      if (details.status === "appended" || details.status === "already_recorded") {
+        try {
+          const run = details.observed_run as number;
+          const verdict = runLinkOf(autoDir, run);
+          const obsText = fs.readFileSync(journalTarget(autoDir, "observations").file, "utf8");
+          const view = runPassportView(verdict, readObservations(obsText).records, run);
+          const returnedDetails = { ...details, run_passport_view: view };
+          const declared = Object.entries(view.components).filter(([, c]) => c.state === "declared");
+          const lines = Object.entries(view.components).map(
+            ([name, c]) => c.state === "declared"
+              ? `${name}: declared (ref: ${c.ref ?? "—"}, sha256: ${c.declared_sha256 ?? "—"}, verified: false)`
+              : `${name}: unknown (${c.conflict ?? c.note ?? "not_provided"})`,
+          );
+          text += `\n📜 Passport view of run #${run} (read-only; from proven-linked observations):\n  ${lines.join("\n  ")}` +
+            `\n  run_epoch: ${view.run_epoch === null ? "unknown" : view.run_epoch} (basis: ${view.run_epoch_basis})` +
+            (declared.length === 0 ? "\n  All components unknown — nothing was declared for this run." : "");
+          return { content: [{ type: "text", text }], details: returnedDetails };
+        } catch { /* passport view is best-effort; observation response unchanged */ }
+      }
+      return result;
+    },
+  });
+
+  registerGatedTool({
+    name: "record_analysis",
+    label: "Record analysis",
+    description:
+      "Append an analysis record (kind prereg | comparison | attribution | supplement) to .auto/analysis.jsonl " +
+      "under analysis.lock. prereg captures the ledger prefix for ordering (§9.3); comparison control, delta " +
+      "eligibility and causal status are computed, never stored. Records never change runs, git or best.",
+    promptSnippet: "Append a prereg/comparison/attribution/supplement analysis record",
+    promptGuidelines: [
+      "prereg BEFORE the run captures ordering proof; a comparison recorded after results is never a prereg.",
+      "comparison declares purpose, baseline_run, candidate_run and changed_components; control is a declaration, not proof.",
+      "attribution needs evidence_refs ({run, artifact:'output', lines:null, anchor:null}); its status is computed and starts unknown.",
+      "Responses may carry a direction-review hint line (S_exh / S_exh_adv) — it proposes `direction_review`, it never runs anything.",
+    ],
+    parameters: RECORD_ANALYSIS_PARAMETERS,
+
+    async execute(toolCallId: string, params: unknown, _signal, _onUpdate, ctx: ExtensionContext) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
+      const workDirError = validateWorkDir(ctx.cwd);
+      if (workDirError) {
+        return { content: [{ type: "text", text: `❌ ${workDirError}` }], details: {} };
+      }
+      const workDir = resolveWorkDir(ctx.cwd);
+      const autoDir = path.join(workDir, AUTO_DIR);
+      const before = computeExhaustionState(autoDir);
+      const tool = createRecordAnalysisTool(autoDir);
+      const result = await tool.execute(toolCallId, params);
+      // §12.4 hint in the response on a permitted transition only (12.4a);
+      // pure reads before/after, nothing persisted, never on a plain success.
+      let text = result.content[0]?.type === "text" ? result.content[0].text : "";
+      const details = result.details as Record<string, unknown> | undefined;
+      if (details && details.status === "appended") {
+        const after = computeExhaustionState(autoDir);
+        const hints = exhaustionHintsBetween(before, after);
+        // §12.3b statement trigger: review_requested fires once per axis per
+        // segment; merged into the same single line as any S_exh cause.
+        const statement = reviewRequestedStatementHint(autoDir, params, details as Record<string, unknown>);
+        if (statement !== null) hints.push(statement);
+        const hintLine = formatExhaustionHintLine(hints);
+        if (hintLine !== null) text += hintLine;
+        const returnedDetails = { ...(details as Record<string, unknown>) };
+        // M-d: details.hint mirrors the FULL merged hint line (all causes +
+        // shared disclaimers), byte-for-byte the text that was appended —
+        // not just the first cause.
+        if (hintLine !== null) returnedDetails.hint = hintLine;
+        return { content: [{ type: "text", text }], details: returnedDetails };
+      }
+      return result;
+    },
+  });
+
+  // -----------------------------------------------------------------------
+  // direction_review tool (§12.1/§12.2, D-RM-07): pure document generation.
+  // Reads ledger + observations + analysis; writes ONE
+  // .auto/reviews/direction-<UTC>.md file; never calls run_experiment,
+  // log_experiment, log_observation or record_analysis (I-15, FR-06.1).
+  // -----------------------------------------------------------------------
+
+  const DIRECTION_REVIEW_MANDATORY_RELIABILITY =
+    "Надёжность алгоритма не оценивается: документ сводит факты и срабатывание признаков.";
+  const DIRECTION_REVIEW_MANDATORY_UNCONFIRMED = EXHAUSTION_DISCLAIMER;
+
+  registerGatedTool({
+    name: "direction_review",
+    label: "Direction review document",
+    description:
+      "Generate a direction-review document at .auto/reviews/direction-<UTC-timestamp>.md from the ledger, " +
+      "observations and analysis. Pure read + one file write: no experiments run, no direction chosen, no " +
+      "auto action. Sections (§12.2): Факты, Неизвестно, Признаки, Альтернативы, Что не доказано, " +
+      "Рекомендации (не действия). Marks exhaustion/comparability as unconfirmed.",
+    promptSnippet: "Write a direction-review document (no auto action)",
+    promptGuidelines: [
+      "Call after a direction-review hint (S_stag / S_ser / S_exh / S_exh_adv) or whenever you want a strategy overview.",
+      "The document is informational: it never runs experiments and never picks the next direction for you.",
+    ],
+    parameters: {
+      type: "object",
+      properties: {},
+    } as any,
+
+    async execute(_toolCallId: string, _params: Record<string, never>, _signal, _onUpdate, ctx: ExtensionContext) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
+      const workDirError = validateWorkDir(ctx.cwd);
+      if (workDirError) {
+        return { content: [{ type: "text", text: `❌ ${workDirError}` }], details: {} };
+      }
+      const workDir = resolveWorkDir(ctx.cwd);
+      const autoDir = path.join(workDir, AUTO_DIR);
+
+      const NO_DATA = "нет данных";
+      const md: string[] = [];
+      md.push("# Обзор направлений");
+      md.push("");
+      md.push(`Сформирован: ${new Date().toISOString()} (UTC).`);
+      md.push("");
+      md.push(DIRECTION_REVIEW_MANDATORY_RELIABILITY);
+      md.push(DIRECTION_REVIEW_MANDATORY_UNCONFIRMED);
+      md.push("");
+
+      // ── Reads: ledger, observations, analysis (pure; single pass each) ──
+      let ledgerText = "";
+      let ledgerState: "ok" | "missing" | "unavailable" = "ok";
+      try {
+        ledgerText = fs.readFileSync(autoresearchJsonlPath(workDir), "utf-8");
+      } catch (e) {
+        ledgerState = (e as NodeJS.ErrnoException)?.code === "ENOENT" ? "missing" : "unavailable";
+      }
+      let observations: ObservationRecord[] = [];
+      let obsTorn = 0;
+      let obsInvalid = 0;
+      let obsState: "ok" | "missing" | "unavailable" = "ok";
+      try {
+        const text = fs.readFileSync(journalTarget(autoDir, "observations").file, "utf8");
+        const read = readObservations(text);
+        observations = read.records;
+        obsTorn = read.torn_lines;
+        obsInvalid = read.invalid;
+      } catch (e) {
+        obsState = (e as NodeJS.ErrnoException)?.code === "ENOENT" ? "missing" : "unavailable";
+      }
+      let analysis: StoredAnalysisRecord[] = [];
+      let analysisTorn = 0;
+      let analysisInvalid = 0;
+      let analysisState: "ok" | "missing" | "unavailable" = "ok";
+      try {
+        const text = fs.readFileSync(journalTarget(autoDir, "analysis").file, "utf8");
+        const read = readAnalysis(text);
+        analysis = read.records;
+        analysisTorn = read.torn_lines;
+        analysisInvalid = read.invalid;
+      } catch (e) {
+        analysisState = (e as NodeJS.ErrnoException)?.code === "ENOENT" ? "missing" : "unavailable";
+      }
+
+      const reconstructed = ledgerState === "ok" ? reconstructJsonlState(ledgerText) : null;
+      const allRunEntries: JsonObject[] = [];
+      if (ledgerState === "ok") {
+        for (const line of ledgerText.split("\n")) {
+          if (line.trim() === "") continue;
+          const entry = parseJsonlEntry(line);
+          if (entry !== null && typeof entry.run === "number") allRunEntries.push(entry);
+        }
+      }
+      const direction = reconstructed?.bestDirection ?? "lower";
+      const metricName = reconstructed?.metricName ?? "metric";
+      const currentSegment = reconstructed?.currentSegment ?? 0;
+      // Owner decision (spec rev.): explore rows are excluded from the S_stag/S_ser
+      // counters entirely (neither increment nor reset) — see K_STAG_RUNS.
+      const segRuns = reconstructed?.results.filter((r) => r.segment === currentSegment && r.status !== "explore") ?? [];
+      const observerState = reconstructed !== null ? computeState(segRuns, direction) : null;
+      const scaleStatus = measurementScaleStatusOfDir(workDir);
+      const healthLine = measurementHealthLine(workDir);
+
+      // Exhaustion engine (trusted stages + advisory counts) — pure reads.
+      const exhaustion = computeExhaustionState(autoDir);
+
+      // ── §12.2 п.1: Факты (current direction, counters, best per epoch) ──
+      md.push("## Факты");
+      md.push("");
+      if (reconstructed === null) {
+        md.push(`${NO_DATA} (леджер ${ledgerState === "missing" ? "отсутствует" : "нечитаем"}).`);
+      } else {
+        md.push(`Метрика: ${metricName}; направление лучше: ${direction === "higher" ? "больше" : "меньше"}.`);
+        md.push(`Прогонов в текущем сегменте: ${segRuns.length}; без улучшения best: ${observerState?.runsSinceBestImprovement ?? "unknown"}.`);
+        // Best per epoch (each epoch separately — never across scales).
+        const bestByEpoch = new Map<number, { run: number; metric: number }>();
+        for (const r of segRuns) {
+          if (r.status !== "keep" || r.metric === 0) continue;
+          const cur = bestByEpoch.get(r.epoch);
+          const better = cur === undefined || (direction === "lower" ? r.metric < cur.metric : r.metric > cur.metric);
+          if (better) bestByEpoch.set(r.epoch, { run: r.run, metric: r.metric });
+        }
+        if (bestByEpoch.size === 0) {
+          md.push(`Лучший результат по эпохам: ${NO_DATA}.`);
+        } else {
+          for (const [epoch, best] of [...bestByEpoch.entries()].sort((a, b) => a[0] - b[0])) {
+            md.push(`Лучший результат эпохи ${epoch}: прогон #${best.run}, ${metricName}=${best.metric}.`);
+          }
+        }
+        // §11.3 activity table (runs): counts only, descriptive not evaluative.
+        const ACTIVITIES = ["measurement", "intermediate", "verification", "attribution", "unknown", "invalid"];
+        const STATUSES = ["keep", "discard", "crash", "checks_failed", "budget_exceeded", "explore"];
+        md.push("");
+        md.push("Тип деятельности (прогоны):");
+        const activityTable: string[] = [`| activity_type | ${STATUSES.join(" | ")} |`, `|---|${STATUSES.map(() => "---").join("|")}|`];
+        let anyActivity = false;
+        for (const activity of ACTIVITIES) {
+          const cells = STATUSES.map((status) => {
+            let n = 0;
+            for (const entry of allRunEntries) {
+              const raw = entry.activity_type;
+              const read = raw === undefined ? "unknown" : (ACTIVITIES.includes(String(raw)) ? String(raw) : "invalid");
+              if (read === activity && entry.status === status) n++;
+            }
+            return String(n);
+          });
+          if (cells.some((c) => c !== "0")) anyActivity = true;
+          activityTable.push(`| ${activity} | ${cells.join(" | ")} |`);
+        }
+        if (!anyActivity) md.push(`${NO_DATA} (метки activity_type не встречаются).`);
+        else md.push(...activityTable);
+        // §11.3 observations table.
+        md.push("");
+        md.push("Наблюдения (activity_type × исход):");
+        const OBS_ACT = ["intermediate", "attribution"];
+        const OBS_OUT = ["success", "technical_failure", "unknown"];
+        const obsTable: string[] = [`| activity_type | ${OBS_OUT.join(" | ")} |`, "|---|---|---|---|"];
+        let anyObs = false;
+        for (const activity of OBS_ACT) {
+          const cells = OBS_OUT.map((outcome) => {
+            const n = observations.filter((o) => o.activity_type === activity && o.outcome === outcome).length;
+            return String(n);
+          });
+          if (cells.some((c) => c !== "0")) anyObs = true;
+          obsTable.push(`| ${activity} | ${cells.join(" | ")} |`);
+        }
+        if (!anyObs) md.push(`${NO_DATA}.`);
+        else md.push(...obsTable);
+        // Runs with technical failure (crash / checks_failed / budget_exceeded).
+        const failed = segRuns.filter((r) => r.status === "crash" || r.status === "checks_failed" || r.status === "budget_exceeded").map((r) => r.run);
+        md.push("");
+        md.push(failed.length > 0 ? `Прогоны с техническим сбоем: ${failed.map((n) => `#${n}`).join(", ")}.` : `Прогоны с техническим сбоем: ${NO_DATA}.`);
+        md.push(`Активная шкала: эпоха ${scaleStatus.epoch}.`);
+        md.push(healthLine);
+      }
+      md.push("");
+
+      // ── §12.2 п.1 (продолжение): счётчики записей анализа и наблюдений ──
+      const comparisons = analysis.filter((r) => r.kind === "comparison");
+      const attributions = analysis.filter((r) => r.kind === "attribution");
+      if (comparisons.length === 0 && attributions.length === 0) {
+        md.push(`${NO_DATA} (записей comparison/attribution нет).`);
+      } else {
+        if (comparisons.length > 0) {
+          md.push(`Записей comparison: ${comparisons.length} (id: ${comparisons.map((r) => r.id).join(", ")}).`);
+        }
+        if (attributions.length > 0) {
+          md.push(`Записей attribution: ${attributions.length} (id: ${attributions.map((r) => r.id).join(", ")}).`);
+        }
+      }
+      if (observations.length > 0) {
+        const failures = observations.filter((o) => o.outcome === "technical_failure").length;
+        md.push(`Наблюдений: ${observations.length} (технических сбоев: ${failures}).`);
+      }
+      // Data sources (§12.1 inputs) — plain list inside Факты; §12.2 fixes the
+      // section names, so there is no separate references heading.
+      const refs: string[] = [];
+      if (ledgerState === "ok") refs.push(".auto/log.jsonl");
+      if (obsState === "ok") refs.push(".auto/observations.jsonl");
+      if (analysisState === "ok") refs.push(".auto/analysis.jsonl");
+      for (const comparison of comparisons.slice(-5)) {
+        refs.push(`.auto/analysis.jsonl#${comparison.id}`);
+      }
+      if (refs.length > 0) {
+        md.push("Источники данных (объявления, доступность и содержимое не проверяются документом):");
+        for (const ref of refs) md.push(`- ${ref}`);
+      }
+      md.push("");
+
+      // ── §12.2 п.2: Неизвестно ──
+      md.push("## Неизвестно");
+      md.push("");
+      const unknowns: string[] = [];
+      // Unverified/unsettled observations (§12.2 п.2).
+      const unverifiedObs = observations.filter((o) => o.binding !== "verified");
+      if (unverifiedObs.length > 0) {
+        unknowns.push(`Наблюдения с непроверенной привязкой: ${unverifiedObs.map((o) => o.obs_id).join(", ")}.`);
+      }
+      // Comparisons without proven delta (computed per §9.2, never stored).
+      if (comparisons.length > 0) {
+        const model = buildLedgerModel(autoDir);
+        for (const comparison of comparisons) {
+          const baseline = model.runFacts(comparison.baseline_run as number);
+          const candidate = model.runFacts(comparison.candidate_run as number);
+          const control = computeComparisonControl(comparison, null, baseline, candidate, model);
+          if (!control.delta_allowed) {
+            unknowns.push(`Сравнение ${comparison.id}: дельта не разрешена (${control.delta_blocked_reason ?? "unknown"}).`);
+          } else if (control.control !== "controlled") {
+            unknowns.push(`Сравнение ${comparison.id}: контроль ${control.control} (${control.control_basis ?? "unknown"}).`);
+          }
+        }
+      }
+      // Causal claims (§12.2 п.5): ALL causal statuses live in «Что не доказано» —
+      // unknown/unverifiable with reasons, evidence_bound as record correspondence,
+      // never an established cause.
+      // Prereg post_hoc/unknown (§12.2 п.2). Computed against the candidate runs of comparisons.
+      const preregs = analysis.filter((r) => r.kind === "prereg");
+      for (const prereg of preregs) {
+        const linkedRuns = comparisons
+          .filter((c) => c.prereg_id === prereg.id)
+          .map((c) => c.candidate_run as number);
+        const verdicts = linkedRuns.map((run) => classifyPreregOrder(autoDir, prereg, run, JOURNAL_FS));
+        const seen = new Set(verdicts.map((v) => `${v.status}:${v.order_reason ?? ""}`));
+        for (const marker of seen) {
+          const [status, reason] = marker.split(":");
+          if (status !== "pre_registered") {
+            unknowns.push(`Предрегистрация ${prereg.id}: порядок ${status}${reason ? ` (${reason})` : ""}.`);
+          }
+        }
+      }
+      // Exhaustion: unknown/budget keys and barriers (§12.2 п.3 → unknowns listing).
+      for (const key of exhaustion.keys) {
+        if (key.display.value === "unknown") {
+          unknowns.push(`Направление ${key.id}: признак исчерпания не оценён (${key.display.code}${key.display.detail ? `: ${key.display.detail}` : ""}).`);
+        }
+      }
+      // Passport unknown components (§8.1 counters).
+      let unknownComponents = 0;
+      for (const o of observations) {
+        if (o.passport === undefined) continue;
+        for (const name of PASSPORT_COMPONENTS) {
+          const component = o.passport.components[name];
+          if (component === undefined || component.state !== "declared") unknownComponents++;
+        }
+      }
+      if (unknownComponents > 0) unknowns.push(`Компонентов паспорта в состоянии unknown: ${unknownComponents}.`);
+      // Damaged data.
+      if (obsTorn > 0 || obsInvalid > 0) unknowns.push(`observations.jsonl: нечитаемых строк ${obsTorn}, невалидных ${obsInvalid}.`);
+      if (analysisTorn > 0 || analysisInvalid > 0) unknowns.push(`analysis.jsonl: нечитаемых строк ${analysisTorn}, невалидных ${analysisInvalid}.`);
+      if (obsState === "missing") unknowns.push("observations.jsonl отсутствует — наблюдений нет.");
+      if (analysisState === "missing") unknowns.push("analysis.jsonl отсутствует — записей анализа нет.");
+      if (unknowns.length === 0) md.push(NO_DATA);
+      else for (const u of unknowns) md.push(`- ${u}`);
+      md.push("");
+
+      // ── §12.2 п.3: Признаки (S_stag/S_ser/S_exh/S_exh_adv) ──
+      md.push("## Признаки");
+      md.push("");
+      const stagValue = observerState === null ? "unknown" : observerState.runsSinceBestImprovement >= K_STAG_RUNS ? "true" : "false";
+      const serTrailing = reconstructed !== null ? trailingBestImprovements(segRuns, direction) : null;
+      const serValue = serTrailing === null ? "unknown" : serTrailing >= K_SER_RUNS ? "true" : "false";
+      md.push(`- S_stag (без улучшения best ≥ ${K_STAG_RUNS} прогонов сегмента): ${stagValue} (счётчик: ${observerState?.runsSinceBestImprovement ?? "unknown"}).`);
+      md.push(`- S_ser (последние ${K_SER_RUNS} прогона подряд улучшают best): ${serValue} (серия: ${serTrailing ?? "unknown"}).`);
+      if (exhaustion.keys.length === 0) {
+        md.push(`- S_exh: ${NO_DATA} (ключей направлений нет).`);
+      } else {
+        for (const key of exhaustion.keys.slice(0, 16)) {
+          const stage = key.display.value === "true" ? String(key.historyMax) : key.display.value;
+          md.push(`- S_exh ${key.id}: ${stage}${key.display.code !== null ? ` (${key.display.code})` : ""}; элементов в текущем сегменте: ${key.segmentCount ?? "unknown"}.`);
+        }
+      }
+      if (exhaustion.axes === null || exhaustion.axes.length === 0) {
+        md.push(`- S_exh_adv: ${NO_DATA} (осей с сравнениями нет).`);
+      } else {
+        for (const axis of exhaustion.axes) {
+          md.push(`- S_exh_adv ось ${axis.axis}: n=${axis.n} (сравнения: ${axis.ids.join(", ")}).`);
+        }
+      }
+      md.push("Исчерпание направления и сопоставимость результатов не подтверждены; формулировки выше — предложение обзора, не вывод.");
+      md.push("");
+
+      // ── §12.2 п.4: Альтернативы (always first alternative, no selection) ──
+      md.push("## Альтернативы");
+      md.push("");
+      md.push("Продолжить текущее направление — всегда доступная альтернатива. Другие варианты: сменить ось; провести контролируемое сравнение (один компонент); остановиться. Документ не выбирает и не запускает (FR-06.1).");
+      md.push("");
+
+      // ── §12.2 п.5: Что не доказано (causal claims, all statuses) ──
+      md.push("## Что не доказано");
+      md.push("");
+      const unproven: string[] = [];
+      for (const attribution of attributions) {
+        const status = computeAttributionStatus(autoDir, attribution, analysis, JOURNAL_FS);
+        if (status.status !== "evidence_bound") {
+          unproven.push(`Каузальное утверждение ${attribution.id}: ${status.status} (${status.reason}); причина не установлена.`);
+        } else {
+          unproven.push(`Каузальное утверждение ${attribution.id}: evidence_bound — соответствие записей, не установленная причина.`);
+        }
+      }
+      if (unproven.length === 0) md.push(NO_DATA);
+      else for (const u of unproven) md.push(`- ${u}`);
+      md.push("");
+
+      // ── §12.2 п.6: Рекомендации (не действия) ──
+      md.push("## Рекомендации (не действия)");
+      md.push("");
+      const recommendations: string[] = [];
+      if (stagValue === "true") recommendations.push("Предлагается обзор направлений из-за S_stag (см. Признаки) — документ, не действие.");
+      if (serValue === "true") recommendations.push("Предлагается обзор направлений из-за S_ser (см. Признаки) — документ, не действие.");
+      const exhaustedKeys = exhaustion.keys.filter((k) => k.display.value === "true");
+      if (exhaustedKeys.length > 0) {
+        recommendations.push(`Предлагается обзор осей с доверенной ступенью (см. Признаки: ${exhaustedKeys.map((k) => k.id).join(", ")}) — это не вывод об исчерпании.`);
+      }
+      const advisoryAxes = (exhaustion.axes ?? []).filter((a) => a.n >= ADVISORY_THRESHOLDS[0]);
+      if (advisoryAxes.length > 0) {
+        recommendations.push(`Предлагается обзор осей с накопленными сравнениями (см. Признаки: ${advisoryAxes.map((a) => a.axis).join(", ")}).`);
+      }
+      if (recommendations.length === 0) md.push(NO_DATA);
+      else for (const r of recommendations.slice(0, 3)) md.push(`- ${r} (иллюстративные примеры, не обязательный набор — FR-06.5).`);
+      md.push("");
+
+      // ── Write ONE document; never overwrite a previous one (§12.1: one file
+      // per call, previous documents are never rewritten). "wx" fails on an
+      // existing stamp (millisecond collisions); retry with -2, -3 … suffixes.
+      const reviewsDir = path.join(autoDir, "reviews");
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      let reviewPath: string | null = null;
+      try {
+        fs.mkdirSync(reviewsDir, { recursive: true });
+        for (let attempt = 1; attempt <= 100 && reviewPath === null; attempt++) {
+          const candidate = path.join(reviewsDir, attempt === 1 ? `direction-${stamp}.md` : `direction-${stamp}-${attempt}.md`);
+          try {
+            fs.writeFileSync(candidate, md.join("\n"), { flag: "wx" });
+            reviewPath = candidate;
+          } catch (e) {
+            if ((e as NodeJS.ErrnoException)?.code !== "EEXIST") throw e;
+          }
+        }
+        if (reviewPath === null) throw new Error(`no free review filename for stamp ${stamp}`);
+      } catch (e) {
+        return {
+          content: [{ type: "text", text: `❌ Failed to write review document: ${e instanceof Error ? e.message : String(e)}` }],
+          details: {},
+        };
+      }
+
+      const summary = md.filter((line) => line.startsWith("## ")).map((line) => line.replace("## ", "")).join(" → ");
+      return {
+        content: [{ type: "text", text: `📄 Direction review written: ${reviewPath}\nSections: ${summary}\nNo experiments were run; no direction was chosen (document only).` }],
+        details: { path: reviewPath, sections: md.filter((line) => line.startsWith("## ")).length },
+      };
+    },
+
+    renderResult(result, _options, theme) {
+      const t = result.content[0];
+      return new Text(t?.type === "text" ? t.text : "", 0, 0);
     },
   });
 
