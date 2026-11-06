@@ -1,0 +1,13 @@
+{"type":"config","name":"legacy-demo","metricName":"latency_ms","metricUnit":"ms","bestDirection":"lower"}
+{"type":"run_started","run_dir":1,"node_id":null,"command":"bench --rounds=5","started_at":"2026-01-10T09:00:00.000Z"}
+{"type":"run_result","run_dir":1,"started_at":"2026-01-10T09:00:00.000Z","node_id":null,"exit_code":0,"killed":false,"duration_seconds":12.5}
+{"run":1,"commit":"f1x9a2b","metric":120.5,"metrics":{"latency_ms":120.5},"status":"keep","description":"baseline build","timestamp":1768035600000,"segment":0,"confidence":0.6}
+{"type":"run_started","run_dir":2,"node_id":null,"command":"bench --rounds=5","started_at":"2026-01-10T09:05:00.000Z"}
+{"type":"run_result","run_dir":2,"started_at":"2026-01-10T09:05:00.000Z","node_id":null,"exit_code":1,"killed":false,"duration_seconds":3.2}
+{"run":2,"commit":"f1x9a2c","metric":0,"metrics":{},"status":"crash","description":"worker aborted before measuring","timestamp":1768035900000,"segment":0,"confidence":null}
+{"type":"run_started","run_dir":3,"node_id":null,"command":"bench --rounds=5","started_at":"2026-01-10T09:10:00.000Z"}
+{"type":"run_result","run_dir":3,"started_at":"2026-01-10T09:10:00.000Z","node_id":null,"exit_code":0,"killed":false,"duration_seconds":11.8}
+{"run":3,"commit":"f1x9a2d","metric":131.0,"metrics":{"latency_ms":131.0},"status":"discard","description":"cache change regressed latency","timestamp":1768036200000,"segment":0,"confidence":0.55}
+{"type":"run_started","run_dir":4,"node_id":null,"command":"bench --rounds=5","started_at":"2026-01-10T09:15:00.000Z"}
+{"type":"run_result","run_dir":4,"started_at":"2026-01-10T09:15:00.000Z","node_id":null,"exit_code":0,"killed":false,"duration_seconds":10.9}
+{"run":4,"commit":"f1x9a2e","metric":117.25,"metrics":{"latency_ms":117.25},"status":"keep","description":"buffer reuse","timestamp":1768036500000,"segment":0,"confidence":0.7}
