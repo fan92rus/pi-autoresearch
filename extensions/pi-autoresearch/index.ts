@@ -100,6 +100,26 @@ import {
   type MeasurementScaleStatus,
   type NoiseFloorStatus,
 } from "./measurement.ts";
+import {
+  appendRunLinkRecord,
+  beginRunIdentity,
+  consumeRunIdentity,
+  createExecutionId,
+  emptyRunLinksRuntime,
+  isRunNumber,
+  recordPendingMarker,
+  resetRunIdentities,
+  type RunLinksRuntime,
+} from "./run-links.ts";
+import {
+  journalPrefixSnapshot,
+  type JournalFs,
+} from "./research-analysis.ts";
+import {
+  journalTarget,
+  withJournalLock,
+} from "./research-journal.ts";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 
 import {
@@ -318,6 +338,8 @@ interface AutoresearchRuntime {
   lastMeasurement: { primary: number | null; wallClockSeconds: number } | null;
   /** Run number minted by the last run_experiment — also its .auto/runs/<n> artifact directory number. Consumed by the next log_experiment so the ledger entry binds to the right artifacts; null when no run precedes the log. */
   lastRunNumber: number | null;
+  /** research-map run-links pending identity (§5.2): the in-flight run_experiment call of this session. Consumed atomically by log_experiment together with lastRunNumber; reset by init_experiment and session restart. Per-process only — no state file (D-RM-08). */
+  runLinks: RunLinksRuntime;
 }
 
 // ---------------------------------------------------------------------------
@@ -1260,6 +1282,153 @@ const autoresearchScriptPath = (dir: string) => sessionFilePath(dir, "measure");
 const autoresearchConfigPath = (dir: string) => sessionFilePath(dir, "config");
 
 // -----------------------------------------------------------------------
+// Run-links sidecar wiring (research-map §5.2, D-RM-05/D-RM-08). Best-effort
+// by contract: any failure here warns and never fails the experiment itself.
+// The analysis prefix snapshot and the run_started marker write share ONE
+// analysis.lock critical section (§5.2/§9.3) — the exact serialized line is
+// captured at the moment of writing and hashed from that buffer (never
+// re-derived from the file). The pending identity is begun right after the
+// critical section with the captured prefix pair, and the marker line is
+// recorded into it immediately afterwards (single-threaded: nothing runs in
+// between).
+// -----------------------------------------------------------------------
+
+/** The node:fs subset journalPrefixSnapshot needs (production wiring). */
+const JOURNAL_FS: JournalFs = {
+  openSync: (file, flags) => fs.openSync(file, flags),
+  closeSync: (fd) => fs.closeSync(fd),
+  writeSync: (fd, data) => fs.writeSync(fd, data),
+  readSync: (fd, buffer, offset, length, position) => fs.readSync(fd, buffer, offset, length, position),
+  fstatSync: (fd) => fs.fstatSync(fd),
+  fsyncSync: (fd) => fs.fsyncSync(fd),
+  readFileSync: (file, encoding) => fs.readFileSync(file, encoding),
+  unlinkSync: (file) => fs.unlinkSync(file),
+};
+
+function sha256OfEmptyPrefix(): string {
+  return createHash("sha256").update(Buffer.alloc(0)).digest("hex");
+}
+
+/** Outcome of the §5.2 run_started critical section: the captured marker line
+ * plus the analysis prefix pair — `prefix: null` whenever the prefix is not
+ * confirmed (busy/unavailable lock, torn analysis tail, snapshot read error). */
+interface RunStartedMarkerOutcome {
+  prefix: { bytes: number; sha256: string } | null;
+  line: string | null;
+}
+
+/**
+ * §5.2/§9.3 run_started critical section: under the shared analysis.lock the
+ * process snapshots the analysis.jsonl byte prefix (bytes up to the last LF +
+ * sha256) AND appends the run_started marker line, then releases the lock — so
+ * no prereg writer (record_analysis) can interleave between the snapshot and
+ * the marker. A torn analysis tail (file bytes beyond the last LF) degrades to
+ * the null pair like any other unconfirmed snapshot. When the lock cannot be
+ * acquired (busy/unavailable after retries) the marker still goes out through
+ * a bare best-effort append with no confirmed prefix; a failed marker write
+ * yields `line: null` (sticky-incomplete identity downstream). Never throws.
+ */
+async function writeRunStartedMarkerWithPrefix(
+  autoDir: string,
+  jsonlPath: string,
+  buildLine: () => string,
+): Promise<RunStartedMarkerOutcome> {
+  try {
+    const locked = await withJournalLock(journalTarget(autoDir, "analysis"), () => {
+      const target = journalTarget(autoDir, "analysis");
+      const snap = journalPrefixSnapshot(target.file, JOURNAL_FS);
+      let prefix: { bytes: number; sha256: string } | null;
+      if (snap.state === "ok") {
+        // §5.2 torn analysis tail: bytes beyond the last LF leave the prefix
+        // boundary short of the file end — the reader-side pairing contract
+        // requires the null pair (unconfirmed), never a guess.
+        try {
+          prefix = fs.statSync(target.file).size > snap.bytes ? null : { bytes: snap.bytes, sha256: snap.sha256 };
+        } catch {
+          prefix = null;
+        }
+      } else if (snap.state === "missing") {
+        // §9.3: a missing file has a defined boundary — the 0-byte prefix.
+        prefix = { bytes: 0, sha256: sha256OfEmptyPrefix() };
+      } else {
+        // Torn tail state or snapshot read error: no confirmed prefix — the
+        // reader-side pairing contract requires the null pair.
+        prefix = null;
+      }
+      let line: string | null = null;
+      try {
+        ensureParentDir(jsonlPath);
+        line = buildLine();
+        fs.appendFileSync(jsonlPath, line + "\n");
+      } catch {
+        // Marker write failure makes the identity sticky-incomplete (§5.2);
+        // the run itself continues regardless.
+        line = null;
+      }
+      return { prefix, line };
+    });
+    if (locked.status === "acquired") return locked.value;
+  } catch { /* fall through to the bare best-effort append */ }
+  // Lock busy or unavailable after retries (or an unexpected failure): §5.2
+  // old path — the marker is still written (bare append, no confirmed prefix).
+  let line: string | null = null;
+  try {
+    ensureParentDir(jsonlPath);
+    line = buildLine();
+    fs.appendFileSync(jsonlPath, line + "\n");
+  } catch {
+    line = null;
+  }
+  return { prefix: null, line };
+}
+
+/**
+ * Try to record one pending marker into the pending identity (§5.2). A failed
+ * marker write is sticky: line=null once recorded can never be healed by a
+ * later re-record. Never throws.
+ */
+function tryRecordPendingMarker(
+  runtime: AutoresearchRuntime,
+  kind: "started" | "result",
+  executionId: string,
+  line: string | null,
+): void {
+  try {
+    runtime.runLinks = recordPendingMarker(runtime.runLinks, kind, executionId, line);
+  } catch {
+    // Pending-identity bookkeeping failure must not affect the experiment.
+  }
+}
+
+/** Begin a fresh pending identity, evicting any unconsumed previous one (§5.2). Never throws. */
+function tryBeginRunIdentity(runtime: AutoresearchRuntime, run: number | null, prefix: { bytes: number; sha256: string } | null): string | null {
+  try {
+    const executionId = createExecutionId();
+    runtime.runLinks = beginRunIdentity(runtime.runLinks, {
+      executionId,
+      run,
+      analysisPrefixBytes: prefix === null ? null : prefix.bytes,
+      analysisPrefixSha256: prefix === null ? null : prefix.sha256,
+    });
+    return executionId;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Rejection-path reminder (§5.2): when a pending run identity exists and the
+ * tool call is rejected before consuming it (e.g. an invalid parameter), the
+ * agent must re-issue the call — otherwise the pending object is never bound
+ * to a ledger row. Empty when there is nothing pending; never thrown or fatal.
+ */
+function runLinkNotConsumedWarning(runtime: AutoresearchRuntime): string {
+  return runtime.runLinks.pending !== null
+    ? "\n⚠ The pending run link was not consumed by this rejected call — re-issue the call (research-map §5.2)."
+    : "";
+}
+
+// -----------------------------------------------------------------------
 // Experiment tree integration helper
 // -----------------------------------------------------------------------
 
@@ -1619,6 +1788,7 @@ function createSessionRuntime(): AutoresearchRuntime {
     lastLogFlag: null,
     lastMeasurement: null,
     lastRunNumber: null,
+    runLinks: emptyRunLinksRuntime(),
   };
 }
 
@@ -2389,6 +2559,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     runtime.autoResumeTurns = 0;
     runtime.lastMeasurement = null;
     runtime.lastRunNumber = null;
+    // Pending identity is per-process only (§5.2): identity is never restored
+    // by run number after a restart, so a fresh session starts empty.
+    runtime.runLinks = resetRunIdentities(runtime.runLinks);
     runtime.state = createExperimentState();
 
     let state = runtime.state;
@@ -2958,6 +3131,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // number: a new segment never inherits the previous segment's binding.
       runtime.lastMeasurement = null;
       runtime.lastRunNumber = null;
+      // Run-links pending identity (§5.2): a new segment never inherits the
+      // previous segment's binding.
+      runtime.runLinks = resetRunIdentities(runtime.runLinks);
       if (params.direction === "lower" || params.direction === "higher") {
         state.bestDirection = params.direction;
       }
@@ -3904,9 +4080,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // TODO(/tree): replace compaction-based resume with a checkpoint-per-iteration model.
       runtime.runningExperiment = { startedAt: Date.now(), command: params.command };
-      // Ledger marker BEFORE the spawn (goal-x discipline: events before action).
-      // If the session dies mid-benchmark, reconstructState sees a run_started
-      // without a matching run_result and marks the hypothesis node crashed.
+      // Run-links identity (§5.2): 128-bit execution_id bound to the minted
+      // run number BEFORE the run_started marker write, so the exact serialized
+      // line can be captured at the moment of writing. Best-effort: on any
+      // failure the run continues without a sidecar record (D-RM-08). The
+      // analysis prefix snapshot AND the run_started marker write share the
+      // shared analysis.lock critical section; a busy lock, torn tail, read
+      // error or failed marker write degrades per §5.2 (null prefix pair /
+      // sticky-incomplete identity) and never blocks the run.
+      const runNumberForLinks = runArtifacts?.runNumber ?? null;
+      const runLinkRun = isRunNumber(runNumberForLinks) ? runNumberForLinks : null;
+      let runLinkExecutionId: string | null = null;
       const runStartedAt = new Date().toISOString();
       let runNodeId: string | null = params.hypothesis_id ?? null;
       if (!runNodeId && treeExists(workDir)) {
@@ -3915,11 +4099,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           runNodeId = startedTree ? (findRunningNode(startedTree)?.id ?? null) : null;
         } catch { runNodeId = null; }
       }
+      const jsonlPath = autoresearchJsonlPath(workDir);
+      const buildRunStartedLine = () => JSON.stringify({ type: "run_started", run_dir: runArtifacts?.runNumber, node_id: runNodeId, command: params.command, started_at: runStartedAt });
       try {
-        const jsonlPath = autoresearchJsonlPath(workDir);
-        ensureParentDir(jsonlPath);
-        fs.appendFileSync(jsonlPath, JSON.stringify({ type: "run_started", run_dir: runArtifacts?.runNumber, node_id: runNodeId, command: params.command, started_at: runStartedAt }) + "\n");
-      } catch { /* best-effort — the run itself matters more than its marker */ }
+        const markerOutcome = await writeRunStartedMarkerWithPrefix(path.join(workDir, AUTO_DIR), jsonlPath, buildRunStartedLine);
+        runLinkExecutionId = tryBeginRunIdentity(runtime, runLinkRun, markerOutcome.prefix);
+        if (runLinkExecutionId !== null) {
+          tryRecordPendingMarker(runtime, "started", runLinkExecutionId, markerOutcome.line);
+        }
+      } catch { /* best-effort: run continues without pending identity */ }
+      // Ledger marker written BEFORE the spawn (goal-x discipline: events before
+      // action, inside the critical section above). If the session dies
+      // mid-benchmark, reconstructState sees a run_started without a matching
+      // run_result and marks the hypothesis node crashed.
       updateWidget(ctx);
       if (overlayTui) overlayTui.requestRender();
 
@@ -4131,10 +4323,20 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       });
 
       // Matching ledger marker AFTER the spawn resolves (exit/timeout/kill alike).
+      let runResultLine: string | null = null;
       try {
         const jsonlPath = autoresearchJsonlPath(workDir);
-        fs.appendFileSync(jsonlPath, JSON.stringify({ type: "run_result", run_dir: runArtifacts?.runNumber, started_at: runStartedAt, node_id: runNodeId, exit_code: exitCode, killed: timedOut, duration_seconds: Number(durationSeconds.toFixed(1)) }) + "\n");
-      } catch { /* best-effort */ }
+        runResultLine = JSON.stringify({ type: "run_result", run_dir: runArtifacts?.runNumber, started_at: runStartedAt, node_id: runNodeId, exit_code: exitCode, killed: timedOut, duration_seconds: Number(durationSeconds.toFixed(1)) });
+        fs.appendFileSync(jsonlPath, runResultLine + "\n");
+      } catch {
+        // best-effort
+        runResultLine = null;
+      }
+      if (runLinkExecutionId !== null) {
+        // A late/evicted identity is ignored inside recordPendingMarker (§5.2):
+        // completion never replaces a newer pending object.
+        tryRecordPendingMarker(runtime, "result", runLinkExecutionId, runResultLine);
+      }
 
       // Parse structured METRIC lines from output
       const parsedMetricMap = parseMetricLines(output);
@@ -4413,7 +4615,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // any side effect, so the ledger, git and the pending run number stay untouched.
       if (params.activity_type !== undefined && !(ACTIVITY_TYPES as readonly string[]).includes(params.activity_type)) {
         return {
-          content: [{ type: "text", text: `❌ Invalid activity_type "${String(params.activity_type)}". Allowed: ${ACTIVITY_TYPES.join(", ")}. Omit the parameter when no label applies.` }],
+          content: [{ type: "text", text: `❌ Invalid activity_type "${String(params.activity_type)}". Allowed: ${ACTIVITY_TYPES.join(", ")}. Omit the parameter when no label applies.${runLinkNotConsumedWarning(runtime)}` }],
           details: {},
         };
       }
@@ -4488,6 +4690,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           ensureParentDir(jsonlPath);
           fs.appendFileSync(jsonlPath, JSON.stringify({ run: state.results.length + 1, commit: params.commit, metric: params.metric, status: "explore", description: params.description, segment: state.currentSegment, epoch: measurementScaleStatusOfDir(workDir).epoch, phaseStep: phase.stepsTaken, ...(params.activity_type !== undefined ? { activity_type: params.activity_type } : {}) }) + "\n");
         } catch { /* best-effort */ }
+        // Run-links sidecar skip (BR-12/T33, §5.2): the explore row shares the run
+        // numbering space but is not an ordinary run — a sidecar record would be
+        // ambiguous at read time (run_number_shared), so none is written. The
+        // pending identity is reset, mirroring the non-consumption of the minted
+        // number: explore rows are never sidecar-bound.
+        runtime.runLinks = resetRunIdentities(runtime.runLinks);
         persistPhase(runtime.phaseStore, workDir);
 
         let exploreText = `🔄 explore step ${phase.stepsTaken}/${phase.maxSteps}: metric=${params.metric}`;
@@ -4556,6 +4764,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         runtime.lastRunNumber ??
         Math.max(readLedgerMaxRun(workDir), highestRunDirNumber(workDir)) + 1;
       runtime.lastRunNumber = null;
+      // Fallback numbering (no in-session run_experiment): a computed fallback
+      // number never proves a link (§5.2) — consume the pending slot without
+      // binding, so a stale identity cannot attach to a guessed number.
+      if (runtime.runLinks.pending !== null && runtime.runLinks.pending.run !== runNumber) {
+        runtime.runLinks = resetRunIdentities(runtime.runLinks);
+      }
 
       // Measurement epoch of this run (task 2.3): every run logged now carries the
       // ledger's current scale epoch, so a later measurement_change never leaves it
@@ -4817,13 +5031,56 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
       const jsonlLine = JSON.stringify(jsonlEntry);
 
+      // Run-links sidecar (§5.2): consume the pending identity atomically with
+      // the run number being logged, and with the EXACT serialized line
+      // (sha256Line over the same buffer). Consumption itself does not write the
+      // sidecar: on any failure reason (no_pending / run_mismatch / poisoned /
+      // incomplete) nothing is written to the sidecar; the response carries a
+      // warning and the ledger append below is byte-identical to the
+      // pre-research-map behavior. The sidecar record is appended only AFTER the
+      // ordinary ledger row write succeeds (§5.2: "после успешной записи обычной
+      // строки леджера") — a failed ledger append writes NO sidecar record, so a
+      // log_sha256 can never reference a line that never landed. Best-effort: a
+      // sidecar write failure never fails the log.
+      let runLinkWarning: string | null = null;
+      let consumedLink: ReturnType<typeof consumeRunIdentity> | null = null;
+      try {
+        consumedLink = consumeRunIdentity(runtime.runLinks, runNumber, jsonlLine);
+        runtime.runLinks = consumedLink.state;
+        if (consumedLink.reason === "no_pending") {
+          runLinkWarning = "⚠ Run link not recorded: no pending run identity for this session (research-map §5.2). The ledger row is unaffected; this run cannot be confirmed as proven later.";
+        } else if (consumedLink.reason === "run_mismatch") {
+          runLinkWarning = "⚠ Run link not recorded: pending identity belongs to another run number. The ledger row is unaffected; this run cannot be confirmed as proven later.";
+        } else if (consumedLink.reason === "poisoned") {
+          runLinkWarning = "⚠ Run link not recorded: run_experiment calls overlapped in this session, so neither can be proven (research-map §5.2). The ledger row is unaffected.";
+        } else if (consumedLink.reason === "incomplete") {
+          runLinkWarning = "⚠ Run link not recorded: a run_started/run_result marker write failed for this run. The ledger row is unaffected; this run cannot be confirmed as proven later.";
+        }
+      } catch (e) {
+        runLinkWarning = `⚠ Run link not recorded: ${e instanceof Error ? e.message : String(e)}. The ledger row is unaffected.`;
+      }
+
+      let ledgerRowAppended = false;
       try {
         const jsonlPath = autoresearchJsonlPath(workDir);
         ensureParentDir(jsonlPath);
         fs.appendFileSync(jsonlPath, jsonlLine + "\n");
+        ledgerRowAppended = true;
         broadcastDashboardUpdate(workDir);
       } catch (e) {
         text += `\n⚠️ Failed to write .auto/log.jsonl: ${e instanceof Error ? e.message : String(e)}`;
+      }
+
+      // Sidecar AFTER the ledger row (§5.2): only a confirmed link from a
+      // successful append above, never for a failed ledger row write.
+      if (ledgerRowAppended && consumedLink !== null && consumedLink.link !== null) {
+        const appended = await appendRunLinkRecord(path.join(workDir, AUTO_DIR), consumedLink.link);
+        if (appended.status !== "appended") {
+          runLinkWarning = `⚠ Run link not recorded (run-links sidecar append failed: ${appended.status}). The ledger row is unaffected; this run cannot be confirmed as proven later.`;
+        }
+      }
+      if (runLinkWarning) {
+        text += `\n${runLinkWarning}`;
       }
 
       // ── Experiment tree: update or create node ──
