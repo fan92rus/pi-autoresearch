@@ -96,6 +96,25 @@ const KNOWN_POLICY_KEYS: readonly string[] = [
 
 const SHA256_RE = /^[0-9a-f]{64}$/i;
 
+/**
+ * Shape check for one change_files entry. Returns the reason it is refused, or
+ * null. Accepts only normalized repo-relative paths: no absolute or drive paths,
+ * no empty, '.', '..' or '.git' segments, and no segment that Windows would
+ * silently normalize (trailing dot or space).
+ */
+function changeFilePathError(p: string): string | null {
+  const s = p.replace(/\\/g, "/");
+  if (s.length === 0) return "is empty";
+  if (s.startsWith("/") || /^[A-Za-z]:/.test(s)) return "must be repo-relative, not absolute";
+  for (const seg of s.split("/")) {
+    if (seg === "") return "has an empty path segment";
+    if (seg === "." || seg === "..") return "must not contain '.' or '..' segments";
+    if (seg.toLowerCase() === ".git") return "must not point into .git";
+    if (/[. ]$/.test(seg)) return "has a segment with a trailing dot or space";
+  }
+  return null;
+}
+
 // ─── Validation ──────────────────────────────────────────────────────────────
 
 export interface PolicyValidationResult {
@@ -271,14 +290,25 @@ export function validateCandidatePolicy(raw: unknown): PolicyValidationResult {
     return { ok: false, errors };
   }
 
+  // Shape of change_files: repo-relative, normalized, no traversal, no .git.
+  // A path that is not in this form can name a methodology file in a spelling
+  // the guard below does not match, so it is refused here.
+  for (const p of changeFiles) {
+    const shapeError = changeFilePathError(p);
+    if (shapeError !== null) {
+      errors.push(`"change_files" entry ${JSON.stringify(p)} ${shapeError}`);
+    }
+  }
+
   // Cross-field: the candidate must never be able to edit methodology files
   // (design §3: "Файлы методики не изменяются кандидатом").
-  // Compare in one spelling: a backslash path (src\\method.md) names the same
-  // file as src/method.md and must not slip past the methodology guard.
-  const slash = (p: string): string => p.replace(/\\/g, "/");
-  const methodologyPaths = new Set(methodologyFiles.map((f) => slash(f.path)));
+  // Compare in one spelling: backslashes become slashes, and case is folded
+  // (Windows file systems are case-insensitive), so src\\METHOD.md and
+  // src/method.md are the same file for this guard.
+  const canon = (p: string): string => p.replace(/\\/g, "/").toLowerCase();
+  const methodologyPaths = new Set(methodologyFiles.map((f) => canon(f.path)));
   for (const p of changeFiles) {
-    if (methodologyPaths.has(slash(p))) {
+    if (methodologyPaths.has(canon(p))) {
       errors.push(
         `"change_files" must not contain methodology file ${JSON.stringify(p)}: methodology files are not modified by the candidate`,
       );

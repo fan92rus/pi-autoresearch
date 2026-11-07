@@ -911,3 +911,20 @@ test("an agent-supplied flag has no effect: the API has no consent parameter at 
   assert.equal(result.stage, "validation");
   assert.ok(result.errors.some((e) => e.includes('unknown field "user_agreed"')));
 });
+
+// Review round (m1): change_files shape and case-insensitive methodology overlap.
+test("change_files: traversal, absolute, dot-trailing and .git entries are refused at init", () => {
+  for (const bad of ["../x", "/abs/x", "src/../src/method.md", "src/method.md.", ".git/config", "a//b"]) {
+    const r = validateCandidatePolicy({ ...validPolicyRaw(), change_files: [bad] });
+    assert.equal(r.ok, false, `change_files entry ${JSON.stringify(bad)} must be refused`);
+  }
+});
+
+test("change_files: a methodology file in another case is refused (Windows case-insensitive)", () => {
+  const r = validateCandidatePolicy({
+    ...validPolicyRaw(),
+    methodology_files: [{ path: "src/method.md", sha256: "a".repeat(64) }],
+    change_files: ["SRC/METHOD.md"],
+  });
+  assert.equal(r.ok, false, "a methodology file in another case must not be editable by the candidate");
+});

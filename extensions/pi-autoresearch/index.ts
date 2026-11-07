@@ -2368,6 +2368,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       cancelPendingResume(runtime);
       return;
     }
+    // Re-check the campaign at SEND time: a message scheduled before an operation
+    // became pending, or before a campaign started, must not be delivered now.
+    // (design §5: unclear state -> stop; active campaign -> candidate wording only.)
+    const workDirNow = resolveWorkDir(ctx.cwd);
+    if (campaignPendingOpSync(workDirNow)) {
+      cancelPendingResume(runtime);
+      return;
+    }
     if (!isAgentSettled(ctx)) return;
     const stopReason = autoResumeStopReasonFor(runtime);
     if (stopReason !== null) {
@@ -2378,7 +2386,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     cancelPendingResume(runtime);
     markAutoResumeSent(runtime);
-    pi.sendUserMessage(message);
+    // A legacy-cycle message stored before a campaign started is replaced by the
+    // campaign wording at send time (design §5: no ordinary run/log prescription).
+    const sendText =
+      campaignActiveSync(workDirNow) && !/candidate_branch/.test(message)
+        ? composeCampaignResumeMessage(ctx)
+        : message;
+    pi.sendUserMessage(sendText);
   };
 
   const schedulePendingResume = (ctx: ExtensionContext, runtime: AutoresearchRuntime, message: string): void => {
@@ -2980,8 +2994,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         schedulePendingResume(ctx, runtime, await composeDriftResumeMessage(resolveWorkDir(ctx.cwd)));
         return;
       }
+      // Under an active candidate campaign the notice must not prescribe the
+      // ordinary loop (design §5); it names the campaign tool instead.
       ctx.ui.notify(
-        "Autoresearch paused — the last turns did no experiment work (no run_experiment/log_experiment). Run /autoresearch <goal> to resume the loop.",
+        campaignActiveSync(resolveWorkDir(ctx.cwd))
+          ? "Autoresearch paused — the last turns did no candidate-campaign work. Use candidate_branch status to see the state, then resume the campaign."
+          : "Autoresearch paused — the last turns did no experiment work (no run_experiment/log_experiment). Run /autoresearch <goal> to resume the loop.",
         "info",
       );
       return;
@@ -7971,11 +7989,30 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
    * True when the campaign state is unclear (pending operation, stale lock,
    * unreadable state): automatic resume messages are then not scheduled.
    */
+  /** Synchronous: usable from the resume timer. Interrupted operation present. */
+  const campaignPendingOpSync = (workDir: string): boolean =>
+    fs.existsSync(path.join(campaignDirOf(workDir), candidateState.PENDING_OP_FILE));
+
+  /**
+   * Synchronous: a candidate campaign is active (state exists and is not disabled,
+   * or is unreadable — fail closed). Mirrors campaignBlocksOrdinaryLoop.
+   */
+  const campaignActiveSync = (workDir: string): boolean => {
+    const statePath = path.join(campaignDirOf(workDir), candidateState.STATE_FILE);
+    if (!fs.existsSync(statePath)) return false;
+    try {
+      const raw = JSON.parse(fs.readFileSync(statePath, "utf8"));
+      return !(raw && typeof raw === "object" && raw.disabled === true);
+    } catch {
+      return true;
+    }
+  };
+
   const campaignNeedsManualCheck = async (workDir: string): Promise<boolean> => {
     // Scoped to an interrupted operation (the pending-op marker). An unreadable
     // state still blocks the ordinary loop tools (campaignBlocksOrdinaryLoop), but
     // does not by itself suppress steers, which would hide the real state from the agent.
-    return fs.existsSync(path.join(campaignDirOf(workDir), candidateState.PENDING_OP_FILE));
+    return campaignPendingOpSync(workDir);
   };
 
   const campaignBlocksOrdinaryLoop = async (workDir: string): Promise<boolean> => {
@@ -8128,7 +8165,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           if (lm && typeof lm.average === "number") text += `Last measurement: ${JSON.stringify(String(lm.metric_name))} average ${lm.average} (candidate ${JSON.stringify(String(lm.candidate))}, ${lm.at})
 `;
         } catch { /* no measurement yet */ }
-        if (insp.lockPresent) text += "Lock file present — if no process is running, resolve with manualClearLock (operator action)\n";
+        if (insp.lockPresent) text += "Lock file present — if no process is running, resolve (operator action, dialog-confirmed)\n";
         return { content: [{ type: "text", text }], details: { inspection: insp as any, leader: leaderSha } };
       }
 

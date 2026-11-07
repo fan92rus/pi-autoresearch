@@ -276,3 +276,36 @@ test("N4 drift path: a settled turn with NO tool events under a pending operatio
   const resumes = pi.sentMessages.filter((m) => RESUME_TEXT.test(m.text));
   assert.equal(resumes.length, 0, `drift resume must not fire under a pending operation: ${JSON.stringify(resumes.map((m) => m.text))}`);
 }, { timeout: 30000 });
+
+test("N4 reschedule: a resume scheduled BEFORE a pending op appears is not delivered once it exists", async () => {
+  const dir = makeTempDir("steer-reschedule");
+  fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
+  const statePath = path.join(dir, ".auto", "candidate", "state.json");
+  fs.writeFileSync(statePath, JSON.stringify({ schema_version: 1, disabled: false, policy: {}, candidates: [] }), "utf8");
+  const { pi, hook, ctx } = await makeFullHarnessAt(dir, "steer-reschedule-ctx");
+  await hook("agent_start")({ messages: [] }, ctx);
+  await hook("agent_end")({ messages: [] }, ctx); // schedules a drift resume (no pending op yet)
+  await hook("agent_start")({ messages: [] }, ctx); // timer paused, message kept
+  fs.writeFileSync(path.join(dir, ".auto", "candidate", "pending-op.json"),
+    JSON.stringify({ name: "checkpoint cand-a", started_at: new Date().toISOString() }), "utf8");
+  await hook("agent_end")({ messages: [] }, ctx);
+  await new Promise((r) => setTimeout(r, 1200));
+  const RESUME_TEXT = /Continue the candidate campaign|Last turn did no candidate-campaign work|Run the next iteration|Resume the cycle/;
+  const resumes = pi.sentMessages.filter((m) => RESUME_TEXT.test(m.text));
+  assert.equal(resumes.length, 0, `a stored resume must not leak into a pending operation: ${JSON.stringify(resumes.map((m) => m.text))}`);
+}, { timeout: 30000 });
+
+test("M1: a legacy resume stored before the campaign started is replaced by campaign wording at send time", async () => {
+  const dir = makeTempDir("steer-legacy-then-campaign");
+  const { pi, hook, ctx } = await makeFullHarnessAt(dir, "steer-legacy-then-campaign-ctx");
+  await hook("agent_start")({ messages: [] }, ctx);
+  await hook("tool_execution_end")({ toolName: "propose_hypothesis" }, ctx);
+  await hook("agent_end")({ messages: [] }, ctx); // legacy partial-cycle resume scheduled
+  // The campaign starts before the timer fires.
+  fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".auto", "candidate", "state.json"),
+    JSON.stringify({ schema_version: 1, disabled: false, policy: {}, candidates: [] }), "utf8");
+  await new Promise((r) => setTimeout(r, 1200));
+  const legacy = pi.sentMessages.filter((m) => /run_experiment \+ log_experiment|Run the next iteration now/.test(m.text));
+  assert.equal(legacy.length, 0, `legacy text must not be delivered under a campaign: ${JSON.stringify(pi.sentMessages.map((m) => m.text))}`);
+}, { timeout: 30000 });
