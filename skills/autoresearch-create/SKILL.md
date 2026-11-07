@@ -200,3 +200,17 @@ On resume (context limit, crash), check `.auto/ideas/` — remove tried files, e
 ## User Messages During Experiments
 
 If the user sends a message while an experiment is running, finish the current `run_experiment` + `log_experiment` cycle first, then incorporate their feedback in the next iteration. Don't abandon a running experiment.
+
+## Candidate-branch mode (opt-in)
+
+When a candidate campaign is active (`candidate_branch` `init` succeeded),
+the system prompt switches to candidate-mode rules: work only through
+`candidate_branch`, do not call `run_experiment` or `log_experiment` (they
+are blocked), and never pass or simulate policy consent. If an operation is
+pending or a lock is stale, stop and report `manual_check_required`; only
+the operator's dialog (`resolve`) clears it. Details and limits:
+`docs/candidate-branches.md`.
+
+Without an active campaign, this skill's loop instructions above apply
+unchanged. Do not create a `.auto/prompt.md` that contradicts the mode in
+effect: write the candidate section only when the user chose the campaign.
