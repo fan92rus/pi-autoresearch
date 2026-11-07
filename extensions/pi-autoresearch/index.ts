@@ -7876,12 +7876,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const campaignBlocksOrdinaryLoop = async (workDir: string): Promise<boolean> => {
     const statePath = path.join(campaignDirOf(workDir), candidateState.STATE_FILE);
     if (!fs.existsSync(statePath)) return false;
+    // Fail closed (design §4): an existing but unreadable or malformed state is an
+    // unclear campaign state, so the ordinary loop stays blocked until the operator
+    // resolves it. Only a readable state with disabled === true lets the loop run.
     try {
       const raw = JSON.parse(fs.readFileSync(statePath, "utf8"));
-      if (raw && typeof raw === "object" && raw.disabled === false) return true;
-      return false;
+      if (raw && typeof raw === "object" && raw.disabled === true) return false;
+      return true;
     } catch {
-      return false;
+      return true;
     }
   };
 

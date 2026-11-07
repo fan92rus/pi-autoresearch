@@ -22,7 +22,8 @@
  *    remove` first, --force only for the paths this call created). Candidate
  *    work worktrees are never deleted (MVP).
  *  - While a campaign is initialized and not disabled, run_experiment and
- *    log_experiment refuse (tasks 3.2). A missing or corrupted state file
+ *    log_experiment refuse (tasks 3.2). A missing state file keeps the ordinary loop;
+ *    an existing but corrupted state file fails closed (blocks it)
  *    keeps the ordinary loop working.
  *
  * Run: timeout 300 node --experimental-strip-types --experimental-loader ./tests/redirect-loader.mjs --test tests/candidate-branch-wiring.test.mjs
@@ -522,10 +523,10 @@ test("no campaign on disk: ordinary loop behaves exactly as before", async () =>
   const res = await runExp.execute("id", { command: "echo hi", timeout_seconds: 10 }, null, null, h.ctx);
   const text = textOf(res);
   assert.equal(/candidate campaign active/i.test(text), false, "no campaign -> no blocking");
-  // corrupt state file => still no blocking of the ordinary loop
+  // corrupt state file => FAIL CLOSED (design §4): an unclear campaign state blocks the ordinary loop
   writeFileSyncSafe(path.join(dir, ".auto", "candidate", "state.json"), "{corrupt");
   const res2 = await runExp.execute("id", { command: "echo hi", timeout_seconds: 10 }, null, null, h.ctx);
-  assert.equal(/candidate campaign active/i.test(textOf(res2)), false, "corrupt state -> no blocking");
+  assert.equal(/candidate campaign active/i.test(textOf(res2)), true, "corrupt state -> fail-closed blocking");
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
