@@ -3205,7 +3205,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     description:
       "Initialize the experiment session. Call once before the first run_experiment to set the name, primary metric, unit, and direction. Writes the config header to .auto/log.jsonl.",
     promptSnippet:
-      "Initialize experiment session (name, metric, unit, direction). Call once before first run.",
+      "Initialize experiment session (name, metric, unit, direction). Call once before first run. (ordinary loop; blocked during a candidate campaign)",
     promptGuidelines: [
       "Call init_experiment exactly once at the start of an autoresearch session, before the first run_experiment.",
       "If the session log (.auto/log.jsonl) already exists with a config, do NOT call init_experiment again.",
@@ -3472,7 +3472,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "Takes either a description string (saved to .auto/ideas/<nodeId>.md) or a path to an existing file. " +
       "SimHash checks against all existing nodes; duplicates get status=duplicate unless force=true. " +
       "Returns the node_id to pass to run_experiment(hypothesis_id).",
-    promptSnippet: "Register a hypothesis in the tree before run_experiment",
+    promptSnippet: "Register a hypothesis in the tree before run_experiment (ordinary loop; blocked during a candidate campaign)",
     promptGuidelines: [
       "ALWAYS call propose_hypothesis BEFORE run_experiment to register the idea.",
       "SimHash duplicate detection runs at registration time, not at run time.",
@@ -4030,7 +4030,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     description:
       `Run a shell command as an experiment. Times wall-clock duration, captures output, detects pass/fail via exit code. Output is truncated to last ${EXPERIMENT_MAX_LINES} lines or ${EXPERIMENT_MAX_BYTES / 1024}KB (whichever is hit first). Full output is always saved to .auto/runs/<n>/output.txt (the path is in the response). Use for any autoresearch experiment.`,
     promptSnippet:
-      "Run a timed experiment command (captures duration, output, exit code)",
+      "Run a timed experiment command (captures duration, output, exit code). Ordinary loop; blocked during a candidate campaign.",
     promptGuidelines: [
       "An experiment ONLY exists if it ran through run_experiment: bash-run benchmarks are invisible to the ledger, corrupt the noise floor, and their edits are lost on the next revert.",
       "Always pass a tight timeout_seconds (required). A runaway process will be force-killed at the limit and logged as 'crash'.",
@@ -7527,7 +7527,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     promptSnippet: "Convene a hypothesis council yourself (autonomous + blocking) — returns the finished slate",
     promptGuidelines: [
       "When stuck (e.g. a long failure streak with no keep in sight, or every direction ends in 'no effect'), convene a council: council_convene({ note: \"...\" }).",
-      "The tool runs the whole council itself and blocks for several minutes; the returned text carries the finished slate — register each EXP via propose_hypothesis.",
+      "The tool runs the whole council itself and blocks for several minutes; the returned text carries the finished slate — follow the instructions in that text.",
     ],
     parameters: {
       type: "object",
@@ -7663,7 +7663,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const file = persistSlateEntry(councilDirAbs, outcome.slate);
         const inCampaign = await campaignBlocksOrdinaryLoop(workDir);
         const nextStep = inCampaign
-          ? "Register each EXP via propose_hypothesis (SimHash dedup applies), then run them through the candidate campaign (candidate_branch), not run_experiment."
+          ? "Follow the slate through the candidate campaign (candidate_branch: run/checkpoint on the active candidate), not run_experiment or propose_hypothesis."
           : "Register each EXP via propose_hypothesis (SimHash dedup applies) and run them through the normal loop.";
         const header = "🏛 COUNCIL #" + seq + " COMPLETE — " + outcome.rounds + " challenge round(s)"
           + (outcome.corrected ? ", slate corrected after validation" : "")
@@ -8906,7 +8906,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           "Convene a hypothesis council NOW: call council_convene({" + noteArg + "}). " +
           "The tool is autonomous and BLOCKING — it runs the analysts, challenge rounds and chair itself and returns the finished slate. " +
           (councilInCampaign
-            ? "When it returns, register each slate EXP via propose_hypothesis and run them through the candidate campaign (candidate_branch), not run_experiment."
+            ? "When it returns, follow the slate through the candidate campaign (candidate_branch), not run_experiment or propose_hypothesis."
             : "When it returns, register each slate EXP via propose_hypothesis and run them through the normal loop."),
           { deliverAs: "followUp" },
         );
