@@ -1,6 +1,6 @@
 # Задачи реализации кандидатного MVP
 
-Реализация выполнена в коммитах 2799b07, 8d2c8fe, 98ae1cf, 31c63fa, 896273f, 33ab1d6, 71a2fb3 (ветка master). Доказательства: `tests/candidate-policy.test.mjs` (44), `tests/candidate-state.test.mjs` (39), `tests/candidate-worktree.test.mjs` (34), `tests/candidate-measure.test.mjs` (47), `tests/candidate-branch-wiring.test.mjs` (36), `tests/candidate-prompt.test.mjs` (3); полный набор `tests/*.test.mjs`: 1296 прошли, 0 упали, 3 пропущены (pre-existing). Проверки интеграции и ручной разбор описаны в `docs/candidate-branches.md`.
+Реализация выполнена в коммитах 2799b07, 8d2c8fe, 98ae1cf, 31c63fa, 896273f, 33ab1d6, 71a2fb3, 5cb3a9a и последующих fix-коммитах до 82c4665 (ветка master). Доказательства (число тестов по файлам по последнему прогону): `tests/candidate-policy.test.mjs` (47), `tests/candidate-state.test.mjs` (40), `tests/candidate-worktree.test.mjs` (34), `tests/candidate-measure.test.mjs` (47), `tests/candidate-branch-wiring.test.mjs` (47), `tests/candidate-prompt.test.mjs` (21); полный набор `tests/*.test.mjs`: 1296 прошли, 0 упали, 3 пропущены (pre-existing). Проверки интеграции и ручной разбор описаны в `docs/candidate-branches.md`.
 
 ## 1. Кампания и штатная работа
 
