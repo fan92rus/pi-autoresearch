@@ -689,3 +689,29 @@ test("an approved brief whose bytes are structurally invalid is brief_invalid", 
     assertRefusal(await R.checkBriefApproval(dir), "brief_invalid");
   });
 });
+
+test("manualResolvePendingOp clears the marker only with the operator token under the lock", async () => {
+  await withWorkDir(async (root) => {
+    const dir = await newCampaign(root, "c1");
+    await writeFile(join(dir, R.PENDING_OP_FILE), JSON.stringify({ name: "close", started_at: "2026-01-01T00:00:00Z" }));
+
+    const wrong = await R.manualResolvePendingOp(dir, "let-me-in");
+    assert.equal(wrong.ok, false);
+    assert.equal(wrong.reason, "invalid_argument");
+    assert.ok(existsSync(join(dir, R.PENDING_OP_FILE)), "marker must stay without the operator token");
+
+    const res = await R.manualResolvePendingOp(dir, R.OPERATOR_CONFIRMATION);
+    assert.equal(res.ok, true, JSON.stringify(res));
+    assert.equal(existsSync(join(dir, R.PENDING_OP_FILE)), false, "operator consent clears the marker");
+    const state = await R.readState(dir);
+    assert.equal(state.ok, true, "state.json is untouched by resolution");
+
+    const again = await R.manualResolvePendingOp(dir, R.OPERATOR_CONFIRMATION);
+    assert.equal(again.ok, false);
+    assert.equal(again.reason, "invalid_transition");
+
+    const outside = join(root, "outside", "c1");
+    await mkdir(outside, { recursive: true });
+    assertRefusal(await R.manualResolvePendingOp(outside, R.OPERATOR_CONFIRMATION), "invalid_argument");
+  });
+});

@@ -56,6 +56,9 @@ export const PENDING_OP_FILE = "pending-op.json";
 export const VERDICTS = ["confirmed", "rejected", "inconclusive", "waiting_for_data"] as const;
 export type Verdict = (typeof VERDICTS)[number];
 
+/** Explicit operator token required by manualResolvePendingOp (spec: manual recovery). */
+export const OPERATOR_CONFIRMATION = "operator-manual-check-done";
+
 export const CAMPAIGN_PHASES = ["briefing", "research", "stopped"] as const;
 export type CampaignPhase = (typeof CAMPAIGN_PHASES)[number];
 
@@ -855,4 +858,27 @@ async function approvedBriefGuard(dir: string): Promise<Refusal | null> {
   if (!(await fileMayExist(join(dir, APPROVAL_FILE)))) return null;
   const checked = await checkBriefApproval(dir);
   return checked.ok ? null : checked;
+}
+
+/**
+ * Operator-consented removal of a pending-operation marker (spec: manual
+ * recovery). The model cannot clear the marker itself: it must go through the
+ * tool layer, which asks the human via a dialog and passes the explicit
+ * operator token here. The lock is respected; a missing marker is a refusal.
+ */
+export async function manualResolvePendingOp(dir: string, confirmation: string): Promise<Result<{ message: string }>> {
+  const contained = requireCampaignContained(dir);
+  if (contained) return contained;
+  if (confirmation !== OPERATOR_CONFIRMATION) {
+    return refuse("invalid_argument", "manual resolution requires the operator confirmation token");
+  }
+  return withCampaignLock(dir, async (): Promise<Result<{ message: string }>> => {
+    const pending = await readPendingOp(dir);
+    if (!pending) return refuse("invalid_transition", "no pending operation to resolve");
+    await clearPendingOp(dir);
+    return {
+      ok: true,
+      message: `pending operation ${quote(pending.name)} resolved by operator; the marker is cleared, state.json is untouched`,
+    };
+  });
 }
