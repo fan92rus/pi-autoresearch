@@ -581,8 +581,19 @@ test("B1: a candidate named like an old ephemeral id keeps unsaved files through
   const wt2 = wtPathFromCreateResponse(created);
   const precious = path.join(wt2, "PRECIOUS_UNSAVED.txt");
   writeFileSyncSafe(precious, "do not lose me\n");
+  // close now refuses on unsaved changes (review final-B3), and a checkpoint
+  // refuses while PRECIOUS exists (outside change_files, review final-B2; the
+  // worktree-wide status scan blocks any uncommitted path). MVP path: remove
+  // PRECIOUS before the in-scope checkpoint + close, then recreate it
+  // byte-exact — the assertions below still prove confirm never deletes
+  // unsaved candidate work that exists at confirm time.
+  fs.rmSync(precious, { force: true });
+  writeFileSyncSafe(path.join(wt2, "src", "algo.ts"), "export const a = 3;\n");
+  const cpClash = await callTool(h, "checkpoint", { candidate_id: "confirm-leader", allowed_files: ["src/algo.ts"], message: "cp-clash" });
+  assert.match(textOf(cpClash), /Checkpoint saved/i, `pre-close checkpoint failed: ${textOf(cpClash)}`);
   const closed = await callTool(h, "close", { candidate_id: "confirm-leader" });
-  assert.match(textOf(closed), /close|done/i, `close failed: ${textOf(closed)}`);
+  assert.match(textOf(closed), /close|done/i, `close failed after clean checkpoint: ${textOf(closed)}`);
+  writeFileSyncSafe(precious, "do not lose me\n");
 
   const resumed = await callTool(h, "resume", { candidate_id: "cand-a" });
   assert.match(textOf(resumed), /resumed/i, `resume must succeed: ${textOf(resumed)}`);
@@ -901,4 +912,159 @@ test("resolve after a crash AFTER the state row was written (already registered)
   assert.equal(fs.existsSync(path.join(dir, ".auto", "candidate", "pending-op.json")), false, "marker must be cleared");
   const again = await callTool(h, "status", {});
   assert.doesNotMatch(textOf(again), /manual_check_required/i, "campaign must be usable again");
+});
+
+// ─── Final review B2/B3 regressions ──────────────────────────────────────────
+
+test("B2: a methodology file in allowed_files is refused before any ref is written", async () => {
+  const { h, dir } = await campaignWithCandidate("methcp", BENCH_DETERMINISTIC);
+  const cp = await callTool(h, "checkpoint", { allowed_files: ["METHOD.md"], message: "steal methodology" });
+  const t = textOf(cp);
+  assert.equal(/Checkpoint saved/i.test(t), false, `methodology checkpoint must refuse: ${t}`);
+  assert.match(t, /methodology|change_files/i, `refusal must name methodology scope: ${t}`);
+});
+
+test("B2: confirm hashes methodology from the checkpoint blob, not the user tree", async () => {
+  // The policy layer forbids methodology files in change_files, so a candidate
+  // can never commit a methodology edit; the checkpoint-level refusal above
+  // closes that door. The remaining hazard this test pins: confirm must hash
+  // the methodology from the CHECKPOINT COMMIT blob, not from the user's live
+  // tree (which a stray process could touch between checkpoint and confirm).
+  const { h, dir, wtPath: wt } = await campaignWithCandidate("methblob", BENCH_BY_SOURCE);
+  writeFileSyncSafe(path.join(wt, "src", "algo.ts"), "export const a = 9;\n");
+  await callTool(h, "run", {});
+  const cp = await callTool(h, "checkpoint", { allowed_files: ["src/algo.ts"], message: "clean cp" });
+  assert.match(textOf(cp), /Checkpoint saved/i, `clean checkpoint failed: ${textOf(cp)}`);
+  // Tamper the USER'S live copy of the pinned methodology file AFTER checkpointing.
+  writeFileSyncSafe(path.join(dir, "METHOD.md"), "methodology TAMPERED IN USER TREE\n");
+  const leaderBefore = git(["rev-parse", "refs/pi-autoresearch/campaign-leader"], dir).trim();
+  const confirm = await callTool(h, "confirm", {});
+  const cText = textOf(confirm);
+  assert.match(cText, /PROMOTED/i, `confirm must hash from the checkpoint blob, not the tampered live tree: ${cText}`);
+  const leader = git(["rev-parse", "refs/pi-autoresearch/campaign-leader"], dir).trim();
+  assert.notEqual(leader, leaderBefore, "leader must advance on a genuine gain");
+});
+
+test("B3: pause refuses while the candidate worktree has unsaved changes; state and bytes stay", async () => {
+  const { h, dir, wtPath: wt } = await campaignWithCandidate("pausedirty", BENCH_DETERMINISTIC);
+  writeFileSyncSafe(path.join(wt, "OTHER.txt"), "stray\n");
+  const paused = await callTool(h, "pause", { candidate_id: "cand-a" });
+  const t = textOf(paused);
+  assert.equal(/pause done/i.test(t), false, `dirty pause must refuse: ${t}`);
+  assert.match(t, /unsaved_changes|OTHER\.txt/i, `refusal must list the stray path: ${t}`);
+  const st = JSON.parse(fs.readFileSync(path.join(dir, ".auto", "candidate", "state.json"), "utf8"));
+  assert.equal(st.candidates.find((c) => c.id === "cand-a").status, "active", "candidate must stay active");
+  assert.equal(fs.readFileSync(path.join(wt, "OTHER.txt"), "utf8"), "stray\n", "stray file must survive byte-exact");
+  // Clean candidate: pause succeeds.
+  fs.rmSync(path.join(wt, "OTHER.txt"), { force: true });
+  const paused2 = await callTool(h, "pause", { candidate_id: "cand-a" });
+  assert.match(textOf(paused2), /pause done/i, `clean pause must succeed: ${textOf(paused2)}`);
+});
+
+test("B3: create refuses while an active candidate carries unsaved changes", async () => {
+  const { h, dir, wtPath: wt } = await campaignWithCandidate("createdirty", BENCH_DETERMINISTIC);
+  writeFileSyncSafe(path.join(wt, "OTHER.txt"), "stray\n");
+  const created = await callTool(h, "create", { candidate_id: "cand-b" });
+  const t = textOf(created);
+  assert.equal(/created/i.test(t), false, `create with dirty active must refuse: ${t}`);
+  assert.match(t, /unsaved_changes|OTHER\.txt/i, `refusal must list the stray path: ${t}`);
+  const st = JSON.parse(fs.readFileSync(path.join(dir, ".auto", "candidate", "state.json"), "utf8"));
+  assert.equal(st.candidates.some((c) => c.id === "cand-b"), false, "no cand-b row may exist");
+  // The stray file survives byte-exact.
+  assert.equal(fs.readFileSync(path.join(wt, "OTHER.txt"), "utf8"), "stray\n", "stray file must survive");
+});
+
+// ─── Round-2 methodology hashing (blob bytes, init pin = HEAD blob) ──────────
+
+test("B2 round-2: a non-ASCII methodology file hashes identically at init and confirm (blob bytes)", async () => {
+  const { h, dir, wtPath: wt } = await campaignWithCandidate("methutf8", BENCH_BY_SOURCE);
+  writeFileSyncSafe(path.join(wt, "src", "algo.ts"), "export const a = 2; // candidate optimization\n");
+  await callTool(h, "run", {});
+  const cp = await callTool(h, "checkpoint", { allowed_files: ["src/algo.ts"], message: "cp-utf8" });
+  assert.match(textOf(cp), /Checkpoint saved/i, `checkpoint failed: ${textOf(cp)}`);
+  const confirm = await callTool(h, "confirm", {});
+  const cText = textOf(confirm);
+  assert.equal(/methodology_changed/i.test(cText), false, `non-ASCII methodology must not break the gate: ${cText}`);
+  assert.match(cText, /PROMOTED/i, `honest candidate must promote with a non-ASCII methodology: ${cText}`);
+});
+
+test("B2 round-2: CRLF working copy under core.autocrlf=true still promotes (init pin from the HEAD blob)", async () => {
+  // Dedicated repo: the shared fixture uses the repo-global autocrlf setting.
+  const dir = makeWorkDir("methcrlf");
+  const h = await createHarness({ dir, sessionId: "candwiring-methcrlf", realGit: false });
+  const g = (args, cwd = dir) => execFileSync("git", args, { cwd, encoding: "utf8" });
+  g(["init"]);
+  g(["config", "user.email", "t@x"]);
+  g(["config", "user.name", "t"]);
+  // Mimic the default Git-for-Windows install: blobs stay LF, the working copy
+  // gets CRLF. The init pin must come from the committed BLOB, not the CRLF file.
+  g(["config", "core.autocrlf", "true"]);
+  writeFileSyncSafe(path.join(dir, "METHOD.md"), "methodology v1\n"); // written with LF; autocrlf converts on checkout
+  writeFileSyncSafe(path.join(dir, "src", "algo.ts"), "export const a = 1;\n");
+  g(["add", "-A"]);
+  g(["commit", "-q", "-m", "seed"]);
+  // Normalize the working copy the way autocrlf=true would after a checkout:
+  // rewrite METHOD.md with CRLF bytes on disk.
+  fs.writeFileSync(path.join(dir, "METHOD.md"), "methodology v1\r\n", "utf8");
+  await h.command("autoresearch").handler("on", h.ctx);
+  h.ctx.ui.confirm = async () => true;
+  const policy = policyOf(dir);
+  policy.benchmark_argv = ["node", "-e", BENCH_BY_SOURCE];
+  const init = await callTool(h, "init", { policy });
+  assert.match(textOf(init), /campaign|created|ready|policy/i, `init failed: ${textOf(init)}`);
+  const created = await callTool(h, "create", { candidate_id: "cand-a" });
+  const wtPath = wtPathFromCreateResponse(created);
+  writeFileSyncSafe(path.join(wtPath, "src", "algo.ts"), "export const a = 2; // candidate optimization\n");
+  await callTool(h, "run", {});
+  const cp = await callTool(h, "checkpoint", { allowed_files: ["src/algo.ts"], message: "cp-crlf" });
+  assert.match(textOf(cp), /Checkpoint saved/i, `checkpoint failed: ${textOf(cp)}`);
+  const confirm = await callTool(h, "confirm", {});
+  const cText = textOf(confirm);
+  assert.equal(/methodology_changed/i.test(cText), false, `CRLF working copy must not break the gate: ${cText}`);
+  assert.match(cText, /PROMOTED/i, `honest candidate must promote under autocrlf: ${cText}`);
+  // Real tamper: rewrite the checkpoint ref to a commit whose tree differs
+  // from the base ONLY in METHOD.md (built via git plumbing, since methodology
+  // files are refused in allowed_files and cannot be committed by the tool).
+  const baseSha = g(['rev-parse', 'refs/pi-autoresearch/candidates/cand-a']).trim();
+  const parent = g(['rev-parse', `${baseSha}^`]).trim();
+  const tamperBlob = execFileSync("git", ["hash-object", "-w", "--stdin"], { cwd: dir, encoding: "utf8", input: "methodology TAMPERED\n" }).trim();
+  // Rebuild the tree with every base entry except METHOD.md, which gets the
+  // tampered blob.
+  const lsTree = g(["ls-tree", baseSha]).trim().split("\n").filter((l) => l && !l.endsWith("\tMETHOD.md"));
+  lsTree.push(`100644 blob ${tamperBlob}\tMETHOD.md`);
+  const newTree = execFileSync("git", ["mktree"], { cwd: dir, encoding: "utf8", input: lsTree.join("\n") + "\n" }).trim();
+  const tamperedCommit = execFileSync("git", ["commit-tree", newTree, "-p", parent, "-m", "tampered methodology"], { cwd: dir, encoding: "utf8" }).trim();
+  g(["update-ref", "refs/pi-autoresearch/candidates/cand-a", tamperedCommit]);
+  const st = JSON.parse(fs.readFileSync(path.join(dir, ".auto", "candidate", "state.json"), "utf8"));
+  const cand = st.candidates.find((c) => c.id === "cand-a");
+  cand.checkpoints = cand.checkpoints.map((c) => (c === baseSha ? tamperedCommit : c));
+  cand.selected_checkpoint = tamperedCommit;
+  fs.writeFileSync(path.join(dir, ".auto", "candidate", "state.json"), JSON.stringify(st, null, 2), "utf8");
+  const confirm2 = await callTool(h, "confirm", {});
+  assert.match(textOf(confirm2), /methodology_changed/i, `a tampered methodology blob must refuse: ${textOf(confirm2)}`);
+  assert.equal(/PROMOTED/i.test(textOf(confirm2)), false, "tampered methodology must never promote");
+});
+
+// ─── Review regression (B-A): methodology file inside a workingDir subdirectory ─
+
+test("campaign under workingDir=sub: methodology blob resolves relative to the workDir (init pins, confirm verifies)", async () => {
+  const dir = makeWorkDir("subdir");
+  fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
+  writeFileSyncSafe(path.join(dir, ".auto", "config.json"), JSON.stringify({ workingDir: "sub" }));
+  const sub = path.join(dir, "sub");
+  writeFileSyncSafe(path.join(sub, "METHOD.md"), "methodology v1\n");
+  writeFileSyncSafe(path.join(sub, "src", "algo.ts"), "export const a = 1;\n");
+  // createHarness(realGit:true) runs git init and commits every file already in dir.
+  const h = await createHarness({ dir, sessionId: "candwiring-subdir", realGit: true });
+  await h.command("autoresearch").handler("on", h.ctx);
+  h.ctx.ui.confirm = async () => true;
+
+  const policy = policyOf(sub);
+  policy.benchmark_argv = ["node", "-e", BENCH_DETERMINISTIC];
+  const init = await callTool(h, "init", { policy });
+  assert.doesNotMatch(textOf(init), /missing from the base commit|invalid_argument/i, `init must pin the subdir methodology: ${textOf(init)}`);
+  assert.match(textOf(init), /initialized|campaign|ready|policy/i, `init must succeed: ${textOf(init)}`);
+
+  const created = await callTool(h, "create", { candidate_id: "cand-a" });
+  assert.match(textOf(created), /created|active|worktree|cand-a/i, `create must succeed under workingDir: ${textOf(created)}`);
 });

@@ -2426,8 +2426,27 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     ].join(" ");
   };
 
+  /** Campaign-mode default resume used by ensurePendingResume when no explicit
+   *  composer is given: never mentions the blocked legacy tools. */
+  const composeCampaignResumeMessage = (ctx: ExtensionContext): string =>
+    [
+      "Continue the candidate campaign now: candidate_branch status, then run/checkpoint on the active candidate.",
+      "The ordinary experiment tools are blocked while the campaign is active.",
+      "If status reports manual_check_required: STOP — report the pending operation and wait for the operator (resolve).",
+    ].join(" ");
+
   /** Corrective resume for a settled turn that did no loop work (bounded — see MAX_CONSECUTIVE_DRIFT_RESUMES). */
-  const composeDriftResumeMessage = (cwd: string): string => {
+  const composeDriftResumeMessage = async (cwd: string): Promise<string> => {
+    // Candidate-branch campaign active (design §5): do NOT prescribe the legacy
+    // cycle; the campaign has its own loop and its own stop rules. resolveWorkDir
+    // (not the raw cwd): the campaign may live under a configured workingDir.
+    if (await campaignBlocksOrdinaryLoop(resolveWorkDir(cwd))) {
+      return [
+        "⚠ Last turn did no candidate-campaign work.",
+        "Resume the campaign now: candidate_branch status, then run/checkpoint on the active candidate.",
+        "If status reports manual_check_required: STOP — report the pending operation and wait for the operator (resolve).",
+      ].join(" ");
+    }
     return [
       "⚠ Last turn used no experiment tools (chat/reads don't advance the loop).",
       "Resume the cycle now: propose_hypothesis → run_experiment → log_experiment.",
@@ -2437,7 +2456,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     ].join(" ");
   };
 
-  const composeCompactionResumeMessage = (_ctx: ExtensionContext): string => {
+  const composeCompactionResumeMessage = async (ctx: ExtensionContext): Promise<string> => {
+    // Candidate-branch campaign active (design §5): resume the campaign, not
+    // the legacy experiment loop; compaction must not reintroduce run_experiment.
+    // resolveWorkDir (not the raw cwd): the campaign may live under a configured
+    // workingDir.
+    if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) {
+      return [
+        "Resume the candidate campaign now: candidate_branch status, then run/checkpoint on the active candidate.",
+        "If status reports manual_check_required: STOP — report the pending operation and wait for the operator (resolve).",
+        "Do not re-read .auto/prompt.md or .auto/log.jsonl — the compaction summary already contains them.",
+      ].join(" ");
+    }
     // The compaction summary already contains the rules, ideas, and recent
     // runs — so this resume message just kicks the loop forward.
     return [
@@ -2445,7 +2475,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "Pick the most promising hypothesis from the ideas backlog or the latest `next:` hints in recent runs, then call run_experiment + log_experiment.",
       "Do not re-read .auto/prompt.md or .auto/log.jsonl — the compaction summary already contains them.",
       MEASUREMENT_GUARDRAIL,
-      experimentLimitClause(_ctx.cwd),
+      experimentLimitClause(ctx.cwd),
       BENCHMARK_GUARDRAIL,
     ].join(" ");
   };
@@ -2864,11 +2894,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     pausePendingResume(runtime);
   });
 
-  const ensurePendingResume = (
+  const ensurePendingResume = async (
     ctx: ExtensionContext,
     gate: (runtime: AutoresearchRuntime) => boolean,
-    composeMessage: (ctx: ExtensionContext) => string = composeResumeMessage,
-  ): void => {
+    composeMessage?: (ctx: ExtensionContext) => string | Promise<string>,
+  ): Promise<void> => {
     const runtime = getRuntime(ctx);
     if (hasPendingResume(runtime)) {
       reschedulePendingResume(ctx, runtime);
@@ -2880,7 +2910,27 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       notifyAutoResumeLimitReached(ctx, stopReason);
       return;
     }
-    schedulePendingResume(ctx, runtime, composeMessage(ctx));
+    // Candidate-branch campaign active (design §5): the default resume must not
+    // prescribe the legacy cycle (run_experiment/log_experiment/propose_hypothesis),
+    // which is blocked while the campaign runs. Applied to the DEFAULT composer
+    // here so every ensurePendingResume call site (partial-cycle agent_end,
+    // post-turn plain resume) inherits the campaign branch. Explicit composers
+    // (drift, compaction) branch by campaign mode themselves.
+    let composed: string | Promise<string>;
+    if (composeMessage) {
+      composed = composeMessage(ctx);
+    } else if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) {
+      composed = composeCampaignResumeMessage(ctx);
+    } else {
+      composed = composeResumeMessage(ctx);
+    }
+    // Claim the pending slot BEFORE awaiting the composer: two agent_end events
+    // settling in the same window would otherwise both pass hasPendingResume and
+    // double-schedule (review M-4). The empty-string claim is transient (a real
+    // message overwrites it synchronously after the await; sendPendingResumeIfReady
+    // treats an empty message as nothing to send).
+    runtime.pendingResumeMessage = "";
+    schedulePendingResume(ctx, runtime, await composed);
   };
 
   pi.on("session_before_compact", async (event, ctx) => {
@@ -2889,7 +2939,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_compact", async (_event, ctx) => {
-    ensurePendingResume(ctx, shouldAutoResumeAfterCompact, composeCompactionResumeMessage);
+    await ensurePendingResume(ctx, shouldAutoResumeAfterCompact, composeCompactionResumeMessage);
   });
 
   pi.on("agent_end", async (_event, ctx) => {
@@ -2911,13 +2961,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (runtime.lastTurnUsedExperimentTools) {
         // Partial cycle (hypothesis registered, experiment running, branch ops):
         // push forward without a drift accusation.
-        ensurePendingResume(ctx, () => true);
+        await ensurePendingResume(ctx, () => true);
         return;
       }
       if (runtime.consecutiveDriftResumes < MAX_CONSECUTIVE_DRIFT_RESUMES) {
         runtime.consecutiveDriftResumes++;
         markAutoResumeSent(runtime);
-        schedulePendingResume(ctx, runtime, composeDriftResumeMessage(ctx.cwd));
+        // composeDriftResumeMessage branches by campaign mode: under an active
+        // candidate campaign it emits candidate-campaign wording only (design §5).
+        // resolveWorkDir: the campaign may live under a configured workingDir,
+        // so the campaign check must not use the raw session cwd.
+        schedulePendingResume(ctx, runtime, await composeDriftResumeMessage(resolveWorkDir(ctx.cwd)));
         return;
       }
       ctx.ui.notify(
@@ -2927,7 +2981,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       return;
     }
 
-    ensurePendingResume(ctx, shouldAutoResumeAfterTurn);
+    await ensurePendingResume(ctx, shouldAutoResumeAfterTurn);
   });
 
   // Track whether the in-flight turn does real loop work (goal-x pattern:
@@ -7529,12 +7583,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           };
         }
         const file = persistSlateEntry(councilDirAbs, outcome.slate);
+        const inCampaign = await campaignBlocksOrdinaryLoop(workDir);
+        const nextStep = inCampaign
+          ? "Register each EXP via propose_hypothesis (SimHash dedup applies), then run them through the candidate campaign (candidate_branch), not run_experiment."
+          : "Register each EXP via propose_hypothesis (SimHash dedup applies) and run them through the normal loop.";
         const header = "🏛 COUNCIL #" + seq + " COMPLETE — " + outcome.rounds + " challenge round(s)"
           + (outcome.corrected ? ", slate corrected after validation" : "")
           + (outcome.unavailable.length ? ", unavailable: " + outcome.unavailable.join(", ") : "")
           + ". Slate persisted to " + councilDirRel + "/entries/" + file + "\n\n";
         return {
-          content: [{ type: "text", text: header + outcome.slate + "\n\nRegister each EXP via propose_hypothesis (SimHash dedup applies) and run them through the normal loop. Honor the KILL_WHEN gates — the slate may legitimately skip experiments." }],
+          content: [{ type: "text", text: header + outcome.slate + "\n\n" + nextStep + " Honor the KILL_WHEN gates — the slate may legitimately skip experiments." }],
           details: { councilSeq: seq, outcome: "complete", validated: true, rounds: outcome.rounds, corrected: outcome.corrected },
         };
       }
@@ -7832,23 +7890,52 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const campaignDirOf = (workDir: string): string => path.join(workDir, CANDIDATE_DIR);
 
   /** SHA-256 of one methodology file, read fresh from disk (repo-relative). */
-  const hashMethodologyFile = (workDir: string, relPath: string): string | null => {
+
+  /** Review final-B2 (round 2): hash a methodology file's blob from a COMMIT,
+ *  not the working copy. Raw bytes via a Buffer-returning git call: the
+ *  string-decoding runner would re-encode non-ASCII content through latin1
+ *  (update(out, "binary")) and break equality with the init pin, and a CRLF
+ *  working copy under core.autocrlf=true would disagree with the LF blob. */
+  const gitShowBytes = async (workDir: string, refPath: string): Promise<Buffer> =>
+    new Promise((resolve, reject) => {
+      const child = spawn("git", ["show", refPath], {
+        cwd: workDir,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: process.env,
+        windowsHide: true,
+      });
+      const chunks: Buffer[] = [];
+      let stderr = "";
+      child.stdout?.on("data", (d: Buffer) => chunks.push(d));
+      child.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
+      child.on("error", (err) => reject(new Error(String(err))));
+      child.on("close", (code) => {
+        if (code !== 0) reject(new Error(`git show ${refPath} failed: ${stderr.slice(0, 200)}`));
+        else resolve(Buffer.concat(chunks));
+      });
+    });
+
+  /** SHA-256 of one methodology file's blob in a commit (raw bytes). */
+  const hashMethodologyBlob = async (workDir: string, commitSha: string, relPath: string): Promise<string | null> => {
     try {
-      const abs = path.resolve(workDir, relPath);
-      // Containment: the file must live inside the workDir.
-      if (!abs.startsWith(path.resolve(workDir) + path.sep) && abs !== path.resolve(workDir)) return null;
-      const content = fs.readFileSync(abs);
+      // Containment: the path must be repo-relative inside the workDir.
+      if (path.isAbsolute(relPath) || relPath.includes("..")) return null;
+      // `./` makes the path relative to the workDir (git resolves a bare path from the repo root)
+      const content = await gitShowBytes(workDir, `${commitSha}:./${relPath}`);
       return createHash("sha256").update(content).digest("hex");
     } catch {
       return null;
     }
   };
 
-  const hashAllMethodology = (workDir: string, policy: CandidatePolicy): { ok: true; hashes: { path: string; sha256: string }[] } | { ok: false; reason: string } => {
+  /** Init pin: methodology hashes from the BASE commit's blobs (git show
+   *  HEAD:<path>), so init and confirm read the same bytes and a CRLF working
+   *  copy or a non-ASCII content cannot break the equality (review round 2). */
+  const hashMethodologyAtCommit = async (workDir: string, commitSha: string, policy: CandidatePolicy): Promise<{ ok: true; hashes: { path: string; sha256: string }[] } | { ok: false; reason: string }> => {
     const hashes: { path: string; sha256: string }[] = [];
     for (const f of policy.methodology_files) {
-      const h = hashMethodologyFile(workDir, f.path);
-      if (h === null) return { ok: false, reason: `methodology file ${JSON.stringify(f.path)} is missing or unreadable` };
+      const h = await hashMethodologyBlob(workDir, commitSha, f.path);
+      if (h === null) return { ok: false, reason: `methodology file ${JSON.stringify(f.path)} does not exist in commit ${commitSha.slice(0, 12)}` };
       hashes.push({ path: f.path, sha256: h });
     }
     return { ok: true, hashes };
@@ -8050,8 +8137,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         for (const m of methodPaths) {
           const p = m && typeof m === "object" && typeof (m as any).path === "string" ? (m as any).path : null;
           if (!p) return fail("invalid_argument", "methodology_files entries must be objects with a path");
-          const hash = hashMethodologyFile(workDir, p);
-          if (!hash) return fail("invalid_argument", `methodology file ${JSON.stringify(p)} missing or unreadable; hash computed from disk, cannot pin`);
+          const hash = await hashMethodologyBlob(workDir, "HEAD", p);
+          if (!hash) return fail("invalid_argument", `methodology file ${JSON.stringify(p)} missing from the base commit HEAD; hash computed from the commit blob, cannot pin`);
           methodFiles.push({ path: p, sha256: hash });
         }
         raw.methodology_files = methodFiles;
@@ -8151,6 +8238,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
         const preActive = preState.candidates.find((c) => c.status === "active");
         if (preActive) {
+          // Review final-B3 (design §2.4): an active candidate with unsaved
+          // worktree changes must not be silently stranded by a create; the
+          // switch is refused with the path list first.
+          const activeWt = path.join(candidateWtRootOf(workDir), preActive.id);
+          if (fs.existsSync(activeWt)) {
+            const activeChanges = await candidateWorktree.collectWorktreeChanges(candidateGitExec, activeWt);
+            if (activeChanges.ok && activeChanges.changes.all.length > 0) {
+              return fail("unsaved_changes", `active candidate ${JSON.stringify(preActive.id)} worktree has unsaved changes: ${activeChanges.changes.all.join(", ")}. Checkpoint or revert them before creating ${JSON.stringify(candidateId)}; nothing was deleted`);
+            }
+          }
           return fail("second_active_candidate", `candidate ${JSON.stringify(preActive.id)} is active; pause it before creating ${JSON.stringify(candidateId)}`);
         }
         const leaderSha = await fullShaOf(workDir, LEADER_REF);
@@ -8246,6 +8343,21 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const allowed = Array.isArray(params.allowed_files) ? params.allowed_files : [];
         const allowedCheck = candidateWorktree.validateAllowedFilePaths(allowed);
         if (!allowedCheck.ok) return fail("invalid_argument", allowedCheck.errors.join("; ") || "allowed_files invalid");
+        // Review final-B2 (FR-07): methodology files are not changed by the
+        // candidate — refuse before any git side effect if the checkpoint tries
+        // to include one. The init-time change_files set is the only writable scope.
+        const changeFiles: readonly string[] = Array.isArray((state.policy as { change_files?: unknown }).change_files)
+          ? (state.policy as { change_files: readonly string[] }).change_files
+          : [];
+        const methodPaths = new Set((state.policy as { methodology_files?: { path?: string }[] }).methodology_files?.map((m) => String(m?.path)) ?? []);
+        for (const p of allowed) {
+          if (methodPaths.has(p)) {
+            return fail("methodology_in_checkpoint", `allowed file ${JSON.stringify(p)} is a pinned methodology file and can never be changed by a candidate`);
+          }
+          if (!changeFiles.includes(p)) {
+            return fail("outside_change_files", `allowed file ${JSON.stringify(p)} is not in the campaign's change_files; only ${JSON.stringify(changeFiles)} may be changed`);
+          }
+        }
         const message = typeof params.message === "string" && params.message.trim().length > 0 ? params.message : `checkpoint ${cand.id}`;
         const wtPath = path.join(candidateWtRootOf(workDir), cand.id);
         let commitSha: string | null = null;
@@ -8283,6 +8395,29 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // ---- pause/resume/select/close/disable: state-machine transitions ----
       if (action === "pause" || action === "close" || action === "disable") {
+        // Review final-B3 (design §2.4): pausing or closing a candidate whose
+        // worktree still carries unsaved changes would strand them (a paused
+        // candidate cannot checkpoint, so the only exit would be manual git).
+        // Refuse with the path list; nothing is changed or deleted.
+        if (action === "pause" || action === "close") {
+          const targetId = String(params.candidate_id ?? "");
+          const inspP = await candidateState.inspectCampaign(campDir);
+          if (inspP.status !== "ready") return fail(inspP.status, inspP.message);
+          const pState = inspP.state!;
+          const pCand = targetId
+            ? pState.candidates.find((c) => c.id === targetId) ?? null
+            : activeCandidateOf(pState);
+          if (!pCand) return fail("unknown_candidate", `candidate ${JSON.stringify(targetId || "<active>")} does not exist`);
+          if (pCand.status === "active") {
+            const wtPathP = path.join(candidateWtRootOf(workDir), pCand.id);
+            if (fs.existsSync(wtPathP)) {
+              const changes = await candidateWorktree.collectWorktreeChanges(candidateGitExec, wtPathP);
+              if (changes.ok && changes.changes.all.length > 0) {
+                return fail("unsaved_changes", `candidate ${JSON.stringify(pCand.id)} worktree has unsaved changes: ${changes.changes.all.join(", ")}. Checkpoint or revert them before ${action}; nothing was deleted`);
+              }
+            }
+          }
+        }
         const res = action === "disable"
           ? await candidateState.disableCampaign(campDir)
           : action === "pause"
@@ -8350,8 +8485,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const expectedLeader = await fullShaOf(workDir, LEADER_REF);
         if (!expectedLeader) return fail("leader_missing", `leader ref ${LEADER_REF} missing`);
         const epoch = String(measurementScaleStatusOfDir(workDir).epoch);
-        const currentMethodology = hashAllMethodology(workDir, policy);
-        if (!currentMethodology.ok) return fail("methodology_missing", currentMethodology.reason);
+        // Review final-B2: hash methodology from the checkpoint COMMIT blob, so
+        // edits committed by the candidate itself are caught (FR-07: methodology
+        // files are not changed by the candidate).
+        const currentMethodology = await hashMethodologyAtCommit(workDir, cpSha, policy);
+        if (!currentMethodology.ok) return fail("methodology_changed", currentMethodology.reason);
 
         let outcome: { text: string; details: Record<string, unknown> } | null = null;
         // Review B1: capture the sides so cleanup removes ONLY worktrees this
@@ -8636,10 +8774,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           return;
         }
         const noteArg = note ? ", note: " + JSON.stringify(note) : "";
+        const councilInCampaign = await campaignBlocksOrdinaryLoop(workDir);
         pi.sendUserMessage(
           "Convene a hypothesis council NOW: call council_convene({" + noteArg + "}). " +
           "The tool is autonomous and BLOCKING — it runs the analysts, challenge rounds and chair itself and returns the finished slate. " +
-          "When it returns, register each slate EXP via propose_hypothesis and run them through the normal loop.",
+          (councilInCampaign
+            ? "When it returns, register each slate EXP via propose_hypothesis and run them through the candidate campaign (candidate_branch), not run_experiment."
+            : "When it returns, register each slate EXP via propose_hypothesis and run them through the normal loop."),
           { deliverAs: "followUp" },
         );
         ctx.ui.notify("Council delegated to council_convene — the agent will run it autonomously", "info");

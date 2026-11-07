@@ -33,6 +33,17 @@ Other actions: `status`, `resume`, `pause`, `select`, `close`, `disable`.
 - A checkpoint never leaves the candidate worktree's allowed set.
 - Refused transitions change no files. Exception: a checkpoint whose git commit
   step fails may leave staged changes for manual inspection (see recovery below).
+
+## Refusal reasons you may see
+
+- `unsaved_changes` — `pause`, `close`, `select`, or `create` while the active
+  candidate's worktree has changes outside the last checkpoint; the refusal
+  lists the paths. `disable` does NOT check for unsaved changes (the campaign
+  can always be turned off).
+- `outside_change_files` — `checkpoint` was asked to save a file that is not
+  in the policy's `change_files`; no ref is written.
+- `methodology_in_checkpoint` — methodology files can never enter a
+  checkpoint (they are pinned by the campaign and must not change).
 - A promotion needs a repeated comparable measurement, the same metric and
   direction, equal epochs, unchanged methodology hashes, passing checks on
   the exact checkpoint, and a gain strictly above `min_gain`.
