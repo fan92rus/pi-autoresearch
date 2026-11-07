@@ -1131,6 +1131,24 @@ test("methodology ./METHOD.md with change_files METHOD.md: init or checkpoint re
   assert.notEqual(ref.status, 0, "no candidate ref may be written for the methodology file");
 });
 
+// ─── Review 65ac927: the TUI starter widget must not show the ordinary sequence ──
+
+test("the starter widget under an active campaign names candidate_branch, not run_experiment", async () => {
+  const { h } = await campaignWithCandidate("widget-campaign");
+  // setupRepo already switched the mode on; switch it off so the next "on" renders the widget.
+  await h.command("autoresearch").handler("off", h.ctx);
+  const calls = [];
+  h.ctx.ui.setWidget = (key, factory) => calls.push({ key, factory });
+  await h.command("autoresearch").handler("on", h.ctx);
+  const widget = [...calls].reverse().find((c) => c.key === "autoresearch" && typeof c.factory === "function");
+  assert.ok(widget, "the starter widget must be set when the mode is switched on under an active campaign");
+  const theme = { fg: (_c, t) => t };
+  const comp = widget.factory({ requestRender() {} }, theme);
+  const text = comp.render(400).join("\n");
+  assert.match(text, /candidate_branch/, "widget must name the campaign tool: " + text);
+  assert.doesNotMatch(text, /run_experiment|log_experiment|init_experiment/, "widget must not show the ordinary loop: " + text);
+});
+
 // ─── Review round (4c5532d): propose_hypothesis is part of the ordinary loop ──
 
 test("propose_hypothesis is refused under an active candidate campaign (writes refs/exp into the user repo)", async () => {

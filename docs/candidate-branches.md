@@ -51,7 +51,14 @@ Other actions: `status`, `resume`, `pause`, `select`, `close`, `disable`.
   `run_experiment`, `log_experiment`, `init_experiment`, `propose_hypothesis`,
   `finalize_research`, and the `/autoresearch` parallel and finalize flows.
   Read-only and note-taking tools (`inspect_results`, `tree_status`,
-  `record_finding`, `update_finding`, `log_observation`) stay available. The
+  `record_finding`, `update_finding`, `log_observation`) stay available.
+  The measurement and analysis tools (`log_measurement_change`,
+  `verify_measurement_change`, `revert_measurement_change`,
+  `record_analysis`, `direction_review`) also stay available: they write only
+  under `.auto/` and never touch git refs, the checkout, or the user's branch.
+  Under a campaign the loop-wording guideline lines of `record_analysis`,
+  `direction_review` and `tree_status` are removed from the system prompt; the
+  guidance of the measurement tools does not name the ordinary loop. The
   ordinary loop's blocked set is a deliberate MVP scope, recorded here.
 
 ## Not promised

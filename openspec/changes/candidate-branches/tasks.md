@@ -1,6 +1,6 @@
 # Задачи реализации кандидатного MVP
 
-Реализация выполнена в коммитах 2799b07, 8d2c8fe, 98ae1cf, 31c63fa, 896273f, 33ab1d6, 71a2fb3, 5cb3a9a и последующих fix-коммитах до b77d5fb (ветка master). Доказательства (число тестов по файлам по последнему прогону): `tests/candidate-policy.test.mjs` (49), `tests/candidate-state.test.mjs` (40), `tests/candidate-worktree.test.mjs` (37), `tests/candidate-measure.test.mjs` (47), `tests/candidate-branch-wiring.test.mjs` (47), `tests/candidate-prompt.test.mjs` (21), `tests/candidate-council-phase4.test.mjs` (2); полный набор `tests/*.test.mjs`: 1303 прошли, 0 упали, 3 пропущены (pre-existing). Проверки интеграции и ручной разбор описаны в `docs/candidate-branches.md`.
+Реализация выполнена в коммитах 2799b07, 8d2c8fe, 98ae1cf, 31c63fa, 896273f, 33ab1d6, 71a2fb3, 5cb3a9a и последующих fix-коммитах (ветка master). Доказательства (число тестов по файлам по последнему прогону): `tests/candidate-policy.test.mjs` (49), `tests/candidate-state.test.mjs` (40), `tests/candidate-worktree.test.mjs` (37), `tests/candidate-measure.test.mjs` (47), `tests/candidate-branch-wiring.test.mjs` (48), `tests/candidate-prompt.test.mjs` (22), `tests/candidate-council-phase4.test.mjs` (2); полный набор `tests/*.test.mjs`: 1305 прошли, 0 упали, 3 пропущены (pre-existing). Проверки интеграции и ручной разбор описаны в `docs/candidate-branches.md`.
 
 ## 1. Кампания и штатная работа
 
@@ -22,7 +22,7 @@
 
 - [x] 4.1 Обновить действующие промпты, шаблон и skills по `amendment-prompts-skills.md`; тесты обоих режимов, resume после прерывания и сохранности пользовательского prompt. (`before_agent_start` кандидатная ветка в `index.ts`; `candidate-prompt.test.mjs`; раздел в `skills/autoresearch-create/SKILL.md`)
 - [x] 4.2 Описать пользовательский цикл, ручную диагностику, лимиты и границы гарантий; проверить примеры на фактическом API. (`docs/candidate-branches.md`; имена инструментов и действий сверены с кодом)
-- [x] 4.3 Независимо прогнать полный набор тестов и OpenSpec validation, включая сквозной штатный цикл и негативные проверки из design §6. (полный набор 1303/0/3skip; `openspec validate candidate-branches --strict` и `--all` — проходят; сквозной цикл — wiring happy path; негативные проверки — wiring/state тесты)
+- [x] 4.3 Независимо прогнать полный набор тестов и OpenSpec validation, включая сквозной штатный цикл и негативные проверки из design §6. (полный набор 1305/0/3skip; `openspec validate candidate-branches --strict` и `--all` — проходят; сквозной цикл — wiring happy path; негативные проверки — wiring/state тесты)
 
 ## Workflow follow-up
 

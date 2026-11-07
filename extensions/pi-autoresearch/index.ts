@@ -2801,6 +2801,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // Mode is active but nothing logged yet: show a starter widget instead of
         // clearing, so the user can SEE that autoresearch is on (adopted from
         // pi-goal-x: the widget is the always-visible sign of a live extension).
+        // Under an active candidate campaign the ordinary sequence is blocked: show the campaign tool instead.
+        const inCandidateCampaign = campaignActiveSync(resolveWorkDir(ctx.cwd));
         ctx.ui.setWidget("autoresearch", (tui, theme) => ({
           render(width: number): string[] {
             const safeWidth = Math.max(1, width || getTuiSize(tui).width);
@@ -2808,8 +2810,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               [
                 theme.fg("accent", "🔬"),
                 state.name ? theme.fg("dim", ` │ ${state.name}`) : "",
-                theme.fg("dim", " │ 0 runs — waiting for baseline"),
-                theme.fg("dim", " │ init_experiment → run_experiment → log_experiment"),
+                theme.fg("dim", inCandidateCampaign ? " │ candidate campaign active" : " │ 0 runs — waiting for baseline"),
+                theme.fg("dim", inCandidateCampaign ? " │ candidate_branch status" : " │ init_experiment → run_experiment → log_experiment"),
               ],
               safeWidth
             );
@@ -2849,7 +2851,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           if (runtime.treeViewMode) {
             const workDir = resolveWorkDir(ctx.cwd);
             if (!treeExists(workDir)) {
-              return [theme.fg("dim", "🌳 No experiment tree yet — call init_experiment")];
+              return [theme.fg("dim", campaignActiveSync(workDir) ? "🌳 No experiment tree (ordinary loop) — candidate campaign active, use candidate_branch" : "🌳 No experiment tree yet — call init_experiment")];
             }
             const tree = loadTree(workDir);
             if (!tree) {
@@ -3077,6 +3079,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // Other registered tools keep their own guidelines; the campaign text in
   // before_agent_start is the authority for how they are used.
   const CAMPAIGN_STRIPPED_GUIDELINES: ReadonlySet<string> = new Set([
+    "prereg BEFORE the run captures ordering proof; a comparison recorded after results is never a prereg.",
+    "Responses may carry a direction-review hint line (S_exh / S_exh_adv) — it proposes `direction_review`, it never runs anything.",
+    "Call after a direction-review hint (S_stag / S_ser / S_exh / S_exh_adv) or whenever you want a strategy overview.",
+    "Call tree_status() after every 3-4 experiments or when you lose track of what was tried.",
     "Call init_experiment exactly once at the start of an autoresearch session, before the first run_experiment.",
     "If the session log (.auto/log.jsonl) already exists with a config, do NOT call init_experiment again.",
     "If the optimization target changes (different benchmark, metric, or workload), call init_experiment again to insert a new config header and reset the baseline.",

@@ -387,6 +387,27 @@ test("B1 (round 3): legacy promptGuidelines lines are stripped from the system p
   assert.match(prompt, /## Candidate Branch Campaign \(ACTIVE\)/, "candidate section must still be appended");
 }, { timeout: 30000 });
 
+test("review 65ac927: record_analysis, direction_review and tree_status loop guidelines are stripped under a campaign", async () => {
+  const dir = makeTempDir("guidelines-campaign-more");
+  fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".auto", "candidate", "state.json"),
+    JSON.stringify({ schema_version: 1, disabled: false, policy: {}, candidates: [] }), "utf8");
+  const { hook, ctx } = await makeFullHarnessAt(dir, "guidelines-campaign-more-ctx");
+  const loopLines = [
+    "prereg BEFORE the run captures ordering proof; a comparison recorded after results is never a prereg.",
+    "Responses may carry a direction-review hint line (S_exh / S_exh_adv) — it proposes `direction_review`, it never runs anything.",
+    "Call after a direction-review hint (S_stag / S_ser / S_exh / S_exh_adv) or whenever you want a strategy overview.",
+    "Call tree_status() after every 3-4 experiments or when you lose track of what was tried.",
+  ];
+  const keepLine = "- Keep this unrelated guideline.";
+  const body = loopLines.map((l) => "- " + l).join("\n");
+  const event = { systemPrompt: "BASE\n" + body + "\n" + keepLine + "\n" };
+  const out = await hook("before_agent_start")(event, ctx);
+  const prompt = out?.systemPrompt ?? "";
+  for (const l of loopLines) assert.equal(prompt.includes(l), false, "must be stripped under a campaign: " + l);
+  assert.equal(prompt.includes(keepLine), true, "unrelated guidelines must be kept");
+}, { timeout: 30000 });
+
 test("B1 (round 3) control: without a campaign the legacy guideline line is kept", async () => {
   const dir = makeTempDir("guidelines-legacy");
   const { hook, ctx } = await makeFullHarnessAt(dir, "guidelines-legacy-ctx");
