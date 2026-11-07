@@ -521,7 +521,7 @@ test("formatCandidatePolicy quotes metric_name and methodology path: LF/CR/ESC r
   const raw = validPolicyRaw();
   raw.metric_name = "p95\nFAKE: direction: higher\r\n";
   raw.methodology_files = [
-    { path: "docs/good.md\n- FAKE methodology entry (sha256: deadbeef)", sha256: SHA_A },
+    { path: "docs/good.md\n- FAKE methodology entry (sha256 deadbeef)", sha256: SHA_A },
     { path: "docs/esc\u001b[31mred.md", sha256: SHA_B },
   ];
   const validation = validateCandidatePolicy(raw);
@@ -552,7 +552,7 @@ test("formatCandidatePolicy quotes metric_name and methodology path: LF/CR/ESC r
   assert.ok(text.includes("metric_name: \"p95\\nFAKE: direction: higher\\r\\n\""));
   assert.ok(
     text.includes(
-      "  - \"docs/good.md\\n- FAKE methodology entry (sha256: deadbeef)\" (sha256: " + SHA_A + ")",
+      "  - \"docs/good.md\\n- FAKE methodology entry (sha256 deadbeef)\" (sha256: " + SHA_A + ")",
     ),
   );
   assert.ok(text.includes("\"docs/esc\\u001b[31mred.md\""));
@@ -915,6 +915,13 @@ test("an agent-supplied flag has no effect: the API has no consent parameter at 
 // Review round (m1): change_files shape and case-insensitive methodology overlap.
 test("change_files: traversal, absolute, dot-trailing and .git entries are refused at init", () => {
   for (const bad of ["../x", "/abs/x", "src/../src/method.md", "src/method.md.", ".git/config", "a//b"]) {
+    const r = validateCandidatePolicy({ ...validPolicyRaw(), change_files: [bad] });
+    assert.equal(r.ok, false, `change_files entry ${JSON.stringify(bad)} must be refused`);
+  }
+});
+
+test("change_files: NTFS alternate-stream and 8.3 short-name spellings are refused", () => {
+  for (const bad of ["METHOD.md::$DATA", "METHOD~1.MD", "src/foo~2.ts"]) {
     const r = validateCandidatePolicy({ ...validPolicyRaw(), change_files: [bad] });
     assert.equal(r.ok, false, `change_files entry ${JSON.stringify(bad)} must be refused`);
   }

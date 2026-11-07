@@ -111,6 +111,8 @@ function changeFilePathError(p: string): string | null {
     if (seg === "." || seg === "..") return "must not contain '.' or '..' segments";
     if (seg.toLowerCase() === ".git") return "must not point into .git";
     if (/[. ]$/.test(seg)) return "has a segment with a trailing dot or space";
+    if (seg.includes(":")) return "must not contain ':' (NTFS alternate data streams)";
+    if (/~\d/.test(seg)) return "must not use an 8.3 short-name segment (~N)";
   }
   return null;
 }

@@ -7991,11 +7991,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   /** Is an ordinary-loop tool blocked by an active candidate campaign? Only a
    *  well-formed, non-disabled campaign state blocks; missing/corrupt state
    *  keeps the ordinary loop working (tasks 3.2). */
-  /**
-   * design §5: outside the normal state the agent must STOP, not be auto-resumed.
-   * True when the campaign state is unclear (pending operation, stale lock,
-   * unreadable state): automatic resume messages are then not scheduled.
-   */
   /** Synchronous: usable from the resume timer. Interrupted operation present. */
   const campaignPendingOpSync = (workDir: string): boolean =>
     fs.existsSync(path.join(campaignDirOf(workDir), candidateState.PENDING_OP_FILE));
@@ -8015,6 +8010,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
   };
 
+  /**
+   * design §5: outside the normal state the agent must STOP, not be auto-resumed.
+   * True when an interrupted campaign operation is pending (pending-op marker):
+   * automatic resume messages are then not scheduled. Lock and unreadable-state
+   * cases are handled by campaignBlocksOrdinaryLoop, not here.
+   */
   const campaignNeedsManualCheck = async (workDir: string): Promise<boolean> => {
     // Scoped to an interrupted operation (the pending-op marker). An unreadable
     // state still blocks the ordinary loop tools (campaignBlocksOrdinaryLoop), but

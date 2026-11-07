@@ -53,7 +53,11 @@ Other actions: `status`, `resume`, `pause`, `select`, `close`, `disable`.
 ## Not promised
 
 Protection against concurrent sessions, power loss, filesystem corruption,
-external processes, or old versions of the extension. Candidate worktrees
+external processes, old versions of the extension, or the agent editing the
+campaign state files directly (see the pending-operation section). An existing
+but unreadable `state.json` blocks `run_experiment` and `log_experiment` while
+the campaign exists (fail-closed); a missing `state.json` leaves the ordinary
+loop unchanged. Candidate worktrees
 are created under the OS temp directory (`pi-ar-candidate/`); they are not
 removed automatically. Automatic cleanup is out of scope for the MVP.
 
@@ -72,7 +76,12 @@ campaign call then returns `manual_check_required`:
    only after consent, or the marker stays with a diagnosis.
 
 A stale campaign lock is cleared the same way (operator dialog only). The
-model cannot approve either action.
+`candidate_branch` tool requires the dialog confirmation for both actions; the
+model's tool calls cannot approve them.
+
+The marker and lock are plain files. The agent's own file tools can delete
+them, and the state file has no integrity check. The dialog gate protects the
+tool path only; it does not stop an agent that edits `.auto/candidate/` by hand.
 
 ## Policy fields
 
