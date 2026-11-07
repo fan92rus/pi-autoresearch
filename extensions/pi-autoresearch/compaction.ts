@@ -42,17 +42,42 @@ export function autoresearchSummaryPathsFor(workDir: string): AutoresearchSummar
  * Build the full compaction summary text from persisted autoresearch state.
  * Returns a markdown string that is itself the entire compaction summary.
  */
-export function buildAutoresearchCompactionSummary(paths: AutoresearchSummaryPaths): string {
+export function buildAutoresearchCompactionSummary(
+  paths: AutoresearchSummaryPaths,
+  opts: { campaign?: boolean } = {},
+): string {
   const state = loadState(paths.jsonlPath);
+  // Under an active candidate campaign the ordinary loop is blocked, so the
+  // summary must not restart it (design §5): header and next step switch to
+  // candidate_branch wording. Run data and rules sections are unchanged.
+  const campaign = opts.campaign === true;
   const sections = [
-    headerSection(),
+    campaign ? candidateHeaderSection() : headerSection(),
     sessionSection(state),
     rulesSection(paths.workDir, paths.mdPath),
     ideasSection(paths.workDir, paths.ideasPath),
     recentRunsSection(state, paths.workDir, paths.jsonlPath),
-    nextStepSection(),
+    campaign ? candidateNextStepSection() : nextStepSection(),
   ];
   return sections.filter(Boolean).join("\n\n");
+}
+
+function candidateHeaderSection(): string {
+  return [
+    "# Autoresearch Compaction Summary (candidate campaign)",
+    "",
+    "The conversation history was discarded. A candidate-branch campaign is active; the persisted state below is the source of truth.",
+    "Continue only through the candidate_branch tool. run_experiment and log_experiment are blocked while the campaign is active.",
+  ].join("\n");
+}
+
+function candidateNextStepSection(): string {
+  return [
+    "## Next Step",
+    "",
+    "Call candidate_branch with action \"status\" first. Then continue the active candidate with run/checkpoint as needed.",
+    "If the status reports manual_check_required or state_unreadable: STOP and report the state to the operator; do not start new measurements or operations.",
+  ].join("\n");
 }
 
 function loadState(jsonlPath: string): ReconstructedJsonlState {

@@ -33,7 +33,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 
 import { createHarness } from "./fake-pi.ts";
 import { measurementScaleStatusOfDir } from "../extensions/pi-autoresearch/measurement.ts";
@@ -1087,4 +1087,33 @@ test("init refuses change_files that name a pinned methodology file with backsla
   assert.match(text, /must not contain methodology file/i, `init must refuse the backslash spelling of a methodology file: ${text}`);
   assert.doesNotMatch(text, /initialized|campaign started/i, "no campaign may start");
   assert.equal(fs.existsSync(path.join(dir, ".auto", "candidate", "state.json")), false, "no state may be written");
+});
+
+// ─── Review regression (B1 round 2): ./METHOD.md as methodology, METHOD.md as change ─
+
+test("methodology ./METHOD.md with change_files METHOD.md: init or checkpoint refuses; no candidate ref is written", async () => {
+  const dir = makeWorkDir("dotslash-method");
+  writeFileSyncSafe(path.join(dir, "METHOD.md"), "methodology v1\n");
+  writeFileSyncSafe(path.join(dir, "src", "algo.ts"), "export const a = 1;\n");
+  const h = await createHarness({ dir, sessionId: "candwiring-dotslash", realGit: true });
+  await h.command("autoresearch").handler("on", h.ctx);
+  h.ctx.ui.confirm = async () => true;
+  const policy = policyOf(dir);
+  policy.methodology_files = [{ path: "./METHOD.md", sha256: "" }];
+  policy.change_files = ["METHOD.md"];
+  const init = await callTool(h, "init", { policy });
+  const initText = textOf(init);
+  if (/initialized|campaign started|ready/i.test(initText)) {
+    const created = await callTool(h, "create", { candidate_id: "c1" });
+    // Actually change the methodology in the candidate worktree, so the bypass is observable
+    // (without a real change the checkpoint refuses as "empty" and proves nothing).
+    const candWt = wtPathFromCreateResponse(created);
+    writeFileSyncSafe(path.join(candWt, "METHOD.md"), "methodology HACKED\n");
+    const cp = await callTool(h, "checkpoint", { allowed_files: ["METHOD.md"], message: "sneaky" });
+    assert.doesNotMatch(textOf(cp), /Checkpoint saved/i, "a methodology file must never enter a checkpoint");
+  } else {
+    assert.match(initText, /methodology|path|invalid|refus/i, `init must refuse a non-normalized methodology path: ${initText}`);
+  }
+  const ref = spawnSync("git", ["rev-parse", "--verify", "--quiet", "refs/pi-autoresearch/candidates/c1"], { cwd: dir, encoding: "utf8" });
+  assert.notEqual(ref.status, 0, "no candidate ref may be written for the methodology file");
 });

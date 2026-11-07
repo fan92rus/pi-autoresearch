@@ -2499,10 +2499,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     event: SessionBeforeCompactEvent,
   ) => {
     if (!getRuntime(ctx).autoresearchMode) return undefined;
+    const workDir = resolveWorkDir(ctx.cwd);
     return {
       compaction: {
         summary: buildAutoresearchCompactionSummary(
-          autoresearchSummaryPathsFor(resolveWorkDir(ctx.cwd)),
+          autoresearchSummaryPathsFor(workDir),
+          { campaign: campaignActiveSync(workDir) },
         ),
         firstKeptEntryId: event.preparation.firstKeptEntryId,
         tokensBefore: event.preparation.tokensBefore,
@@ -8405,7 +8407,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           ? (state.policy as { change_files: readonly string[] }).change_files
           : [];
         // Compare in one spelling (forward slashes): src\\method.md is src/method.md.
-        const slash = (p: string): string => String(p).replace(/\\/g, "/");
+        // Same canonical form as candidate-policy (slashes + lowercase), so the
+        // checkpoint guard matches the init-time overlap guard exactly.
+        const slash = (p: string): string => String(p).replace(/\\/g, "/").toLowerCase();
         const methodPaths = new Set((state.policy as { methodology_files?: { path?: string }[] }).methodology_files?.map((m) => slash(String(m?.path))) ?? []);
         const changeSet = new Set(changeFiles.map(slash));
         for (const p of allowed) {

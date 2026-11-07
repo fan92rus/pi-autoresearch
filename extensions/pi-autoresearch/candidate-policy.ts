@@ -471,6 +471,12 @@ function validateMethodologyFiles(
       );
     }
     if (typeof path === "string" && path.trim().length > 0) {
+      // Same shape rule as change_files: a non-normalized spelling (./METHOD.md,
+      // a//b, METHOD.md.) names the same file to git but not to the overlap guard.
+      const shapeError = changeFilePathError(path);
+      if (shapeError !== null) {
+        errors.push(`"methodology_files[${i}].path" ${JSON.stringify(path)} ${shapeError}`);
+      }
       if (seenPaths.has(path)) {
         errors.push(
           `"methodology_files" contains duplicate path ${JSON.stringify(path)}`,

@@ -309,3 +309,46 @@ test("M1: a legacy resume stored before the campaign started is replaced by camp
   const legacy = pi.sentMessages.filter((m) => /run_experiment \+ log_experiment|Run the next iteration now/.test(m.text));
   assert.equal(legacy.length, 0, `legacy text must not be delivered under a campaign: ${JSON.stringify(pi.sentMessages.map((m) => m.text))}`);
 }, { timeout: 30000 });
+
+test("B2: compaction under an active campaign does not restart the experiment loop", async () => {
+  const dir = makeTempDir("compact-campaign");
+  fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".auto", "candidate", "state.json"),
+    JSON.stringify({ schema_version: 1, disabled: false, policy: {}, candidates: [] }), "utf8");
+  const { hook, ctx } = await makeFullHarnessAt(dir, "compact-campaign-ctx");
+  const out = await hook("session_before_compact")(
+    { preparation: { firstKeptEntryId: "e1", tokensBefore: 10 } },
+    ctx,
+  );
+  const summary = out?.compaction?.summary ?? "";
+  assert.match(summary, /candidate campaign/i, "summary must describe the candidate campaign");
+  assert.equal(/run the next experiment immediately/i.test(summary), false, "summary must not prescribe the loop");
+  assert.equal(/Continue the experiment loop/i.test(summary), false, "summary header must not restart the loop");
+}, { timeout: 30000 });
+
+test("B2 control: compaction without a campaign keeps the legacy summary", async () => {
+  const dir = makeTempDir("compact-legacy");
+  const { hook, ctx } = await makeFullHarnessAt(dir, "compact-legacy-ctx");
+  const out = await hook("session_before_compact")(
+    { preparation: { firstKeptEntryId: "e1", tokensBefore: 10 } },
+    ctx,
+  );
+  const summary = out?.compaction?.summary ?? "";
+  assert.match(summary, /run the next experiment immediately/i, "legacy summary must be unchanged without a campaign");
+}, { timeout: 30000 });
+
+test("M2: a stored campaign resume is not delivered after the campaign was disabled", async () => {
+  const dir = makeTempDir("stored-after-disable");
+  fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
+  const statePath = path.join(dir, ".auto", "candidate", "state.json");
+  fs.writeFileSync(statePath, JSON.stringify({ schema_version: 1, disabled: false, policy: {}, candidates: [] }), "utf8");
+  const { pi, hook, ctx } = await makeFullHarnessAt(dir, "stored-after-disable-ctx");
+  await hook("agent_start")({ messages: [] }, ctx);
+  await hook("agent_end")({ messages: [] }, ctx); // campaign wording scheduled
+  await hook("agent_start")({ messages: [] }, ctx);
+  fs.writeFileSync(statePath, JSON.stringify({ schema_version: 1, disabled: true, policy: {}, candidates: [] }), "utf8");
+  await hook("agent_end")({ messages: [] }, ctx);
+  await new Promise((r) => setTimeout(r, 1200));
+  const campaignText = pi.sentMessages.filter((m) => /candidate_branch/.test(m.text) && /run_experiment|log_experiment/.test(m.text));
+  assert.equal(campaignText.length, 0, `a stale campaign resume must not claim the campaign is active: ${JSON.stringify(pi.sentMessages.map((m) => m.text))}`);
+}, { timeout: 30000 });
