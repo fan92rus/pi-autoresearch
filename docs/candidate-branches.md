@@ -57,9 +57,21 @@ Other actions: `status`, `resume`, `pause`, `select`, `close`, `disable`.
   `record_analysis`, `direction_review`) also stay available: they write only
   under `.auto/` and never touch git refs, the checkout, or the user's branch.
   Under a campaign the loop-wording guideline lines of `record_analysis`,
-  `direction_review` and `tree_status` are removed from the system prompt; the
-  guidance of the measurement tools does not name the ordinary loop. The
+  `direction_review` and the single line "Call tree_status() after every 3-4
+  experiments" are removed from the system prompt; the other guidance of these
+  tools names no blocked tool. The
   ordinary loop's blocked set is a deliberate MVP scope, recorded here.
+
+## Known residuals (review 65ac927 / f7887ad minors, accepted for MVP)
+
+- `autoResumeStopReasonFor` counts consecutive discards/crashes from the
+  ledger without campaign awareness, so legacy history can stop auto-resume
+  under a campaign.
+- The steers for a `state_unreadable` state say "run/checkpoint"; the tools
+  themselves refuse with no side effect, so this is wording only.
+- Changes hidden by `git update-index --assume-unchanged` or `skip-worktree`
+  are not reported by `git status` and do not block a checkpoint.
+- Windows junction handling in the checkpoint symlink check is not probed.
 
 ## Not promised
 

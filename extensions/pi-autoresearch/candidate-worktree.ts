@@ -14,7 +14,9 @@
  *     inside the candidate worktree and point a candidate-scoped ref
  *     (refs/pi-autoresearch/candidates/<candidateId>) at the checkpoint
  *     commit. Unaccounted staged/unstaged/untracked changes (anything outside
- *     the allowed set) block the checkpoint with the offending paths listed;
+ *     the allowed set) block the checkpoint with the offending paths listed.
+ *     Changes hidden by `assume-unchanged` / `skip-worktree` are not reported
+ *     by git status and are not caught here (documented residual);
  *     nothing is discarded or reverted on refusal — the changes stay in the
  *     worktree exactly as they were. Symlinks and path-traversal paths are
  *     never included. The campaign leader ref and the user's branches are
@@ -717,7 +719,7 @@ export async function checkpointCandidateWorktree(
     }
   }
 
-  // 4. Unaccounted changes block the checkpoint.
+  // 4. Unaccounted changes block the checkpoint (status-visible changes only).
   const collected = await collectWorktreeChanges(exec, wtPath);
   if (!collected.ok) {
     return failCheckpoint("guard", `cannot read worktree status: ${collected.reason}`);
