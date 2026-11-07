@@ -105,6 +105,7 @@ const SHA256_RE = /^[0-9a-f]{64}$/i;
 function changeFilePathError(p: string): string | null {
   const s = p.replace(/\\/g, "/");
   if (s.length === 0) return "is empty";
+  if (/[\u0000-\u001f\u007f]/.test(s)) return "must not contain control characters";
   if (s.startsWith("/") || /^[A-Za-z]:/.test(s)) return "must be repo-relative, not absolute";
   for (const seg of s.split("/")) {
     if (seg === "") return "has an empty path segment";

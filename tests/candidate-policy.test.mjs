@@ -390,10 +390,11 @@ test("overlapping methodology paths cannot inject control characters into errors
   raw.change_files = [injected];
   const result = validateCandidatePolicy(raw);
   assert.equal(result.ok, false);
-  const error = result.errors.find((e) => e.includes("must not contain methodology file"));
-  assert.ok(error);
+  // The control-character shape rule refuses the path before the overlap guard runs.
+  const error = result.errors.find((e) => e.includes("must not contain control characters"));
+  assert.ok(error, `expected a control-character refusal, got: ${JSON.stringify(result.errors)}`);
   assert.ok(error.includes(JSON.stringify(injected)));
-  assert.doesNotMatch(error, /[\x00-\x1f\x7f]/);
+  for (const e of result.errors) assert.doesNotMatch(e, /[\x00-\x1f\x7f]/);
 });
 
 test("unknown top-level fields are rejected — an agent cannot smuggle a consent flag", () => {
@@ -450,11 +451,21 @@ test("formatCandidatePolicy renders every field for the confirmation dialog", ()
   }
 });
 
+test("change_files entries with control characters are refused by validation", () => {
+  for (const bad of ["src/new\nline.txt", "src/tab\tname.ts", "src/esc\u001b.ts", "src/nul\u0000.ts"]) {
+    const raw = validPolicyRaw();
+    raw.change_files = [bad];
+    const result = validateCandidatePolicy(raw);
+    assert.equal(result.ok, false, `must refuse ${JSON.stringify(bad)}`);
+    assert.ok(result.errors.some((e) => e.includes("must not contain control characters")));
+  }
+});
+
 test("formatCandidatePolicy JSON-quotes each argv value: commas and control characters preserved exactly", () => {
   const raw = validPolicyRaw();
   raw.benchmark_argv = ["node", "a,b", "line1\nline2\ttabbed", 'quo"te', "back\\slash"];
   raw.checks_argv = ["node", "a,b"];
-  raw.change_files = ["src/dir,with,commas/file.ts", "src/new\nline.txt"];
+  raw.change_files = ["src/dir,with,commas/file.ts", "src/new line.txt"];
   const validation = validateCandidatePolicy(raw);
   assert.ok(validation.policy);
   const text = formatCandidatePolicy(validation.policy);
@@ -470,7 +481,7 @@ test("formatCandidatePolicy JSON-quotes each argv value: commas and control char
   assert.ok(text.includes('"quo\\"te"'));
   assert.ok(text.includes('"back\\\\slash"'));
   assert.ok(text.includes('"src/dir,with,commas/file.ts"'));
-  assert.ok(text.includes('"src/new\\nline.txt"'));
+  assert.ok(text.includes('"src/new line.txt"'));
 
   // No raw control characters may leak into the dialog text: every control
   // character (newline, tab, CR) must appear only as a JSON escape, so the
@@ -511,6 +522,26 @@ test("the confirmation dialog shows the exact argv value 'a,b' without comma dis
 // ─── pi-autoresearch-3e4.4.1.4, Reviewer B1) ────────────────────────────────
 
 /**
+ * The shape rules refuse control characters in path fields before formatting,
+ * so these escaping tests validate a safe copy of the policy and then swap in
+ * the hostile path values. That exercises the formatter's own defence.
+ */
+function formatWithHostilePaths(raw) {
+  const safe = {
+    ...raw,
+    change_files: ["src/safe.ts"],
+    methodology_files: [{ path: "docs/safe.md", sha256: SHA_A }],
+  };
+  const validation = validateCandidatePolicy(safe);
+  assert.ok(validation.policy, `safe baseline must validate: ${JSON.stringify(validation.errors)}`);
+  return formatCandidatePolicy({
+    ...validation.policy,
+    change_files: raw.change_files,
+    methodology_files: raw.methodology_files,
+  });
+}
+
+/**
  * Reviewer B1 regression: metric_name and methodology_files[].path were
  * interpolated without JSON quoting, so an LF or CR inside the value forged
  * extra lines in the confirmation dialog. Every user-controlled string is
@@ -524,9 +555,7 @@ test("formatCandidatePolicy quotes metric_name and methodology path: LF/CR/ESC r
     { path: "docs/good.md\n- FAKE methodology entry (sha256 deadbeef)", sha256: SHA_A },
     { path: "docs/esc\u001b[31mred.md", sha256: SHA_B },
   ];
-  const validation = validateCandidatePolicy(raw);
-  assert.ok(validation.policy);
-  const text = formatCandidatePolicy(validation.policy);
+  const text = formatWithHostilePaths(raw);
 
   // No raw control character anywhere in the rendered policy: LF, CR and
   // ESC must appear only as backslash escapes, so nothing can forge extra
@@ -602,9 +631,7 @@ test("formatCandidatePolicy round-trips every user string exactly through JSON q
     path: "docs/" + p,
     sha256: i % 2 === 0 ? SHA_A : SHA_B,
   }));
-  const validation = validateCandidatePolicy(raw);
-  assert.ok(validation.policy);
-  const text = formatCandidatePolicy(validation.policy);
+  const text = formatWithHostilePaths(raw);
 
   // No raw control character in the whole rendered policy.
   for (const line of text.split("\n")) {
@@ -652,9 +679,8 @@ test("formatCandidatePolicy round-trips every user string exactly through JSON q
 test("the confirmation dialog message with LF/CR bombs stays structurally intact", async () => {
   const raw = validPolicyRaw();
   raw.metric_name = "m\nline2\rfake: line3";
-  raw.methodology_files = [{ path: "p\nq.md", sha256: SHA_A }];
   const validation = validateCandidatePolicy(raw);
-  assert.ok(validation.policy);
+  assert.ok(validation.policy, `metric bomb is a valid JSON-quoted value: ${JSON.stringify(validation.errors)}`);
   const { ui, calls } = makeUi(true);
   const result = await confirmCandidatePolicy(ui, validation.policy);
   assert.equal(result.ok, true);
@@ -665,8 +691,18 @@ test("the confirmation dialog message with LF/CR bombs stays structurally intact
   assert.ok(message.startsWith(formatted));
   assert.ok(message.endsWith("Refusal, cancellation, a closed dialog or an error blocks the campaign."));
   assert.ok(message.includes("metric_name: \"m\\nline2\\rfake: line3\""));
-  assert.ok(message.includes("\"p\\nq.md\""));
 });
+
+test("a policy with a control character in a path never reaches the consent dialog", async () => {
+  const raw = validPolicyRaw();
+  raw.methodology_files = [{ path: "p\nq.md", sha256: SHA_A }];
+  const { ui, calls } = makeUi(true);
+  const result = await confirmCandidatePolicy(ui, raw);
+  assert.equal(result.ok, false);
+  assert.equal(result.stage, "validation");
+  assert.equal(calls.length, 0, "the user must not be asked about a hostile policy");
+});
+
 
 // ─── validation diagnostics: honest single lines under LF/CR injection ──────
 
