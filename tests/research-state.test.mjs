@@ -715,3 +715,31 @@ test("manualResolvePendingOp clears the marker only with the operator token unde
     assertRefusal(await R.manualResolvePendingOp(outside, R.OPERATOR_CONFIRMATION), "invalid_argument");
   });
 });
+
+test("writeApproval records the confirmed hash and refuses re-approval or a changed brief", async () => {
+  await withWorkDir(async (root) => {
+    const dir = await newCampaign(root, "c1");
+    await draftBrief(dir);
+    const hash = (await R.briefSha256(dir)).sha256;
+
+    assertRefusal(await R.writeApproval(dir, "not-a-hash"), "invalid_argument");
+    assert.equal(existsSync(join(dir, R.APPROVAL_FILE)), false, "bad hash means no approval file");
+
+    const ok = await R.writeApproval(dir, hash);
+    assert.equal(ok.ok, true, JSON.stringify(ok));
+    assert.equal(ok.approval.brief_sha256, hash);
+    assert.equal(ok.approval.confirmed, true);
+
+    assertRefusal(await R.writeApproval(dir, hash), "approval_invalid");
+    const before = await snapshot(dir);
+    assertRefusal(await R.writeApproval(dir, hash), "approval_invalid");
+    assert.deepEqual(await snapshot(dir), before, "re-approval must not rewrite anything");
+
+    await writeFile(join(dir, R.BRIEF_FILE), JSON.stringify(validBrief({ goal: "changed" })));
+    assertRefusal(await R.updateState(dir, "try", noopDecide), "brief_changed");
+
+    const outside = join(root, "outside", "c1");
+    await mkdir(outside, { recursive: true });
+    assertRefusal(await R.writeApproval(outside, hash), "invalid_argument");
+  });
+});

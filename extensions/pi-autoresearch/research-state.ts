@@ -882,3 +882,46 @@ export async function manualResolvePendingOp(dir: string, confirmation: string):
     };
   });
 }
+
+/**
+ * Writes approval.json after the OWNER's dialog consent (ctx.ui.confirm ===
+ * true). The caller passes the current brief hash it showed the user; the
+ * function re-hashes brief.json from disk and refuses when the hash no longer
+ * matches what was confirmed. An existing approval is never rewritten: a new
+ * approval means a new campaign.
+ */
+export async function writeApproval(
+  dir: string,
+  confirmedBriefSha256: string,
+): Promise<Result<{ approval: Approval }>> {
+  const contained = requireCampaignContained(dir);
+  if (contained) return contained;
+  if (typeof confirmedBriefSha256 !== "string" || !SHA256_RE.test(confirmedBriefSha256)) {
+    return refuse("invalid_argument", "confirmed brief hash must be 64 lowercase hex characters");
+  }
+  return withCampaignLock(dir, async (): Promise<Result<{ approval }>> => {
+    if (await fileMayExist(join(dir, APPROVAL_FILE))) {
+      return refuse("approval_invalid", "the brief is already approved; approval.json is never rewritten");
+    }
+    const current = await briefSha256(dir);
+    if (!current.ok) return current;
+    if (current.sha256 !== confirmedBriefSha256) {
+      return refuse(
+        "brief_changed",
+        `the brief changed while it was shown for confirmation (confirmed ${confirmedBriefSha256.slice(0, 12)}, now ${current.sha256.slice(0, 12)}); show the brief again before consenting`,
+      );
+    }
+    const approval: Approval = {
+      schema_version: APPROVAL_SCHEMA_VERSION,
+      brief_sha256: current.sha256,
+      approved_at: new Date().toISOString(),
+      confirmed: true,
+    };
+    try {
+      await writeFileAtomic(join(dir, APPROVAL_FILE), JSON.stringify(approval, null, 2) + "\n");
+    } catch (err) {
+      return refuse("io_failed", `approval.json cannot be written (${errorText(err)}); nothing was approved`);
+    }
+    return { ok: true, approval };
+  });
+}
