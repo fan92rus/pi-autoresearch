@@ -520,7 +520,7 @@ test("missing output.txt: honest warning with the path and the advice to re-run,
   });
   const res = inspectResults(dir, {});
   assert.match(res.text, /^⚠️ inspect_results: вывод прогона 1 не персистирован \(\.auto\/runs\/1\/output\.txt отсутствует\)/);
-  assert.match(res.text, /run_experiment/);
+  assert.match(res.text, /перезапустите замер в текущем режиме/i);
   assert.equal(res.details.status, "output_missing");
 });
 
@@ -552,7 +552,8 @@ test("ledger with runs but no .auto/runs directory (pre-lens campaign): output_m
   ].join("\n") + "\n");
   const res = inspectResults(dir, {});
   assert.equal(res.details.status, "output_missing");
-  assert.match(res.text, /перезапустите замер через run_experiment/i);
+  assert.match(res.text, /перезапустите замер в текущем режиме/i);
+  assert.doesNotMatch(res.text, /run_experiment|log_experiment/);
 });
 
 test("analysis.extractors from the header: regex extractor shows the gold/pred pairs of the default run", () => {

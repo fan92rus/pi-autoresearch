@@ -340,7 +340,7 @@ export function selectInspectRun(
   if (metas.length === 0) {
     return {
       ok: false,
-      error: "в леджере (.auto/log.jsonl) нет записанных прогонов, инспектировать нечего. Запустите замер через run_experiment и log_experiment.",
+      error: "в леджере (.auto/log.jsonl) нет записанных прогонов, инспектировать нечего. Запустите замер в текущем режиме (обычный цикл или candidate_branch) и запишите его в леджер.",
     };
   }
   const epoch = currentEpoch;
@@ -905,7 +905,7 @@ export function inspectResults(workDir: string, args: InspectArgs): InspectRespo
       text:
         `⚠️ inspect_results: вывод прогона ${meta.run} не персистирован (${outputPath} отсутствует). ` +
         "Прогон записан в леджер до внедрения .auto/runs или сохранение не удалось. " +
-        "Перезапустите замер через run_experiment, чтобы получить персистированный вывод.",
+        "Перезапустите замер в текущем режиме (обычный цикл или candidate_branch), чтобы получить персистированный вывод.",
       details: { run: meta.run, status: "output_missing", outputPath },
     };
   }
