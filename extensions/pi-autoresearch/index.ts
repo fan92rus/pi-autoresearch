@@ -3047,6 +3047,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       ? (event.input as { command: string }).command
       : "";
     if (!cmd || !BENCHMARK_EXEC_RE.test(cmd)) return;
+    // Under an active candidate campaign the ordinary loop is blocked, so the
+    // reason must not name run_experiment (design §5). Point to candidate_branch.
+    if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) {
+      return {
+        block: true,
+        reason:
+          "Blocked: a bash-run of the benchmark is not a candidate measurement. " +
+          "While a candidate campaign is active, measure through candidate_branch run.",
+      };
+    }
     return {
       block: true,
       reason:
@@ -3456,7 +3466,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     name: "propose_hypothesis",
     label: "Propose Hypothesis",
     description:
-      "Register a hypothesis in the experiment tree BEFORE calling run_experiment. " +
+      "Register a hypothesis in the experiment tree BEFORE calling run_experiment (ordinary loop; while a candidate campaign is active, use candidate_branch instead). " +
       "Takes either a description string (saved to .auto/ideas/<nodeId>.md) or a path to an existing file. " +
       "SimHash checks against all existing nodes; duplicates get status=duplicate unless force=true. " +
       "Returns the node_id to pass to run_experiment(hypothesis_id).",
@@ -4769,7 +4779,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     name: "log_experiment",
     label: "Log Experiment",
     description:
-      "Record an experiment result. Tracks metrics, updates the status widget and dashboard. Call after every run_experiment.",
+      "Record an experiment result. Tracks metrics, updates the status widget and dashboard. Call after every run_experiment. Blocked while a candidate campaign is active (use candidate_branch).",
     promptSnippet:
       "Log experiment result (commit, metric, status, description)",
     promptGuidelines: [
