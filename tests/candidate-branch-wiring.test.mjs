@@ -529,6 +529,19 @@ test("no campaign on disk: ordinary loop behaves exactly as before", async () =>
   assert.equal(/candidate campaign active/i.test(textOf(res2)), true, "corrupt state -> fail-closed blocking");
 });
 
+test("junk state with disabled:true (no schema) fails closed; a schema-valid disabled campaign releases the loop", async () => {
+  const { h, dir } = await setupRepo("junkdisabled");
+  const runExp = h.tool("run_experiment");
+  const statePath = path.join(dir, ".auto", "candidate", "state.json");
+  fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  writeFileSyncSafe(statePath, JSON.stringify({ disabled: true, junk: 1 }));
+  const junk = await runExp.execute("id", { command: "echo hi", timeout_seconds: 10 }, null, null, h.ctx);
+  assert.equal(/candidate campaign active/i.test(textOf(junk)), true, "a non-schema disabled file must keep the loop blocked");
+  writeFileSyncSafe(statePath, JSON.stringify({ schema_version: 1, disabled: true, candidates: [] }));
+  const valid = await runExp.execute("id", { command: "echo hi", timeout_seconds: 10 }, null, null, h.ctx);
+  assert.equal(/candidate campaign active/i.test(textOf(valid)), false, "a schema-valid disabled campaign must release the loop");
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // close / disable keep data
 // ─────────────────────────────────────────────────────────────────────────────
