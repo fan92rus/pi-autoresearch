@@ -832,6 +832,28 @@ test("checkpoint refuses when the candidate's own commit touched a path outside 
   assert.notEqual(ref.status, 0, "no candidate ref may be written");
 });
 
+test("checkpoint refuses when the candidate's own commit renames a methodology file into scope", async () => {
+  const { repo, commit, wtPath } = await makeCampaignWithWorktree("committed-rename");
+  // docs/methodology.md is tracked at the base commit; the candidate renames it into an allowed path.
+  gitSync(["mv", "docs/methodology.md", "src/moved.md"], wtPath);
+  gitSync(["-c", "user.name=T", "-c", "user.email=t@t", "commit", "-q", "-m", "rename-into-scope"], wtPath);
+  writeFile(path.join(wtPath, "src", "algo.ts"), "export const a = 5;\n");
+  const r = await checkpointCandidateWorktree(exec, {
+    repoRoot: repo,
+    worktreePath: wtPath,
+    candidateId: "c1",
+    allowedFiles: ["src/algo.ts"],
+    message: "rename probe",
+    committedScope: { baseRef: commit, scope: ["src/algo.ts", "src/moved.md"] },
+  });
+  assert.equal(r.ok, false, "a rename that removes a methodology path must block the checkpoint");
+  assert.equal(r.stage, "outside-allowed");
+  assert.match(r.reason, /committed in the candidate worktree/i);
+  const ref = spawnSync("git", ["rev-parse", "--verify", "--quiet", "refs/pi-autoresearch/candidates/c1"], { cwd: repo, encoding: "utf8" });
+  assert.notEqual(ref.status, 0, "no candidate ref may be written");
+});
+
+
 test("checkpoint accepts a candidate commit whose paths are all inside the campaign scope", async () => {
   const { repo, commit, wtPath } = await makeCampaignWithWorktree("committed-scope-ok");
   writeFile(path.join(wtPath, "src", "algo.ts"), "export const a = 3;\n");

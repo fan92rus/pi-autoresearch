@@ -702,7 +702,7 @@ export async function checkpointCandidateWorktree(
     let touched: string[];
     try {
       const baseSha = (await git(exec, ["rev-parse", "--verify", "--quiet", `${opts.committedScope.baseRef}^{commit}`], { cwd: wtPath })).trim();
-      const out = await git(exec, ["log", "-z", "--name-only", "--format=", `${baseSha}..HEAD`], { cwd: wtPath });
+      const out = await git(exec, ["log", "-z", "--no-renames", "--name-only", "--format=", `${baseSha}..HEAD`], { cwd: wtPath });
       touched = Array.from(new Set(out.split("\0").map((s) => s.replace(/^\n+/, "")).filter((s) => s.length > 0)));
     } catch (err) {
       return failCheckpoint("guard", `cannot read the candidate's own commits: ${gitReason(err)}`);

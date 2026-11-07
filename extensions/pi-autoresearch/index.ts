@@ -3018,6 +3018,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // Track whether the in-flight turn does real loop work (goal-x pattern:
   // the settled-turn drift policy reads this). Branching tools are disabled
   // (BRANCHING_TOOLS_ENABLED) — re-add their names here when re-enabled.
+  // While they are disabled they are not registered at all, so a candidate
+  // campaign cannot reach them. Re-enabling them requires a campaign guard
+  // (campaignBlocksOrdinaryLoop -> campaignBlockedResponse) in each execute,
+  // because explore_from and restore_main move the user checkout.
   const EXPERIMENT_LOOP_TOOLS = new Set([
     "run_experiment", "log_experiment", "propose_hypothesis", "init_experiment",
     "tree_status", "finalize_research",
