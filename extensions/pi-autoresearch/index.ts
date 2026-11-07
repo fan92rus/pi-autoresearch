@@ -7642,6 +7642,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               maxChallengeRounds: 5,
               minExperiments: 3,
               supplementText,
+              campaignActive: await campaignBlocksOrdinaryLoop(workDir),
             }),
           ].join("\n");
           return {
@@ -7688,6 +7689,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           maxChallengeRounds: 5,
           minExperiments: 3,
           supplementText,
+          campaignActive: await campaignBlocksOrdinaryLoop(workDir),
         }),
       ].join("\n");
 

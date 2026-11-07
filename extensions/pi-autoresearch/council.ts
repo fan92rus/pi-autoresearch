@@ -893,6 +893,8 @@ export interface FacilitatorInput {
   minExperiments: number;
   /** Resume supplement (buildPrecedentSupplement text); appended as a separate block, the brief is unchanged. */
   supplementText?: string;
+  /** A candidate-branch campaign is active: Phase 4 must not prescribe the ordinary loop (design §5). */
+  campaignActive?: boolean;
 }
 
 function participantTask(name: string, letter: string, model: string, persona: CouncilPersona, input: FacilitatorInput, round: "diverge" | "challenge"): string {
@@ -1030,9 +1032,11 @@ export function composeFacilitatorMessage(input: FacilitatorInput): string {
       "DIFF/RESCORE/JUSTIFY plan and a KILL_WHEN line. If invalid → one retry with the chair asking to fix the listed problems.",
     "",
     "## Phase 4 — Execute",
-    "Register each slate experiment with propose_hypothesis (SimHash will drop duplicates of already-tried ideas — " +
-      "that is expected and fine), then run them through the normal loop: run_experiment → log_experiment with ASI " +
-      "(finding / do_not_retry). The benchmark decides — a council opinion is not evidence.",
+    ...(input.campaignActive
+      ? ["A candidate-branch campaign is active: the ordinary experiment loop is blocked. Carry the slate through candidate_branch (create/run/checkpoint on the active candidate). The benchmark decides — a council opinion is not evidence."]
+      : ["Register each slate experiment with propose_hypothesis (SimHash will drop duplicates of already-tried ideas — " +
+         "that is expected and fine), then run them through the normal loop: run_experiment → log_experiment with ASI " +
+         "(finding / do_not_retry). The benchmark decides — a council opinion is not evidence."]),
     "",
     `Budget note: councils are unlimited by default — a long campaign may convene as many as stagnation demands. ` +
       `Set council.max_councils in .auto/config.json to cap them. A keep from this slate resets the stagnation clock.`,
