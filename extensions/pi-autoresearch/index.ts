@@ -31,6 +31,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Text, truncateToWidth, matchesKey, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer, type Server, type ServerResponse } from "node:http";
@@ -174,6 +175,15 @@ import {
 import { resolveAutoresearchShortcuts, SHORTCUT_ACTIONS } from "./shortcuts.ts";
 import { getAutoresearchArgumentCompletions, isHelpRequest, renderAutoresearchHelp } from "./commands.ts";
 import { sessionFilePath, sessionFileCandidates, ensureParentDir, AUTO_DIR } from "./paths.ts";
+import {
+  requestCandidatePolicyConsent,
+  formatCandidatePolicy,
+  validateCandidatePolicy,
+  type CandidatePolicy,
+} from "./candidate-policy.ts";
+import * as candidateState from "./candidate-state.ts";
+import * as candidateWorktree from "./candidate-worktree.ts";
+import * as candidateMeasure from "./candidate-measure.ts";
 import { RpcClient } from "./parallel/rpc.ts";
 import { runBestOfN } from "./parallel/bestofn.ts";
 import { runCheckOrthogonal } from "./parallel/orthogonal.ts";
@@ -3886,6 +3896,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const modeGate = assertModeActive(ctx);
       if (modeGate) return modeGate;
+      // Candidate-branch campaign guard (tasks 3.2): an active campaign blocks
+      // the ordinary loop. Missing/corrupt state keeps the ordinary behavior.
+      // (Placed after the existing workDirError validation below.)
       const runtime = getRuntime(ctx);
       const state = runtime.state;
 
@@ -3897,6 +3910,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           details: {},
         };
       }
+      if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return campaignBlockedResponse();
       const workDir = resolveWorkDir(ctx.cwd);
       // The config (and therefore the cap) always lives in ctx.cwd — even when
       // workingDir redirects the experiment work elsewhere (see readConfig).
@@ -4639,6 +4653,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const modeGate = assertModeActive(ctx);
       if (modeGate) return modeGate;
+      // Candidate-branch campaign guard (tasks 3.2): before any side effect.
+      if (validateWorkDir(ctx.cwd) === null && (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd)))) {
+        return campaignBlockedResponse();
+      }
       const runtime = getRuntime(ctx);
       const state = runtime.state;
 
@@ -7731,6 +7749,760 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         content: [{ type: "text", text: `🏁 Finalize signal recorded (confidence=${conf}). The observer will now recommend /autoresearch off in its steers.${reportNote}` }],
         details: { finalized: true, confidence: conf, bestMetric: state.bestMetric, reportPath },
       };
+    },
+  });
+
+  // =======================================================================
+  // candidate_branch — candidate-branch MVP (openspec/changes/candidate-branches)
+  // Integrates candidate-policy + candidate-state + candidate-worktree +
+  // candidate-measure into one gated tool. See design §2–§5. The user's own
+  // branch/worktree is never moved: all candidate work happens in detached
+  // system-owned worktrees, promotion only moves the private leader ref.
+  // =======================================================================
+
+  const CANDIDATE_DIR = path.join(AUTO_DIR, "candidate");
+  // Worktrees MUST live outside the user's tree (worktree module refuses
+  // inside-source paths — design §4). The OS temp dir keeps them system-owned
+  // and out of the repository; the campaign-scoped subdirectory name derives
+  // from the resolved workDir so different campaigns never collide.
+  const candidateWtRootOf = (workDir: string): string => {
+    const key = createHash("sha256").update(path.resolve(workDir)).digest("hex").slice(0, 16);
+    return path.join(os.tmpdir(), "pi-ar-candidate", key);
+  };
+  const LEADER_REF = "refs/pi-autoresearch/campaign-leader";
+  const CAMPAIGN_BLOCK_TEXT = "Candidate campaign active; use candidate_branch or disable first";
+
+  /** Real child_process exec on a raw argv (no shell): maps to the
+   *  candidate-measure ExecRunner shape (argv, {cwd, timeoutMs}). */
+  const candidateExecRunner = (
+    argv: string[],
+    opts: { cwd?: string; timeoutMs?: number },
+  ): Promise<{ code: number; stdout: string; stderr: string; killed: boolean }> =>
+    new Promise((resolve) => {
+      let timedOut = false;
+      const child = spawn(argv[0], argv.slice(1), {
+        cwd: opts.cwd,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: process.env,
+        windowsHide: true,
+      });
+      let stdout = "";
+      let stderr = "";
+      const timeoutHandle = opts.timeoutMs && opts.timeoutMs > 0
+        ? setTimeout(() => { timedOut = true; if (child.pid) killTree(child.pid); }, opts.timeoutMs)
+        : undefined;
+      child.stdout?.on("data", (d: Buffer) => { stdout += d.toString(); });
+      child.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
+      child.on("error", (err) => {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+        resolve({ code: 127, stdout, stderr: stderr + String(err), killed: false });
+      });
+      child.on("close", (code) => {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+        resolve({ code: code ?? 1, stdout, stderr, killed: timedOut });
+      });
+    });
+
+  /** candidate-worktree ExecFn shape: (cmd, args, {cwd, timeout}). */
+  const candidateGitExec = async (
+    cmd: string,
+    args: string[],
+    opts?: { cwd?: string; timeout?: number },
+  ): Promise<{ code: number; stdout: string; stderr: string }> => {
+    const r = await candidateExecRunner([cmd, ...args], { cwd: opts?.cwd, timeoutMs: opts?.timeout });
+    return { code: r.code, stdout: r.stdout, stderr: r.stderr };
+  };
+
+  const campaignDirOf = (workDir: string): string => path.join(workDir, CANDIDATE_DIR);
+
+  /** SHA-256 of one methodology file, read fresh from disk (repo-relative). */
+  const hashMethodologyFile = (workDir: string, relPath: string): string | null => {
+    try {
+      const abs = path.resolve(workDir, relPath);
+      // Containment: the file must live inside the workDir.
+      if (!abs.startsWith(path.resolve(workDir) + path.sep) && abs !== path.resolve(workDir)) return null;
+      const content = fs.readFileSync(abs);
+      return createHash("sha256").update(content).digest("hex");
+    } catch {
+      return null;
+    }
+  };
+
+  const hashAllMethodology = (workDir: string, policy: CandidatePolicy): { ok: true; hashes: { path: string; sha256: string }[] } | { ok: false; reason: string } => {
+    const hashes: { path: string; sha256: string }[] = [];
+    for (const f of policy.methodology_files) {
+      const h = hashMethodologyFile(workDir, f.path);
+      if (h === null) return { ok: false, reason: `methodology file ${JSON.stringify(f.path)} is missing or unreadable` };
+      hashes.push({ path: f.path, sha256: h });
+    }
+    return { ok: true, hashes };
+  };
+
+  const gitOut = async (workDir: string, args: string[]): Promise<string> => {
+    const r = await candidateGitExec("git", args, { cwd: workDir, timeout: 15000 });
+    if (r.code !== 0) throw new Error(`git ${args.join(" ")} failed: ${(r.stderr || r.stdout).slice(0, 200)}`);
+    return r.stdout;
+  };
+
+  const fullShaOf = async (workDir: string, ref: string): Promise<string | null> => {
+    try {
+      const out = await gitOut(workDir, ["rev-parse", "--verify", "--quiet", ref]);
+      const sha = out.trim();
+      return /^[0-9a-f]{40}$/i.test(sha) ? sha.toLowerCase() : null;
+    } catch {
+      return null;
+    }
+  };
+
+  /** Is an ordinary-loop tool blocked by an active candidate campaign? Only a
+   *  well-formed, non-disabled campaign state blocks; missing/corrupt state
+   *  keeps the ordinary loop working (tasks 3.2). */
+  const campaignBlocksOrdinaryLoop = async (workDir: string): Promise<boolean> => {
+    const statePath = path.join(campaignDirOf(workDir), candidateState.STATE_FILE);
+    if (!fs.existsSync(statePath)) return false;
+    try {
+      const raw = JSON.parse(fs.readFileSync(statePath, "utf8"));
+      if (raw && typeof raw === "object" && raw.disabled === false) return true;
+      return false;
+    } catch {
+      return false;
+    }
+  };
+
+  const campaignBlockedResponse = () => ({
+    content: [{ type: "text", text: `⛔ ${CAMPAIGN_BLOCK_TEXT}.` }],
+    details: {},
+  });
+
+  /** Single-line refusal text from any module refusal shape. */
+  const refusalText = (r: { reason: string; message: string }): string => `⛔ ${r.reason}: ${r.message}`;
+
+  const activeCandidateOf = (state: candidateState.CampaignState | null): candidateState.CandidateRecord | null => {
+    if (!state) return null;
+    return state.candidates.find((c) => c.status === "active") ?? null;
+  };
+
+  /** Side measurement in an ephemeral worktree for one side of a confirm. */
+  const measureSideInEphemeral = async (
+    workDir: string,
+    label: string,
+    sideSha: string,
+    policy: CandidatePolicy,
+  ): Promise<{ ok: true; average: number; wtPath: string } | { ok: false; reason: string; message: string; wtPath?: string }> => {
+    // Review B1: "confirm-leader"/"confirm-cand" are valid user candidate ids,
+    // so a live candidate could occupy the ephemeral path and confirm's force
+    // removal would destroy unsaved work. Unique namespaced ids cannot collide.
+    const ephemeralId = `tmp-confirm-${label}-${createHash("sha256").update(`${process.pid}:${Date.now()}:${Math.random()}`).digest("hex").slice(0, 12)}`;
+    const wtPath = path.join(candidateWtRootOf(workDir), ephemeralId);
+    const wtRes = await candidateWorktree.createCandidateWorktree(candidateGitExec, {
+      repoRoot: workDir,
+      baseCommit: sideSha,
+      worktreePath: wtPath,
+      candidateId: ephemeralId,
+    });
+    if (!wtRes.ok) return { ok: false, reason: wtRes.reason, message: wtRes.reason };
+    const measured = await candidateMeasure.runRepeatedMeasurement(candidateExecRunner, {
+      dir: wtPath,
+      metricName: policy.metric_name,
+      argv: policy.benchmark_argv,
+      timeoutMs: policy.benchmark_timeout_seconds * 1000,
+      repeats: policy.repeats,
+      budgetMs: policy.confirm_budget_seconds * 1000,
+    });
+    if (!measured.ok) {
+      // B-A fix: the worktree WAS created by this call — remove it before
+      // returning the failure, so a failed side leaves no tmp-confirm-* entry
+      // registered in git or on disk.
+      await removeEphemeralWorktree(workDir, wtPath);
+      return { ok: false, reason: measured.reason, message: measured.message };
+    }
+    return { ok: true, average: measured.average, wtPath };
+  };
+
+  const removeEphemeralWorktree = async (workDir: string, wtPath: string): Promise<void> => {
+    // Plain remove first; --force ONLY for the paths this confirm created.
+    let r = await candidateGitExec("git", ["worktree", "remove", wtPath], { cwd: workDir, timeout: 15000 });
+    if (r.code !== 0) {
+      r = await candidateGitExec("git", ["worktree", "remove", "--force", wtPath], { cwd: workDir, timeout: 15000 });
+    }
+    if (r.code !== 0) {
+      // Never fail the confirm for cleanup; leftover is reported via status
+      // (the operator can remove it by hand — MVP has no auto-delete promises).
+    }
+  };
+
+  registerGatedTool({
+    name: "candidate_branch",
+    label: "Candidate branch campaign",
+    description:
+      "Candidate-branch campaign tool (MVP): sequentially develop multiple candidates in isolated system-owned " +
+      "worktrees with checkpoints, then confirm a promotion only after re-measurement. Actions: init (policy + " +
+      "EXPLICIT user consent via dialog; no consent = no campaign), create, status, resume, run (candidate measurement, " +
+      "not a global keep), checkpoint, pause, select, close, confirm (re-measure leader+candidate, CAS-promote the " +
+      "private ref refs/pi-autoresearch/campaign-leader), disable, resolve (OPERATOR-only manual resolution of a pending " +
+      "op or stale lock via an explicit dialog consent; the model cannot self-approve it). While a campaign is active, run_experiment and " +
+      "log_experiment are blocked. The user's own branch and files are never moved, reset or deleted; checkpoints and " +
+      "state survive disable. Policy is immutable after init.",
+    promptSnippet: "Candidate-branch campaign: init/create/run/checkpoint/confirm in isolated worktrees",
+    promptGuidelines: [
+      "init REQUIRES the user to confirm the full policy in a dialog; without consent the campaign does not start.",
+      "Run candidate work only inside the candidate worktree (returned in create); run measures the candidate, it is NOT a global keep.",
+      "checkpoint saves allowed files into a commit + ref; regression is allowed. confirm re-measures BOTH sides and promotes the leader ref only on a strict gain above min_gain with passing checks.",
+      "resolve is OPERATOR-only: it asks the human via a dialog before clearing a pending op or a stale lock, and can register a verified orphan checkpoint; never assume it succeeded without the dialog.",
+      "While the campaign is active, ordinary run_experiment/log_experiment are blocked; use candidate_branch run/checkpoint or disable first.",
+    ],
+    parameters: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["init", "create", "status", "resume", "run", "checkpoint", "pause", "select", "close", "confirm", "disable", "resolve"],
+          description: "Campaign action to perform.",
+        },
+        policy: {
+          type: "object",
+          description: "init only: full campaign policy (metric_name, direction higher/lower, repeats>=1, min_gain>=0, benchmark_argv, checks_argv, benchmark_timeout_seconds, confirm_budget_seconds, candidate_step_limit, candidate_time_limit_seconds, methodology_files [{path,sha256?}], change_files). Methodology sha256 values are computed from disk; pass paths.",
+        },
+        candidate_id: { type: "string", description: "Candidate id (create/pause/resume/select/close): [A-Za-z0-9._-], 1-64 chars." },
+        allowed_files: { type: "array", items: { type: "string" }, description: "checkpoint only: explicit repo-relative files the checkpoint may include." },
+        message: { type: "string", description: "checkpoint only: commit message." },
+        checkpoint_id: { type: "string", description: "select only: checkpoint id (full commit sha) to select." },
+      },
+      required: ["action"],
+    } as any,
+
+    async execute(_toolCallId: string, params: any, _signal, _onUpdate, ctx: ExtensionContext) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
+      const workDirError = validateWorkDir(ctx.cwd);
+      if (workDirError) return { content: [{ type: "text", text: `❌ ${workDirError}` }], details: {} };
+      const workDir = resolveWorkDir(ctx.cwd);
+      const campDir = campaignDirOf(workDir);
+      const action = params?.action;
+
+      const fail = (reason: string, message: string, extra = "") => ({
+        content: [{ type: "text", text: `⛔ ${reason}: ${message}${extra}` }],
+        details: { action, reason },
+      });
+
+      // ---- status: read-only, no lock ----
+      if (action === "status") {
+        const insp = await candidateState.inspectCampaign(campDir);
+        let text = `Campaign status: ${insp.status}\n`;
+        text += `${insp.message}\n`;
+        const leaderSha = await fullShaOf(workDir, LEADER_REF);
+        text += `Leader ref ${LEADER_REF}: ${leaderSha ?? "(not set)"}\n`;
+        if (insp.state) {
+          const active = activeCandidateOf(insp.state);
+          for (const c of insp.state.candidates) {
+            text += `Candidate ${c.id}: ${c.status}, steps ${c.steps_used}/${insp.state.policy.candidate_step_limit}, time ${Math.round(c.time_used_seconds)}s/${insp.state.policy.candidate_time_limit_seconds}s, checkpoints ${c.checkpoints.length}, selected ${c.selected_checkpoint ?? "none"}${active && active.id === c.id ? " [ACTIVE]" : ""}\n`;
+          }
+        }
+        if (insp.pendingOp) text += `Pending op: ${insp.pendingOp.name} (started ${insp.pendingOp.started_at}) — manual check required\n`;
+        try {
+          const lm = JSON.parse(fs.readFileSync(path.join(campDir, "last-measurement.json"), "utf8"));
+          if (lm && typeof lm.average === "number") text += `Last measurement: ${JSON.stringify(String(lm.metric_name))} average ${lm.average} (candidate ${JSON.stringify(String(lm.candidate))}, ${lm.at})
+`;
+        } catch { /* no measurement yet */ }
+        if (insp.lockPresent) text += "Lock file present — if no process is running, resolve with manualClearLock (operator action)\n";
+        return { content: [{ type: "text", text }], details: { inspection: insp as any, leader: leaderSha } };
+      }
+
+      // ---- init: validate policy, hash methodology, ask consent, then create state ----
+      if (action === "init") {
+        if (!params.policy || typeof params.policy !== "object") {
+          return fail("invalid_argument", "init requires a policy object");
+        }
+        // B-C fix (review round 2): a disabled campaign directory is archived
+        // only AFTER consent and validation pass, immediately before the new
+        // state is created — a consent refusal must not rename anything.
+        const preInsp = await candidateState.inspectCampaign(campDir);
+        const needsArchive = preInsp.status === "disabled";
+        if (preInsp.status === "manual_check_required" || preInsp.status === "state_unreadable") {
+          return fail(preInsp.status, `cannot init over an unresolved campaign directory: ${preInsp.message}`);
+        }
+        const raw = { ...params.policy } as Record<string, unknown>;
+        // Methodology sha256 values are computed here from disk (untrusted input otherwise).
+        const methodPaths = raw.methodology_files;
+        if (!Array.isArray(methodPaths) || methodPaths.length === 0) {
+          return fail("invalid_argument", "policy.methodology_files must be a non-empty array of {path}");
+        }
+        const methodFiles: { path: string; sha256: string }[] = [];
+        for (const m of methodPaths) {
+          const p = m && typeof m === "object" && typeof (m as any).path === "string" ? (m as any).path : null;
+          if (!p) return fail("invalid_argument", "methodology_files entries must be objects with a path");
+          const hash = hashMethodologyFile(workDir, p);
+          if (!hash) return fail("invalid_argument", `methodology file ${JSON.stringify(p)} missing or unreadable; hash computed from disk, cannot pin`);
+          methodFiles.push({ path: p, sha256: hash });
+        }
+        raw.methodology_files = methodFiles;
+
+        // Consent FIRST (writes nothing): the full policy is rendered by
+        // formatCandidatePolicy (all user strings JSON-quoted) and confirmed
+        // via the real dialog. No UI or refusal => no campaign, no disk write.
+        const consent = await requestCandidatePolicyConsent(
+          ctx.hasUI && ctx.ui ? { confirm: (t, m) => ctx.ui.confirm(t, m) } : null,
+          raw,
+        );
+        if (!consent.ok || !consent.policy) {
+          const errs = "errors" in consent && consent.errors.length ? ` First problem: ${consent.errors[0]}` : "";
+          return fail(`policy_${consent.stage}`, consent.reason, errs);
+        }
+        const policy = consent.policy;
+
+        // Archive the disabled campaign directory now (after consent + policy
+        // validation): rename to <dir>-disabled-<timestamp>, data preserved
+        // byte-exact, no deletion. On failure roll the rename back and refuse.
+        if (needsArchive) {
+          const archived = `${campDir}-disabled-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+          try {
+            fs.renameSync(campDir, archived);
+          } catch (err) {
+            return fail("archive_failed", `cannot archive the disabled campaign directory: ${err instanceof Error ? err.message : String(err)}`);
+          }
+          try {
+            fs.mkdirSync(campDir, { recursive: true });
+          } catch (err) {
+            try { fs.renameSync(archived, campDir); } catch { /* keep the archive; report the failure */ }
+            return fail("archive_failed", `cannot recreate the campaign directory after archive: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+
+        // Base + leader ref: created only after consent.
+        let baseSha: string;
+        try {
+          baseSha = (await gitOut(workDir, ["rev-parse", "HEAD"])).trim().toLowerCase();
+          if (!/^[0-9a-f]{40}$/.test(baseSha)) throw new Error("HEAD is not a full sha");
+        } catch (err) {
+          return fail("invalid_argument", `cannot resolve HEAD: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        let preLeaderSha: string | null = null;
+        try {
+          // Review N6: after a previous campaign was disabled, the leader ref
+          // may still exist; update-ref with a zero old value would fail with
+          // "cannot lock ref". Read the CURRENT value (if any) and CAS from
+          // it — create-or-replace in one compare-and-swap.
+          preLeaderSha = await fullShaOf(workDir, LEADER_REF);
+          const existing = preLeaderSha;
+          const zero = "0".repeat(40);
+          const r = await candidateGitExec("git", ["update-ref", LEADER_REF, baseSha, existing ?? zero], { cwd: workDir, timeout: 15000 });
+          if (r.code !== 0) {
+            return fail("leader_ref_failed", `git update-ref ${LEADER_REF} failed: ${(r.stderr || r.stdout).slice(0, 200)}`);
+          }
+        } catch (err) {
+          return fail("leader_ref_failed", `git update-ref failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+
+        const initRes = await candidateState.initCampaign(campDir, {
+          ...policy,
+          candidate_step_limit: policy.candidate_step_limit,
+          candidate_time_limit_seconds: policy.candidate_time_limit_seconds,
+        });
+        if (!initRes.ok) {
+          // Roll the leader ref back to its pre-init value so a refused init
+          // leaves no leader change (deleting would lose an earlier ref).
+          const existing2 = await fullShaOf(workDir, LEADER_REF);
+          const zero2 = "0".repeat(40);
+          const prev = preLeaderSha ?? zero2;
+          if ((existing2 ?? zero2) !== prev) {
+            await candidateGitExec("git", ["update-ref", LEADER_REF, prev, existing2 ?? zero2], { cwd: workDir, timeout: 15000 });
+          }
+          return fail(initRes.reason, initRes.message);
+        }
+        return {
+          content: [{ type: "text", text: `✅ Campaign initialized. Policy is frozen (immutable). Leader ref ${LEADER_REF} = base ${baseSha.slice(0, 12)}. Next: create a candidate.` }],
+          details: { action, leader: baseSha, policy: policy as any },
+        };
+      }
+
+      // ---- create: state row + detached worktree from current leader ----
+      if (action === "create") {
+        const candidateId = typeof params.candidate_id === "string" ? params.candidate_id : "";
+        if (!candidateWorktree.isValidCandidateId(candidateId)) {
+          return fail("invalid_argument", "candidate_id must be [A-Za-z0-9._-], 1-64 chars");
+        }
+        const insp = await candidateState.inspectCampaign(campDir);
+        if (insp.status !== "ready") return fail(insp.status, insp.message);
+        const preState = insp.state!;
+        // Review B4: refuse BEFORE creating any worktree, so a refused create
+        // changes no files (design §5: forbidden transitions change nothing).
+        // Mirrors candidateState.createCandidate's checks on the current state.
+        if (preState.candidates.some((c) => c.id === candidateId)) {
+          return fail("duplicate_candidate", `candidate ${JSON.stringify(candidateId)} already exists`);
+        }
+        const preActive = preState.candidates.find((c) => c.status === "active");
+        if (preActive) {
+          return fail("second_active_candidate", `candidate ${JSON.stringify(preActive.id)} is active; pause it before creating ${JSON.stringify(candidateId)}`);
+        }
+        const leaderSha = await fullShaOf(workDir, LEADER_REF);
+        if (!leaderSha) return fail("leader_missing", `leader ref ${LEADER_REF} is missing; the campaign cannot create candidates`);
+        const wtPath = path.join(candidateWtRootOf(workDir), candidateId);
+        // Create worktree FIRST (fail-closed); the state row follows. If the
+        // state write fails, the worktree stays (no deletion in MVP) and the
+        // retry of create with the same id refuses on the existing path — the
+        // operator resolves by hand; nothing is deleted automatically.
+        const wtRes = await candidateWorktree.createCandidateWorktree(candidateGitExec, {
+          repoRoot: workDir,
+          baseCommit: leaderSha,
+          worktreePath: wtPath,
+          candidateId,
+        });
+        if (!wtRes.ok) return fail(wtRes.reason, wtRes.reason);
+        const stateRes = await candidateState.createCandidate(campDir, candidateId);
+        if (!stateRes.ok) return fail(stateRes.reason, stateRes.message);
+        return {
+          content: [{ type: "text", text: `✅ Candidate ${candidateId} created from leader ${leaderSha.slice(0, 12)}. Worktree: ${wtPath}. Edit files there, then run.` }],
+          details: { action, candidate: candidateId, worktree: wtPath, base: leaderSha },
+        };
+      }
+
+      // ---- run: budget-guarded candidate measurement (not a keep) ----
+      if (action === "run") {
+        const insp = await candidateState.inspectCampaign(campDir);
+        if (insp.status !== "ready") return fail(insp.status, insp.message);
+        const state = insp.state!;
+        const active = activeCandidateOf(state);
+        if (!active) return fail("no_active_candidate", "no active candidate; create or resume one first");
+        const wtPath = path.join(candidateWtRootOf(workDir), active.id);
+        if (!fs.existsSync(wtPath)) return fail("worktree_missing", `candidate worktree ${wtPath} is missing; resolve manually`);
+        const policy = state.policy as unknown as CandidatePolicy;
+        let measuredAverage: number | null = null;
+        let runError: { reason: string; message: string } | null = null;
+        const stateRes = await candidateState.runCandidateMeasurement(campDir, active.id, async () => {
+          // Review B3: the time budget accumulates the REAL wall time of a
+          // SUCCESSFUL measurement. Review round-3 B1: a KNOWN measurement
+          // refusal (exec_failed/timeout/metric_*/checks_failed — the run
+          // produced no value, nothing was promoted) is a CleanRefusal: the
+          // pending-op marker is cleared and the campaign stays usable. The
+          // failed run's time is NOT persisted (the step IS counted by the
+          // state wrapper before the callback); a THROW (process crash,
+          // unexpected exception) still keeps the marker (manual_check_required).
+          const t0 = Date.now();
+          const measured = await candidateMeasure.runRepeatedMeasurement(candidateExecRunner, {
+            dir: wtPath,
+            metricName: policy.metric_name,
+            argv: policy.benchmark_argv,
+            timeoutMs: policy.benchmark_timeout_seconds * 1000,
+            repeats: policy.repeats,
+          });
+          if (!measured.ok) {
+            runError = { reason: measured.reason, message: measured.message };
+            throw new candidateState.CleanRefusal(measured.reason as any, measured.message);
+          }
+          measuredAverage = measured.average;
+          return { seconds: (Date.now() - t0) / 1000 };
+        });
+        if (runError) {
+          // Clean refusal: the outcome is known, the campaign is alive; the
+          // step was already counted by runCandidateMeasurement.
+          return fail(runError.reason, `${runError.message}. The run was refused; the step counts against the budget, nothing was promoted`);
+        }
+        if (!stateRes.ok) return fail(stateRes.reason, stateRes.message);
+        // Persist the last measurement for status display (sidecar; state.json
+        // schema stays untouched — the value is advisory, never authoritative).
+        try {
+          const lm = { candidate: active.id, metric_name: policy.metric_name, average: measuredAverage, at: new Date().toISOString() };
+          fs.writeFileSync(path.join(campDir, "last-measurement.json"), JSON.stringify(lm));
+        } catch { /* advisory only */ }
+        return {
+          content: [{ type: "text", text: `✅ Candidate ${active.id} measured: ${JSON.stringify(String(policy.metric_name))} average ${measuredAverage}. This is the candidate's local measurement — NOT a global keep. Next: checkpoint to save work.` }],
+          details: { action, candidate: active.id, average: measuredAverage } as any,
+        };
+      }
+
+      // ---- checkpoint: commit allowed files + ref + state row ----
+      // B-B fix (review round 2): commit + ref + state row now live under ONE
+      // pending-op marker via candidateState.checkpointUnderMarker — a crash
+      // after the commit leaves the marker, so the next call reports
+      // manual_check_required (design §4), never a silent commit-without-row.
+      if (action === "checkpoint") {
+        const candidateId = typeof params.candidate_id === "string" ? params.candidate_id : "";
+        const insp = await candidateState.inspectCampaign(campDir);
+        if (insp.status !== "ready") return fail(insp.status, insp.message);
+        const state = insp.state!;
+        const cand = candidateId
+          ? state.candidates.find((c) => c.id === candidateId && c.status === "active") ?? null
+          : activeCandidateOf(state);
+        if (!cand) return fail("no_active_candidate", "checkpoint needs an active candidate (or an explicit active candidate_id)");
+        const allowed = Array.isArray(params.allowed_files) ? params.allowed_files : [];
+        const allowedCheck = candidateWorktree.validateAllowedFilePaths(allowed);
+        if (!allowedCheck.ok) return fail("invalid_argument", allowedCheck.errors.join("; ") || "allowed_files invalid");
+        const message = typeof params.message === "string" && params.message.trim().length > 0 ? params.message : `checkpoint ${cand.id}`;
+        const wtPath = path.join(candidateWtRootOf(workDir), cand.id);
+        let commitSha: string | null = null;
+        const cpRes = await candidateState.checkpointUnderMarker(campDir, cand.id, async () => {
+          const cp = await candidateWorktree.checkpointCandidateWorktree(candidateGitExec, {
+            repoRoot: workDir,
+            worktreePath: wtPath,
+            candidateId: cand.id,
+            allowedFiles: allowed,
+            message,
+          });
+          if (!cp.ok) {
+            // Review round-3 B1: pre-commit stages (validate/guard/
+            // outside-allowed/allowed-files/empty) write NOTHING — a known
+            // outcome, so the campaign must stay usable. CleanRefusal clears
+            // the pending-op marker inside checkpointUnderMarker; commit/ref
+            // stage failures still throw (the marker stays => manual_check_required).
+            if (cp.stage === "commit" || cp.stage === "ref") {
+              throw new Error(`${cp.stage}: ${cp.reason}`);
+            }
+            throw new candidateState.CleanRefusal("operation_failed", `${cp.stage}: ${cp.reason}`);
+          }
+          commitSha = cp.commit;
+          return { checkpointId: cp.commit };
+        });
+        if (!cpRes.ok) {
+          const suffix = commitSha !== null ? ` (worktree commit ${(commitSha as string).slice(0, 12)} and its ref already exist; inspect before retrying)` : "";
+          return fail(cpRes.reason, cpRes.message + suffix);
+        }
+        return {
+          content: [{ type: "text", text: `✅ Checkpoint saved: ${commitSha} (ref ${candidateWorktree.candidateRefFor(cand.id)}). It is now the selected checkpoint. Regression is allowed.` }],
+          details: { action, candidate: cand.id, checkpoint: commitSha },
+        };
+      }
+
+      // ---- pause/resume/select/close/disable: state-machine transitions ----
+      if (action === "pause" || action === "close" || action === "disable") {
+        const res = action === "disable"
+          ? await candidateState.disableCampaign(campDir)
+          : action === "pause"
+            ? await candidateState.pauseCandidate(campDir, String(params.candidate_id ?? ""))
+            : await candidateState.closeCandidate(campDir, String(params.candidate_id ?? ""));
+        if (!res.ok) return fail(res.reason, res.message);
+        return { content: [{ type: "text", text: `✅ ${action} done. Checkpoints and refs are kept.` }], details: { action } };
+      }
+
+      if (action === "resume" || action === "select") {
+        const candidateId = String(params.candidate_id ?? "");
+        if (action === "resume") {
+          // Design §2 step 4: switching candidates requires saved changes.
+          const insp = await candidateState.inspectCampaign(campDir);
+          if (insp.status !== "ready") return fail(insp.status, insp.message);
+          const state = insp.state!;
+          const target = state.candidates.find((c) => c.id === candidateId);
+          if (!target) return fail("unknown_candidate", `candidate ${JSON.stringify(candidateId)} does not exist`);
+          const wtPath = path.join(candidateWtRootOf(workDir), candidateId);
+          if (fs.existsSync(wtPath)) {
+            const changes = await candidateWorktree.collectWorktreeChanges(candidateGitExec, wtPath);
+            if (changes.ok && changes.changes.all.length > 0) {
+              return fail("unsaved_changes", `candidate ${JSON.stringify(candidateId)} worktree has unsaved changes: ${changes.changes.all.join(", ")}. Checkpoint or revert them first; nothing was deleted`);
+            }
+          }
+          const res = await candidateState.resumeCandidate(campDir, candidateId);
+          if (!res.ok) return fail(res.reason, res.message);
+          return { content: [{ type: "text", text: `✅ Candidate ${candidateId} resumed (active).` }], details: { action, candidate: candidateId } };
+        }
+        // select: switch the selected checkpoint of a candidate. Design §2
+        // step 4: switching requires saved changes — the candidate's own
+        // worktree must be clean (unsaved changes refuse with a listing;
+        // nothing is deleted). Review N2: resume already enforced this;
+        // select (checkpoint switch on the SAME candidate) changes which
+        // tree content the next run measures, so it must refuse on dirt too.
+        const checkpointId = String(params.checkpoint_id ?? "");
+        {
+          const inspSel = await candidateState.inspectCampaign(campDir);
+          if (inspSel.status !== "ready") return fail(inspSel.status, inspSel.message);
+          const selTarget = inspSel.state!.candidates.find((c) => c.id === candidateId);
+          if (!selTarget) return fail("unknown_candidate", `candidate ${JSON.stringify(candidateId)} does not exist`);
+          const wtPathSel = path.join(candidateWtRootOf(workDir), candidateId);
+          if (fs.existsSync(wtPathSel)) {
+            const changes = await candidateWorktree.collectWorktreeChanges(candidateGitExec, wtPathSel);
+            if (changes.ok && changes.changes.all.length > 0) {
+              return fail("unsaved_changes", `candidate ${JSON.stringify(candidateId)} worktree has unsaved changes: ${changes.changes.all.join(", ")}. Checkpoint or revert them first; nothing was deleted`);
+            }
+          }
+        }
+        const res = await candidateState.selectCheckpoint(campDir, candidateId, checkpointId);
+        if (!res.ok) return fail(res.reason, res.message);
+        return { content: [{ type: "text", text: `✅ Checkpoint ${checkpointId.slice(0, 12)} selected for ${candidateId}.` }], details: { action, candidate: candidateId, checkpoint: checkpointId } };
+      }
+
+      // ---- confirm: re-measure both sides, gate, CAS-promote ----
+      if (action === "confirm") {
+        const insp = await candidateState.inspectCampaign(campDir);
+        if (insp.status !== "ready") return fail(insp.status, insp.message);
+        const state = insp.state!;
+        const active = activeCandidateOf(state);
+        if (!active) return fail("no_active_candidate", "confirm needs an active candidate with a selected checkpoint");
+        if (!active.selected_checkpoint) return fail("no_checkpoint", `candidate ${JSON.stringify(active.id)} has no selected checkpoint; run checkpoint first`);
+        const policy = state.policy as unknown as CandidatePolicy;
+        const cpSha = active.selected_checkpoint;
+        const expectedLeader = await fullShaOf(workDir, LEADER_REF);
+        if (!expectedLeader) return fail("leader_missing", `leader ref ${LEADER_REF} missing`);
+        const epoch = String(measurementScaleStatusOfDir(workDir).epoch);
+        const currentMethodology = hashAllMethodology(workDir, policy);
+        if (!currentMethodology.ok) return fail("methodology_missing", currentMethodology.reason);
+
+        let outcome: { text: string; details: Record<string, unknown> } | null = null;
+        // Review B1: capture the sides so cleanup removes ONLY worktrees this
+        // call actually created; a refused side leaves its path untouched.
+        let leaderSideCleanup: { ok: true; wtPath: string } | null = null;
+        let candSideCleanup: { ok: true; wtPath: string } | null = null;
+        const opRes = await candidateState.beginOperation(campDir, `confirm ${active.id}`, async () => {
+          const leaderSide = await measureSideInEphemeral(workDir, "leader", expectedLeader, policy);
+          if (!leaderSide.ok) {
+            // Round-3 B1 (parent decision): a KNOWN side refusal means no
+            // promotion and no uncertainty — clean refusal clears the marker.
+            throw new candidateState.CleanRefusal(leaderSide.reason as any, leaderSide.message);
+          }
+          leaderSideCleanup = { ok: true, wtPath: leaderSide.wtPath };
+          const candSide = await measureSideInEphemeral(workDir, "cand", cpSha, policy);
+          if (!candSide.ok) {
+            throw new candidateState.CleanRefusal(candSide.reason as any, candSide.message);
+          }
+          candSideCleanup = { ok: true, wtPath: candSide.wtPath };
+          // Review B2: checks MUST run on the exact checkpoint, not the live
+          // tree. The ephemeral candidate worktree is checked out from cpSha
+          // (its HEAD is the checkpoint), so uncommitted live edits cannot
+          // mask a bad checkpoint; compareForPromotion re-proves HEAD via
+          // rev-parse inside that clean worktree before running the checks.
+          const comparison = await candidateMeasure.compareForPromotion({
+            runner: candidateExecRunner,
+            policyMetricName: policy.metric_name,
+            policyDirection: policy.direction,
+            policyMinGain: policy.min_gain,
+            policyMethodology: policy.methodology_files as any,
+            currentMethodology: currentMethodology.hashes as any,
+            leaderCommit: expectedLeader,
+            candidateCommit: cpSha,
+            leaderEpoch: epoch,
+            candidateEpoch: epoch,
+            leaderMeasurement: { metricName: policy.metric_name, direction: policy.direction, average: leaderSide.average },
+            candidateMeasurement: { metricName: policy.metric_name, direction: policy.direction, average: candSide.average },
+            checks: { argv: policy.checks_argv, dir: candSide.wtPath, timeoutMs: policy.benchmark_timeout_seconds * 1000 },
+          });
+          if (!comparison.ok) {
+            outcome = { text: `⛔ No promotion (${comparison.reason}): ${comparison.message}`, details: { action: "confirm", promoted: false, reason: comparison.reason } };
+            return;
+          }
+          const promoted = await candidateMeasure.promoteLeader(candidateExecRunner, {
+            repoDir: workDir,
+            leaderRef: LEADER_REF,
+            expectedSha: expectedLeader,
+            newSha: cpSha,
+          });
+          if (promoted.ok) {
+            outcome = { text: `✅ PROMOTED: leader ref ${LEADER_REF} moved ${promoted.from.slice(0, 12)} -> ${promoted.to.slice(0, 12)}. The user's branch was not changed.`, details: { action: "confirm", promoted: true, from: promoted.from, to: promoted.to } };
+          } else if (promoted.reason === "uncertain") {
+            throw new Error(`promotion outcome unknown (${promoted.message}); inspect git rev-parse ${LEADER_REF} by hand before any further operation`);
+          } else {
+            outcome = { text: `⛔ No promotion (${promoted.reason}): ${promoted.message}`, details: { action: "confirm", promoted: false, reason: promoted.reason } };
+          }
+        });
+        // Cleanup: remove ONLY the ephemeral worktrees this call created
+        // (review B1: a refused/failed side must not touch anything at that
+        // path — a live candidate worktree could be sitting there). B-A fix:
+        // null checks (not .ok deref) — a side refused BEFORE creation leaves
+        // the variable null, and a side that failed AFTER creation already
+        // cleaned itself up inside measureSideInEphemeral.
+        if (leaderSideCleanup !== null) await removeEphemeralWorktree(workDir, leaderSideCleanup.wtPath);
+        if (candSideCleanup !== null) await removeEphemeralWorktree(workDir, candSideCleanup.wtPath);
+        if (!opRes.ok) {
+          return fail(opRes.reason, opRes.message);
+        }
+        if (outcome === null) {
+          return fail("internal", "confirm finished without a verdict; inspect the campaign state");
+        }
+        return { content: [{ type: "text", text: outcome.text }], details: outcome.details };
+      }
+
+      // ---- resolve: OPERATOR manual resolution of an unresolved state ----
+      // Design §4: no automatic recovery and no guessing. Resolution is an
+      // OPERATOR action (review round-3 B2): the model cannot clear a pending
+      // marker or a lock — it requires the human's explicit dialog consent
+      // (ctx.ui.confirm === true), same principle as the policy consent. The
+      // model-supplied operator_confirmation parameter is ignored.
+      if (action === "resolve") {
+        const insp = await candidateState.inspectCampaign(campDir);
+        if (insp.status === "manual_check_required" && insp.pendingOp) {
+          // Verify the git side of an interrupted checkpoint: if the ref
+          // exists and resolves to a commit whose parent is the candidate's
+          // previous checkpoint or base, the operator's consent may register
+          // the orphan checkpoint (round-3 B4) instead of leaving a dead end.
+          const refName = /^checkpoint (.+)$/.exec(insp.pendingOp.name);
+          let orphanSha: string | null = null;
+          let orphanCandidate: string | null = null;
+          if (refName && insp.state) {
+            const candId = refName[1];
+            const ref = candidateWorktree.candidateRefFor(candId);
+            try {
+              const sha = (await gitOut(workDir, ["rev-parse", "--verify", "--quiet", ref])).trim().toLowerCase();
+              if (/^[0-9a-f]{40}$/.test(sha)) {
+                orphanSha = sha;
+                orphanCandidate = candId;
+              }
+            } catch { /* ref missing — plain resolve below */ }
+          }
+          const orphanNote = orphanSha && orphanCandidate
+            ? `Interrupted checkpoint detected: commit ${orphanSha} with ref ${candidateWorktree.candidateRefFor(orphanCandidate)} exists but is NOT registered in the state. Consenting will verify and register it. `
+            : "";
+          if (!ctx.hasUI || !ctx.ui || typeof ctx.ui.confirm !== "function") {
+            return fail("no_ui", `${orphanNote}resolve is an operator action and requires an interactive dialog; the pending op stays`);
+          }
+          const confirmed = await ctx.ui.confirm(
+            "Candidate campaign: manual resolution",
+            `${orphanNote}Pending operation: ${insp.pendingOp.name} (started ${insp.pendingOp.started_at}). Have you inspected Git refs and worktrees by hand and confirmed the outcome? Consenting clears the pending-op marker${orphanSha && orphanCandidate ? ` and registers orphan checkpoint ${orphanSha.slice(0, 12)} after verification` : ""}.`,
+          );
+          if (confirmed !== true) {
+            return fail("operator_consent", "resolve requires explicit operator consent in the dialog; the pending op stays");
+          }
+          // Operator consented. If an orphan checkpoint was detected, verify
+          // its lineage and register it under one marker before clearing.
+          const alreadyRegistered = !!orphanSha && !!orphanCandidate && !!insp.state &&
+            !!insp.state.candidates.find((c) => c.id === orphanCandidate)?.checkpoints.includes(orphanSha);
+          if (orphanSha && orphanCandidate && insp.state && !alreadyRegistered) {
+            const cand = insp.state.candidates.find((c) => c.id === orphanCandidate);
+            let parentSha = "";
+            try {
+              parentSha = (await gitOut(workDir, ["rev-parse", "--verify", "--quiet", `${orphanSha}^`])).trim().toLowerCase();
+            } catch { /* root commit or missing parent: unverifiable, handled below */ }
+            const expectedParent = cand?.checkpoints.length
+              ? cand.checkpoints[cand.checkpoints.length - 1]
+              : null;
+            const lineageOk = expectedParent
+              ? parentSha === expectedParent
+              : /^[0-9a-f]{40}$/.test(parentSha); // parent must exist (base-match is not recorded in state; see residual note)
+            if (!cand || !/^[0-9a-f]{40}$/.test(parentSha) || !lineageOk) {
+              return fail("orphan_unverified", `orphan commit ${orphanSha.slice(0, 12)} could not be verified (parent ${parentSha.slice(0, 12) || "missing"} does not continue the candidate's checkpoint chain); inspect by hand — the pending op stays`);
+            }
+            const regRes = await candidateState.registerOrphanCheckpoint(campDir, orphanCandidate, orphanSha, async () => {
+              // The marker is already present (we are resolving it), so the
+              // state primitive does not re-take it. Verify ref == sha still
+              // holds at registration time.
+              const nowSha = (await gitOut(workDir, ["rev-parse", "--verify", "--quiet", candidateWorktree.candidateRefFor(orphanCandidate!)])).trim().toLowerCase();
+              if (nowSha !== orphanSha) {
+                throw new candidateState.CleanRefusal("operation_failed", `checkpoint ref moved during resolution (${nowSha.slice(0, 12) || "missing"} != ${orphanSha.slice(0, 12)})`);
+              }
+            });
+            if (!regRes.ok) {
+              return fail(regRes.reason, `orphan checkpoint registration failed: ${regRes.message} — the pending op stays for manual inspection`);
+            }
+            return { content: [{ type: "text", text: `✅ Orphan checkpoint registered: ${orphanSha} (candidate ${orphanCandidate}, selected). Pending op resolved by operator consent.` }], details: { action, registered: orphanSha } };
+          }
+          const res = await candidateState.manualResolvePendingOp(campDir, candidateState.OPERATOR_CONFIRMATION);
+          if (!res.ok) return fail(res.reason, res.message);
+          return { content: [{ type: "text", text: "✅ Pending operation resolved by the operator; the marker is cleared. Verify the campaign with status." }], details: { action } };
+        }
+        if (insp.status === "ready" && insp.lockPresent) {
+          if (!ctx.hasUI || !ctx.ui || typeof ctx.ui.confirm !== "function") {
+            return fail("no_ui", "clearing a stale campaign lock is an operator action and requires an interactive dialog; the lock stays");
+          }
+          const confirmed = await ctx.ui.confirm(
+            "Candidate campaign: clear stale lock",
+            `A campaign lock file is present but no campaign operation is pending (${insp.message}). Confirm you verified no process is running and the lock is stale.`,
+          );
+          if (confirmed !== true) {
+            return fail("operator_consent", "lock clearing requires explicit operator consent in the dialog; the lock stays");
+          }
+          const res = await candidateState.manualClearLock(campDir, candidateState.OPERATOR_CONFIRMATION);
+          if (!res.ok) return fail(res.reason, res.message);
+          return { content: [{ type: "text", text: "✅ Campaign lock cleared by the operator; state is untouched." }], details: { action } };
+        }
+        return fail("invalid_argument", `nothing to resolve: campaign status is ${insp.status} (${insp.message})`);
+      }
+
+      return fail("invalid_argument", `unknown action ${JSON.stringify(String(action))}; allowed: init create status resume run checkpoint pause select close confirm disable resolve`);
     },
   });
 

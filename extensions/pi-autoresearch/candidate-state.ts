@@ -126,6 +126,35 @@ export interface Refusal {
   message: string;
 }
 
+/**
+ * Sentinel for work() callbacks: a refusal with a KNOWN outcome — the git
+ * side effect did not happen (pre-commit validation stages refused) or the
+ * measurement did not produce a value (known benchmark/check failure).
+ * Wrappers (checkpointUnderMarker, transition-based flows) that catch this
+ * CLEAR the pending-op marker and return the refusal: the campaign stays
+ * usable (design §4: "ошибка... без продвижения"), because there is no
+ * uncertainty about what happened. Thrown errors keep the marker
+ * (manual_check_required). Created via cleanRefusal(); NEVER construct the
+ * sentinel by hand inside work().
+ */
+export class CleanRefusal extends Error {
+  readonly refusal: Refusal;
+  constructor(reason: RefusalReason, message: string) {
+    super(message);
+    this.refusal = refuse(reason, message);
+  }
+}
+
+/** Factory for the known-outcome refusal a work() callback may return. */
+export function cleanRefusal(reason: RefusalReason, message: string): CleanRefusal {
+  return new CleanRefusal(reason, message);
+}
+
+/** True when the error is a clean-refusal sentinel thrown by a work callback. */
+function isCleanRefusal(err: unknown): err is CleanRefusal {
+  return err instanceof CleanRefusal;
+}
+
 export interface StateOk {
   ok: true;
   state: CampaignState;
@@ -463,6 +492,9 @@ async function transition(
       if (decision.next !== loaded.state) await writeStateAtomic(dir, decision.next);
       await clearPendingOp(dir);
     } catch (err) {
+      // CleanRefusal = known outcome (the operation did not reach an
+      // uncertain state): the marker is cleared, the campaign stays usable.
+      if (isCleanRefusal(err)) return err.refusal;
       return operationFailed(opName, err);
     }
     return { ok: true, state: decision.next };
@@ -599,6 +631,71 @@ export async function recordCheckpoint(
   );
 }
 
+/**
+ * B-B fix: records a checkpoint so the git work (commit + ref) and the state
+ * row live under ONE pending-op marker. Ordering: marker -> git work ->
+ * decide(commit sha, state) -> state write -> marker clear, evaluated twice
+ * (pre-flight validation before the work, then with the commit sha). A crash
+ * after the commit leaves the marker, so the next call reports
+ * manual_check_required — never a silent commit-without-row (design §4).
+ * The git work runs in `work`; it must return the checkpoint id (the commit
+ * sha). Refusals (not active, duplicate, etc.) are evaluated both before and
+ * after the work; a refusal after a successful work still leaves nothing
+ * written to the state but may have created the git commit — the marker
+ * STAYS in that case (fail-closed, operator inspects). A CleanRefusal thrown
+ * by work() (known outcome: pre-commit stages refused, nothing written)
+ * CLEARS the marker and returns the refusal — the campaign stays usable.
+ */
+export async function checkpointUnderMarker(
+  dir: string,
+  candidateId: string,
+  work: () => Promise<{ checkpointId: string }>,
+): Promise<CandidateStateResult> {
+  const idError = checkId("candidate", candidateId);
+  if (idError) return idError;
+  return locked(dir, async (): Promise<CandidateStateResult> => {
+    const pending = await readPendingOp(dir);
+    if (pending) return pendingRefusal(pending);
+    const loaded = await readStateFile(dir);
+    if (!loaded.ok) return loaded;
+    const s = loaded.state;
+    const decide = (checkpointId: string | null, st: CampaignState): Decision => {
+      if (st.disabled) return disabledRefusal();
+      const c = findCandidate(st, candidateId);
+      if (isRefusal(c)) return c;
+      if (c.status !== "active") {
+        return refuse("candidate_not_active", `candidate ${quote(candidateId)} is ${c.status}; only the active candidate saves checkpoints`);
+      }
+      if (checkpointId === null) return { ok: true, next: st };
+      if (st.candidates.some((x) => x.checkpoints.includes(checkpointId))) {
+        return refuse("duplicate_checkpoint", `checkpoint ${quote(checkpointId)} already exists`);
+      }
+      const updated: CandidateRecord = {
+        ...c,
+        checkpoints: [...c.checkpoints, checkpointId],
+        selected_checkpoint: checkpointId,
+      };
+      return { ok: true, next: replaceCandidate(st, updated) };
+    };
+    const pre = decide(null, s);
+    if (!pre.ok) return pre;
+    try {
+      await writePendingOp(dir, `checkpoint ${candidateId}`);
+      const { checkpointId } = await work();
+      const decision = decide(checkpointId, s);
+      if (!decision.ok) return decision;
+      if (decision.next !== s) await writeStateAtomic(dir, decision.next);
+      await clearPendingOp(dir);
+      return { ok: true, state: decision.next };
+    } catch (err) {
+      // CleanRefusal = known outcome (nothing was written by the git side);
+      // the campaign stays usable (design §4: error without promotion).
+      if (isCleanRefusal(err)) return err.refusal;
+      return operationFailed(`checkpoint ${candidateId}`, err);
+    }
+  });
+}
+
 /** Selects one of the candidate's own checkpoints. Nothing is deleted. */
 export async function selectCheckpoint(
   dir: string,
@@ -691,6 +788,10 @@ export async function runCandidateMeasurement(
       await clearPendingOp(dir);
       return { ok: true, state: finished };
     } catch (err) {
+      // CleanRefusal = known measurement refusal (no value produced, nothing
+      // promoted): the step counts (already written), the marker is cleared,
+      // the campaign stays usable (design §4: error without promotion).
+      if (isCleanRefusal(err)) return err.refusal;
       return operationFailed(`run ${candidateId}`, err);
     }
   });
@@ -783,5 +884,57 @@ export async function manualResolvePendingOp(dir: string, confirmation: string):
       ok: true,
       message: `pending operation ${quote(pending.name)} resolved by operator; state.json was left as last written`,
     };
+  });
+}
+
+/**
+ * Operator-consented registration of an ORPHAN checkpoint (round-3 B4).
+ * Runs only while the pending-op marker `checkpoint <candidateId>` is present
+ * (an interrupted checkpoint); it does NOT re-take the marker, because the
+ * marker is the very thing being resolved. `verify` checks the git side
+ * (ref == sha, lineage); on success the checkpoint is written to state and
+ * the marker is cleared, all under the campaign lock.
+ */
+export async function registerOrphanCheckpoint(
+  dir: string,
+  candidateId: string,
+  checkpointId: string,
+  verify: () => Promise<void>,
+): Promise<CandidateStateResult> {
+  const idError = checkId("candidate", candidateId) ?? checkId("checkpoint", checkpointId);
+  if (idError) return idError;
+  return locked(dir, async (): Promise<CandidateStateResult> => {
+    const pending = await readPendingOp(dir);
+    if (!pending) return refuse("invalid_transition", "no pending operation to resolve");
+    if (pending.name !== `checkpoint ${candidateId}`) {
+      return refuse("invalid_transition", `pending operation ${quote(pending.name)} is not a checkpoint of ${quote(candidateId)}`);
+    }
+    const loaded = await readStateFile(dir);
+    if (!loaded.ok) return loaded;
+    const s = loaded.state;
+    if (s.disabled) return disabledRefusal();
+    const c = findCandidate(s, candidateId);
+    if (isRefusal(c)) return c;
+    if (c.status !== "active") {
+      return refuse("candidate_not_active", `candidate ${quote(candidateId)} is ${c.status}; only the active candidate can register a checkpoint`);
+    }
+    if (s.candidates.some((x) => x.checkpoints.includes(checkpointId))) {
+      return refuse("duplicate_checkpoint", `checkpoint ${quote(checkpointId)} is already registered`);
+    }
+    try {
+      await verify();
+    } catch (err) {
+      if (isCleanRefusal(err)) return err.refusal;
+      return operationFailed(`register checkpoint ${candidateId}`, err);
+    }
+    const updated: CandidateRecord = {
+      ...c,
+      checkpoints: [...c.checkpoints, checkpointId],
+      selected_checkpoint: checkpointId,
+    };
+    const next = replaceCandidate(s, updated);
+    await writeStateAtomic(dir, next);
+    await clearPendingOp(dir);
+    return { ok: true, state: next };
   });
 }

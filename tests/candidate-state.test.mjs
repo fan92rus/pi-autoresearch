@@ -582,3 +582,168 @@ test("inspectCampaign writes nothing and reports the lock state", async () => {
     assert.deepEqual(await snapshot(dir), before);
   });
 });
+
+// ─── checkpointUnderMarker (one-marker checkpoint primitive) ─────────────────
+
+test("checkpointUnderMarker: work result lands in state under one marker, marker cleared on success", async () => {
+  await withDir(async (dir) => {
+    await initOk(dir);
+    await S.createCandidate(dir, "cand-a");
+    const r = await S.checkpointUnderMarker(dir, "cand-a", async () => ({ checkpointId: "abc123" }));
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(r.state.candidates[0].checkpoints.includes("abc123"), true);
+    assert.equal(r.state.candidates[0].selected_checkpoint, "abc123");
+    assert.equal(existsSync(join(dir, "pending-op.json")), false, "marker must be cleared on success");
+  });
+});
+
+test("checkpointUnderMarker: work throw after side effects keeps the marker => manual_check_required", async () => {
+  await withDir(async (dir) => {
+    await initOk(dir);
+    await S.createCandidate(dir, "cand-a");
+    const stateBefore = await readFile(join(dir, "state.json"), "utf8");
+    // Simulate the crash window: the git work "succeeded" (side effects done
+    // by the caller) but work() throws before returning the checkpoint id.
+    const r = await S.checkpointUnderMarker(dir, "cand-a", async () => {
+      await writeFile(join(dir, "side-effect.txt"), "git commit landed");
+      throw new Error("state write exploded mid-flight");
+    });
+    assertRefusal(r, "operation_failed");
+    assert.equal(existsSync(join(dir, "pending-op.json")), true, "marker must remain after a work throw");
+    assert.equal(existsSync(join(dir, "side-effect.txt")), true, "side effects are not rolled back (fail-closed)");
+    // Every later operation reports manual_check_required, not state_unreadable.
+    assertRefusal(await S.createCandidate(dir, "cand-b"), "manual_check_required");
+    assertRefusal(await S.recordCheckpoint(dir, "cand-a", "cp2"), "manual_check_required");
+    // Operator resolution clears the marker; state is untouched.
+    assert.equal(await readFile(join(dir, "state.json"), "utf8"), stateBefore, "state bytes must be unchanged");
+    const resolved = await S.manualResolvePendingOp(dir, S.OPERATOR_CONFIRMATION);
+    assert.equal(resolved.ok, true);
+    assert.equal(existsSync(join(dir, "pending-op.json")), false);
+    // Campaign is consistent again: the checkpoint id from the failed call is
+    // NOT in state (the row was never written) — the operator decides.
+    const insp = await S.inspectCampaign(dir);
+    assert.equal(insp.status, "ready");
+  });
+});
+
+test("checkpointUnderMarker: refusal after successful work keeps the marker (duplicate id)", async () => {
+  await withDir(async (dir) => {
+    await initOk(dir);
+    await S.createCandidate(dir, "cand-a");
+    const first = await S.checkpointUnderMarker(dir, "cand-a", async () => ({ checkpointId: "dup1" }));
+    assert.equal(first.ok, true);
+    const r = await S.checkpointUnderMarker(dir, "cand-a", async () => ({ checkpointId: "dup1" }));
+    assertRefusal(r, "duplicate_checkpoint");
+    // The refusal was discovered AFTER work ran (post-decide) — marker stays.
+    assert.equal(existsSync(join(dir, "pending-op.json")), true, "post-work refusal must keep the marker (fail-closed)");
+    await S.manualResolvePendingOp(dir, S.OPERATOR_CONFIRMATION);
+  });
+});
+
+test("checkpointUnderMarker: pre-flight refusal (not active) touches nothing", async () => {
+  await withDir(async (dir) => {
+    await initOk(dir);
+    await S.createCandidate(dir, "cand-a");
+    await S.pauseCandidate(dir, "cand-a");
+    const before = await snapshot(dir);
+    const r = await S.checkpointUnderMarker(dir, "cand-a", async () => {
+      throw new Error("work must not run");
+    });
+    assertRefusal(r, "candidate_not_active");
+    assert.deepEqual(await snapshot(dir), before, "pre-flight refusal must not touch any file");
+  });
+});
+
+// ─── registerOrphanCheckpoint (review F4) ────────────────────────────────────
+
+async function crashedMarker(dir) {
+  // Create a candidate, then leave a checkpoint marker as if the commit+ref
+  // succeeded and the state write never happened.
+  await initOk(dir);
+  await S.createCandidate(dir, "cand-a");
+  await writeFile(join(dir, "pending-op.json"), JSON.stringify({ name: "checkpoint cand-a", started_at: new Date().toISOString() }), "utf8");
+}
+
+const SHA_X = "a".repeat(40);
+const SHA_Y = "b".repeat(40);
+
+test("registerOrphanCheckpoint: wrong pending-op name refuses and changes nothing", async () => {
+  await withDir(async (dir) => {
+    await initOk(dir);
+    await S.createCandidate(dir, "cand-a");
+    await writeFile(join(dir, "pending-op.json"), JSON.stringify({ name: "resume cand-a", started_at: "x" }), "utf8");
+    const before = await snapshot(dir);
+    assertRefusal(await S.registerOrphanCheckpoint(dir, "cand-a", SHA_X, async () => {}), "invalid_transition");
+    assert.deepEqual(await snapshot(dir), before, "bytes must not change");
+  });
+});
+
+test("registerOrphanCheckpoint: disabled campaign refuses and keeps the marker", async () => {
+  await withDir(async (dir) => {
+    await crashedMarker(dir);
+    const st = JSON.parse(await readFile(join(dir, "state.json"), "utf8"));
+    st.disabled = true;
+    await writeFile(join(dir, "state.json"), JSON.stringify(st, null, 2), "utf8");
+    assertRefusal(await S.registerOrphanCheckpoint(dir, "cand-a", SHA_X, async () => {}), "campaign_disabled");
+    assert.equal(existsSync(join(dir, "pending-op.json")), true, "marker must stay");
+  });
+});
+
+test("registerOrphanCheckpoint: non-active candidate refuses and keeps the marker", async () => {
+  await withDir(async (dir) => {
+    await crashedMarker(dir);
+    const st = JSON.parse(await readFile(join(dir, "state.json"), "utf8"));
+    st.candidates[0].status = "paused";
+    await writeFile(join(dir, "state.json"), JSON.stringify(st, null, 2), "utf8");
+    assertRefusal(await S.registerOrphanCheckpoint(dir, "cand-a", SHA_X, async () => {}), "candidate_not_active");
+    assert.equal(existsSync(join(dir, "pending-op.json")), true, "marker must stay");
+  });
+});
+
+test("registerOrphanCheckpoint: verify refusal returns the refusal and keeps the marker and state bytes", async () => {
+  await withDir(async (dir) => {
+    await crashedMarker(dir);
+    const before = await snapshot(dir);
+    const res = await S.registerOrphanCheckpoint(dir, "cand-a", SHA_X, async () => {
+      throw new S.CleanRefusal("operation_failed", "ref moved");
+    });
+    assert.equal(res.ok, false);
+    assert.deepEqual(await snapshot(dir), before, "bytes must not change on verify refusal");
+  });
+});
+
+test("registerOrphanCheckpoint: success registers the checkpoint, selects it and clears the marker", async () => {
+  await withDir(async (dir) => {
+    await crashedMarker(dir);
+    const res = await S.registerOrphanCheckpoint(dir, "cand-a", SHA_X, async () => {});
+    assert.equal(res.ok, true, JSON.stringify(res));
+    const st = JSON.parse(await readFile(join(dir, "state.json"), "utf8"));
+    assert.deepEqual(st.candidates[0].checkpoints, [SHA_X]);
+    assert.equal(st.candidates[0].selected_checkpoint, SHA_X);
+    assert.equal(existsSync(join(dir, "pending-op.json")), false, "marker must be cleared");
+    assert.equal((await S.inspectCampaign(dir)).status, "ready");
+  });
+});
+
+test("registerOrphanCheckpoint: duplicate checkpoint refuses without calling verify", async () => {
+  await withDir(async (dir) => {
+    await crashedMarker(dir);
+    assert.equal((await S.registerOrphanCheckpoint(dir, "cand-a", SHA_X, async () => {})).ok, true);
+    await writeFile(join(dir, "pending-op.json"), JSON.stringify({ name: "checkpoint cand-a", started_at: "x" }), "utf8");
+    let called = false;
+    assertRefusal(
+      await S.registerOrphanCheckpoint(dir, "cand-a", SHA_X, async () => { called = true; }),
+      "duplicate_checkpoint",
+    );
+    assert.equal(called, false, "verify must not run for a duplicate");
+    assert.equal(existsSync(join(dir, "pending-op.json")), true, "marker must stay");
+  });
+});
+
+test("registerOrphanCheckpoint: malformed sha is refused as invalid argument", async () => {
+  await withDir(async (dir) => {
+    await crashedMarker(dir);
+    const res = await S.registerOrphanCheckpoint(dir, "cand-a", "not-a-sha!", async () => {});
+    assert.equal(res.ok, false);
+  });
+});
