@@ -273,9 +273,12 @@ export function validateCandidatePolicy(raw: unknown): PolicyValidationResult {
 
   // Cross-field: the candidate must never be able to edit methodology files
   // (design §3: "Файлы методики не изменяются кандидатом").
-  const methodologyPaths = new Set(methodologyFiles.map((f) => f.path));
+  // Compare in one spelling: a backslash path (src\\method.md) names the same
+  // file as src/method.md and must not slip past the methodology guard.
+  const slash = (p: string): string => p.replace(/\\/g, "/");
+  const methodologyPaths = new Set(methodologyFiles.map((f) => slash(f.path)));
   for (const p of changeFiles) {
-    if (methodologyPaths.has(p)) {
+    if (methodologyPaths.has(slash(p))) {
       errors.push(
         `"change_files" must not contain methodology file ${JSON.stringify(p)}: methodology files are not modified by the candidate`,
       );

@@ -2969,6 +2969,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return;
       }
       if (runtime.consecutiveDriftResumes < MAX_CONSECUTIVE_DRIFT_RESUMES) {
+        // Unclear campaign state (pending operation): stop, do not auto-resume (design §5).
+        if (await campaignNeedsManualCheck(resolveWorkDir(ctx.cwd))) return;
         runtime.consecutiveDriftResumes++;
         markAutoResumeSent(runtime);
         // composeDriftResumeMessage branches by campaign mode: under an active
@@ -8365,12 +8367,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const changeFiles: readonly string[] = Array.isArray((state.policy as { change_files?: unknown }).change_files)
           ? (state.policy as { change_files: readonly string[] }).change_files
           : [];
-        const methodPaths = new Set((state.policy as { methodology_files?: { path?: string }[] }).methodology_files?.map((m) => String(m?.path)) ?? []);
+        // Compare in one spelling (forward slashes): src\\method.md is src/method.md.
+        const slash = (p: string): string => String(p).replace(/\\/g, "/");
+        const methodPaths = new Set((state.policy as { methodology_files?: { path?: string }[] }).methodology_files?.map((m) => slash(String(m?.path))) ?? []);
+        const changeSet = new Set(changeFiles.map(slash));
         for (const p of allowed) {
-          if (methodPaths.has(p)) {
+          if (methodPaths.has(slash(p))) {
             return fail("methodology_in_checkpoint", `allowed file ${JSON.stringify(p)} is a pinned methodology file and can never be changed by a candidate`);
           }
-          if (!changeFiles.includes(p)) {
+          if (!changeSet.has(slash(p))) {
             return fail("outside_change_files", `allowed file ${JSON.stringify(p)} is not in the campaign's change_files; only ${JSON.stringify(changeFiles)} may be changed`);
           }
         }

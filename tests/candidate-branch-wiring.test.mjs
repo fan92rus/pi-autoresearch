@@ -1068,3 +1068,23 @@ test("campaign under workingDir=sub: methodology blob resolves relative to the w
   const created = await callTool(h, "create", { candidate_id: "cand-a" });
   assert.match(textOf(created), /created|active|worktree|cand-a/i, `create must succeed under workingDir: ${textOf(created)}`);
 });
+
+// ─── Review regression (B2): backslash spelling must not bypass the methodology guard ─
+
+test("init refuses change_files that name a pinned methodology file with backslashes (same file, other spelling)", async () => {
+  const dir = makeWorkDir("backslash-init");
+  writeFileSyncSafe(path.join(dir, "src", "method.md"), "methodology v1\n");
+  writeFileSyncSafe(path.join(dir, "src", "algo.ts"), "export const a = 1;\n");
+  const h = await createHarness({ dir, sessionId: "candwiring-backslash-init", realGit: true });
+  await h.command("autoresearch").handler("on", h.ctx);
+  h.ctx.ui.confirm = async () => true;
+  const policy = policyOf(dir);
+  policy.methodology_files = [{ path: "src/method.md", sha256: "" }];
+  // The candidate must not be able to edit the methodology file by another spelling.
+  policy.change_files = ["src\\method.md"];
+  const init = await callTool(h, "init", { policy });
+  const text = textOf(init);
+  assert.match(text, /must not contain methodology file/i, `init must refuse the backslash spelling of a methodology file: ${text}`);
+  assert.doesNotMatch(text, /initialized|campaign started/i, "no campaign may start");
+  assert.equal(fs.existsSync(path.join(dir, ".auto", "candidate", "state.json")), false, "no state may be written");
+});

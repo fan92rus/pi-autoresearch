@@ -254,3 +254,25 @@ test("N4: a partial-cycle turn under a campaign with a pending operation sends N
     `no automatic resume may be scheduled while a campaign operation is pending: ${JSON.stringify(resumes.map((m) => m.text))}`,
   );
 }, { timeout: 30000 });
+
+test("N4 drift path: a settled turn with NO tool events under a pending operation sends no resume", async () => {
+  const dir = makeTempDir("steer-drift-pending");
+  fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".auto", "candidate", "state.json"),
+    JSON.stringify({ schema_version: 1, disabled: false, policy: {}, candidates: [] }),
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(dir, ".auto", "candidate", "pending-op.json"),
+    JSON.stringify({ name: "checkpoint cand-a", started_at: new Date().toISOString() }),
+    "utf8",
+  );
+  const { pi, hook, ctx } = await makeFullHarnessAt(dir, "steer-drift-pending-ctx");
+  await hook("agent_start")({ messages: [] }, ctx);
+  await hook("agent_end")({ messages: [] }, ctx);
+  await new Promise((r) => setTimeout(r, 1100));
+  const RESUME_TEXT = /Continue the candidate campaign|Last turn did no candidate-campaign work|Run the next iteration|Resume the cycle/;
+  const resumes = pi.sentMessages.filter((m) => RESUME_TEXT.test(m.text));
+  assert.equal(resumes.length, 0, `drift resume must not fire under a pending operation: ${JSON.stringify(resumes.map((m) => m.text))}`);
+}, { timeout: 30000 });
