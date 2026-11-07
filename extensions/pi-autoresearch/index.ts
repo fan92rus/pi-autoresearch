@@ -2376,6 +2376,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       cancelPendingResume(runtime);
       return;
     }
+    // Stored campaign wording is stale once the campaign is disabled or gone.
+    if (!campaignActiveSync(workDirNow) && /candidate_branch/.test(message)) {
+      cancelPendingResume(runtime);
+      return;
+    }
     if (!isAgentSettled(ctx)) return;
     const stopReason = autoResumeStopReasonFor(runtime);
     if (stopReason !== null) {
@@ -8971,6 +8976,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Register the widget NOW: the agent may take a while before its first
       // init_experiment, and the mode indicator must be visible immediately.
       updateWidget(ctx);
+      // A candidate campaign is active: the legacy create kickoff prescribes the
+      // ordinary loop (run/log), which is blocked. Point to the campaign instead.
+      if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) {
+        ctx.ui.notify("Candidate campaign active — continue it with candidate_branch status; the legacy autoresearch kickoff is not sent.", "info");
+        return;
+      }
       const rulesLoaded = hasAutoresearchRules(ctx);
       // No .auto/prompt.md yet — load the create skill so the agent follows the
       // setup guidelines. `/skill:<name>` is expanded to the full SKILL.md when

@@ -54,7 +54,8 @@ export function buildAutoresearchCompactionSummary(
   const sections = [
     campaign ? candidateHeaderSection() : headerSection(),
     sessionSection(state),
-    rulesSection(paths.workDir, paths.mdPath),
+    // prompt.md rules carry the ordinary loop; omitted under a campaign (design §5).
+    campaign ? null : rulesSection(paths.workDir, paths.mdPath),
     ideasSection(paths.workDir, paths.ideasPath),
     recentRunsSection(state, paths.workDir, paths.jsonlPath),
     campaign ? candidateNextStepSection() : nextStepSection(),

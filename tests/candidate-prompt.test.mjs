@@ -349,6 +349,24 @@ test("M2: a stored campaign resume is not delivered after the campaign was disab
   fs.writeFileSync(statePath, JSON.stringify({ schema_version: 1, disabled: true, policy: {}, candidates: [] }), "utf8");
   await hook("agent_end")({ messages: [] }, ctx);
   await new Promise((r) => setTimeout(r, 1200));
-  const campaignText = pi.sentMessages.filter((m) => /candidate_branch/.test(m.text) && /run_experiment|log_experiment/.test(m.text));
+  const campaignText = pi.sentMessages.filter((m) => /candidate_branch/.test(m.text));
   assert.equal(campaignText.length, 0, `a stale campaign resume must not claim the campaign is active: ${JSON.stringify(pi.sentMessages.map((m) => m.text))}`);
+}, { timeout: 30000 });
+
+test("B1 (re-review): compaction under a campaign omits the prompt.md rules that prescribe run/log", async () => {
+  const dir = makeTempDir("compact-campaign-rules");
+  fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".auto", "candidate", "state.json"),
+    JSON.stringify({ schema_version: 1, disabled: false, policy: {}, candidates: [] }), "utf8");
+  fs.writeFileSync(path.join(dir, ".auto", "prompt.md"),
+    "# Experiment rules\nOne idea = one cycle: propose_hypothesis -> run_experiment -> log_experiment.\n", "utf8");
+  const { hook, ctx } = await makeFullHarnessAt(dir, "compact-campaign-rules-ctx");
+  const out = await hook("session_before_compact")(
+    { preparation: { firstKeptEntryId: "e1", tokensBefore: 10 } },
+    ctx,
+  );
+  const summary = out?.compaction?.summary ?? "";
+  assert.match(summary, /candidate campaign/i, "summary must describe the candidate campaign");
+  // The header may say run_experiment is blocked; what must not appear is the prompt.md loop rule itself.
+  assert.equal(/One idea = one cycle|propose_hypothesis -> run_experiment/.test(summary), false, "campaign summary must not carry the prompt.md loop rule");
 }, { timeout: 30000 });
