@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "goal": "Answer whether the documented API rate limit matches observed behaviour",
+  "plan_source": "docs/plans/api-behaviour-review.md",
+  "caveat_block": "Observations are descriptive: no causal claim, no guarantee about future behaviour.",
+  "data_roles": {
+    "explore": ["logs/2024-01-*.jsonl", "logs/2024-02-*.jsonl"],
+    "validate": ["logs/2024-03-*.jsonl"],
+    "confirm": []
+  },
+  "questions": [
+    {
+      "id": "Q1",
+      "text": "Does the observed 429 rate match the documented 60 requests/minute?",
+      "decision_rules": [
+        { "id": "Q1-yes", "verdict": "confirmed", "when": "validate-window logs show throttling starting within 5% of 60 rpm" },
+        { "id": "Q1-no", "verdict": "rejected", "when": "validate-window logs show throttling outside 20% of 60 rpm" },
+        { "id": "Q1-unknown", "verdict": "inconclusive", "when": "validate logs are too sparse to decide" },
+        { "id": "Q1-wait", "verdict": "waiting_for_data", "when": "validate-window logs do not exist yet" }
+      ],
+      "needs_data": null
+    },
+    {
+      "id": "Q2",
+      "text": "Does the documented backoff header match the observed retry-after values?",
+      "decision_rules": [
+        { "id": "Q2-yes", "verdict": "confirmed", "when": "all sampled retry-after values fall in the documented range" },
+        { "id": "Q2-no", "verdict": "rejected", "when": "any sampled retry-after value is outside the documented range" },
+        { "id": "Q2-unknown", "verdict": "inconclusive", "when": "fewer than 10 samples in validate data" },
+        { "id": "Q2-wait", "verdict": "waiting_for_data", "when": "an independent confirm set is required and missing" }
+      ],
+      "needs_data": "an independent confirm set, collected after validate"
+    }
+  ],
+  "process_metrics": ["number of log files read", "share of days covered"],
+  "stop_rules": [
+    { "id": "S1", "when": "two consecutive rejected vectors without new data" }
+  ]
+}
