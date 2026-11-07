@@ -8491,6 +8491,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             candidateId: cand.id,
             allowedFiles: allowed,
             message,
+            committedScope: { baseRef: LEADER_REF, scope: changeFiles },
           });
           if (!cp.ok) {
             // Review round-3 B1: pre-commit stages (validate/guard/

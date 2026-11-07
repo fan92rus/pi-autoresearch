@@ -559,6 +559,11 @@ export interface CheckpointOptions {
   allowedFiles: string[];
   /** Commit message for the checkpoint commit. */
   message: string;
+  /** Campaign-wide scope for commits the candidate already made in its worktree
+   *  (agent-side `git commit`, invisible to the status check): every path
+   *  touched by `baseRef..HEAD` must be in `scope`. The caller passes the
+   *  campaign leader ref and the policy's change_files. */
+  committedScope?: { baseRef: string; scope: readonly string[] };
 }
 
 export type CheckpointFailureStage =
@@ -685,6 +690,29 @@ export async function checkpointCandidateWorktree(
       return failCheckpoint(
         "guard",
         `an unfinished merge/cherry-pick/revert appears to be in progress (${marker} exists); resolve it manually first`,
+      );
+    }
+  }
+
+  // 3b. Commits the candidate already made in this worktree are not visible to
+  //     the status check below. Every path they touched must be inside the
+  //     campaign's change scope, not just this call's allowed set.
+  if (opts.committedScope) {
+    const scope = new Set(opts.committedScope.scope.map((p) => p.replace(/\\/g, "/")));
+    let touched: string[];
+    try {
+      const baseSha = (await git(exec, ["rev-parse", "--verify", "--quiet", `${opts.committedScope.baseRef}^{commit}`], { cwd: wtPath })).trim();
+      const out = await git(exec, ["log", "-z", "--name-only", "--format=", `${baseSha}..HEAD`], { cwd: wtPath });
+      touched = Array.from(new Set(out.split("\0").map((s) => s.replace(/^\n+/, "")).filter((s) => s.length > 0)));
+    } catch (err) {
+      return failCheckpoint("guard", `cannot read the candidate's own commits: ${gitReason(err)}`);
+    }
+    const committedOffenders = touched.filter((p) => !scope.has(p)).sort();
+    if (committedOffenders.length > 0) {
+      return failCheckpoint(
+        "outside-allowed",
+        `${committedOffenders.length} path(s) committed in the candidate worktree are outside the campaign change scope; nothing was committed and no ref was written`,
+        committedOffenders.map((p) => `committed:${p}`),
       );
     }
   }

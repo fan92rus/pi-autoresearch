@@ -20,7 +20,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 
 import {
   createCandidateWorktree,
@@ -805,4 +805,46 @@ test("ignored files do not block a checkpoint", async () => {
 
   const r = await checkpointCandidateWorktree(exec, { repoRoot: repo, worktreePath: wtPath, candidateId: "c1", allowedFiles: ["src/algo.ts", ".gitignore"], message: "with ignored" });
   assert.equal(r.ok, true, r.reason ?? "");
+});
+
+// ═══ committedScope: commits the agent made itself inside the candidate worktree ═══
+
+test("checkpoint refuses when the candidate's own commit touched a path outside the campaign scope", async () => {
+  const { repo, commit, wtPath } = await makeCampaignWithWorktree("committed-scope");
+  // The agent commits an out-of-scope file itself (invisible to the status check).
+  writeFile(path.join(wtPath, "src", "other.ts"), "o-OUT-OF-SCOPE\n");
+  gitSync(["add", "--", "src/other.ts"], wtPath);
+  gitSync(["-c", "user.name=T", "-c", "user.email=t@t", "commit", "-q", "-m", "agent"], wtPath);
+  // Then a legitimate in-scope edit.
+  writeFile(path.join(wtPath, "src", "algo.ts"), "export const a = 2;\n");
+  const r = await checkpointCandidateWorktree(exec, {
+    repoRoot: repo,
+    worktreePath: wtPath,
+    candidateId: "c1",
+    allowedFiles: ["src/algo.ts"],
+    message: "scoped",
+    committedScope: { baseRef: commit, scope: ["src/algo.ts"] },
+  });
+  assert.equal(r.ok, false, "a committed out-of-scope path must block the checkpoint");
+  assert.equal(r.stage, "outside-allowed");
+  assert.match(r.reason, /committed in the candidate worktree/i);
+  const ref = spawnSync("git", ["rev-parse", "--verify", "--quiet", "refs/pi-autoresearch/candidates/c1"], { cwd: repo, encoding: "utf8" });
+  assert.notEqual(ref.status, 0, "no candidate ref may be written");
+});
+
+test("checkpoint accepts a candidate commit whose paths are all inside the campaign scope", async () => {
+  const { repo, commit, wtPath } = await makeCampaignWithWorktree("committed-scope-ok");
+  writeFile(path.join(wtPath, "src", "algo.ts"), "export const a = 3;\n");
+  gitSync(["add", "--", "src/algo.ts"], wtPath);
+  gitSync(["-c", "user.name=T", "-c", "user.email=t@t", "commit", "-q", "-m", "agent-in-scope"], wtPath);
+  writeFile(path.join(wtPath, "src", "algo.ts"), "export const a = 4;\n");
+  const r = await checkpointCandidateWorktree(exec, {
+    repoRoot: repo,
+    worktreePath: wtPath,
+    candidateId: "c1",
+    allowedFiles: ["src/algo.ts"],
+    message: "scoped ok",
+    committedScope: { baseRef: commit, scope: ["src/algo.ts"] },
+  });
+  assert.equal(r.ok, true, `in-scope committed history must pass: ${r.ok ? "" : r.reason}`);
 });
