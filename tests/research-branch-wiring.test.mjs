@@ -57,8 +57,8 @@ function rulesFor(qid) {
   ];
 }
 
-function briefFixture() {
-  return {
+function briefFixture(overrides = {}) {
+  const base = {
     schema_version: 1,
     goal: "Check whether the cache layer explains the latency drop.",
     plan_source: "docs/plan.md",
@@ -71,6 +71,7 @@ function briefFixture() {
     process_metrics: ["number of log files read"],
     stop_rules: [{ id: "S1", when: "two consecutive rejected vectors without new data" }],
   };
+  return { ...base, ...overrides };
 }
 
 /** Loads the REAL extension on a fake pi, turns autoresearch mode on, returns the handles. */
@@ -397,6 +398,9 @@ test("(g) git through the shell is blocked while a research campaign is active",
   for (const [toolName, command] of [
     ["bash", "git commit -m x"],
     ["bash", "echo ok && git status"],
+    ["bash", "  git status"],
+    ["bash", "cd repo\ngit status"],
+    ["bash", "bash -lc \"git add -A\""],
     ["powershell", "git push"],
     ["bash", "env git log"],
   ]) {
@@ -458,6 +462,9 @@ test("B1: council_* tools are blocked under an active research campaign and open
     const res = textOf(await call(h, name, name === "council_write_entry" ? { ...params, speaker: "A", phase: "facts", summary: "s", content: "c" } : params));
     assert.match(res, /Research campaign active/, `${name} must be blocked under research: ${res}`);
   }
+  const convene = textOf(await call(h, "council_convene", {}));
+  assert.match(convene, /Research campaign active/, `council_convene must be blocked under research: ${convene}`);
+  assert.equal(fs.existsSync(path.join(dir, ".auto", "councils")), true, "no council state is created under the block");
   const empty = makeWorkDir("council-open");
   const h2 = await loadExtension(empty, "council-open");
   fs.mkdirSync(path.join(empty, ".auto", "councils", "2"), { recursive: true });

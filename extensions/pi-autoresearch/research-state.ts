@@ -415,10 +415,23 @@ async function acquireLock(dir: string): Promise<Refusal | null> {
           `campaign lock is held by pid ${record.pid} since ${record.acquired_at}; the operation was not started. ` +
             "The lock is never removed automatically",
         )
-      : refuse(
-          "lock_unreadable",
-          "campaign lock exists but is unreadable; the operation was not started. " +
-            "The lock is never removed automatically",
+      : // A just-created lock can be briefly empty on Windows when another
+        // process opened it between our failed wx and its write (flaky
+        // lock_unreadable under full-suite load). One short retry; a still-
+        // unreadable lock fails closed (never removed automatically).
+        await new Promise((r) => setTimeout(r, 50)).then(() => readLockRecord(path)).then(
+          (retry) =>
+            retry
+              ? refuse(
+                  "lock_busy",
+                  `campaign lock is held by pid ${retry.pid} since ${retry.acquired_at}; the operation was not started. ` +
+                    "The lock is never removed automatically",
+                )
+              : refuse(
+                  "lock_unreadable",
+                  "campaign lock exists but is unreadable; the operation was not started. " +
+                    "The lock is never removed automatically",
+                ),
         );
   }
   try {

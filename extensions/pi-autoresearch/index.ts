@@ -2437,11 +2437,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // ── Research-vectors campaign (openspec/changes/research-vectors, design §8) ──
   const RESEARCH_BLOCK_TEXT = "Research campaign active; use research status or the operator resolve; the ordinary loop is blocked";
   /** Git invocations through the shell hook (design §8: no Git while the research campaign runs). */
-  // Command-position match (review B2): the git word must be the command or a
-  // wrapper-prefixed command; harmless prose like `echo git is useful` does not
-  // match. sh/bash/zsh/dash -c with a git word inside is covered too (fail-closed
-  // on `sh -c 'echo git'` — accepted residual).
-  const RESEARCH_GIT_RE = /(^|[;&|(]\s*)(?:(?:\w+=\S*|env|command|exec|sudo|nohup|xargs|time)\s+)*(?:git|(?:ba|z|da)?sh\s+(?:-\w+\s+)*["']?.*\bgit\b)(?=\s|$|["'])/;
+  // Command-position match (review B2 + round-2 BLOCKER-1): the git word must
+  // be the command or a wrapper-prefixed command; harmless prose like
+  // `echo git is useful` does not match. Leading whitespace and newline
+  // separators are command positions too. sh/bash/zsh/dash -c with a git word
+  // inside is covered (fail-closed on `sh -c 'echo git'` — accepted residual).
+  // Not a shell parser: known bypasses (/usr/bin/git, "git" status, { git; },
+  // /bin/bash -c, nice/time -p forms) are documented residuals (design §8:
+  // interception at the Pi command layer, not an OS sandbox).
+  const RESEARCH_GIT_RE = /(^^\s*|[;&|(\n\r]\s*)(?:(?:\w+=\S*|env|command|exec|sudo|nohup|xargs|time)\s+)*(?:git|(?:ba|z|da)?sh\s+(?:-\w+\s+)*["']?.*\bgit\b)(?=\s|$|["'])/;
 
   /**
    * Synchronous scan of every research campaign under <workDir>/.auto/research.
