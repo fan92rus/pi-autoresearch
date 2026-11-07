@@ -2484,7 +2484,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       return [
         "Resume the candidate campaign now: candidate_branch status, then run/checkpoint on the active candidate.",
         "If status reports manual_check_required: STOP — report the pending operation and wait for the operator (resolve).",
-        "Do not re-read .auto/prompt.md or .auto/log.jsonl — the compaction summary already contains them.",
+        "Read the campaign state with candidate_branch status; do not re-read .auto/prompt.md for loop rules (they are not part of the campaign).",
       ].join(" ");
     }
     // The compaction summary already contains the rules, ideas, and recent
@@ -3057,6 +3057,32 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   // When in autoresearch mode, add a static note to the system prompt.
   // Only a short pointer — no file content, fully cache-safe.
+  // Legacy experiment-loop guideline lines of the tools that stay registered.
+  // Under an active candidate campaign these must not reach the model: the
+  // system prompt is rebuilt from registered promptGuidelines on every turn.
+  const CAMPAIGN_STRIPPED_GUIDELINES: ReadonlySet<string> = new Set([
+    "Call init_experiment exactly once at the start of an autoresearch session, before the first run_experiment.",
+    "If the session log (.auto/log.jsonl) already exists with a config, do NOT call init_experiment again.",
+    "If the optimization target changes (different benchmark, metric, or workload), call init_experiment again to insert a new config header and reset the baseline.",
+    "ALWAYS call propose_hypothesis BEFORE run_experiment to register the idea.",
+    "SimHash duplicate detection runs at registration time, not at run time.",
+    "Use the returned node_id in run_experiment(hypothesis_id: \"nX\").",
+    "Use force=true to override SimHash duplicate detection if the idea is genuinely different.",
+    "An experiment ONLY exists if it ran through run_experiment: bash-run benchmarks are invisible to the ledger, corrupt the noise floor, and their edits are lost on the next revert.",
+    "Always pass a tight timeout_seconds (required). A runaway process will be force-killed at the limit and logged as 'crash'.",
+    "After run_experiment, always call log_experiment to record the result.",
+    "ALWAYS call propose_hypothesis BEFORE run_experiment to get a hypothesis_id. Pass hypothesis_id to both run_experiment and log_experiment.",
+    "Exception: the baseline run (first after init_experiment) does NOT need hypothesis_id.",
+    "If the benchmark script outputs structured METRIC lines (e.g. 'METRIC total_µs=15200'), run_experiment will parse them automatically and suggest exact values for log_experiment. Use these parsed values directly instead of extracting them manually from the output.",
+    "Always call log_experiment after run_experiment to record the result.",
+    "log_experiment automatically runs git add -A && git commit on 'keep', and auto-reverts code changes on 'discard'/'crash'/'checks_failed' (autoresearch files are preserved). Do NOT commit or revert manually.",
+    "Use status 'keep' if the PRIMARY metric improved. 'discard' if worse or unchanged. 'crash' if it failed. Secondary metrics are for monitoring — they almost never affect keep/discard. Only discard a primary improvement if a secondary metric degraded catastrophically, and explain why in the description.",
+    "log_experiment reports a confidence score after 3+ runs (best improvement as a multiple of the noise floor). ≥2.0× = likely real, <1.0× = within noise. If confidence is below 1.0×, consider re-running the same experiment to confirm before keeping. The score is advisory — it never auto-discards.",
+    "If you discover complex but promising optimizations you won't pursue immediately, write them as files in .auto/ideas/ (one .md per idea). Don't let good ideas get lost.",
+    "Always include the asi parameter. At minimum: {\"hypothesis\": \"what you tried\"}. On discard/crash, also include rollback_reason and next_action_hint. Add any other key/value pairs that capture what you learned — dead ends, surprising findings, error details, bottlenecks. This is the only structured memory that survives reverts.",
+    "When log_experiment records a retry of a previously discarded idea after its assumptions changed, set asi.revisits_run to the earlier run number (a positive integer) and explain what changed in description. Omit revisits_run for new ideas and verification reruns.",
+  ]);
+  
   pi.on("before_agent_start", async (event, ctx) => {
     const runtime = getRuntime(ctx);
     // Per-turn loop-tool tracking: fresh turn starts with no loop work done.
@@ -3078,7 +3104,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         "\n- Your user's own branch, checkout and files are never reset, cleaned or deleted by this mode." +
         "\n- If an operation is pending or a lock is stale (manual_check_required): STOP. Do not start new measurements or operations; report the state and ask the operator. Only the operator's dialog resolves it (resolve)." +
         "\n- The general autonomy directive does not override the human policy consent.";
-      return { systemPrompt: event.systemPrompt + candidateExtra };
+      // Drop legacy loop guideline lines that the tool registrations inject.
+      const kept = event.systemPrompt
+        .split("\n")
+        .filter((line) => !CAMPAIGN_STRIPPED_GUIDELINES.has(line.replace(/^\s*-\s*/, "").trim()))
+        .join("\n");
+      return { systemPrompt: kept + candidateExtra };
     }
     const mdPath = autoresearchMdPath(workDir);
     const ideasPath = autoresearchIdeasPath(workDir);
@@ -3171,6 +3202,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     parameters: InitParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return campaignBlockedResponse();
       const modeGate = assertModeActive(ctx);
       if (modeGate) return modeGate;
       const runtime = getRuntime(ctx);
@@ -3998,7 +4030,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const modeGate = assertModeActive(ctx);
       if (modeGate) return modeGate;
       // Candidate-branch campaign guard (tasks 3.2): an active campaign blocks
-      // the ordinary loop. Missing/corrupt state keeps the ordinary behavior.
+      // the ordinary loop. A missing state keeps the ordinary behavior; an unreadable state fails closed.
       // (Placed after the existing workDirError validation below.)
       const runtime = getRuntime(ctx);
       const state = runtime.state;
@@ -7800,6 +7832,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       required: ["reason"],
     } as any,
     async execute(_toolCallId: string, params: { reason: string; evidence?: string; confidence?: number }, _signal, _onUpdate, ctx: ExtensionContext) {
+      if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return campaignBlockedResponse();
       assertModeActive(ctx);
       const workDir = resolveWorkDir(ctx.cwd);
       const runtime = getRuntime(ctx);
@@ -7988,9 +8021,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
   };
 
-  /** Is an ordinary-loop tool blocked by an active candidate campaign? Only a
-   *  well-formed, non-disabled campaign state blocks; missing/corrupt state
-   *  keeps the ordinary loop working (tasks 3.2). */
   /** Synchronous: usable from the resume timer. Interrupted operation present. */
   const campaignPendingOpSync = (workDir: string): boolean =>
     fs.existsSync(path.join(campaignDirOf(workDir), candidateState.PENDING_OP_FILE));
@@ -8013,8 +8043,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   /**
    * design §5: outside the normal state the agent must STOP, not be auto-resumed.
    * True when an interrupted campaign operation is pending (pending-op marker):
-   * automatic resume messages are then not scheduled. Lock and unreadable-state
-   * cases are handled by campaignBlocksOrdinaryLoop, not here.
+   * automatic resume messages are then not scheduled. A stale lock and an
+   * unreadable state do not suppress steers; the tools refuse in those cases.
    */
   const campaignNeedsManualCheck = async (workDir: string): Promise<boolean> => {
     // Scoped to an interrupted operation (the pending-op marker). An unreadable
@@ -8023,6 +8053,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return campaignPendingOpSync(workDir);
   };
 
+  /** Is an ordinary-loop tool blocked by an active candidate campaign? A missing
+   *  state never blocks. An existing state blocks unless it is readable and
+   *  disabled; an unreadable state fails closed (tasks 3.2, design §4). */
   const campaignBlocksOrdinaryLoop = async (workDir: string): Promise<boolean> => {
     const statePath = path.join(campaignDirOf(workDir), candidateState.STATE_FILE);
     if (!fs.existsSync(statePath)) return false;
@@ -8804,6 +8837,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       if (command === "finalize") {
+        if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) {
+          ctx.ui.notify("Candidate campaign active — use candidate_branch; the legacy finalize flow is not started.", "info");
+          return;
+        }
         await finalizeAutoresearch(ctx);
         return;
       }
@@ -8950,6 +8987,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // ===== parallel subcommands: activate mode + inject the parallel skill =====
       const parallelMatch = command.match(/^parallel-(best-of-n|stack|search)\b/);
       if (parallelMatch) {
+        if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) {
+          ctx.ui.notify("Candidate campaign active — use candidate_branch; the legacy parallel flow is not started.", "info");
+          return;
+        }
         const workDir = resolveWorkDir(ctx.cwd);
         // clean any stale worktrees from a previous crashed round
         await cleanupAllWorktrees(async (cmd: string, args: string[], o?: { cwd?: string; timeout?: number }) => {

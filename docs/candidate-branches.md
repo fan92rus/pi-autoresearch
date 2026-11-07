@@ -36,7 +36,7 @@ Other actions: `status`, `resume`, `pause`, `select`, `close`, `disable`.
 
 ## Refusal reasons you may see
 
-- `unsaved_changes` — `pause`, `close`, `select`, or `create` while the active
+- `unsaved_changes` — `pause`, `close`, `select`, `resume`, or `create` while the active
   candidate's worktree has changes outside the last checkpoint; the refusal
   lists the paths. `disable` does NOT check for unsaved changes (the campaign
   can always be turned off).

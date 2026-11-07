@@ -370,3 +370,29 @@ test("B1 (re-review): compaction under a campaign omits the prompt.md rules that
   // The header may say run_experiment is blocked; what must not appear is the prompt.md loop rule itself.
   assert.equal(/One idea = one cycle|propose_hypothesis -> run_experiment/.test(summary), false, "campaign summary must not carry the prompt.md loop rule");
 }, { timeout: 30000 });
+
+test("B1 (round 3): legacy promptGuidelines lines are stripped from the system prompt under an active campaign", async () => {
+  const dir = makeTempDir("guidelines-campaign");
+  fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".auto", "candidate", "state.json"),
+    JSON.stringify({ schema_version: 1, disabled: false, policy: {}, candidates: [] }), "utf8");
+  const { hook, ctx } = await makeFullHarnessAt(dir, "guidelines-campaign-ctx");
+  const legacyLine = "- ALWAYS call propose_hypothesis BEFORE run_experiment to register the idea.";
+  const keepLine = "- Keep this unrelated guideline.";
+  const event = { systemPrompt: "BASE\n" + legacyLine + "\n" + keepLine + "\n" };
+  const out = await hook("before_agent_start")(event, ctx);
+  const prompt = out?.systemPrompt ?? "";
+  assert.equal(prompt.includes("ALWAYS call propose_hypothesis BEFORE run_experiment"), false, "legacy guideline must be stripped under a campaign");
+  assert.equal(prompt.includes(keepLine), true, "unrelated guidelines must be kept");
+  assert.match(prompt, /## Candidate Branch Campaign \(ACTIVE\)/, "candidate section must still be appended");
+}, { timeout: 30000 });
+
+test("B1 (round 3) control: without a campaign the legacy guideline line is kept", async () => {
+  const dir = makeTempDir("guidelines-legacy");
+  const { hook, ctx } = await makeFullHarnessAt(dir, "guidelines-legacy-ctx");
+  const legacyLine = "- ALWAYS call propose_hypothesis BEFORE run_experiment to register the idea.";
+  const event = { systemPrompt: "BASE\n" + legacyLine + "\n" };
+  const out = await hook("before_agent_start")(event, ctx);
+  const prompt = out?.systemPrompt ?? event.systemPrompt;
+  assert.equal(prompt.includes(legacyLine), true, "legacy prompt must be unchanged without a campaign");
+}, { timeout: 30000 });
