@@ -2979,6 +2979,22 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (!runtime.autoresearchMode) return;
 
     const workDir = resolveWorkDir(ctx.cwd);
+
+    // Candidate-branch campaign active (design §5): the legacy experiment-loop
+    // text (run_experiment/log_experiment, auto-revert, pre-approval of owner
+    // questions) must NOT be prescribed. Inject only the candidate-mode rules.
+    if (await campaignBlocksOrdinaryLoop(workDir)) {
+      const candidateExtra =
+        "\n\n## Candidate Branch Campaign (ACTIVE)" +
+        "\nWork through the candidate_branch tool only. Sequence: init (policy confirmed by the USER in a dialog) \u2192 create \u2192 run (candidate measurement, NOT a global keep) \u2192 checkpoint (explicit allowed_files) \u2192 confirm (re-measures leader and candidate; the leader ref moves only on a strict gain above min_gain with passing checks)." +
+        "\n- Ordinary run_experiment and log_experiment are BLOCKED while this campaign is active. Do not use auto-revert or discard semantics here." +
+        "\n- Policy consent is the user's alone. Never pass or simulate consent; a refusal or missing UI means no campaign." +
+        "\n- Only one candidate is active at a time. This is sequential candidate development, not parallel search." +
+        "\n- Your user's own branch, checkout and files are never reset, cleaned or deleted by this mode." +
+        "\n- If an operation is pending or a lock is stale (manual_check_required): STOP. Do not start new measurements or operations; report the state and ask the operator. Only the operator's dialog resolves it (resolve)." +
+        "\n- The general autonomy directive does not override the human policy consent.";
+      return { systemPrompt: event.systemPrompt + candidateExtra };
+    }
     const mdPath = autoresearchMdPath(workDir);
     const ideasPath = autoresearchIdeasPath(workDir);
     const hasIdeas = fs.existsSync(ideasPath);
