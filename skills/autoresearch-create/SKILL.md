@@ -203,14 +203,32 @@ If the user sends a message while an experiment is running, finish the current `
 
 ## Candidate-branch mode (opt-in)
 
-When a candidate campaign is active (`candidate_branch` `init` succeeded),
-the system prompt switches to candidate-mode rules: work only through
-`candidate_branch`, do not call `run_experiment` or `log_experiment` (they
-are blocked), and never pass or simulate policy consent. If an operation is
-pending or a lock is stale, stop and report `manual_check_required`; only
-the operator's dialog (`resolve`) clears it. Details and limits:
-`docs/candidate-branches.md`.
+When the user chooses the candidate-branches campaign, write the following
+section into the new campaign's `.auto/prompt.md` INSTEAD of the experiment
+loop section above (never overwrite an existing user `.auto/prompt.md`):
+
+```markdown
+## Candidate Branch Campaign
+- Work only through candidate_branch: init → create → run → checkpoint →
+  confirm. Ordinary run_experiment/log_experiment are blocked in this mode.
+- Policy parameters require the USER's explicit dialog consent; without it,
+  init fails. Never pass or simulate consent.
+- run measures the candidate; it is NOT a global keep.
+- checkpoint saves only allowed_files from the campaign's change_files.
+- confirm re-measures leader and candidate; the leader ref moves only on a
+  strict gain above min_gain with passing checks.
+- If a call returns manual_check_required or the lock is stale: STOP. Report
+  the pending operation and wait for the operator (resolve is dialog-only).
+- One active candidate at a time. This is sequential candidate development,
+  not parallel search.
+```
+
+While a campaign is already active, the system prompt carries these rules
+automatically (candidate mode replaces the experiment-loop section); do not
+call `run_experiment` or `log_experiment` (they are blocked), and never pass
+or simulate policy consent. If an operation is pending or a lock is stale,
+stop and report `manual_check_required`; only the operator's dialog
+(`resolve`) clears it. Details and limits: `docs/candidate-branches.md`.
 
 Without an active campaign, this skill's loop instructions above apply
-unchanged. Do not create a `.auto/prompt.md` that contradicts the mode in
-effect: write the candidate section only when the user chose the campaign.
+unchanged.

@@ -747,3 +747,20 @@ test("registerOrphanCheckpoint: malformed sha is refused as invalid argument", a
     assert.equal(res.ok, false);
   });
 });
+
+test("pause switches the active candidate after a clean pause; forbidden resume of a closed candidate refuses", async () => {
+  await withDir(async (dir) => {
+    await initOk(dir);
+    await S.createCandidate(dir, "cand-a");
+    await S.recordCheckpoint(dir, "cand-a", "cp1");
+    // pause: switches the active candidate without touching checkpoint bytes.
+    const paused = await S.pauseCandidate(dir, "cand-a");
+    assert.equal(paused.ok, true, JSON.stringify(paused));
+    const st = JSON.parse(await readFile(join(dir, "state.json"), "utf8"));
+    const a = st.candidates.find((c) => c.id === "cand-a");
+    assert.equal(a.status, "paused");
+    assert.deepEqual(a.checkpoints, ["cp1"], "checkpoints survive a pause");
+    await S.createCandidate(dir, "cand-b");
+    assert.equal((await S.resumeCandidate(dir, "cand-a")).ok, false, "resume while another is active must refuse");
+  });
+});
