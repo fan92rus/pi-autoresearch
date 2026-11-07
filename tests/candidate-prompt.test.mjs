@@ -396,3 +396,18 @@ test("B1 (round 3) control: without a campaign the legacy guideline line is kept
   const prompt = out?.systemPrompt ?? event.systemPrompt;
   assert.equal(prompt.includes(legacyLine), true, "legacy prompt must be unchanged without a campaign");
 }, { timeout: 30000 });
+
+test("junk disabled state (no schema) under compaction keeps the campaign summary, not the legacy loop", async () => {
+  const dir = makeTempDir("compact-junk-disabled");
+  fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".auto", "candidate", "state.json"),
+    JSON.stringify({ disabled: true, junk: 1 }), "utf8");
+  const { hook, ctx } = await makeFullHarnessAt(dir, "compact-junk-disabled-ctx");
+  const out = await hook("session_before_compact")(
+    { preparation: { firstKeptEntryId: "e1", tokensBefore: 10 } },
+    ctx,
+  );
+  const summary = out?.compaction?.summary ?? "";
+  assert.match(summary, /candidate campaign/i, "an unclear state must keep the campaign summary (fail closed)");
+  assert.equal(/Continue the experiment loop|run the next experiment immediately/i.test(summary), false, "legacy loop text must not appear");
+}, { timeout: 30000 });

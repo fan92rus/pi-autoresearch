@@ -1130,3 +1130,13 @@ test("methodology ./METHOD.md with change_files METHOD.md: init or checkpoint re
   const ref = spawnSync("git", ["rev-parse", "--verify", "--quiet", "refs/pi-autoresearch/candidates/c1"], { cwd: dir, encoding: "utf8" });
   assert.notEqual(ref.status, 0, "no candidate ref may be written for the methodology file");
 });
+
+// ─── Review round (4c5532d): propose_hypothesis is part of the ordinary loop ──
+
+test("propose_hypothesis is refused under an active candidate campaign (writes refs/exp into the user repo)", async () => {
+  const { h } = await campaignWithCandidate("propose-blocked");
+  const propose = h.tool("propose_hypothesis");
+  assert.ok(propose, "propose_hypothesis must be registered");
+  const res = await propose.execute("id", { description: "try a faster loop" }, null, null, h.ctx);
+  assert.match(textOf(res), /candidate campaign active/i, `propose must be refused under a campaign: ${textOf(res)}`);
+});

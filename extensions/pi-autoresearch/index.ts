@@ -3067,9 +3067,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   // When in autoresearch mode, add a static note to the system prompt.
   // Only a short pointer — no file content, fully cache-safe.
-  // Legacy experiment-loop guideline lines of the tools that stay registered.
+  // Guideline lines of the four ordinary-loop tools (run/log/propose/init).
   // Under an active candidate campaign these must not reach the model: the
   // system prompt is rebuilt from registered promptGuidelines on every turn.
+  // Other registered tools keep their own guidelines; the campaign text in
+  // before_agent_start is the authority for how they are used.
   const CAMPAIGN_STRIPPED_GUIDELINES: ReadonlySet<string> = new Set([
     "Call init_experiment exactly once at the start of an autoresearch session, before the first run_experiment.",
     "If the session log (.auto/log.jsonl) already exists with a config, do NOT call init_experiment again.",
@@ -3482,6 +3484,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const modeGate = assertModeActive(ctx);
       if (modeGate) return modeGate;
+      // The ordinary loop is blocked under a candidate campaign; this tool writes
+      // refs/exp/* into the user's repository (design §5: incompatible tools).
+      if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return campaignBlockedResponse();
 
       // ── Read hypothesis text ──
       let hypothesisText: string;
@@ -8044,7 +8049,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (!fs.existsSync(statePath)) return false;
     try {
       const raw = JSON.parse(fs.readFileSync(statePath, "utf8"));
-      return !(raw && typeof raw === "object" && raw.disabled === true);
+      const schemaValid =
+        raw && typeof raw === "object" && raw.schema_version === 1 && Array.isArray(raw.candidates);
+      return !(schemaValid && raw.disabled === true);
     } catch {
       return true;
     }
@@ -8464,12 +8471,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // checkpoint guard matches the init-time overlap guard exactly.
         const slash = (p: string): string => String(p).replace(/\\/g, "/").toLowerCase();
         const methodPaths = new Set((state.policy as { methodology_files?: { path?: string }[] }).methodology_files?.map((m) => slash(String(m?.path))) ?? []);
-        const changeSet = new Set(changeFiles.map(slash));
+        const exactPath = (p: string): string => String(p).replace(/\\/g, "/");
+        const changeSet = new Set(changeFiles.map(exactPath));
         for (const p of allowed) {
           if (methodPaths.has(slash(p))) {
             return fail("methodology_in_checkpoint", `allowed file ${JSON.stringify(p)} is a pinned methodology file and can never be changed by a candidate`);
           }
-          if (!changeSet.has(slash(p))) {
+          if (!changeSet.has(exactPath(p))) {
             return fail("outside_change_files", `allowed file ${JSON.stringify(p)} is not in the campaign's change_files; only ${JSON.stringify(changeFiles)} may be changed`);
           }
         }

@@ -47,8 +47,12 @@ Other actions: `status`, `resume`, `pause`, `select`, `close`, `disable`.
 - A promotion needs a repeated comparable measurement, the same metric and
   direction, equal epochs, unchanged methodology hashes, passing checks on
   the exact checkpoint, and a gain strictly above `min_gain`.
-- While a campaign is active, `run_experiment` and `log_experiment` are
-  blocked.
+- While a campaign is active, the ordinary-loop tools are refused:
+  `run_experiment`, `log_experiment`, `init_experiment`, `propose_hypothesis`,
+  `finalize_research`, and the `/autoresearch` parallel and finalize flows.
+  Read-only and note-taking tools (`inspect_results`, `tree_status`,
+  `record_finding`, `update_finding`, `log_observation`) stay available. The
+  ordinary loop's blocked set is a deliberate MVP scope, recorded here.
 
 ## Not promised
 
