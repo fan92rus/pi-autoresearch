@@ -184,6 +184,7 @@ import {
 import * as candidateState from "./candidate-state.ts";
 import * as candidateWorktree from "./candidate-worktree.ts";
 import * as candidateMeasure from "./candidate-measure.ts";
+import * as researchState from "./research-state.ts";
 import { RpcClient } from "./parallel/rpc.ts";
 import { runBestOfN } from "./parallel/bestofn.ts";
 import { runCheckOrthogonal } from "./parallel/orthogonal.ts";
@@ -2372,7 +2373,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // became pending, or before a campaign started, must not be delivered now.
     // (design §5: unclear state -> stop; active campaign -> candidate wording only.)
     const workDirNow = resolveWorkDir(ctx.cwd);
-    if (campaignPendingOpSync(workDirNow)) {
+    const researchNow = researchScanSync(workDirNow);
+    if (campaignPendingOpSync(workDirNow) || researchNow.halted) {
       cancelPendingResume(runtime);
       return;
     }
@@ -2393,8 +2395,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     markAutoResumeSent(runtime);
     // A legacy-cycle message stored before a campaign started is replaced by the
     // campaign wording at send time (design §5: no ordinary run/log prescription).
-    const sendText =
-      campaignActiveSync(workDirNow) && !/candidate_branch/.test(message)
+    const sendText = researchNow.blocks
+      ? RESEARCH_RESUME_TEXT
+      : campaignActiveSync(workDirNow) && !/candidate_branch/.test(message)
         ? composeCampaignResumeMessage(ctx)
         : message;
     pi.sendUserMessage(sendText);
@@ -2431,6 +2434,91 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     ctx.ui.notify(reason ?? `Autoresearch auto-resume limit reached`, "info");
   };
 
+  // ── Research-vectors campaign (openspec/changes/research-vectors, design §8) ──
+  const RESEARCH_BLOCK_TEXT = "Research campaign active; use research status or the operator resolve; the ordinary loop is blocked";
+  /** Git invocations through the shell hook (design §8: no Git while the research campaign runs). */
+  // Command-position match (review B2): the git word must be the command or a
+  // wrapper-prefixed command; harmless prose like `echo git is useful` does not
+  // match. sh/bash/zsh/dash -c with a git word inside is covered too (fail-closed
+  // on `sh -c 'echo git'` — accepted residual).
+  const RESEARCH_GIT_RE = /(^|[;&|(]\s*)(?:(?:\w+=\S*|env|command|exec|sudo|nohup|xargs|time)\s+)*(?:git|(?:ba|z|da)?sh\s+(?:-\w+\s+)*["']?.*\bgit\b)(?=\s|$|["'])/;
+
+  /**
+   * Synchronous scan of every research campaign under <workDir>/.auto/research.
+   * blocks: the ordinary loop and candidate tools are refused — a campaign in phase
+   * research or stopped, or any campaign whose state is unreadable or invalid, or
+   * one with a pending operation (fail closed). A missing research root blocks nothing.
+   * halted: automatic continuation must not run (stopped, unreadable, or pending operation).
+   */
+  const researchScanSync = (workDir: string): { blocks: boolean; halted: boolean } => {
+    const root = researchState.researchRoot(workDir);
+    if (!fs.existsSync(root)) return { blocks: false, halted: false };
+    let names: string[];
+    try {
+      names = fs.readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+    } catch {
+      return { blocks: true, halted: true };
+    }
+    let blocks = false;
+    let halted = false;
+    for (const name of names) {
+      const dir = path.join(root, name);
+      if (fs.existsSync(path.join(dir, researchState.PENDING_OP_FILE))) {
+        blocks = true;
+        halted = true;
+        continue;
+      }
+      let phase: string | null = null;
+      try {
+        const raw = JSON.parse(fs.readFileSync(path.join(dir, researchState.STATE_FILE), "utf8"));
+        if (
+          raw && typeof raw === "object" &&
+          raw.schema_version === researchState.RESEARCH_STATE_SCHEMA_VERSION &&
+          raw.campaign_id === name &&
+          (researchState.CAMPAIGN_PHASES as readonly string[]).includes(raw.phase)
+        ) {
+          phase = raw.phase;
+        }
+      } catch {
+        phase = null;
+      }
+      if (phase === null) {
+        blocks = true;
+        halted = true;
+      } else if (phase === "research") {
+        blocks = true;
+      } else if (phase === "stopped") {
+        blocks = true;
+        halted = true;
+      }
+    }
+    return { blocks, halted };
+  };
+
+  const researchBlocksOrdinaryLoop = async (workDir: string): Promise<boolean> => researchScanSync(workDir).blocks;
+
+  const researchBlockedResponse = () => ({
+    content: [{ type: "text", text: `⛔ ${RESEARCH_BLOCK_TEXT}.` }],
+    details: {},
+  });
+
+  const RESEARCH_RESUME_TEXT =
+    "Continue the research campaign: research status/open/record/close; STOP on manual_check_required.";
+
+  const composeResearchDriftMessage = (): string =>
+    [
+      "⚠ Last turn did no research-campaign work.",
+      RESEARCH_RESUME_TEXT,
+      "Questions and decision rules come only from the approved brief.",
+    ].join(" ");
+
+  const composeResearchCompactionMessage = (): string =>
+    [
+      "Resume the research campaign now: research status, then open/record/close per the brief.",
+      "Do not re-read .auto/prompt.md for loop rules (they are not part of the research campaign).",
+      "STOP on manual_check_required.",
+    ].join(" ");
+
   const composeResumeMessage = (ctx: ExtensionContext): string => {
     const flag = getRuntime(ctx).lastLogFlag;
     const head = flag
@@ -2448,14 +2536,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   /** Campaign-mode default resume used by ensurePendingResume when no explicit
    *  composer is given: never mentions the blocked legacy tools. */
   const composeCampaignResumeMessage = (ctx: ExtensionContext): string =>
-    [
-      "Continue the candidate campaign now: candidate_branch status, then run/checkpoint on the active candidate.",
-      "The ordinary experiment tools are blocked while the campaign is active.",
-      "If status reports manual_check_required: STOP — report the pending operation and wait for the operator (resolve).",
-    ].join(" ");
+    researchScanSync(resolveWorkDir(ctx.cwd)).blocks
+      ? RESEARCH_RESUME_TEXT
+      : [
+          "Continue the candidate campaign now: candidate_branch status, then run/checkpoint on the active candidate.",
+          "The ordinary experiment tools are blocked while the campaign is active.",
+          "If status reports manual_check_required: STOP — report the pending operation and wait for the operator (resolve).",
+        ].join(" ");
 
   /** Corrective resume for a settled turn that did no loop work (bounded — see MAX_CONSECUTIVE_DRIFT_RESUMES). */
   const composeDriftResumeMessage = async (cwd: string): Promise<string> => {
+    // Research campaign active (design §8): resume the research campaign only.
+    if (researchScanSync(resolveWorkDir(cwd)).blocks) return composeResearchDriftMessage();
     // Candidate-branch campaign active (design §5): do NOT prescribe the legacy
     // cycle; the campaign has its own loop and its own stop rules. resolveWorkDir
     // (not the raw cwd): the campaign may live under a configured workingDir.
@@ -2476,6 +2568,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   };
 
   const composeCompactionResumeMessage = async (ctx: ExtensionContext): Promise<string> => {
+    if (researchScanSync(resolveWorkDir(ctx.cwd)).blocks) return composeResearchCompactionMessage();
     // Candidate-branch campaign active (design §5): resume the campaign, not
     // the legacy experiment loop; compaction must not reintroduce run_experiment.
     // resolveWorkDir (not the raw cwd): the campaign may live under a configured
@@ -2946,7 +3039,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     let composed: string | Promise<string>;
     if (composeMessage) {
       composed = composeMessage(ctx);
-    } else if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) {
+    } else if (
+      (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) ||
+      (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd)))
+    ) {
       composed = composeCampaignResumeMessage(ctx);
     } else {
       composed = composeResumeMessage(ctx);
@@ -3006,7 +3102,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Under an active candidate campaign the notice must not prescribe the
       // ordinary loop (design §5); it names the campaign tool instead.
       ctx.ui.notify(
-        campaignActiveSync(resolveWorkDir(ctx.cwd))
+        researchScanSync(resolveWorkDir(ctx.cwd)).blocks
+          ? "Autoresearch paused — the last turns did no research-campaign work. Use research status to see the state, then resume the campaign."
+          : campaignActiveSync(resolveWorkDir(ctx.cwd))
           ? "Autoresearch paused — the last turns did no candidate-campaign work. Use candidate_branch status to see the state, then resume the campaign."
           : "Autoresearch paused — the last turns did no experiment work (no run_experiment/log_experiment). Run /autoresearch <goal> to resume the loop.",
         "info",
@@ -3027,6 +3125,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const EXPERIMENT_LOOP_TOOLS = new Set([
     "run_experiment", "log_experiment", "propose_hypothesis", "init_experiment",
     "tree_status", "finalize_research",
+    // Research-campaign tools are campaign work, not idle turns (design §8).
+    "research", "research_brief",
     // Council facilitation IS loop work: without these, drift-resume would nag
     // the agent mid-council (observed in the E2E run).
     "council_write_entry", "council_check_consensus",
@@ -3048,10 +3148,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const BENCHMARK_EXEC_RE = /(?:^|[\s;&(])(?:bash|sh|\.\/)\s+\S*measure\.sh\b|\bBENCH_MODE\s*=/;
   pi.on("tool_call", async (event, ctx) => {
     if (event.toolName !== "bash" && event.toolName !== "powershell") return;
-    if (!getRuntime(ctx).autoresearchMode) return;
     const cmd = typeof (event.input as { command?: unknown })?.command === "string"
       ? (event.input as { command: string }).command
       : "";
+    // Research campaign (design §8): no Git through the shell, regardless of the loop mode.
+    if (cmd && RESEARCH_GIT_RE.test(cmd) && (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd)))) {
+      return {
+        block: true,
+        reason:
+          "Blocked: git is not allowed while a research campaign is active; the research tools record evidence without Git.",
+      };
+    }
+    if (!getRuntime(ctx).autoresearchMode) return;
     if (!cmd || !BENCHMARK_EXEC_RE.test(cmd)) return;
     // Under an active candidate campaign the ordinary loop is blocked, so the
     // reason must not name run_experiment (design §5). Point to candidate_branch.
@@ -3112,6 +3220,26 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (!runtime.autoresearchMode) return;
 
     const workDir = resolveWorkDir(ctx.cwd);
+
+    // Research campaign active (design §8): the legacy loop and candidate text must NOT be
+    // prescribed. Inject only the research-mode rules.
+    if (await researchBlocksOrdinaryLoop(workDir)) {
+      const researchExtra =
+        "\n\n## Research Campaign (ACTIVE)" +
+        "\nWork through the research and research_brief tools only. Sequence: research_brief draft → propose (brief confirmed by the USER in a dialog) → research start (expected brief sha256) → open (one question from the brief) → record (evidence_ref) → close (verdict with a rule_id of that question) → stop (stop rule) → report." +
+        "\n- Questions and decision rules come ONLY from the approved brief. Never add or change a question or a rule during the campaign." +
+        "\n- Close a vector only by a decision rule of that question, with recorded evidence. inconclusive and waiting_for_data need a reason; if the brief requires independent data that is missing, the verdict is waiting_for_data." +
+        "\n- Only one vector is open at a time. A closed vector is never reopened." +
+        "\n- Brief approval is the user's alone. Never pass or simulate confirmation." +
+        "\n- Git operations are FORBIDDEN in this mode: no git commands through the shell. The research tools never run Git." +
+        "\n- If status reports manual_check_required or brief_changed: STOP. Do not open or record anything; report the state and ask the operator. Only the operator's dialog resolves it (resolve)." +
+        "\n- Copy the caveat_block of the brief verbatim into the report. Do not present unverified figures as computed facts.";
+      const keptResearch = event.systemPrompt
+        .split("\n")
+        .filter((line) => !CAMPAIGN_STRIPPED_GUIDELINES.has(line.replace(/^\s*-\s*/, "").trim()))
+        .join("\n");
+      return { systemPrompt: keptResearch + researchExtra };
+    }
 
     // Candidate-branch campaign active (design §5): the legacy experiment-loop
     // text (run_experiment/log_experiment, auto-revert, pre-approval of owner
@@ -3225,6 +3353,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return campaignBlockedResponse();
+      if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return researchBlockedResponse();
       const modeGate = assertModeActive(ctx);
       if (modeGate) return modeGate;
       const runtime = getRuntime(ctx);
@@ -3497,6 +3626,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // The ordinary loop is blocked under a candidate campaign; this tool writes
       // refs/exp/* into the user's repository (design §5: incompatible tools).
       if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return campaignBlockedResponse();
+      if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return researchBlockedResponse();
 
       // ── Read hypothesis text ──
       let hypothesisText: string;
@@ -4069,6 +4199,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
       if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return campaignBlockedResponse();
+      if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return researchBlockedResponse();
       const workDir = resolveWorkDir(ctx.cwd);
       // The config (and therefore the cap) always lives in ctx.cwd — even when
       // workingDir redirects the experiment work elsewhere (see readConfig).
@@ -4815,6 +4946,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (validateWorkDir(ctx.cwd) === null && (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd)))) {
         return campaignBlockedResponse();
       }
+      if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return researchBlockedResponse();
       const runtime = getRuntime(ctx);
       const state = runtime.state;
 
@@ -7509,7 +7641,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   // ── Council blackboard tools (NOT mode-gated: council participants are
   // separate headless sessions with no autoresearch mode of their own) ──
-  registerCouncilTools(pi);
+  // Council blackboard tools: gated under an active research campaign
+  // (research-vectors spec §8, review B1). The guard is sync (researchScanSync).
+  registerCouncilTools(pi, (cwd) =>
+    researchScanSync(resolveWorkDir(cwd)).blocks ? (researchBlockedResponse() as { content: { type: "text"; text: string }[]; details: Record<string, never> }) : undefined,
+  );
 
   // Precedent search is standalone: no campaign or autoresearch-mode gate;
   // it reads only existing local .auto/ sources.
@@ -7552,6 +7688,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const modeGate = assertModeActive(ctx);
       if (modeGate) return modeGate;
       const workDir = resolveWorkDir(ctx.cwd);
+      if (await researchBlocksOrdinaryLoop(workDir)) return researchBlockedResponse();
       const state = getRuntime(ctx).state;
       const cfg = readCouncilConfig(workDir);
       if (!cfg.enabled) {
@@ -7860,6 +7997,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     } as any,
     async execute(_toolCallId: string, params: { reason: string; evidence?: string; confidence?: number }, _signal, _onUpdate, ctx: ExtensionContext) {
       if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return campaignBlockedResponse();
+      if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return researchBlockedResponse();
       assertModeActive(ctx);
       const workDir = resolveWorkDir(ctx.cwd);
       const runtime = getRuntime(ctx);
@@ -8079,7 +8217,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // Scoped to an interrupted operation (the pending-op marker). An unreadable
     // state still blocks the ordinary loop tools (campaignBlocksOrdinaryLoop), but
     // does not by itself suppress steers, which would hide the real state from the agent.
-    return campaignPendingOpSync(workDir);
+    // A research campaign that is stopped, unreadable or pending never auto-continues (design §8, §9).
+    return researchScanSync(workDir).halted || campaignPendingOpSync(workDir);
   };
 
   /** Is an ordinary-loop tool blocked by an active candidate campaign? A missing
@@ -8213,6 +8352,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (workDirError) return { content: [{ type: "text", text: `❌ ${workDirError}` }], details: {} };
       const workDir = resolveWorkDir(ctx.cwd);
       const campDir = campaignDirOf(workDir);
+      if (await researchBlocksOrdinaryLoop(workDir)) return researchBlockedResponse();
       const action = params?.action;
 
       const fail = (reason: string, message: string, extra = "") => ({
@@ -8799,6 +8939,685 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     },
   });
 
+  // ── research_brief (phase 1) and research (phase 2) ───────────────────────
+  // Campaign files and invariants live in research-state.ts. state.json carries
+  // only the phase; vector status, evidence and stop are derived from the
+  // append-only log.jsonl. Every mutating action runs under the campaign update
+  // protocol (lock, pending-op marker, approved-brief guard).
+
+  const RESEARCH_LOG_FILE = "log.jsonl";
+
+  const RESEARCH_BRIEF_ACTION_KEYS = new Map<string, string[]>([
+    ["draft", ["action", "campaign_id", "brief"]],
+    ["status", ["action", "campaign_id"]],
+    ["propose", ["action", "campaign_id"]],
+  ]);
+
+  const RESEARCH_ACTION_KEYS = new Map<string, string[]>([
+    ["start", ["action", "campaign_id", "expected_sha256"]],
+    ["open", ["action", "campaign_id", "question_id"]],
+    ["record", ["action", "campaign_id", "evidence_ref"]],
+    ["close", ["action", "campaign_id", "question_id", "rule_id", "verdict", "reason"]],
+    ["stop", ["action", "campaign_id", "rule_id", "reason"]],
+    ["status", ["action", "campaign_id"]],
+    ["report", ["action", "campaign_id"]],
+    ["resolve", ["action", "campaign_id"]],
+  ]);
+
+  const researchRefusal = (reason: researchState.RefusalReason, message: string): researchState.Refusal => ({
+    ok: false,
+    reason,
+    message,
+  });
+
+  /** Refuses any field the action does not accept, so approval fields never reach the tools. */
+  const unexpectedArgKeys = (params: Record<string, unknown>, allowed: readonly string[]): string | null => {
+    const extra = Object.keys(params).filter((k) => !allowed.includes(k));
+    if (extra.length === 0) return null;
+    return `unexpected field(s) ${extra.map((k) => JSON.stringify(k)).join(", ")}; this action accepts only ${allowed.join(", ")}. Approval and operator confirmation are never accepted from the model`;
+  };
+
+  const listResearchCampaignIds = (workDir: string): string[] | null => {
+    const root = researchState.researchRoot(workDir);
+    if (!fs.existsSync(root)) return [];
+    try {
+      return fs.readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name).sort();
+    } catch {
+      return null;
+    }
+  };
+
+  /** Review B3: only one campaign may work at a time. Returns a reason string
+   *  when any OTHER campaign under the research root is in phase research or
+   *  holds a pending operation; null when the start may proceed. */
+  const otherCampaignBusyReason = async (workDir: string, selfId: string): Promise<string | null> => {
+    const ids = listResearchCampaignIds(workDir);
+    if (ids === null) return "the research root cannot be listed; start is refused (fail closed)";
+    for (const other of ids) {
+      if (other === selfId) continue;
+      const resolved = researchState.resolveCampaignDir(workDir, other);
+      if (!resolved.ok) continue;
+      const insp = await researchState.inspectCampaign(resolved.dir);
+      if (insp.status === "invalid_argument" || insp.status === "state_unreadable") {
+        return `campaign ${JSON.stringify(other)} cannot be inspected; start is refused (fail closed)`;
+      }
+      if (insp.pendingOp) return `campaign ${JSON.stringify(other)} has a pending operation (${insp.pendingOp.name}); resolve it first`;
+      if (insp.state?.phase === "research") return `campaign ${JSON.stringify(other)} is already in phase research; only one campaign may work at a time`;
+    }
+    return null;
+  };
+
+  /** Explicit campaign_id, or the only campaign of the work directory. */
+  const resolveResearchTarget = (workDir: string, campaignId: unknown): researchState.Result<{ dir: string; id: string }> => {
+    if (campaignId !== undefined) {
+      if (typeof campaignId !== "string") return researchRefusal("invalid_argument", "campaign_id must be a string");
+      const resolved = researchState.resolveCampaignDir(workDir, campaignId);
+      return resolved.ok ? { ok: true, dir: resolved.dir, id: campaignId } : resolved;
+    }
+    const ids = listResearchCampaignIds(workDir);
+    if (ids === null) return researchRefusal("state_unreadable", "the research root cannot be listed; nothing was changed");
+    if (ids.length === 0) return researchRefusal("campaign_missing", "no research campaign exists; create one with research_brief draft");
+    if (ids.length > 1) return researchRefusal("invalid_argument", `several research campaigns exist (${ids.join(", ")}); pass campaign_id`);
+    const resolved = researchState.resolveCampaignDir(workDir, ids[0]);
+    return resolved.ok ? { ok: true, dir: resolved.dir, id: ids[0] } : resolved;
+  };
+
+  interface ResearchEvidence {
+    evidence_ref: string;
+    evidence_path: string;
+    evidence_sha256: string;
+  }
+
+  interface ResearchVector {
+    question_id: string;
+    status: "open" | "closed";
+    verdict: string | null;
+    rule_id: string | null;
+    reason: string | null;
+    evidence: ResearchEvidence[];
+  }
+
+  interface ResearchReplay {
+    vectors: Map<string, ResearchVector>;
+    open: string | null;
+    stop: { rule_id: string; reason: string } | null;
+  }
+
+  /** Reads log.jsonl. A missing log is empty; any malformed line fails closed. */
+  const readResearchLog = async (dir: string): Promise<researchState.Result<{ events: any[] }>> => {
+    let text: string;
+    try {
+      text = await fs.promises.readFile(path.join(dir, RESEARCH_LOG_FILE), "utf8");
+    } catch (err) {
+      if ((err as { code?: string }).code === "ENOENT") return { ok: true, events: [] };
+      return researchRefusal("state_unreadable", `log.jsonl cannot be read (${String(err)}); nothing was changed`);
+    }
+    const events: any[] = [];
+    const lines = text.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].trim() === "") continue;
+      let entry: any = null;
+      try {
+        entry = JSON.parse(lines[i]);
+      } catch {
+        entry = null;
+      }
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        return researchRefusal("state_unreadable", `log.jsonl line ${i + 1} is not a valid entry; nothing was changed`);
+      }
+      events.push(entry);
+    }
+    return { ok: true, events };
+  };
+
+  /** Replays the log into vector statuses. Any inconsistent entry fails closed. */
+  const replayResearchLog = (events: any[]): researchState.Result<{ replay: ResearchReplay }> => {
+    const replay: ResearchReplay = { vectors: new Map(), open: null, stop: null };
+    const bad = (i: number, why: string) =>
+      researchRefusal("state_unreadable", `log.jsonl entry ${i + 1} ${why}; nothing was changed`);
+    for (let i = 0; i < events.length; i++) {
+      const e = events[i];
+      if (e.event === "open") {
+        if (typeof e.question_id !== "string" || replay.open !== null || replay.vectors.has(e.question_id)) {
+          return bad(i, "is an invalid open");
+        }
+        replay.vectors.set(e.question_id, {
+          question_id: e.question_id,
+          status: "open",
+          verdict: null,
+          rule_id: null,
+          reason: null,
+          evidence: [],
+        });
+        replay.open = e.question_id;
+      } else if (e.event === "record") {
+        const v = typeof e.question_id === "string" ? replay.vectors.get(e.question_id) : undefined;
+        if (
+          !v || v.status !== "open" ||
+          typeof e.evidence_ref !== "string" ||
+          typeof e.evidence_path !== "string" ||
+          typeof e.evidence_sha256 !== "string"
+        ) {
+          return bad(i, "is an invalid record");
+        }
+        v.evidence.push({ evidence_ref: e.evidence_ref, evidence_path: e.evidence_path, evidence_sha256: e.evidence_sha256 });
+      } else if (e.event === "close") {
+        const v = typeof e.question_id === "string" ? replay.vectors.get(e.question_id) : undefined;
+        if (!v || v.status !== "open" || replay.open !== v.question_id || typeof e.verdict !== "string" || typeof e.rule_id !== "string") {
+          return bad(i, "is an invalid close");
+        }
+        v.status = "closed";
+        v.verdict = e.verdict;
+        v.rule_id = e.rule_id;
+        v.reason = typeof e.reason === "string" ? e.reason : null;
+        replay.open = null;
+      } else if (e.event === "stop") {
+        if (replay.stop !== null || typeof e.rule_id !== "string") return bad(i, "is an invalid stop");
+        replay.stop = { rule_id: e.rule_id, reason: typeof e.reason === "string" ? e.reason : "" };
+      } else {
+        return bad(i, "has an unknown event");
+      }
+    }
+    return { ok: true, replay };
+  };
+
+  /** Appends one entry to log.jsonl (called inside the update protocol, after the pending-op marker). */
+  const appendResearchEvent = async (dir: string, entry: Record<string, unknown>): Promise<void> => {
+    await fs.promises.appendFile(
+      path.join(dir, RESEARCH_LOG_FILE),
+      JSON.stringify({ at: new Date().toISOString(), ...entry }) + "\n",
+      "utf8",
+    );
+  };
+
+  interface ResearchSnapshot {
+    state: researchState.CampaignState;
+    brief: researchState.ResearchBrief | null;
+    briefSha256: string | null;
+    replay: ResearchReplay;
+  }
+
+  /**
+   * Read-only view of a campaign. A brief that is approved but no longer matches
+   * its approval refuses (brief_changed); an unapproved draft yields brief null.
+   */
+  const researchSnapshot = async (dir: string): Promise<researchState.Result<ResearchSnapshot>> => {
+    const loaded = await researchState.readState(dir);
+    if (!loaded.ok) return loaded;
+    let brief: researchState.ResearchBrief | null = null;
+    let briefSha256: string | null = null;
+    const approval = await researchState.readApproval(dir);
+    if (!approval.ok && approval.reason !== "not_approved") return approval;
+    if (approval.ok) {
+      const checked = await researchState.checkBriefApproval(dir);
+      if (!checked.ok) return checked;
+      brief = checked.brief;
+      briefSha256 = checked.sha256;
+    }
+    const log = await readResearchLog(dir);
+    if (!log.ok) return log;
+    const replayed = replayResearchLog(log.events);
+    if (!replayed.ok) return replayed;
+    return { ok: true, state: loaded.state, brief, briefSha256, replay: replayed.replay };
+  };
+
+  /**
+   * Evidence reference: "path:lines" or "path#anchor" (path relative to the work
+   * directory or absolute inside it). Returns the path and the SHA-256 of the file.
+   */
+  const locateEvidence = async (workDir: string, ref: string): Promise<researchState.Result<{ path: string; sha256: string }>> => {
+    const hashAt = ref.indexOf("#");
+    const lineRef = /^(.*):(\d+(?:-\d+)?)$/.exec(ref);
+    const filePart = hashAt > 0 ? ref.slice(0, hashAt) : lineRef ? lineRef[1] : ref;
+    const abs = path.resolve(workDir, filePart);
+    const rel = path.relative(workDir, abs);
+    if (rel === "" || path.isAbsolute(rel) || rel.split(path.sep)[0] === "..") {
+      return researchRefusal("invalid_argument", "evidence must be a file inside the work directory");
+    }
+    try {
+      const st = await fs.promises.stat(abs);
+      if (!st.isFile()) return researchRefusal("invalid_argument", `evidence ${rel} is not a file`);
+      return { ok: true, path: rel, sha256: researchState.sha256Hex(await fs.promises.readFile(abs)) };
+    } catch {
+      return researchRefusal("invalid_argument", `evidence file ${rel} cannot be read`);
+    }
+  };
+
+  const evidenceStatus = async (workDir: string, e: ResearchEvidence): Promise<"ok" | "changed" | "missing"> => {
+    try {
+      const bytes = await fs.promises.readFile(path.resolve(workDir, e.evidence_path));
+      return researchState.sha256Hex(bytes) === e.evidence_sha256 ? "ok" : "changed";
+    } catch {
+      return "missing";
+    }
+  };
+
+  /** Per-question status lines for status and report. Hash checks only; no reproducibility is claimed. */
+  const questionLines = async (workDir: string, brief: researchState.ResearchBrief, replay: ResearchReplay): Promise<string[]> => {
+    const lines: string[] = [];
+    for (const q of brief.questions) {
+      const v = replay.vectors.get(q.id);
+      if (!v) {
+        lines.push(`${q.id}: not opened`);
+        continue;
+      }
+      const head = v.status === "closed"
+        ? `${q.id}: closed — verdict ${v.verdict} by rule ${v.rule_id}${v.reason ? ` (${v.reason})` : ""}`
+        : `${q.id}: open`;
+      const statuses = await Promise.all(v.evidence.map((e) => evidenceStatus(workDir, e)));
+      const bad = statuses.filter((s) => s !== "ok").length;
+      const hashes = statuses.length === 0
+        ? "no evidence recorded"
+        : bad === 0
+          ? `evidence hashes match (${statuses.length})`
+          : `${bad} of ${statuses.length} evidence file(s) changed or missing — not reproducible`;
+      lines.push(`${head}; ${hashes}`);
+    }
+    return lines;
+  };
+
+  registerGatedTool({
+    name: "research_brief",
+    label: "Research brief (phase 1)",
+    description:
+      "Research-vectors campaign, phase 1: draft a brief of questions and decision rules, then ask the OWNER to approve it. " +
+      "Actions: draft (validated brief saved for a new or still-unapproved campaign), status (approval and hash state), " +
+      "propose (OWNER dialog showing the brief and its SHA-256; approval is written only on an explicit confirm). The model cannot " +
+      "approve: approval fields are rejected. An approved brief is immutable; a changed brief means a new campaign. " +
+      "While a research campaign is active the ordinary loop and candidate_branch are blocked.",
+    promptSnippet: "Research brief: draft questions and decision rules, then the owner approves it in a dialog (propose)",
+    promptGuidelines: [
+      "Draft questions, one decision rule per verdict (confirmed, rejected, inconclusive, waiting_for_data) and stop rules with research_brief draft. caveat_block is required and is copied verbatim into the report.",
+      "propose asks the OWNER to confirm the brief in a dialog. Never try to pass approval, confirmation or operator fields; they are refused.",
+      "After approval, start the research phase with research start using the expected_sha256 that propose returned.",
+    ],
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["draft", "status", "propose"], description: "Brief action to perform." },
+        campaign_id: { type: "string", description: "Campaign id: [A-Za-z0-9._-], 1-64 chars, starting with a letter or digit." },
+        brief: {
+          type: "object",
+          description: "draft only: the full brief (schema_version 1, goal, plan_source, caveat_block, data_roles {explore, validate, confirm}, questions [{id, text, decision_rules [{id, verdict, when}], needs_data}], process_metrics, stop_rules [{id, when}]).",
+        },
+      },
+      required: ["action", "campaign_id"],
+    } as any,
+
+    async execute(_toolCallId: string, params: any, _signal, _onUpdate, ctx: ExtensionContext) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
+      const action = params?.action;
+      const reply = (text: string) => ({ content: [{ type: "text", text }], details: { action } });
+      const fail = (reason: string, message: string) => ({
+        content: [{ type: "text", text: refusalText({ reason, message }) }],
+        details: { action, reason },
+      });
+
+      const allowed = RESEARCH_BRIEF_ACTION_KEYS.get(action);
+      if (!allowed) return fail("invalid_argument", `unknown action ${JSON.stringify(String(action))}; allowed: draft status propose`);
+      const extra = unexpectedArgKeys(params ?? {}, allowed);
+      if (extra) return fail("invalid_argument", extra);
+      if (typeof params.campaign_id !== "string") return fail("invalid_argument", "campaign_id is required");
+      const campaignId: string = params.campaign_id;
+      const workDir = resolveWorkDir(ctx.cwd);
+      const resolved = researchState.resolveCampaignDir(workDir, campaignId);
+      if (!resolved.ok) return fail(resolved.reason, resolved.message);
+      const dir = resolved.dir;
+
+      if (action === "draft") {
+        if (params.brief === undefined) return fail("invalid_argument", "draft requires the brief object");
+        const validation = researchState.validateBrief(params.brief);
+        if (!validation.ok) {
+          return fail("brief_invalid", `brief rejected (${validation.errors.length} problem(s)): ${validation.errors.join("; ")}`);
+        }
+        const created = await researchState.createCampaign(workDir, campaignId);
+        if (!created.ok && created.reason !== "campaign_exists") return fail(created.reason, created.message);
+        const written = await researchState.writeBriefDraft(dir, params.brief);
+        if (!written.ok) return fail(written.reason, written.message);
+        return reply(`✅ Brief draft saved for campaign ${campaignId} (sha256 ${written.sha256}). It is NOT approved yet: the owner confirms it with research_brief propose.`);
+      }
+
+      if (action === "status") {
+        const insp = await researchState.inspectCampaign(dir);
+        const snap = await researchSnapshot(dir);
+        if (!snap.ok) return fail(snap.reason, snap.message);
+        const lines = [
+          `Research brief status for campaign ${campaignId} (phase ${snap.state.phase})`,
+          `Campaign state: ${insp.status} — ${insp.message}`,
+        ];
+        if (insp.pendingOp) lines.push(`Pending op: ${insp.pendingOp.name} (started ${insp.pendingOp.started_at}) — manual check required`);
+        const approval = await researchState.readApproval(dir);
+        if (snap.brief && snap.briefSha256) {
+          lines.push(`Brief approved; sha256 ${snap.briefSha256} matches approval.json`);
+        } else if (!approval.ok && approval.reason === "not_approved") {
+          const sha = await researchState.briefSha256(dir);
+          lines.push(sha.ok ? `Brief draft, NOT approved; sha256 ${sha.sha256}` : `Brief draft: ${sha.message}`);
+        }
+        return { content: [{ type: "text", text: lines.join("\n") }], details: { action, inspection: insp as any } };
+      }
+
+      // propose: owner dialog. No UI or no explicit confirm === true means no approval.
+      const state = await researchState.readState(dir);
+      if (!state.ok) return fail(state.reason, state.message);
+      // Checked before the dialog: an approved (or unreadable) approval is never shown for consent again.
+      const existing = await researchState.readApproval(dir);
+      if (existing.ok) return fail("brief_approved", "the brief is already approved; a changed brief means a new campaign");
+      if (existing.reason !== "not_approved") return fail(existing.reason, existing.message);
+      if (!ctx.hasUI || !ctx.ui || typeof ctx.ui.confirm !== "function") {
+        return fail("not_approved", "brief approval is an owner action and needs an interactive dialog; the brief stays unapproved");
+      }
+      let briefText: string;
+      let briefSha = "";
+      try {
+        // Review M2: hash the SAME bytes shown in the dialog, not a second read.
+        const bytes = await fs.promises.readFile(path.join(dir, researchState.BRIEF_FILE));
+        briefText = bytes.toString("utf8");
+        briefSha = researchState.sha256Hex(bytes);
+      } catch {
+        return fail("brief_missing", "brief.json does not exist; draft the brief first");
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(briefText);
+      } catch {
+        return fail("brief_invalid", "brief.json is not valid JSON; the brief cannot be approved");
+      }
+      const validation = researchState.validateBrief(parsed);
+      if (!validation.ok) {
+        return fail("brief_invalid", `brief.json failed validation (${validation.errors.length} problem(s)): ${validation.errors.join("; ")}`);
+      }
+      const sha = briefSha ? { ok: true as const, sha256: briefSha } : await researchState.briefSha256(dir);
+      if (!sha.ok) return fail(sha.reason, sha.message);
+      const confirmed = await ctx.ui.confirm(
+        `Research campaign ${campaignId}: approve brief`,
+        `Brief SHA-256: ${sha.sha256}\n\n${briefText.trimEnd()}\n\n` +
+          "Approval freezes this brief: questions and decision rules cannot change in this campaign. Approve?",
+      );
+      if (confirmed !== true) return fail("not_approved", "the owner did not confirm the brief; nothing was approved");
+      const approved = await researchState.writeApproval(dir, sha.sha256);
+      if (!approved.ok) return fail(approved.reason, approved.message);
+      return reply(
+        `✅ Brief approved for campaign ${campaignId} (sha256 ${sha.sha256}). Start the research phase: research start with campaign_id "${campaignId}" and expected_sha256 "${sha.sha256}". Brief file: ${path.join(dir, researchState.BRIEF_FILE)}.`,
+      );
+    },
+  });
+
+  registerGatedTool({
+    name: "research",
+    label: "Research campaign (phase 2)",
+    description:
+      "Research-vectors campaign, phase 2 (after an approved brief). Actions: start (expected_sha256 must match the approved brief), " +
+      "open (one question id from the brief; one vector at a time), record (evidence_ref path:lines or path#anchor; its SHA-256 is stored), " +
+      "close (verdict plus rule_id of that question; reason for inconclusive and waiting_for_data), stop (stop rule id plus the condition met), " +
+      "status, report (caveat block verbatim, question statuses, evidence hash check), resolve (OPERATOR-only: dialog consent clears a pending-op marker). " +
+      "Questions and rules are never added or changed here. While this campaign runs, the ordinary loop and candidate_branch are blocked; no Git.",
+    promptSnippet: "Research campaign: start, open/record/close questions from the approved brief, stop, report",
+    promptGuidelines: [
+      "research start needs expected_sha256: the sha256 that research_brief propose returned after the owner approved the brief.",
+      "open takes a question_id from the approved brief only; one vector at a time; a closed vector is never reopened.",
+      "close needs a decision rule of THAT question with the matching verdict and recorded evidence; use waiting_for_data when the brief requires data that is missing.",
+      "STOP on manual_check_required or brief_changed. resolve is OPERATOR-only: it asks the human via a dialog.",
+    ],
+    parameters: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["start", "open", "record", "close", "stop", "status", "report", "resolve"],
+          description: "Research action to perform.",
+        },
+        campaign_id: { type: "string", description: "Campaign id (optional when only one campaign exists)." },
+        expected_sha256: { type: "string", description: "start only: sha256 of the approved brief (64 lowercase hex)." },
+        question_id: { type: "string", description: "open/close: question id from the approved brief." },
+        evidence_ref: { type: "string", description: "record only: path:lines or path#anchor inside the work directory." },
+        rule_id: { type: "string", description: "close: decision rule id of the question; stop: stop rule id of the brief." },
+        verdict: { type: "string", enum: ["confirmed", "rejected", "inconclusive", "waiting_for_data"], description: "close only." },
+        reason: { type: "string", description: "close: required for inconclusive and waiting_for_data. stop: the stop condition you mark as met." },
+      },
+      required: ["action"],
+    } as any,
+
+    async execute(_toolCallId: string, params: any, _signal, _onUpdate, ctx: ExtensionContext) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
+      const action = params?.action;
+      const reply = (text: string) => ({ content: [{ type: "text", text }], details: { action } });
+      const fail = (reason: string, message: string) => ({
+        content: [{ type: "text", text: refusalText({ reason, message }) }],
+        details: { action, reason },
+      });
+
+      const allowed = RESEARCH_ACTION_KEYS.get(action);
+      if (!allowed) {
+        return fail("invalid_argument", `unknown action ${JSON.stringify(String(action))}; allowed: start open record close stop status report resolve`);
+      }
+      const extra = unexpectedArgKeys(params ?? {}, allowed);
+      if (extra) return fail("invalid_argument", extra);
+      const workDir = resolveWorkDir(ctx.cwd);
+      const target = resolveResearchTarget(workDir, params.campaign_id);
+      if (!target.ok) return fail(target.reason, target.message);
+      const { dir, id } = target;
+
+      if (action === "resolve") {
+        // Operator-only (design §9): the model cannot clear the marker; the dialog consent is required.
+        const insp = await researchState.inspectCampaign(dir);
+        if (!insp.pendingOp) return fail("invalid_argument", `nothing to resolve: campaign status is ${insp.status} (${insp.message})`);
+        if (!ctx.hasUI || !ctx.ui || typeof ctx.ui.confirm !== "function") {
+          return fail("manual_check_required", "resolve is an operator action and needs an interactive dialog; the pending operation stays");
+        }
+        const confirmed = await ctx.ui.confirm(
+          "Research campaign: manual resolution",
+          `Pending operation: ${insp.pendingOp.name} (started ${insp.pendingOp.started_at}). Have you checked the campaign files by hand? ` +
+            "Consenting clears the pending-op marker; state.json is not changed.",
+        );
+        if (confirmed !== true) {
+          return fail("manual_check_required", "resolve requires explicit operator consent in the dialog; the pending operation stays");
+        }
+        const res = await researchState.manualResolvePendingOp(dir, researchState.OPERATOR_CONFIRMATION);
+        if (!res.ok) return fail(res.reason, res.message);
+        return reply("✅ Pending operation resolved by the operator; the marker is cleared. Check the campaign with research status.");
+      }
+
+      if (action === "start") {
+        const expected = params.expected_sha256;
+        if (typeof expected !== "string") {
+          return fail("invalid_argument", "start requires expected_sha256: the sha256 of the approved brief from research_brief propose");
+        }
+        // One campaign works at a time (review B3): refuse the start when any
+        // other campaign under the research root is already in the research
+        // phase or holds a pending operation.
+        const otherBusy = await otherCampaignBusyReason(workDir, id);
+        if (otherBusy) return fail("invalid_transition", otherBusy);
+        const checked = await researchState.checkBriefApproval(dir, expected);
+        if (!checked.ok) return fail(checked.reason, checked.message);
+        const started = await researchState.updateState(dir, "start research phase", (s) =>
+          s.phase === "briefing"
+            ? { ok: true, next: { ...s, phase: "research" } }
+            : researchRefusal("invalid_transition", `campaign is in phase ${s.phase}; start needs phase briefing`),
+        );
+        if (!started.ok) return fail(started.reason, started.message);
+        return reply(
+          `✅ Research phase started for campaign ${id} (brief sha256 ${checked.sha256}). Questions come only from the brief. Next: research open with a question_id from the brief.`,
+        );
+      }
+
+      const snap = await researchSnapshot(dir);
+      if (!snap.ok) return fail(snap.reason, snap.message);
+
+      if (action === "status") {
+        const insp = await researchState.inspectCampaign(dir);
+        const lines = [
+          `Research campaign ${id}: phase ${snap.state.phase}`,
+          `Campaign state: ${insp.status} — ${insp.message}`,
+        ];
+        if (insp.pendingOp) lines.push(`Pending op: ${insp.pendingOp.name} (started ${insp.pendingOp.started_at}) — manual check required`);
+        if (snap.brief) {
+          lines.push(...(await questionLines(workDir, snap.brief, snap.replay)));
+        } else {
+          lines.push("Brief: not approved; no vector can be opened");
+        }
+        if (snap.replay.open) lines.push(`Open vector: ${snap.replay.open}`);
+        const stop = snap.replay.stop;
+        if (stop) lines.push(`Stop rule ${stop.rule_id} triggered: ${stop.reason}`);
+        return { content: [{ type: "text", text: lines.join("\n") }], details: { action, inspection: insp as any } };
+      }
+
+      if (action === "report") {
+        if (!snap.brief || !snap.briefSha256) return fail("not_approved", "the report needs an approved brief");
+        const brief = snap.brief;
+        const stop = snap.replay.stop;
+        const allEvidence = [...snap.replay.vectors.values()].flatMap((v) => v.evidence);
+        const evidenceStates = await Promise.all(allEvidence.map((e) => evidenceStatus(workDir, e)));
+        const changed = evidenceStates.filter((s) => s !== "ok").length;
+        const lines = [
+          `# Research campaign report: ${id}`,
+          `Phase: ${snap.state.phase}`,
+          `Brief sha256: ${snap.briefSha256}`,
+          `Goal: ${brief.goal}`,
+          `Plan source: ${brief.plan_source}`,
+          "",
+          "## Caveat (verbatim from the brief)",
+          brief.caveat_block,
+          "",
+          "## Questions",
+          ...(await questionLines(workDir, brief, snap.replay)),
+          "",
+          "## Stop rules",
+          ...brief.stop_rules.map((r) => `${r.id}: ${r.when}${stop && stop.rule_id === r.id ? ` — TRIGGERED (${stop.reason})` : ""}`),
+          "",
+          "## Process metrics (declared by the brief; the system does not compute them)",
+          ...brief.process_metrics.map((m) => `- ${m}`),
+          "",
+          "## Evidence integrity",
+          `Evidence records: ${evidenceStates.length}; changed or missing: ${changed}`,
+          "No target metric: the campaign answers only the questions of its brief.",
+        ];
+        return reply(lines.join("\n"));
+      }
+
+      // Vector actions: the brief must be approved and the campaign in phase research.
+      if (!snap.brief) return fail("not_approved", "the brief is not approved; no vector can be opened, recorded or closed");
+      const brief = snap.brief;
+      const phaseRefusal = () =>
+        fail("invalid_transition", `campaign is in phase ${snap.state.phase}; ${action} needs phase research`);
+      const inResearchPhase = (cur: researchState.CampaignState) => cur.phase === "research";
+
+      if (action === "open") {
+        const qid = params.question_id;
+        if (typeof qid !== "string") return fail("invalid_argument", "open requires question_id");
+        if (snap.state.phase !== "research") return phaseRefusal();
+        const question = brief.questions.find((q) => q.id === qid);
+        if (!question) return fail("invalid_argument", `question ${JSON.stringify(qid)} is not in the approved brief`);
+        if (snap.replay.open !== null) return fail("invalid_transition", `vector ${snap.replay.open} is open; close it before opening another`);
+        if (snap.replay.vectors.has(qid)) return fail("invalid_transition", `vector ${qid} is already closed; a closed vector is never reopened`);
+        const done = await researchState.updateState(
+          dir,
+          `open vector ${qid}`,
+          (cur) => (inResearchPhase(cur) ? { ok: true, next: cur } : researchRefusal("invalid_transition", `campaign is in phase ${cur.phase}; open needs phase research`)),
+          async () => appendResearchEvent(dir, { event: "open", question_id: qid, question_text: question.text }),
+        );
+        if (!done.ok) return fail(done.reason, done.message);
+        return reply(`✅ Vector ${qid} opened: ${question.text}`);
+      }
+
+      if (action === "record") {
+        const ref = params.evidence_ref;
+        if (typeof ref !== "string" || ref.trim() === "") {
+          return fail("invalid_argument", "record requires evidence_ref: path:lines or path#anchor inside the work directory");
+        }
+        if (snap.state.phase !== "research") return phaseRefusal();
+        const openId = snap.replay.open;
+        if (openId === null) return fail("invalid_transition", "no vector is open; open a question before recording evidence");
+        const located = await locateEvidence(workDir, ref);
+        if (!located.ok) return fail(located.reason, located.message);
+        const done = await researchState.updateState(
+          dir,
+          `record evidence for ${openId}`,
+          (cur) => (inResearchPhase(cur) ? { ok: true, next: cur } : researchRefusal("invalid_transition", `campaign is in phase ${cur.phase}; record needs phase research`)),
+          async () =>
+            appendResearchEvent(dir, {
+              event: "record",
+              question_id: openId,
+              evidence_ref: ref,
+              evidence_path: located.path,
+              evidence_sha256: located.sha256,
+            }),
+        );
+        if (!done.ok) return fail(done.reason, done.message);
+        return reply(`✅ Evidence recorded for vector ${openId}: ${ref} (sha256 ${located.sha256}).`);
+      }
+
+      if (action === "close") {
+        const { question_id: qid, rule_id: rid, verdict, reason } = params;
+        if (typeof qid !== "string" || typeof rid !== "string") return fail("invalid_argument", "close requires question_id and rule_id");
+        if (typeof verdict !== "string" || !(researchState.VERDICTS as readonly string[]).includes(verdict)) {
+          return fail("invalid_argument", `verdict must be one of ${researchState.VERDICTS.join(", ")}`);
+        }
+        const needsReason = verdict === "inconclusive" || verdict === "waiting_for_data";
+        if (needsReason && (typeof reason !== "string" || reason.trim() === "")) {
+          return fail("invalid_argument", `verdict ${verdict} requires a reason`);
+        }
+        if (snap.state.phase !== "research") return phaseRefusal();
+        const question = brief.questions.find((q) => q.id === qid);
+        if (!question) return fail("invalid_argument", `question ${JSON.stringify(qid)} is not in the approved brief`);
+        const rule = question.decision_rules.find((r) => r.id === rid);
+        if (!rule) return fail("invalid_argument", `rule ${JSON.stringify(rid)} is not a decision rule of question ${qid}`);
+        if (rule.verdict !== verdict) return fail("invalid_argument", `rule ${rid} has verdict ${rule.verdict}, not ${verdict}`);
+        if (snap.replay.open !== qid) {
+          return fail("invalid_transition", snap.replay.open ? `vector ${snap.replay.open} is open, not ${qid}` : `vector ${qid} is not open`);
+        }
+        const vector = snap.replay.vectors.get(qid);
+        if (!vector || vector.evidence.length === 0) {
+          return fail("invalid_transition", `no evidence recorded for ${qid}; record evidence before closing`);
+        }
+        const done = await researchState.updateState(
+          dir,
+          `close vector ${qid}`,
+          (cur) => (inResearchPhase(cur) ? { ok: true, next: cur } : researchRefusal("invalid_transition", `campaign is in phase ${cur.phase}; close needs phase research`)),
+          async () =>
+            appendResearchEvent(dir, {
+              event: "close",
+              question_id: qid,
+              question_text: question.text,
+              rule_id: rid,
+              rule_when: rule.when,
+              verdict,
+              reason: typeof reason === "string" ? reason : null,
+              evidence_count: vector.evidence.length,
+            }),
+        );
+        if (!done.ok) return fail(done.reason, done.message);
+        return reply(`✅ Vector ${qid} closed: ${verdict} by rule ${rid}.`);
+      }
+
+      if (action === "stop") {
+        const rid = params.rule_id;
+        const reason = params.reason;
+        if (typeof rid !== "string") return fail("invalid_argument", "stop requires rule_id: a stop rule of the brief");
+        if (typeof reason !== "string" || reason.trim() === "") {
+          return fail("invalid_argument", "stop requires reason: the stop condition you mark as met");
+        }
+        const stopRule = brief.stop_rules.find((s) => s.id === rid);
+        if (!stopRule) return fail("invalid_argument", `stop rule ${JSON.stringify(rid)} is not in the approved brief`);
+        if (snap.state.phase !== "research") return phaseRefusal();
+        const done = await researchState.updateState(
+          dir,
+          "stop research phase",
+          (cur) =>
+            inResearchPhase(cur)
+              ? { ok: true, next: { ...cur, phase: "stopped" } }
+              : researchRefusal("invalid_transition", `campaign is in phase ${cur.phase}; stop needs phase research`),
+          async () => appendResearchEvent(dir, { event: "stop", rule_id: rid, stop_when: stopRule.when, reason }),
+        );
+        if (!done.ok) return fail(done.reason, done.message);
+        return reply(`🛑 Research stopped by ${rid}. No vector can be opened in this campaign; a new campaign needs a new brief.`);
+      }
+
+      return fail("invalid_argument", `unknown action ${JSON.stringify(String(action))}`);
+    },
+  });
+
   // /autoresearch command — enter autoresearch mode
   // -----------------------------------------------------------------------
 
@@ -8872,6 +9691,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       if (command === "finalize") {
+        if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) {
+          ctx.ui.notify("Research campaign active — use research status; the legacy finalize flow is not started.", "info");
+          return;
+        }
         if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) {
           ctx.ui.notify("Candidate campaign active — use candidate_branch; the legacy finalize flow is not started.", "info");
           return;
@@ -8908,6 +9731,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // context has no executeTool, so the agent performs the blocking call.
         const note = trimmedArgs.replace(/^council\b\s*/i, "").trim();
         const workDir = resolveWorkDir(ctx.cwd);
+        if (await researchBlocksOrdinaryLoop(workDir)) {
+          ctx.ui.notify("Research campaign active — the council is blocked in this mode; use research status.", "info");
+          return;
+        }
         const cfg = readCouncilConfig(workDir);
         if (!cfg.enabled) {
           ctx.ui.notify("Council is disabled (council.enabled=false in .auto/config.json)", "error");
@@ -9022,6 +9849,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // ===== parallel subcommands: activate mode + inject the parallel skill =====
       const parallelMatch = command.match(/^parallel-(best-of-n|stack|search)\b/);
       if (parallelMatch) {
+        if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) {
+          ctx.ui.notify("Research campaign active — the legacy parallel flow is not started; use research status.", "info");
+          return;
+        }
         if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) {
           ctx.ui.notify("Candidate campaign active — use candidate_branch; the legacy parallel flow is not started.", "info");
           return;
@@ -9055,6 +9886,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       updateWidget(ctx);
       // A candidate campaign is active: the legacy create kickoff prescribes the
       // ordinary loop (run/log), which is blocked. Point to the campaign instead.
+      if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) {
+        ctx.ui.notify("Research campaign active — continue it with research status; the legacy autoresearch kickoff is not sent.", "info");
+        return;
+      }
       if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) {
         ctx.ui.notify("Candidate campaign active — continue it with candidate_branch status; the legacy autoresearch kickoff is not sent.", "info");
         return;

@@ -276,7 +276,17 @@ interface RegisterToolLike {
   registerTool(tool: unknown): void;
 }
 
-export function registerCouncilTools(pi: RegisterToolLike): void {
+/** Optional campaign guard: returns a refusal response shape when the tool must
+ * not run under an active research campaign (research-vectors spec §8). Called
+ * before any side effect; the tool layer in index.ts supplies it. */
+export type CouncilGuard = (cwd: string) => { content: { type: "text"; text: string }[]; details: Record<string, never> } | undefined;
+
+export function registerCouncilTools(pi: RegisterToolLike, campaignGuard?: CouncilGuard): void {
+  // Review B1 (research-vectors): council_* IS gated when a research campaign is
+  // active. The gate is injected by index.ts so this file stays free of the
+  // research-state import; council participants (separate headless sessions with
+  // no campaign) are unaffected because the guard only reads the campaign dir
+  // of the caller's cwd.
   pi.registerTool({
     name: "council_write_entry",
     label: "Council: Write Entry",
@@ -302,6 +312,8 @@ export function registerCouncilTools(pi: RegisterToolLike): void {
       additionalProperties: false,
     },
     async execute(_toolCallId: string, params: { councilDir: string; speaker: string; phase: string; summary: string; content: string }, _signal: unknown, _onUpdate: unknown, ctx: { cwd: string }) {
+      const blocked = campaignGuard?.(ctx.cwd);
+      if (blocked) return blocked;
       const resolved = ensureCouncilDir(ctx.cwd, params.councilDir);
       if (!resolved) {
         return {
@@ -348,6 +360,8 @@ export function registerCouncilTools(pi: RegisterToolLike): void {
       additionalProperties: false,
     },
     async execute(_toolCallId: string, params: { councilDir: string }, _signal: unknown, _onUpdate: unknown, ctx: { cwd: string }) {
+      const blocked = campaignGuard?.(ctx.cwd);
+      if (blocked) return blocked;
       const resolved = resolveCouncilDir(ctx.cwd, params.councilDir);
       if (!resolved) {
         return { content: [{ type: "text", text: "❌ Invalid councilDir." }], details: {} };
@@ -386,6 +400,8 @@ export function registerCouncilTools(pi: RegisterToolLike): void {
       additionalProperties: false,
     },
     async execute(_toolCallId: string, params: { councilDir: string; entryFile: string }, _signal: unknown, _onUpdate: unknown, ctx: { cwd: string }) {
+      const blocked = campaignGuard?.(ctx.cwd);
+      if (blocked) return blocked;
       const resolved = resolveCouncilDir(ctx.cwd, params.councilDir);
       if (!resolved) {
         return { content: [{ type: "text", text: "❌ Invalid councilDir." }], details: {} };
@@ -440,6 +456,8 @@ export function registerCouncilTools(pi: RegisterToolLike): void {
       _onUpdate: unknown,
       ctx: { cwd: string },
     ) {
+      const blocked = campaignGuard?.(ctx.cwd);
+      if (blocked) return blocked;
       const resolved = resolveCouncilDir(ctx.cwd, params.councilDir);
       if (!resolved) {
         return { content: [{ type: "text", text: "❌ Invalid councilDir." }], details: {} };
