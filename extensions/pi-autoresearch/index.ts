@@ -8074,7 +8074,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // resolves it. Only a readable state with disabled === true lets the loop run.
     try {
       const raw = JSON.parse(fs.readFileSync(statePath, "utf8"));
-      if (raw && typeof raw === "object" && raw.disabled === true) return false;
+      // Only a schema-valid disabled state lets the loop run; a junk file with
+      // disabled:true is an unclear state and stays blocked (fail closed).
+      const schemaValid =
+        raw && typeof raw === "object" && raw.schema_version === 1 && Array.isArray(raw.candidates);
+      if (schemaValid && raw.disabled === true) return false;
       return true;
     } catch {
       return true;

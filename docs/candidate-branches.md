@@ -75,7 +75,9 @@ campaign call then returns `manual_check_required`:
    registered as the selected checkpoint. Otherwise the marker is cleared
    only after consent, or the marker stays with a diagnosis.
 
-A stale campaign lock is cleared the same way (operator dialog only). The
+A stale campaign lock is cleared the same way (operator dialog only). A lock
+left in a disabled campaign is not cleared by `resolve`; re-create the campaign
+from a clean `init` after inspecting the lock by hand. The
 `candidate_branch` tool requires the dialog confirmation for both actions; the
 model's tool calls cannot approve them.
 
