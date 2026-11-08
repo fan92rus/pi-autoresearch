@@ -69,9 +69,10 @@ export function briefChatMarkdown(brief: ResearchBrief, sha256: string, campaign
  * the first line is `Brief SHA-256: <hex>`, the rest is the mode's summary. Enforces the line budget.
  */
 export function consentDialogBody(sha256: string, summaryLines: string[], question: string): string {
-  const lines = [`Brief SHA-256: ${sha256}`, ...summaryLines, "Подтверждение фиксирует этот SHA-256: поля брифа не меняются.", question];
-  if (lines.length > CONSENT_SUMMARY_MAX_LINES) throw new Error("consent summary exceeds the line budget");
-  return lines.join("\n");
+  const body = [`Brief SHA-256: ${sha256}`, ...summaryLines, "Подтверждение фиксирует этот SHA-256: поля брифа не меняются.", question].join("\n");
+  // Budget counts physical lines, not array items: an embedded newline must not slip past it.
+  if (body.split("\n").length > CONSENT_SUMMARY_MAX_LINES) throw new Error("consent summary exceeds the line budget");
+  return body;
 }
 
 /**

@@ -3416,7 +3416,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // Two-phase start (optimize-two-phase-start): a new or changed session needs an approved brief; a resume of the same config needs none.
       const optimizeGate = optimizeStartGate(ctx, params);
-      if (optimizeGate) return optimizeGate;
+      if (optimizeGate) {
+        if ("approvedDirection" in optimizeGate) params.direction = optimizeGate.approvedDirection;
+        else return optimizeGate;
+      }
       // Task 1.2 (add-result-reflection): read + validate the `analysis`
       // section of .auto/config.json BEFORE any writes — the params.cwd block
       // below is init's first write (writeConfig + _customWorkDir), and a
@@ -8563,8 +8566,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     ctx: ExtensionContext,
     params: { name: string; metric_name: string; metric_unit?: string; direction?: string; cwd?: string },
   ) => {
-    const header = lastConfigHeader(autoresearchJsonlPath(resolveWorkDir(ctx.cwd)));
+    const workDir = resolveWorkDir(ctx.cwd);
+    const header = lastConfigHeader(autoresearchJsonlPath(workDir));
+    // D1 covers only this session's own ledger: a cwd that points elsewhere is another ledger and needs the brief.
+    const sameDir = params.cwd === undefined || path.resolve(params.cwd) === path.resolve(workDir);
     if (
+      sameDir &&
       header &&
       header.name === params.name &&
       header.metricName === params.metric_name &&
@@ -8581,7 +8588,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (diffs.length > 0) {
       return optimizeRefusal(`❌ init_experiment does not match the approved brief:\n- ${diffs.join("\n- ")}\nDraft the new values with optimize_brief draft and propose them again.`);
     }
-    return undefined;
+    // The session runs with the approved direction, not with a direction inherited from an earlier segment.
+    return { approvedDirection: optimizeBrief.effectiveDirection(approved.brief) };
   };
   // run_experiment / log_experiment: no measurement before a started session.
   const optimizeNotStartedGate = (ctx: ExtensionContext) => {
@@ -8635,6 +8643,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const action = params?.action;
       if (action !== "draft" && action !== "propose") {
         return optimizeRefusal(`❌ unknown action ${JSON.stringify(String(action))}; allowed: draft propose`);
+      }
+      if (action === "propose" && params.brief !== undefined) {
+        return optimizeRefusal("❌ propose takes no brief: the approved text is brief.json; draft a new brief first");
       }
       const extra = Object.keys(params ?? {}).filter((k) => k !== "action" && k !== "brief");
       if (extra.length > 0) {

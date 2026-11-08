@@ -95,7 +95,7 @@ await test("registers all 26 tools (parallel + branching disabled)", async () =>
   for (const expected of EXPECTED_TOOLS) {
     assert.ok(names.includes(expected), `Missing tool: ${expected}`);
   }
-  assert.strictEqual(names.length, 26, `Expected 25 tools, got ${names.length}: ${names.join(", ")}`);
+  assert.strictEqual(names.length, 26, `Expected 26 tools, got ${names.length}: ${names.join(", ")}`);
 });
 
 await test("registers all 11 hooks", async () => {

@@ -164,3 +164,72 @@ test("the transcript row shows the readable brief before the dialog, not JSON", 
   assert.match(out, /total_us/);
   assert.doesNotMatch(out, /"schema_version"/);
 });
+
+// ── review round 1 (b2109ec6): blockers and gaps ─────────────────────
+
+function readConfigHeaders(dir) {
+  const p = path.join(dir, ".auto", "log.jsonl");
+  if (!fs.existsSync(p)) return [];
+  return fs.readFileSync(p, "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((e) => e.type === "config");
+}
+
+test("B1: a started session cannot be re-initialised in another directory with the same fields", async () => {
+  const dir = makeWorkDir("cwd-bypass");
+  const other = makeWorkDir("cwd-bypass-other");
+  const h = await loadBare(dir, "cwd-bypass");
+  h.ctx.ui.confirm = async () => true;
+  await run(h, "optimize_brief", { action: "draft", brief: briefArgs() });
+  await run(h, "optimize_brief", { action: "propose" });
+  await run(h, "init_experiment", { name: "liquid speed", metric_name: "total_us", metric_unit: "us", direction: "lower" });
+  const init = await run(h, "init_experiment", { name: "liquid speed", metric_name: "total_us", metric_unit: "us", direction: "lower", cwd: other });
+  assert.match(init, /refused|does not match/, init);
+  assert.equal(fs.existsSync(path.join(other, ".auto", "log.jsonl")), false, "the other directory's ledger must not be written");
+});
+
+test("B2: a multi-line name is refused at draft, so the dialog budget holds", async () => {
+  const dir = makeWorkDir("multiline");
+  const h = await loadBare(dir, "multiline");
+  const text = await run(h, "optimize_brief", { action: "draft", brief: briefArgs({ name: "liquid\n\n\n\n\n\n\n\n\n\n\n\nspeed" }) });
+  assert.match(text, /single line/);
+  assert.equal(fs.existsSync(path.join(dir, ".auto", "optimize", "brief.json")), false);
+});
+
+test("B2: the consent body counts physical lines, not array items", async () => {
+  const { consentDialogBody } = await import("../extensions/pi-autoresearch/brief-consent.ts");
+  assert.throws(() => consentDialogBody("a".repeat(64), ["x\n\n\n\n\n\n\n\n\n\n"], "Q?"), /line budget/);
+});
+
+test("B3: an approved brief without direction starts with lower, not with an inherited higher", async () => {
+  const dir = makeWorkDir("direction");
+  const h = await loadBare(dir, "direction");
+  h.ctx.ui.confirm = async () => true;
+  await run(h, "optimize_brief", { action: "draft", brief: briefArgs({ name: "a", direction: "higher" }) });
+  await run(h, "optimize_brief", { action: "propose" });
+  await run(h, "init_experiment", { name: "a", metric_name: "total_us", metric_unit: "us", direction: "higher" });
+  await run(h, "optimize_brief", { action: "draft", brief: { name: "b", metric_name: "total_us" } });
+  await run(h, "optimize_brief", { action: "propose" });
+  const init = await run(h, "init_experiment", { name: "b", metric_name: "total_us" });
+  assert.doesNotMatch(init, /refused|does not match/, init);
+  const headers = readConfigHeaders(dir);
+  assert.equal(headers[headers.length - 1].bestDirection, "lower");
+});
+
+test("gap: a refused init leaves log.jsonl absent and brief.json byte-identical", async () => {
+  const dir = makeWorkDir("no-write");
+  const h = await loadBare(dir, "no-write");
+  h.ctx.ui.confirm = async () => false;
+  await run(h, "optimize_brief", { action: "draft", brief: briefArgs() });
+  const briefBefore = fs.readFileSync(path.join(dir, ".auto", "optimize", "brief.json"), "utf-8");
+  await run(h, "optimize_brief", { action: "propose" });
+  assert.equal(fs.readFileSync(path.join(dir, ".auto", "optimize", "brief.json"), "utf-8"), briefBefore);
+  await run(h, "init_experiment", { name: "liquid speed", metric_name: "total_us", metric_unit: "us", direction: "lower" });
+  assert.equal(fs.existsSync(path.join(dir, ".auto", "log.jsonl")), false);
+});
+
+test("N5: propose refuses a brief argument instead of ignoring it", async () => {
+  const dir = makeWorkDir("propose-brief");
+  const h = await loadBare(dir, "propose-brief");
+  await run(h, "optimize_brief", { action: "draft", brief: briefArgs() });
+  const text = await run(h, "optimize_brief", { action: "propose", brief: briefArgs({ metric_name: "other" }) });
+  assert.match(text, /propose takes no brief/);
+});
