@@ -2511,6 +2511,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   };
 
   const researchBlocksOrdinaryLoop = async (workDir: string): Promise<boolean> => researchScanSync(workDir).blocks;
+  // Guard for starting a new research campaign: any campaign directory in any
+  // phase (briefing included) refuses. Unlike researchBlocksOrdinaryLoop, which
+  // leaves briefing campaigns unblocked for the ordinary loop and git.
+  const researchCampaignExists = (workDir: string): boolean => {
+    const root = researchState.researchRoot(workDir);
+    if (!fs.existsSync(root)) return false;
+    try {
+      return fs.readdirSync(root, { withFileTypes: true }).some((d) => d.isDirectory());
+    } catch {
+      return true; // fail closed: an unreadable research root blocks a new campaign
+    }
+  };
 
   const researchBlockedResponse = () => ({
     content: [{ type: "text", text: `⛔ ${RESEARCH_BLOCK_TEXT}.` }],
@@ -9883,6 +9895,41 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const kickoff = `/skill:autoresearch-parallel ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`.replace(/\s+/g, " ").trim();
         ctx.ui.notify(`Parallel mode ON (${parallelMatch[1]}) — loaded autoresearch-parallel skill`, "info");
         sendWhenReady(ctx, kickoff);
+        return;
+      }
+
+      // ===== research subcommand: a research campaign, not the metric loop =====
+      // Matched before the already-active branch: a research campaign is a
+      // separate campaign kind, so the loop's active flag must not block it.
+      if (/^research(\s|$)/.test(command)) {
+        const researchWorkDir = resolveWorkDir(ctx.cwd);
+        if (researchCampaignExists(researchWorkDir)) {
+          ctx.ui.notify("Research campaign already exists — complete or remove it first; use research status.", "info");
+          return;
+        }
+        if (await campaignBlocksOrdinaryLoop(researchWorkDir)) {
+          ctx.ui.notify("Candidate campaign active — use candidate_branch; the research campaign is not started.", "info");
+          return;
+        }
+        const description = trimmedArgs.slice("research".length).trim();
+        recordAutoresearchActivation(researchWorkDir, true);
+        setAutoresearchMode(ctx, true);
+        runtime.autoResumeTurns = 0;
+        runtime.consecutiveDriftResumes = 0;
+        updateWidget(ctx);
+        ctx.ui.notify("Research mode ON — briefing phase; the research kickoff is sent", "info");
+        // No /skill: prefix: the metric-loop skill must not be expanded into a research campaign.
+        const researchKickoff = [
+          "Research campaign: briefing phase." + (description ? ` Campaign description: ${description}.` : ""),
+          "The optimization loop does not apply here; the research_brief and research tools are the campaign tools.",
+          "Wait for the next message: it gives the campaign id, the absolute path of the brief file and its SHA-256. Then follow it in order:",
+          "1. research_brief draft from the object in the brief file,",
+          "2. research_brief propose (the owner approves the Brief SHA-256 dialog),",
+          "3. research start,",
+          "4. research open for each question, record evidence, research close with a verdict,",
+          "5. research stop, then research report.",
+        ].join("\n");
+        sendWhenReady(ctx, researchKickoff);
         return;
       }
 

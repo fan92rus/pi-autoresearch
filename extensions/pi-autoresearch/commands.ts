@@ -10,6 +10,7 @@ export interface Subcommand {
 
 export const SUBCOMMANDS: readonly Subcommand[] = [
   { name: "off", description: "Leave autoresearch mode." },
+  { name: "research", description: "Start a research campaign (briefing via research_brief; supports headless launch)." },
   { name: "finalize", description: "Stop the loop and turn kept experiments into reviewable branches." },
   { name: "report", description: "Write the campaign report to .auto/report.md now, without stopping the loop." },
   { name: "clear", description: "Delete the session log (.auto/log.jsonl) and turn autoresearch mode off." },
