@@ -406,11 +406,15 @@ test("(g) git through the shell is blocked while a research campaign is active",
     ["bash", "/usr/bin/git status"],
     ["bash", "\"C:\\Program Files\\Git\\cmd\\git.exe\" status"],
     ["bash", "cmd /c git status"],
+    ["bash", "cmd /c \"git status\""],
     ["bash", "powershell -c git status"],
+    ["bash", "powershell -Command \"git status\""],
     ["bash", "pwsh -Command git add -A"],
+    ["bash", "pwsh -Command \"git add -A\""],
     ["bash", "bash -lc \"git add -A\""],
     ["powershell", "git push"],
     ["bash", "env git log"],
+    ["bash", "FOO=1 git commit"],
   ]) {
     const result = await hook({ toolName, input: { command } }, h.ctx);
     assert.equal(result?.block, true, `${command} must be blocked`);
