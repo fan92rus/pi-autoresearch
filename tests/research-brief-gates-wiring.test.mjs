@@ -135,3 +135,28 @@ test("record on a blocked test-split path is refused until the gate file contain
   );
   assert.equal(readLog(dir).filter((e) => e.event === "record").length, 1);
 });
+
+test("record through a symlink that points at a blocked test file is refused", async (t) => {
+  const dir = makeWorkDir("symlink");
+  const h = await loadExtension(dir, "symlink");
+  await startCampaign(h);
+  assert.match(textOf(await call(h, "research", { action: "open", question_id: "Q1" })), /Vector Q1 opened/);
+  try {
+    fs.symlinkSync(path.join(dir, TEST_FILE), path.join(dir, "data", "alias.jsonl"));
+  } catch (err) {
+    t.skip(`symlink not available here: ${err.code}`);
+    return;
+  }
+  const refused = textOf(await call(h, "research", { action: "record", evidence_ref: "data/alias.jsonl:1-2" }));
+  assert.match(refused, /blocked test split \(evidence_gate\)/, refused);
+  assert.equal(readLog(dir).filter((e) => e.event === "record").length, 0);
+});
+
+test("record with a case-variant path to the blocked test file is refused", async () => {
+  const dir = makeWorkDir("case");
+  const h = await loadExtension(dir, "case");
+  await startCampaign(h);
+  assert.match(textOf(await call(h, "research", { action: "open", question_id: "Q1" })), /Vector Q1 opened/);
+  const refused = textOf(await call(h, "research", { action: "record", evidence_ref: "DATA/EPISODES_TEST_V1.JSONL:1-2" }));
+  assert.match(refused, /blocked test split \(evidence_gate\)/, refused);
+});

@@ -799,13 +799,14 @@ function isRelativeInsidePath(p: string): boolean {
 
 /**
  * Glob match for evidence paths. `*` matches inside one segment, `**` matches zero or
- * more whole segments. Slashes are normalized; a leading `./` is ignored.
+ * more whole segments. Slashes are normalized; a leading `./` is ignored. Matching is case-insensitive so the gate fails closed on
+ * case-insensitive file systems.
  */
 export function matchesGlob(path: string, glob: string): boolean {
   const p = path.replace(/\\/g, "/").replace(/^\.\//, "").split("/");
   const g = glob.replace(/\\/g, "/").replace(/^\.\//, "").split("/");
   const segmentRe = (seg: string): RegExp =>
-    new RegExp(`^${seg.split("*").map((s) => s.replace(/[.+^${}()|[\]\\]/g, "\\$&")).join("[^/]*")}$`);
+    new RegExp(`^${seg.split("*").map((s) => s.replace(/[.+^${}()|[\]\\]/g, "\\$&")).join("[^/]*")}$`, "i");
   const from = (pi: number, gi: number): boolean => {
     if (gi === g.length) return pi === p.length;
     if (g[gi] === "**") {

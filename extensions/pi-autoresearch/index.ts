@@ -8421,7 +8421,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     evidencePath: string,
   ): Promise<string | null> => {
     const gate = brief.evidence_gate;
-    if (!gate || !gate.blocked_globs.some((glob) => researchState.matchesGlob(evidencePath, glob))) return null;
+    if (!gate) return null;
+    // A symlink or junction inside the work directory may point at a blocked file:
+    // match the resolved path too (hard links are not detectable here; see docs).
+    const candidates = [evidencePath];
+    try {
+      const real = await fs.promises.realpath(path.resolve(workDir, evidencePath));
+      const realRel = path.relative(await fs.promises.realpath(workDir), real);
+      if (realRel !== "" && !path.isAbsolute(realRel) && realRel.split(path.sep)[0] !== "..") candidates.push(realRel);
+    } catch {
+      // unresolved path: the original path is the only candidate
+    }
+    const blocked = candidates.some((p) => gate.blocked_globs.some((glob) => researchState.matchesGlob(p, glob)));
+    if (!blocked) return null;
     const gateAbs = path.resolve(workDir, gate.gate_file);
     const rel = path.relative(workDir, gateAbs);
     if (rel === "" || path.isAbsolute(rel) || rel.split(path.sep)[0] === "..") {

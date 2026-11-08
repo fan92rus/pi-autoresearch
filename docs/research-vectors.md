@@ -135,7 +135,9 @@ Absent fields keep the behaviour above unchanged.
   `evidence_gate_blocked` until `gate_file` exists inside the work directory and
   contains `gate_contains`. `gate_file` must be relative and must not contain
   `..`. Glob syntax: `*` matches inside one path segment, `**` matches zero or
-  more whole segments; backslashes and a leading `./` are normalised.
+  more whole segments; backslashes and a leading `./` are normalised, and matching
+  is case-insensitive. The gate matches both the evidence path as written and
+  its resolved path, so a symlink or junction into the blocked split is refused.
 
 Limits of this MVP:
 
@@ -147,6 +149,8 @@ Limits of this MVP:
   The tool checks for the marker substring; it cannot check who wrote the file.
   The gate stops an accidental early read of the test split, not an agent that
   writes the gate file itself.
+- Hard links to a blocked file are not detected: the resolved path of a hard
+  link is its own name. Keep the test split out of reach of agent-written links.
 
 ## Headless launch (research)
 

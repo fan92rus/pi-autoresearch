@@ -172,3 +172,8 @@ test("the module still exports the default verdict list and the Verdict-typed VE
   assert.deepEqual([...R.DEFAULT_VERDICTS], DEFAULTS);
   assert.deepEqual([...R.VERDICTS], DEFAULTS);
 });
+
+test("matchesGlob is case-insensitive so the gate fails closed on case-insensitive file systems", () => {
+  assert.equal(R.matchesGlob("DATA/EPISODES_TEST_V1.JSONL", "data/episodes_test*.jsonl"), true);
+  assert.equal(R.matchesGlob("Data/Episodes_Test_V1.jsonl", "data/episodes_test*.jsonl"), true);
+});
