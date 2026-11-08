@@ -49,9 +49,9 @@ export const AUTORESEARCH_SUBCOMMANDS: AutocompleteEntry[] = [
   { value: "dashboard", label: "dashboard", description: "Open the fullscreen scrollable dashboard overlay in the terminal" },
   { value: "council", label: "council", description: "Convene a stagnation council (multi-model hypothesis review)" },
   { value: "help", label: "help", description: "Show /autoresearch usage help" },
-  { value: "parallel-best-of-n", label: "parallel-best-of-n", description: "Try N hypotheses at once, keep the best" },
-  { value: "parallel-stack", label: "parallel-stack", description: "Stack independent file-scoped optimizations" },
-  { value: "parallel-search", label: "parallel-search", description: "Beam search (K states × M candidates)" },
+  { value: "parallel-best-of-n", label: "parallel-best-of-n", description: "Campaign config (models, concurrency, budget) — parallel tools removed (scope split)" },
+  { value: "parallel-stack", label: "parallel-stack", description: "Campaign config (models, concurrency, budget) — parallel tools removed (scope split)" },
+  { value: "parallel-search", label: "parallel-search", description: "Campaign config (models, concurrency, budget) — parallel tools removed (scope split)" },
 ];
 
 export function filterSubcommands(prefix: string): AutocompleteEntry[] {
@@ -238,8 +238,9 @@ async function configureConcurrency(ctx: ConfigCtx, workDir: string): Promise<bo
   const title = [
     (RU ? "Конкурентность (текущая: " : "Concurrency (current: ") + current + ")",
     "",
-    RU ? "Количество воркер-субагентов, работающих параллельно в" : "Number of worker subagents running in parallel during",
-    "BestOfN, SpaceSearch, valleyProbe, CheckOrthogonal.",
+    RU ? "Количество воркер-субагентов, работающих параллельно" : "Number of worker subagents running in parallel",
+    RU ? "в будущих параллельных режимах кампании (сейчас инструменты" : "in future campaign parallel modes (the parallel tools are",
+    RU ? "удалены — скоуп-сплит; настройка сохраняется для политики)." : "removed — scope split; the setting is kept as campaign policy).",
     "",
     RU ? "Каждый воркер клонирует git worktree и независимо" : "Each worker clones a git worktree and runs measure.sh",
     RU ? "запускает measure.sh. Больше = быстрее, но больше нагрузка на CPU." : "independently. Higher = faster exploration, but more CPU load.",

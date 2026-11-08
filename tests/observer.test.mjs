@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import {
+  runObserver,
   checkFinalize,
   checkFloor,
   computeState,
@@ -280,4 +281,53 @@ test("FILE-PER-IDEA: multi-line content works correctly", () => {
   const remaining = fs.readdirSync(ideasDir).filter((f) => f.endsWith(".md"));
   assert.equal(remaining.length, 1);
   assert.equal(remaining[0], "bit-packed.md");
+});
+
+// ── parallel_enabled compat: user-set true is ignored, never honored ────────
+// (dead-code cut dd43c7f removed the parallel tools; bd pi-autoresearch-hsu)
+
+function plantStagnationForParallel(dir) {
+  const autoDir = path.join(dir, ".auto");
+  fs.mkdirSync(autoDir, { recursive: true });
+  const lines = [JSON.stringify({ type: "config", name: "bench", metricName: "ms", metricUnit: "ms", bestDirection: "lower" })];
+  // streak 3-4 = the old parallel-opportunity window (fires at 3, before stagnation 5)
+  for (let i = 0; i < 3; i++) {
+    lines.push(JSON.stringify({ run: i + 1, metric: 120 + i, status: "discard", description: `tweak ${i}` }));
+  }
+  fs.writeFileSync(path.join(autoDir, "log.jsonl"), lines.join("\n") + "\n");
+  // ideas dir with 2 untried ideas — the old trigger needed >= 2 untried ideas
+  const ideasDir = path.join(autoDir, "ideas");
+  fs.mkdirSync(ideasDir, { recursive: true });
+  fs.writeFileSync(path.join(ideasDir, "idea-a.md"), "# Idea A\n\nTry a hash-based approach for the parser rewrite.");
+  fs.writeFileSync(path.join(ideasDir, "idea-b.md"), "# Idea B\n\nBatch the requests in src/net.ts module.");
+  return dir;
+}
+
+function parallelPayload(dir) {
+  return {
+    cwd: dir, direction: "lower", metricName: "ms", metricUnit: "ms",
+    baselineMetric: 100, bestMetric: 100, runCount: 3, goal: "bench",
+  };
+}
+
+test("parallel_enabled:true in config is ignored — observer never suggests parallel tools", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "obs-parallel-compat-"));
+  plantStagnationForParallel(dir);
+  fs.writeFileSync(
+    path.join(dir, ".auto", "config.json"),
+    JSON.stringify({ observer: { parallel_enabled: true } }),
+  );
+  const steer = runObserver(parallelPayload(dir));
+  if (steer !== null) {
+    assert.doesNotMatch(steer, /BestOfN|SpaceSearch|CheckOrthogonal|valleyProbe|startPhase|PARALLEL OPPORTUNITY|PARALLEL HINT/);
+  }
+});
+
+test("no parallel config: baseline behavior — no parallel tool suggestions", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "obs-parallel-off-"));
+  plantStagnationForParallel(dir);
+  const steer = runObserver(parallelPayload(dir));
+  if (steer !== null) {
+    assert.doesNotMatch(steer, /BestOfN|SpaceSearch|CheckOrthogonal|valleyProbe|startPhase|PARALLEL OPPORTUNITY|PARALLEL HINT/);
+  }
 });

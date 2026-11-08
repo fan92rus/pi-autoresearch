@@ -1,7 +1,10 @@
 ---
 name: autoresearch-parallel
-description: Run pi-autoresearch in parallel modes — best-of-N hypothesis testing, orthogonal patch stacking, beam space-search, valley probes, and multi-step phases via worker subagents fanned out over the shared event bus. Use when the optimization has multiple candidate hypotheses to try at once, or when a single sequential loop is too slow / gets stuck in local optima.
+description: SCOPE SPLIT (2026-11-08): the tools described below were removed in the dead-code cut (dd43c7f); the /autoresearch parallel-* commands remain for campaign configuration only (models, concurrency, budget). Kept for config-policy reference.
 ---
+
+> **SCOPE SPLIT (2026-11-08): tools described below were removed in the dead-code cut (dd43c7f); the /autoresearch parallel-* commands remain for campaign config only.**
+> The `BestOfN` / `SpaceSearch` / `CheckOrthogonal` / `valleyProbe` / `startPhase` tools no longer exist. The `/autoresearch config` dialog and `parallel-*` subcommands persist because tier presets, concurrency and budget are campaign policy settings that survive the tool removal.
 
 # Autoresearch — Parallel Modes
 

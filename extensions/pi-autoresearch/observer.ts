@@ -51,7 +51,7 @@ export interface ObserverConfig {
   finalizeRecommendations: boolean;
   /** Enable finalize recommendations inside stagnation (ASI floor/exhausted, critical level). Default: true */
   stagnationFinalizeEnabled: boolean;
-  /** Enable parallel tool suggestions (BestOfN, CheckOrthogonal, SpaceSearch). Default: false (tools disabled) */
+  /** Legacy toggle: parallel tools were removed (dead-code cut dd43c7f), so this is read for config compat but always behaves as false. Default: false */
   parallelEnabled: boolean;
 }
 
@@ -70,7 +70,7 @@ export const DEFAULT_OBSERVER_CONFIG: ObserverConfig = {
   floorDetectionEnabled: true,
   finalizeRecommendations: true,
   stagnationFinalizeEnabled: true,
-  parallelEnabled: false,
+  parallelEnabled: false, // tools removed (dead-code cut dd43c7f); pinned false at config read
 };
 
 function readObserverConfig(cwd: string): ObserverConfig {
@@ -93,7 +93,15 @@ function readObserverConfig(cwd: string): ObserverConfig {
     if (typeof obs.floor_detection_enabled === "boolean") cfg.floorDetectionEnabled = obs.floor_detection_enabled;
     if (typeof obs.finalize_recommendations === "boolean") cfg.finalizeRecommendations = obs.finalize_recommendations;
     if (typeof obs.stagnation_finalize_enabled === "boolean") cfg.stagnationFinalizeEnabled = obs.stagnation_finalize_enabled;
-    if (typeof obs.parallel_enabled === "boolean") cfg.parallelEnabled = obs.parallel_enabled;
+    if (typeof obs.parallel_enabled === "boolean") {
+      // Config-compat only: the parallel tools were removed in the dead-code
+      // cut (dd43c7f), so a user-set parallel_enabled:true is ignored, never
+      // honored.
+      if (obs.parallel_enabled) {
+        console.warn("[autoresearch] config parallel_enabled:true is ignored — parallel tools were removed (dead-code cut); observer parallel hints stay off");
+      }
+      cfg.parallelEnabled = false;
+    }
     return cfg;
   } catch {
     return { ...DEFAULT_OBSERVER_CONFIG };
