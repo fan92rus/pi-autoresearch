@@ -119,6 +119,35 @@ recovery path.
 - No per-question time or token limit (owner decision 3).
 - No automatic computation of rule conditions; no new data collection.
 
+## Brief-declared verdicts and evidence gate
+
+Two optional brief fields (openspec change `brief-verdicts-and-evidence-gate`).
+Absent fields keep the behaviour above unchanged.
+
+- `verdicts` — an array of verdict names the brief declares, e.g.
+  `["test-consistent", "rejected", "inconclusive", "waiting_for_data"]`.
+  Absent means `confirmed, rejected, inconclusive, waiting_for_data`.
+  Names are tokens `^[a-z][a-z0-9_-]{0,31}$`, unique and non-empty. Every
+  decision rule's `verdict` must be declared, and every question needs a rule
+  for every declared verdict. `research close` accepts only declared verdicts.
+- `evidence_gate` — `{blocked_globs, gate_file, gate_contains}`. A `record`
+  whose evidence path matches a `blocked_globs` pattern is refused with
+  `evidence_gate_blocked` until `gate_file` exists inside the work directory and
+  contains `gate_contains`. `gate_file` must be relative and must not contain
+  `..`. Glob syntax: `*` matches inside one path segment, `**` matches zero or
+  more whole segments; backslashes and a leading `./` are normalised.
+
+Limits of this MVP:
+
+- Branch reasons and findings routing use the literal names only:
+  `inconclusive` and `waiting_for_data` require a reason, and only
+  `confirmed` and `rejected` write to `findings.jsonl`. A brief that declares
+  `test-consistent` therefore writes no findings for it. This is deliberate.
+- The gate file is created by the operator or the pipeline, not by the agent.
+  The tool checks for the marker substring; it cannot check who wrote the file.
+  The gate stops an accidental early read of the test split, not an agent that
+  writes the gate file itself.
+
 ## Headless launch (research)
 
 `scripts/research-rpc.mjs` launches a research campaign without an interactive
