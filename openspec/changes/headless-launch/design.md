@@ -5,122 +5,133 @@
 ```
 оператор ──> scripts/research-rpc.mjs ──spawn──> pi --mode rpc (cwd=<target>)
                 │                                    │
-                │<── extension_ui_request (confirm) ──┘
-                │──> extension_ui_response (confirmed) │
-                │<── jsonl events (tool_call, agent_*)─┘
-                └──> session-events.log (полный JSONL) + console tail
+                │  stage 1: /autoresearch research   │
+                │  (extension: mode + research rules)│
+                │  wait: disposition + agent_settled │
+                │  stage 2: brief path/hash/steps    │
+                │<── extension_ui_request (confirm) ──┤
+                │──> extension_ui_response (confirmed)│
+                │<── jsonl events (tool_call, agent_*)┤
+                └──> session-events.log + console tail
 ```
 
-Оператор заранее вычисляет SHA-256 брифа и передаёт её в переменной
-`PI_RPC_AUTO_APPROVE` (или флагом `--approve-sha`). Скрипт подтверждает
-confirm-диалог только когда: (а) метод — `confirm`, (б) в сообщении диалога
-есть строка `Brief SHA-256: <hex>` (формат из `research_brief propose`),
-(в) `<hex>` совпадает с фиксированным оператором, (г) хеш совпадает
-также с хешем файла `--brief`, посчитанным скриптом при старте. Любое
-несовпадение (операторский ≠ диалоговый, диалоговый ≠ файловый) —
-`confirmed: false` и завершение сессии с ненулевым кодом до дальнейших
-шагов агента (fail-closed: агент никогда не получает подтверждения брифа,
-расходящегося с зафиксированным). Остальные confirm — `confirmed: false`
-с пометкой в логе.
+## Каноническая форма брифа и хеши
+
+`research_brief draft` записывает бриф в канонической форме:
+`JSON.stringify(validation.brief, null, 2) + "\n"` (research-state.ts), и
+одобряемый хеш считается по этим байтам. Поэтому:
+
+- Обёртка при старте парсит `--brief` и ТРЕБУЕТ, чтобы байты файла уже были
+  канонической формой: `bytes === JSON.stringify(JSON.parse(bytes), null, 2) + "\n"`.
+  Не канонический файл — ошибка аргументов (exit 2) до спавна pi; оператор
+  канонизирует файл заранее (в docs — однострочник).
+- `--approve-sha` = sha256 канонических байтов файла (sha256 от сырых байтов,
+  lowercase hex — тот же алгоритм, что `sha256Hex`).
+- Три хеша сверяются В МОМЕНТ ответа на диалог: диалоговый (из message),
+  операторский (`--approve-sha`) и файловый — пересчитанный из `--brief` в этот
+  момент. Это делает сценарий «файл изменён после kickoff» детерминированным:
+  мутация файла, сделанная пока диалог висит, обнаруживается при ответе.
+- Любое несовпадение: `confirmed: false`, затем немедленно RPC-команда abort
+  процессу pi (агент прерывается до дальнейших шагов), ожидание выхода
+  (kill после 10 с), exit 1. Тест ассертит: после отказа в логе нет
+  `research_brief`/`research` вызовов.
 
 ## Компоненты
 
 ### 1. `scripts/research-rpc.mjs` (новый)
 
-Node-скрипт без внешних зависимостей (`node:child_process`, `node:readline`
-не используется — ручной JSONL-фрейминг по LF, сплит только по `\n`, как
-требует docs/rpc.md).
+Node-скрипт без внешних зависимостей. JSONL-фрейминг по LF, сплит только по
+`\n` (U+2028/29 не границы, как требует docs/rpc.md).
 
-CLI:
 ```
 node scripts/research-rpc.mjs --cwd <dir> --mode research|optimize
-     [--goal "<text>"] [--brief <path>] [--approve-sha <hex>]
-     [--pi <путь к pi>] [--log <файл>] [--timeout-sec N]
+     [--brief <path>] [--approve-sha <hex>] [--campaign-id <id>]
+     [--goal "<description>"] [--pi <путь>] [--log <файл>] [--timeout-sec N]
 ```
 
-- `--mode research` ТРЕБУЕТ `--brief` (и `--approve-sha`): без файла брифа
-  скрипт завершается с ошибкой аргументов до спавна pi (research-кампания
-  без зафиксированного брифа не запускается).
+- `--mode research` ТРЕБУЕТ `--brief` и `--approve-sha` (иначе exit 2 до спавна).
+- Активация: ОДНО сообщение `/autoresearch research` (+ описание из `--goal`
+  как хвост аргумента). Команду обрабатывает расширение: флипает режим и
+  отправляет research-kickoff (правила кампании). Обёртка НЕ отправляет
+  `/autoresearch on` (не подкоманда) и никогда не отправляет
+  `/skill:autoresearch-create`.
+- Sequencing: после отправки stage 1 обёртка ждёт ответ prompt
+  (`data.disposition`): `started` — ждёт `agent_settled`; `handled` — режим
+  активирован без запуска LLM-хода, переходим к stage 2 немедленно. Один
+  сигнал во всех файлах: disposition + agent_settled.
+- Stage 2 (после stage-1 завершения): текст с путём `--brief`, его SHA-256,
+  `campaign_id` (из `--campaign-id`, иначе сгенерированный `bench-<yyyymmdd-hhmmss>`)
+  и шагами: прочитать файл брифа → `research_brief draft` (campaign_id, объект
+  из JSON файла) → `propose` → `research start` (campaign_id, expected_sha256)
+  → open по одному вопросу → close по правилам → stop → report.
+- `--mode optimize "<goal>"`: ОДНО сообщение `/autoresearch optimize <goal>`
+  (явный алиас metric-loop). Никогда не `/autoresearch <goal>` голым текстом —
+  цель, начинающаяся с `research`, иначе попала бы в зарезервированную ветку.
+- Диалоги: см. раздел хешей; не-брифовые confirm — `confirmed: false` + лог
+  (оптимизационный цикл может остановиться — документированное поведение).
+- Таймаут: незакрытый request → `confirmed: false`/`cancelled: true`, shutdown
+  pi (kill после 10 с), exit 3, причина в логе.
+- Exit codes: 0 — успех (report/финиш цикла); 1 — отказ по хешу/диалогу;
+  2 — ошибки аргументов; 3 — таймаут.
+- Лог: сырой JSONL всех записей stdout + консольный tail tool-вызовов.
 
-- `--mode research`: шлёт `/autoresearch on`, дожидается observable-подтверждения
-  активации режима (первый `agent_end`/`agent_settled` после команды), затем
-  отправляет kickoff: инструкцию прочитать файл брифа (`--brief`, путь передаётся
-  агенту дословно), его SHA-256 (скрипт считает sha256 байтов файла тем же
-  алгоритмом, что `sha256Hex` в research-state.ts: sha256 от сырых байтов,
-  hex-строка) и последовательностью: прочитать бриф → `research_brief draft`
-  с содержимым этого файла (объект из JSON) → `propose` → `research start`
-  `expected_sha256=<hash>` → open по одному вопросу → close по правилам →
-  stop → report. Так одобряемый draft по построению совпадает с файлом,
-  чей хеш зафиксирован (решение по ревью раунда 2: явная передача handoff).
-- `--mode optimize "<goal>"`: `/autoresearch <goal>` — обычный цикл.
-- Лог: сырой JSONL всех записей stdout-потока + сводка tool-вызовов в консоль.
-- Завершение: `agent_settled` после report/финиша цикла, или таймаут.
+### 2. Изменения в `extensions/pi-autoresearch/index.ts` и `commands.ts`
 
-### 2. Таймаут и висящие диалоги
-
-По достижении `--timeout-sec`: если есть незакрытый `extension_ui_request`,
-скрипт отвечает `confirmed: false` (или `cancelled: true`), посылает pi
-shutdown, дожидается выхода процесса (kill после 10с), пишет в лог причину
-`timeout` и выходит с кодом 3. Кампания остаётся в текущей фазе — состояние
-на диске не повреждается (approval либо записан целиком, либо нет: запись
-approval атомарна на стороне расширения).
-
-### 3. Изменения в `extensions/pi-autoresearch/index.ts`
-
-Минимальные:
-
-- В обработчике `/autoresearch`: подкоманда `research` распознаётся ТОЛЬКО
-  как точное слово `research` или префикс `research ` (с последующим текстом —
-  он становится описанием кампании). Free-text цель «research something»
-  поэтому интерпретируется как research-кампания с темой «something» — это
-  документированное поведение (см. spec); ЕДИНСТВЕННОЕ изменение поведения
-  TUI (решение владельца). Цель optimize со словом `research` остаётся
-  выразимой через новый явный алиас `/autoresearch optimize <goal>` —
-  синтаксический сахар над существующим free-text потоком (тот же kickoff,
-  что и у free-text цели сегодня). Остальные аргументы — без изменений.
-- Ветка `research`: активирует режим, затем отправляет research-kickoff
-  (перечисление шагов кампании, БЕЗ `/skill:autoresearch-create`); guard
-  против существующей research-кампании (reuse `researchBlocksOrdinaryLoop`).
+- Подкоманда `research` в парсере `/autoresearch`: точное слово `research`
+  или префикс `research ` (хвост — описание кампании). Ветвление проверяется
+  ДО ветки «already active» (иначе `/autoresearch research` при включённом
+  режиме молча проглатывается). Guard: отказ, если каталог `.auto/research`
+  существует и содержит хоть одну кампанию (любая фаза — briefing тоже:
+  `researchBlocksOrdinaryLoop` блокирует только research/stopped/pending, его
+  недостаточно). Kickoff — research-правила, БЕЗ `/skill:autoresearch-create`.
+- Подкоманда `optimize` (алиас): `/autoresearch optimize <goal>` — явный вход
+  в metric-loop: слово `optimize` отбрасывается, хвост — цель. Проверяется
+  ДО зарезервированного слова `research`, поэтому
+  `/autoresearch optimize research habits` даёт metric-loop с полной целью
+  «research habits». Это НЕ чистый сахар: алиас минует зарезервированное
+  слово. Два документированных примера (`commands.ts:30`, `index.ts:2742` —
+  «/autoresearch optimize unit test runtime…») меняют смысл: их kickoff-цель
+  теперь без слова `optimize` — обновить примеры (task 4.2).
+- Регистрация обеих подкоманд в `commands.ts` `SUBCOMMANDS` (help/completions).
 - Никаких изменений в `ctx.ui.confirm`-гейтах инструментов.
 
-### 4. Что НЕ меняется
+### 3. Что НЕ меняется
 
 - Гейты инструментов, fail-closed поведение, форматы state/journal.
-- TUI-путь запуска.
+- Остальные свободные цели `/autoresearch <goal>` (кроме префикса `research `
+  и нового алиаса) — как раньше.
 
 ## Потоки
 
 ### Research (headless)
-1. Оператор готовит бриф-JSON и считает `sha256(файла)`.
-2. Запуск обёртки с `--brief` и `--approve-sha`.
-3. Обёртка: `/autoresearch on` → ждёт первый `agent_end` → kickoff-текст.
-4. Агент: `research_brief draft` → `research_brief propose` → пи эмитит confirm →
-   обёртка сверяет хеш (три стороны: операторский, диалоговый, файловый) →
-   `confirmed: true` → approval записан.
-5. Агент: `research start` с хешем → фаза research → вопросы → report.
-6. Обёртка печатает tail событий, сохраняет лог, завершается по `agent_settled`.
+1. Оператор канонизирует бриф-JSON и считает `sha256(файла)`.
+2. Обёртка `--mode research --brief --approve-sha [--campaign-id] [--goal]`.
+3. Stage 1 `/autoresearch research` → disposition/agent_settled.
+4. Stage 2: путь брифа + хеш + campaign_id + шаги.
+5. Агент: draft (объект из файла; записанные байты = каноническая форма =
+   байты файла, т.к. файл уже канонический) → propose → confirm → обёртка
+   сверяет три хеша в момент диалога → `confirmed: true`.
+6. Агент: `research start` (campaign_id, expected_sha256) → вопросы → report.
+7. Обёртка: tail, лог, exit 0 по agent_settled после report.
 
 ### Optimize (headless)
-1. `/autoresearch <goal>` → обычный цикл init/run/log. Диалогов нет; если
-   расширение эмитит confirm — обёртка отвечает `false` и логирует. Цикл
-   при этом может остановиться: это документированное поведение, а не сбой
-   (candidate policy-consent и manual recovery — отдельные интерактивные
-   пути, в optimize-headless не входят).
+`/autoresearch optimize <goal>` → metric-loop init/run/log. Диалог → `false`
++ лог (цикл может остановиться — документировано).
 
 ## Тесты
 
-- Юнит на обёртку (без спавна pi): парсер `extension_ui_request`, решение
-  confirm по хешу: совпал / чужой диалоговый / файловый ≠ диалоговый /
-  не-брифовый (substring без hex или другой метод) / timeout с висящим
-  confirm; сборка kickoff-текстов обоих режимов; последовательность
-  mode-flip → ожидание agent_end → kickoff.
-- Интеграционный (спавн настоящего `pi --mode rpc`; путь к CLI берётся из
-  `--pi`, иначе `pi` из PATH; выполняется только при `PI_RPC_E2E=1`, иначе
-  `skip`): draft→propose с auto-approve доходит до phase research; чужой хеш
-  кампания остаётся briefing; файл брифа изменён после kickoff — отказ до
-  confirm.
-- Wiring: `/autoresearch research` не отправляет `/skill:autoresearch-create`;
-  `/autoresearch research something` трактуется как research-кампания с темой
-  `something` (документированное поведение парсера); `/autoresearch optimize
-  <goal>` отправляет metric-loop kickoff с целью `<goal>` (алиас работает);
-  foreign-hash E2E также проверяет завершение обёртки с ненулевым кодом.
+- Юнит обёртки: каноничность файла (не канонический → exit 2); решение confirm
+  (три совпали / операторский ≠ диалоговый → false+abort+exit 1 / диалоговый ≠
+  файловый в момент ответа → false+abort+exit 1 / не-брифовый → false);
+  timeout → exit 3; exit codes 0/1/2/3; sequencing disposition+agent_settled,
+  ветка handled; сборка stage-2 текста (путь, хеш, campaign_id, шаги).
+- Wiring: `/autoresearch research` без `/skill:autoresearch-create`;
+  `research something` = кампания с темой something; `research` до ветки
+  already-active; guard на briefing-кампанию; `/autoresearch optimize research
+  habits` = metric-loop с полной целью; SUBCOMMANDS содержит research/optimize;
+  edge-кейсы парсера: tab после `research`, `optimize` без цели → отказ,
+  lowercase-чувствительность (command.toLowerCase()).
+- E2E (`PI_RPC_E2E=1`, иначе skip; CLI из `--pi` или PATH): research до phase
+  research без «mode OFF» отказов; чужой sha → отказ + abort + exit 1 + нет
+  research-вызовов после отказа; мутация файла при висящем диалоге → отказ;
+  optimize-прогон наполняет `.auto/log.jsonl`.
