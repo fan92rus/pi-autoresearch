@@ -102,6 +102,13 @@ function call(h, name, params) {
   return h.tool(name).execute("tool-call-id", params, null, null, h.ctx);
 }
 
+// The transcript row of research_brief propose: drawn before execute and before the owner dialog.
+function renderPropose(h) {
+  const component = h.tool("research_brief").renderCall({ action: "propose" }, { fg: (_c, t) => t, bold: (t) => t }, {});
+  const out = component.render(200);
+  return Array.isArray(out) ? out.join("\n") : String(out);
+}
+
 function textOf(res) {
   return res?.content?.[0]?.text ?? "";
 }
@@ -231,7 +238,7 @@ test("(d) research_brief propose: owner confirm === true writes approval.json wi
   await call(h, "research_brief", { action: "draft", brief: briefFixture() });
   const dialogs = [];
   h.ctx.ui.confirm = async (title, message) => {
-    dialogs.push({ title, message, chatBefore: h.pi.chatMessages.length });
+    dialogs.push({ title, message, shown: renderPropose(h) });
     return true;
   };
   const text = textOf(await call(h, "research_brief", { action: "propose" }));
@@ -239,12 +246,9 @@ test("(d) research_brief propose: owner confirm === true writes approval.json wi
   const expected = sha256Of(fs.readFileSync(briefPath));
   assert.equal(dialogs.length, 1, "exactly one owner dialog");
   assert.ok(dialogs[0].message.includes(expected), "dialog must show the brief hash");
-  assert.equal(dialogs[0].chatBefore, 1, "full brief must be in the chat before the dialog opens");
-  const chat = h.pi.chatMessages[0];
-  assert.equal(chat.customType, "research-brief");
-  assert.match(chat.content, /cache layer explains the latency drop/, "chat must show the brief goal");
-  assert.ok(chat.content.includes(expected), "chat must show the brief SHA-256");
-  assert.doesNotMatch(chat.content, /"schema_version"|"questions"\s*:/, "chat must not be raw JSON");
+  assert.match(dialogs[0].shown, /cache layer explains the latency drop/, "the transcript row before the dialog must show the brief goal");
+  assert.ok(dialogs[0].shown.includes(expected), "the transcript row must show the brief SHA-256");
+  assert.doesNotMatch(dialogs[0].shown, /"schema_version"|"questions"\s*:/, "the transcript row must not be raw JSON");
   const approval = readJson(path.join(dir, ".auto", "research", "c1", "approval.json"));
   assert.equal(approval.confirmed, true);
   assert.equal(approval.brief_sha256, expected);

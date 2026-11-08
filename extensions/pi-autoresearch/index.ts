@@ -8500,9 +8500,34 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return lines;
   };
 
+  // Directory of the last drafted campaign: the transcript view of propose reads its brief.json.
+  let briefPreviewDir: string | null = null;
+  const briefTranscriptText = (dir: string | null): string => {
+    if (dir === null) return "Бриф для показа не найден: в этой сессии не было research_brief draft.";
+    let bytes: Buffer;
+    try {
+      bytes = fs.readFileSync(path.join(dir, researchState.BRIEF_FILE));
+    } catch {
+      return "Бриф для показа не найден: brief.json отсутствует.";
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(bytes.toString("utf8"));
+    } catch {
+      return "brief.json не читается как JSON.";
+    }
+    const validation = researchState.validateBrief(parsed);
+    if (!validation.ok) return "brief.json не проходит проверку.";
+    return briefChatMarkdown(validation.brief, researchState.sha256Hex(bytes), path.basename(dir));
+  };
   registerGatedTool({
     name: "research_brief",
     label: "Research brief (phase 1)",
+    // The full brief is drawn as this tool call's row in the transcript: the row is shown before execute and before the owner dialog.
+    renderCall(args: any, _theme: any, _context: any) {
+      if (args?.action !== "propose") return new Text(`research_brief ${String(args?.action ?? "")}`, 0, 0);
+      return new Text(briefTranscriptText(briefPreviewDir), 0, 0);
+    },
     description:
       "Research-vectors campaign, phase 1: draft a brief of questions and decision rules, then ask the OWNER to approve it. " +
       "Actions: draft (validated brief saved for a new or still-unapproved campaign), status (approval and hash state), " +
@@ -8600,6 +8625,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (!created.ok && created.reason !== "campaign_exists") return fail(created.reason, created.message);
         const written = await researchState.writeBriefDraft(dir, params.brief);
         if (!written.ok) return fail(written.reason, written.message);
+        briefPreviewDir = dir;
         return reply(`✅ Brief draft saved for campaign ${campaignId} (sha256 ${written.sha256}). It is NOT approved yet: the owner confirms it with research_brief propose.`);
       }
 
@@ -8654,13 +8680,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
       const sha = briefSha ? { ok: true as const, sha256: briefSha } : await researchState.briefSha256(dir);
       if (!sha.ok) return fail(sha.reason, sha.message);
-      // Full brief goes to the chat as readable Markdown; the dialog carries only the summary and the SHA.
-      pi.sendMessage({
-        customType: "research-brief",
-        content: briefChatMarkdown(validation.brief, sha.sha256, campaignId),
-        display: true,
-        details: { campaign_id: campaignId, brief_sha256: sha.sha256 },
-      });
+      // The full brief is in this tool call's transcript row (renderCall), above this dialog.
       const confirmed = await ctx.ui.confirm(
         `Research campaign ${campaignId}: approve brief`,
         briefConsentSummary(validation.brief, sha.sha256, campaignId),

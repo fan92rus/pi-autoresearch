@@ -83,7 +83,7 @@ export function briefConsentSummary(brief: ResearchBrief, sha256: string, campai
     `Вердикты: ${clip(verdicts.join(", "), CLIP_LIST)}`,
     `Стоп-правил: ${brief.stop_rules.length}; метрик процесса: ${brief.process_metrics.length}`,
     `Замок тестовых данных: ${gate}`,
-    "Полный бриф — в чате выше (сообщение research-brief).",
+    "Полный бриф выведен выше, в строке вызова research_brief propose.",
     "Подтверждение фиксирует этот SHA-256: вопросы и правила не меняются.",
     "Подтвердить согласование?",
   ];
