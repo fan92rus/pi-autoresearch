@@ -261,3 +261,18 @@ test("B4: a pinned session (init with cwd) refuses a cwd-less brief and writes n
   assert.match(second, /cwd: brief ""/);
   assert.equal(readConfigHeaders(pinned).length, before, "the pinned dir's ledger must not get a new config header");
 });
+
+test("B4 round 3: init with cwd \"\" is refused on a pinned session and writes no config header", async () => {
+  const dir = makeWorkDir("empty-cwd-a");
+  const pinned = makeWorkDir("empty-cwd-b");
+  const h = await loadBare(dir, "empty-cwd");
+  h.ctx.ui.confirm = async () => true;
+  await run(h, "optimize_brief", { action: "draft", brief: briefArgs({ cwd: pinned }) });
+  await run(h, "optimize_brief", { action: "propose" });
+  await run(h, "init_experiment", { name: "liquid speed", metric_name: "total_us", metric_unit: "us", direction: "lower", cwd: pinned });
+  const before = readConfigHeaders(pinned).length;
+  const text = await run(h, "init_experiment", { name: "liquid speed", metric_name: "total_us", metric_unit: "us", direction: "lower", cwd: "" });
+  assert.match(text, /cwd must be a non-empty path/, text);
+  assert.equal(readConfigHeaders(pinned).length, before, "the pinned dir's ledger must not get a new config header");
+  assert.equal(readConfigHeaders(dir).length, 0, "the session dir must not get a config header from the refused call");
+});
