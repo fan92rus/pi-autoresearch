@@ -2442,15 +2442,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // does not match. Leading whitespace and newline separators are command
   // positions too. Path-prefixed forms (`/usr/bin/git`, `C:\\...git.exe`,
   // quoted Windows paths) and case are covered; so are cmd(.exe) /c,
-  // powershell(.exe)/pwsh(.exe) (-Command with a quoted git command),
-  // nice with flag/number adjustments (nice -n 5, nice -15), and
-  // sh/bash/zsh/dash -c wrappers (fail-closed on `sh -c 'echo git'`).
-  // Not a shell parser: remaining quoting tricks ({ git; }, nested quotes)
-  // are documented residuals (design §8: interception at the Pi
-  // command layer, not an OS sandbox).
+  // powershell(.exe)/pwsh(.exe) with multiple flags (-NoProfile -Command
+  // with a quoted git command), nice with flag/number adjustments
+  // (nice -n 5, nice -15), sudo with -u/-g targets, env/command/xargs
+  // with options (-i, -p, -0), and sh/bash/zsh/dash -c wrappers
+  // (fail-closed on `sh -c 'echo git'`).
+  // Not a shell parser: remaining quoting tricks ({ git; }, nested quotes,
+  // `find . -exec git`, `/bin/sh -c` with quoted payloads) are documented
+  // residuals (design §8: interception at the Pi command layer, not an
+  // OS sandbox).
   const RESEARCH_GIT_RE = new RegExp(
-    '(?:^|[;&|(\\n\\r])\\s*(?:(?:\\w+=\\S*|env|command|exec|sudo|nohup|xargs|time|nice(?:\\s+-\\w+|\\s*?-\\d+|\\s+\\d+)*|cmd(?:\\.exe)?(?:\\s+/c)?|powershell(?:\\.exe)?(?:\\s+-\\w+)?|pwsh(?:\\.exe)?(?:\\s+-\\' +
-    'w+)?)\\s+)*(?:(?:"[^"]*?[\\/\\\\]|[^";&|()]*?[\\/\\\\])?git(?:\\.exe)?"?|"\\s*git(?:\\.exe)?[^"\\n]*"|(?:ba|z|da)?sh\\s+(?:-\\w+\\s+)*' +
+    '(?:^|[;&|(\\n\\r])\\s*(?:(?:\\w+=\\S*|env(?:\\s+-\\S+)*|command(?:\\s+-\\w+)*|exec|sudo(?:\\s+-(?:u\\s+\\S+|g\\s+\\S+|\\w+))*|nohup|xargs(?:\\s+-\\S+)*|time|nice(?:\\s+-\\w+|\\s*?-\\d+|\\s+\\d+)*|cmd(?:\\.exe)?(?:\\s+/c)?|powershell(?:\\.exe)?(?:\\s+-\\w+|\\s+-\\w+:)*|pwsh(?:\\.exe)?(?:\\s+-\\w+|\\s+-\\' +
+    'w+:)*)\\s+)*(?:(?:"[^"]*?[\\/\\\\]|[^";&|()]*?[\\/\\\\])?git(?:\\.exe)?"?|"\\s*git(?:\\.exe)?[^"\\n]*"|(?:ba|z|da)?sh\\s+(?:-\\w+\\s+)*' +
     '"?\\S*\\bgit(?:\\.exe)?\\b)(?=\\s|$|")',
     "i",
   );
