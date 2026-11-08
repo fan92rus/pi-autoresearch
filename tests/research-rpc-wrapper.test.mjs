@@ -209,3 +209,66 @@ test("unexpected pi exit is logged as pi_exited and exits 3", async () => {
   assert.equal(result.code, 3);
   assert.ok(events(ctx).some((entry) => entry.direction === "wrapper" && entry.record.event === "pi_exited"));
 });
+
+const draftBytesFor = (variant) => Buffer.from(`${JSON.stringify({ schema_version: 1, goal: "test", extra_rule: variant }, null, 2)}\n`);
+
+test("stage 2 instructs byte-for-byte transcription of the brief", async () => {
+  const ctx = setup();
+  assert.equal((await run(ctx)).code, 0);
+  const messages = sentMessages(ctx);
+  assert.match(messages[1], /Transcribe the brief VERBATIM byte-for-byte from the file; do NOT add, remove, reorder or reformat anything/);
+});
+
+test("auto-adopt retries once with the agent draft and exits 0", async () => {
+  const ctx = setup();
+  const result = await run(ctx, ["--auto-adopt-draft"], "transcription-drift");
+  assert.equal(result.code, 0, result.stderr);
+  const logged = events(ctx);
+  const adopt = logged.find((entry) => entry.direction === "wrapper" && entry.record.type === "auto_adopt");
+  assert.equal(adopt?.record.from_sha, ctx.digest);
+  assert.equal(adopt?.record.to_sha, sha(draftBytesFor("first")));
+  const confirmations = logged.filter((entry) => entry.record?.event === "brief_confirmation").map((entry) => entry.record.confirmed);
+  assert.deepEqual(confirmations, [false, true]);
+  const messages = sentMessages(ctx);
+  assert.equal(messages.length, 3, "exactly one retry prompt after stage 2");
+  assert.match(messages[2], /Re-transcribe research_brief draft VERBATIM from that file byte-for-byte/);
+  assert.ok(messages[2].includes(path.join(ctx.dir, ".auto", "research", "test-campaign", "brief.json")));
+  assert.ok(messages[2].includes(sha(draftBytesFor("first"))));
+});
+
+test("without the flag the same drift exits 1 and never retries", async () => {
+  const ctx = setup();
+  const result = await run(ctx, [], "transcription-drift");
+  assert.equal(result.code, 1, result.stderr);
+  assert.equal(events(ctx).some((entry) => entry.record.type === "auto_adopt"), false);
+  assert.equal(sentMessages(ctx).length, 2);
+});
+
+test("a second refusal after the adopted retry exits 1 as exhausted", async () => {
+  const ctx = setup();
+  const result = await run(ctx, ["--auto-adopt-draft"], "double-drift");
+  assert.equal(result.code, 1, result.stderr);
+  assert.match(result.stderr, /auto-adopt retry exhausted/);
+  const logged = events(ctx);
+  assert.ok(logged.some((entry) => entry.record.event === "auto_adopt_exhausted" && entry.record.message === "auto-adopt retry exhausted"));
+  assert.equal(logged.filter((entry) => entry.record.type === "auto_adopt").length, 1);
+  assert.equal(sentMessages(ctx).length, 3, "no retry beyond the single adopted prompt");
+});
+
+test("missing agent draft is skipped with a warning and exits 1", async () => {
+  const ctx = setup();
+  const result = await run(ctx, ["--auto-adopt-draft"], "drift-no-draft");
+  assert.equal(result.code, 1, result.stderr);
+  assert.ok(events(ctx).some((entry) => entry.record.event === "auto_adopt_skipped" && entry.record.level === "warn" && entry.record.reason === "draft_missing"));
+  assert.equal(events(ctx).some((entry) => entry.record.type === "auto_adopt"), false);
+  assert.equal(sentMessages(ctx).length, 2);
+});
+
+test("stale agent draft (dialog sha differs from disk) is skipped with a warning and exits 1", async () => {
+  const ctx = setup();
+  const result = await run(ctx, ["--auto-adopt-draft"], "drift-stale-draft");
+  assert.equal(result.code, 1, result.stderr);
+  assert.ok(events(ctx).some((entry) => entry.record.event === "auto_adopt_skipped" && entry.record.level === "warn" && entry.record.reason === "draft_sha_differs_from_dialog"));
+  assert.equal(events(ctx).some((entry) => entry.record.type === "auto_adopt"), false);
+  assert.equal(sentMessages(ctx).length, 2);
+});

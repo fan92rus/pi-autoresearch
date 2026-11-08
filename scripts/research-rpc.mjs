@@ -45,6 +45,7 @@ function parseArgs(argv) {
     const key = item.slice(2);
     if (key === "help") { args.help = true; continue; }
     if (args[key] !== undefined) throw new Error(`Duplicate option: --${key}`);
+    if (key === "auto-adopt-draft") { args[key] = true; continue; }
     const value = argv[i + 1];
     if (value === undefined || value.startsWith("--")) throw new Error(`Missing value for --${key}`);
     args[key] = value;
@@ -71,7 +72,7 @@ function parseArgs(argv) {
 
 function sha256(bytes) { return createHash("sha256").update(bytes).digest("hex"); }
 function jsonLine(value) { return `${JSON.stringify(value)}\n`; }
-function usage() { return "Usage: node scripts/research-rpc.mjs --mode research --brief <canonical.json> --approve-sha <sha256> [--campaign-id <id>] [--pi <path>] [--cwd <dir>] [--timeout-sec 3600] [--stage1-timeout-sec 30] [--hold-dialog-ms 0] [--log <path>]"; }
+function usage() { return "Usage: node scripts/research-rpc.mjs --mode research --brief <canonical.json> --approve-sha <sha256> [--campaign-id <id>] [--pi <path>] [--cwd <dir>] [--timeout-sec 3600] [--stage1-timeout-sec 30] [--hold-dialog-ms 0] [--auto-adopt-draft] [--log <path>]"; }
 
 async function main() {
   let args;
@@ -80,7 +81,7 @@ async function main() {
   if (args.help) { console.log(usage()); return 0; }
 
   const cwd = path.resolve(args.cwd ?? process.cwd());
-  const briefPath = path.resolve(cwd, args.brief);
+  let briefPath = path.resolve(cwd, args.brief);
   let briefBytes;
   try {
     briefBytes = fs.readFileSync(briefPath);
@@ -95,7 +96,11 @@ async function main() {
 
   const campaignId = args["campaign-id"] ?? `bench-${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z")}`;
   if (!ID_RE.test(campaignId)) { console.error("Generated campaign id is invalid"); return 2; }
-  const approveSha = args["approve-sha"];
+  let approveSha = args["approve-sha"];
+  const autoAdopt = args["auto-adopt-draft"] === true;
+  // Auto-adopt state: none -> pending (first refusal, draft captured) -> applied (retry sent) or exhausted by a second refusal.
+  let adoptState = "none";
+  let adoptCandidate = null;
   const timeoutMs = Number(args["timeout-sec"] ?? DEFAULT_TIMEOUT) * 1000;
   const stage1TimeoutMs = Number(args["stage1-timeout-sec"] ?? DEFAULT_STAGE1_TIMEOUT) * 1000;
   const holdDialogMs = Number(args["hold-dialog-ms"] ?? 0);
@@ -129,6 +134,47 @@ async function main() {
   child.stdin.on("error", (error) => {
     logEvent("wrapper", { event: "stdin_error", message: error.message });
   });
+
+  const readAdoptCandidate = (dialogSha) => {
+    const draftPath = path.join(cwd, ".auto", "research", campaignId, "brief.json");
+    let bytes;
+    try { bytes = fs.readFileSync(draftPath); } catch { return { ok: false, reason: "draft_missing" }; }
+    const digest = sha256(bytes);
+    // Adopt only the exact draft the operator dialog displayed.
+    if (digest !== dialogSha) return { ok: false, reason: "draft_sha_differs_from_dialog" };
+    const text = bytes.toString("utf8");
+    try {
+      if (text !== `${JSON.stringify(JSON.parse(text), null, 2)}\n`) return { ok: false, reason: "draft_not_canonical" };
+    } catch {
+      return { ok: false, reason: "draft_not_json" };
+    }
+    return { ok: true, path: draftPath, sha: digest };
+  };
+  const handleAdoptRefusal = async (dialogSha) => {
+    // A refusal inside the pending window is answered (confirmed:false) and waits for the turn to settle.
+    if (adoptState === "pending") return;
+    if (adoptState === "applied") {
+      logEvent("wrapper", { event: "auto_adopt_exhausted", message: "auto-adopt retry exhausted", dialog_sha: dialogSha });
+      console.error("auto-adopt retry exhausted: the adopted brief was refused again");
+      await stopChild(1, "auto_adopt_exhausted", true);
+      return;
+    }
+    const candidate = readAdoptCandidate(dialogSha);
+    if (!candidate.ok) {
+      logEvent("wrapper", { event: "auto_adopt_skipped", level: "warn", reason: candidate.reason });
+      console.error(`auto-adopt skipped: ${candidate.reason}`);
+      await stopChild(1, "brief_hash_mismatch", true);
+      return;
+    }
+    adoptCandidate = candidate;
+    adoptState = "pending";
+  };
+  const adoptRetryMessage = () => [
+    `Brief transcription mismatch. The canonical brief is at ${adoptCandidate.path} with SHA-256 ${adoptCandidate.sha}.`,
+    `Campaign ${campaignId} (the id is pinned by the launch command; never pass a campaign_id to the tools).`,
+    "Re-transcribe research_brief draft VERBATIM from that file byte-for-byte: copy the file content exactly, do NOT add, remove, reorder or reformat anything.",
+    "Then run research_brief propose.",
+  ].join("\n");
 
   const send = (record) => {
     if (!child.stdin.destroyed && child.stdin.writable) {
@@ -195,7 +241,7 @@ async function main() {
       const disposition = record.data?.disposition;
       if (stage === 1 && disposition === "queued") {
         await stopChild(2, "stage_1_prompt_queued");
-      } else if (stage === 2 && disposition === "queued") {
+      } else if (stage >= 2 && disposition === "queued") {
         await stopChild(1, "stage_2_prompt_queued");
       }
       return;
@@ -219,12 +265,21 @@ async function main() {
             `Brief file: ${briefPath}`,
             `Brief SHA-256: ${briefHash}`,
             "Create the campaign with research_brief draft from this file, then research_brief propose.",
+            "Transcribe the brief VERBATIM byte-for-byte from the file; do NOT add, remove, reorder or reformat anything (no new rules, no key reordering).",
             "After approval of the Brief SHA-256 dialog, run research start, open each question, record evidence, close each question, then research stop and research report.",
           ].join("\n");
           requestPrompt(message, 2);
         }
       } else if (successfulReport) {
         await stopChild(0, "successful_report");
+      } else if (adoptState === "pending") {
+        // The refused turn has settled, so the retry prompt can be sent without streaming conflicts.
+        const from = approveSha;
+        approveSha = adoptCandidate.sha;
+        briefPath = adoptCandidate.path;
+        adoptState = "applied";
+        logEvent("wrapper", { type: "auto_adopt", from_sha: from, to_sha: approveSha });
+        requestPrompt(adoptRetryMessage(), 3);
       }
       return;
     }
@@ -263,7 +318,10 @@ async function main() {
         send({ type: "extension_ui_response", id: dialogId, confirmed });
         pendingDialogs.delete(dialogId);
         logEvent("wrapper", { event: "brief_confirmation", id: dialogId, confirmed, dialog_sha: shaMatch[1], file_readable: currentFileHash !== null });
-        if (!confirmed) await stopChild(1, "brief_hash_mismatch", true);
+        if (!confirmed) {
+          if (autoAdopt) await handleAdoptRefusal(shaMatch[1]);
+          else await stopChild(1, "brief_hash_mismatch", true);
+        }
         return;
       }
       if (["select", "input", "editor"].includes(record.method)) {
