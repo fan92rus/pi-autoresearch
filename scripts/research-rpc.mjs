@@ -51,6 +51,10 @@ function parseArgs(argv) {
     args[key] = value;
     i += 1;
   }
+  const KNOWN = new Set(["help", "mode", "brief", "approve-sha", "campaign-id", "state-root", "pi", "cwd", "timeout-sec", "stage1-timeout-sec", "hold-dialog-ms", "auto-adopt-draft", "log"]);
+  for (const key of Object.keys(args)) {
+    if (!KNOWN.has(key)) throw new Error(`Unknown option: --${key} (typos silently become part of the campaign description otherwise)`);
+  }
   if (args.help) return args;
   if (args.mode === "optimize") {
     // Optimize is an explicit scope split for this MVP; see the headless-launch change.
@@ -61,6 +65,7 @@ function parseArgs(argv) {
   if (!args["approve-sha"]) throw new Error("--approve-sha is required");
   if (!SHA_RE.test(args["approve-sha"])) throw new Error("--approve-sha must be 64 lowercase hexadecimal characters");
   if (args["campaign-id"] !== undefined && !ID_RE.test(args["campaign-id"])) throw new Error("Invalid --campaign-id");
+  if (args["state-root"] !== undefined && (typeof args["state-root"] !== "string" || args["state-root"].trim() === "")) throw new Error("Invalid --state-root");
   for (const key of ["timeout-sec", "stage1-timeout-sec", "hold-dialog-ms"]) {
     if (args[key] !== undefined && (!/^\d+(?:\.\d+)?$/.test(args[key]) || Number(args[key]) <= 0 && key !== "hold-dialog-ms")) {
       throw new Error(`Invalid --${key}`);
@@ -72,7 +77,7 @@ function parseArgs(argv) {
 
 function sha256(bytes) { return createHash("sha256").update(bytes).digest("hex"); }
 function jsonLine(value) { return `${JSON.stringify(value)}\n`; }
-function usage() { return "Usage: node scripts/research-rpc.mjs --mode research --brief <canonical.json> --approve-sha <sha256> [--campaign-id <id>] [--pi <path>] [--cwd <dir>] [--timeout-sec 3600] [--stage1-timeout-sec 30] [--hold-dialog-ms 0] [--auto-adopt-draft] [--log <path>]"; }
+function usage() { return "Usage: node scripts/research-rpc.mjs --mode research --brief <canonical.json> --approve-sha <sha256> [--campaign-id <id>] [--state-root <dir>] [--pi <path>] [--cwd <dir>] [--timeout-sec 3600] [--stage1-timeout-sec 30] [--hold-dialog-ms 0] [--auto-adopt-draft] [--log <path>]"; }
 
 async function main() {
   let args;
@@ -257,6 +262,17 @@ async function main() {
       if (!stage1Started) return;
       if (!stage1Settled) {
         stage1Settled = true;
+        if (adoptState === "pending") {
+          // The agent proposed the brief DURING stage 1 (did not wait for the
+          // stage-2 message). Send the adopt retry instead of stage 2.
+          const from = approveSha;
+          approveSha = adoptCandidate.sha;
+          briefPath = adoptCandidate.path;
+          adoptState = "applied";
+          logEvent("wrapper", { type: "auto_adopt", from_sha: from, to_sha: approveSha });
+          requestPrompt(adoptRetryMessage(), 2);
+          return;
+        }
         if (!stage2Sent) {
           stage2Sent = true;
           const briefHash = sha256(briefBytes);
@@ -369,7 +385,7 @@ async function main() {
     }
   }, stage1TimeoutMs);
 
-  requestPrompt(`/autoresearch research --id ${campaignId}`, 1);
+  requestPrompt(`/autoresearch research --id ${campaignId}${args["state-root"] ? ` --state-root ${args["state-root"]}` : ""}`, 1);
   const resultCode = await new Promise((resolve) => child.on("close", () => resolve(exitCode)));
   if (killTimer) clearTimeout(killTimer);
   await closeLog();
