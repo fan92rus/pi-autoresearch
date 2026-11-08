@@ -185,18 +185,8 @@ import * as candidateState from "./candidate-state.ts";
 import * as candidateWorktree from "./candidate-worktree.ts";
 import * as candidateMeasure from "./candidate-measure.ts";
 import * as researchState from "./research-state.ts";
-import { RpcClient } from "./parallel/rpc.ts";
-import { runBestOfN } from "./parallel/bestofn.ts";
-import { runCheckOrthogonal } from "./parallel/orthogonal.ts";
-import { initBeam, stepBeam, finishBeam, statusBeam, clearBeam } from "./parallel/spacesearch.ts";
-import { runValleyProbe } from "./parallel/valley.ts";
-import { reMeasureWinner, applyDiff } from "./parallel/remeasure.ts";
-import { computeNoiseFloor } from "./parallel/aggregate.ts";
-import { resolveConfig, defaultConcurrency } from "./parallel/config.ts";
 import { interactiveParallelConfig, filterSubcommands, applyExperimentLimitArg, configureExperimentLimit } from "./parallel/config-ui.ts";
 import { resolveRepoRoot, cleanupAllWorktrees } from "./parallel/worktree.ts";
-import { newPhaseStore, startPhase, recordExploreStep, endPhaseDecision, clearPhase, markBestCheckpoint, persistPhase, clearPersistedPhase, commitPhaseGit, abortPhaseGit } from "./parallel/phases.ts";
-import type { Direction } from "./parallel/types.ts";
 import {
   treeExists,
   loadTree,
@@ -224,7 +214,6 @@ import {
 } from "./parallel/tree.ts";
 import { computeSimhash, hammingDistance, classifyDistance } from "./parallel/simhash.ts";
 import { rankNodes, type RankedNode } from "./parallel/ucb1.ts";
-import { composeDiffs } from "./parallel/compose.ts";
 import { renderTree, renderNodeDetail, findBestNodeId } from "./parallel/treeview.ts";
 
 // ---------------------------------------------------------------------------
@@ -250,7 +239,7 @@ interface ExperimentResult {
   metric: number;
   /** Additional tracked metrics: { name: value } */
   metrics: Record<string, number>;
-  status: "keep" | "discard" | "crash" | "checks_failed" | "budget_exceeded" | "explore";
+  status: "keep" | "discard" | "crash" | "checks_failed" | "budget_exceeded";
   description: string;
   timestamp: number;
   /** Segment index — increments on each config header. Current segment = highest. */
@@ -366,11 +355,9 @@ interface AutoresearchRuntime {
   pendingResumeTimer: ReturnType<typeof setTimeout> | null;
   /** Resume message to send when the pending timer fires. */
   pendingResumeMessage: string | null;
-  /** Active phase state for valley-crossing multi-step optimizations (ТЗ §11.5). */
-  phaseStore: ReturnType<typeof newPhaseStore>;
   /** TUI view mode: 'list' (dashboard table) or 'tree' (experiment tree). Toggle with Tab. */
   treeViewMode: boolean;
-  /** True when the current turn used a loop tool (run_experiment/log_experiment/propose_hypothesis/parallel tools). Reset in before_agent_start; read by agent_end drift policy. */
+  /** True when the current turn used a loop tool (run_experiment/log_experiment/propose_hypothesis). Reset in before_agent_start; read by agent_end drift policy. */
   lastTurnUsedExperimentTools: boolean;
   /** Consecutive settled turns that did no loop work and were nudged. After MAX_CONSECUTIVE_DRIFT_RESUMES the loop stops instead of nudging again (anti chat-loop bound, goal-x pattern). Reset whenever a loop tool fires. */
   consecutiveDriftResumes: number;
@@ -474,12 +461,12 @@ const InitParams = Type.Object({
 const ACTIVITY_TYPES = ["measurement", "intermediate", "verification", "attribution"] as const;
 
 export const LogParams = Type.Object({
-  commit: Type.Optional(Type.String({ description: "Git commit hash (short, 7 chars). Optional for explore/budget_exceeded statuses." })),
+  commit: Type.Optional(Type.String({ description: "Git commit hash (short, 7 chars). Optional for budget_exceeded status." })),
   metric: Type.Number({
     description:
       "The primary optimization metric value (e.g. seconds, val_bpb). 0 for crashes.",
   }),
-  status: StringEnum(["keep", "discard", "crash", "checks_failed", "budget_exceeded", "explore"] as const),
+  status: StringEnum(["keep", "discard", "crash", "checks_failed", "budget_exceeded"] as const),
   description: Type.String({
     description: "Short description of what this experiment tried",
   }),
@@ -1513,7 +1500,6 @@ async function recordTreeNode(
 
   // Map ExperimentResult.status → TreeNodeStatus.
   // budget_exceeded behaves like crash (code reverted, no commit).
-  // explore is handled earlier in log_experiment and never reaches here.
   const rawStatus = info.experiment.status;
   const status: TreeNode["status"] =
     rawStatus === "keep" ? "keep" :
@@ -1823,7 +1809,6 @@ function createSessionRuntime(): AutoresearchRuntime {
     state: createExperimentState(),
     pendingResumeTimer: null,
     pendingResumeMessage: null,
-    phaseStore: newPhaseStore(),
     treeViewMode: false,
     lastTurnUsedExperimentTools: false,
     consecutiveDriftResumes: 0,
@@ -2231,20 +2216,6 @@ export function renderDashboardLines(
 
 export default function autoresearchExtension(pi: ExtensionAPI) {
   const MAX_AUTORESUME_TURNS = 300;
-  // Parallel in-process tools (BestOfN, phases, valleyProbe, CheckOrthogonal,
-  // SpaceSearch) are disabled for now — the owner doesn't use them. Flip to
-  // true to re-register them; also re-add their names to EXPERIMENT_LOOP_TOOLS
-  // and to the smoke EXPECTED_TOOLS list.
-  const PARALLEL_TOOLS_ENABLED = false;
-
-  // Branch/merge tree tools (explore_from, restore_main, compose) are disabled.
-  // Evidence: ~700 real runs across 7 campaigns produced ZERO branch operations —
-  // agents work a flat hypothesis list (propose_hypothesis → run_experiment →
-  // log_experiment) and even "retry an old idea" is done as a new hypothesis
-  // (observed verbatim: "H19 (повтор H16)"). Flip to true to re-enable; also
-  // re-add their names to EXPERIMENT_LOOP_TOOLS and smoke DISABLED_TOOLS.
-  const BRANCHING_TOOLS_ENABLED = false;
-
   const BENCHMARK_GUARDRAIL =
     "Be careful not to overfit to the benchmarks and do not cheat on the benchmarks.";
 
@@ -3143,12 +3114,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   });
 
   // Track whether the in-flight turn does real loop work (goal-x pattern:
-  // the settled-turn drift policy reads this). Branching tools are disabled
-  // (BRANCHING_TOOLS_ENABLED) — re-add their names here when re-enabled.
-  // While they are disabled they are not registered at all, so a candidate
-  // campaign cannot reach them. Re-enabling them requires a campaign guard
-  // (campaignBlocksOrdinaryLoop -> campaignBlockedResponse) in each execute,
-  // because explore_from and restore_main move the user checkout.
+  // the settled-turn drift policy reads this).
   const EXPERIMENT_LOOP_TOOLS = new Set([
     "run_experiment", "log_experiment", "propose_hypothesis", "init_experiment",
     "tree_status", "finalize_research",
@@ -5004,7 +4970,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // Honest-metric provenance (goal-x pattern: agent claims are untrusted,
       // the run_experiment measurement is the evidence). Only statuses that
-      // carry a real measurement are checked; crash/budget/explore are exempt.
+      // carry a real measurement are checked; crash/budget are exempt.
       const provenanceChecked = params.status === "keep" || params.status === "discard" || params.status === "checks_failed";
       let metricProvenance: string | undefined;
       let provenanceNote = "";
@@ -5041,52 +5007,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           }],
           details: {},
         };
-      }
-
-      // ===== explore status: phase step logging (no commit, no revert) =====
-      if (params.status === "explore") {
-        const phase = runtime.phaseStore.active;
-        if (!phase) {
-          return { content: [{ type: "text", text: "❌ status=explore requires an active phase. Call startPhase first." }], details: {} };
-        }
-        const outcome = recordExploreStep(runtime.phaseStore, { metric: params.metric, direction: state.bestDirection });
-        // best-checkpoint: if this step improved, snapshot HEAD
-        if (params.metric !== null && outcome.kind === "continue") {
-          const head = (await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: workDir, timeout: 5000 })).stdout.trim();
-          markBestCheckpoint(runtime.phaseStore, head);
-        }
-        // append a scratch entry to the log (no git mutation)
-        try {
-          const jsonlPath = autoresearchJsonlPath(workDir);
-          ensureParentDir(jsonlPath);
-          fs.appendFileSync(jsonlPath, JSON.stringify({ run: state.results.length + 1, commit: params.commit, metric: params.metric, status: "explore", description: params.description, segment: state.currentSegment, epoch: measurementScaleStatusOfDir(workDir).epoch, phaseStep: phase.stepsTaken, ...(params.activity_type !== undefined ? { activity_type: params.activity_type } : {}) }) + "\n");
-        } catch { /* best-effort */ }
-        // Run-links sidecar skip (BR-12/T33, §5.2): the explore row shares the run
-        // numbering space but is not an ordinary run — a sidecar record would be
-        // ambiguous at read time (run_number_shared), so none is written. The
-        // pending identity is reset, mirroring the non-consumption of the minted
-        // number: explore rows are never sidecar-bound.
-        runtime.runLinks = resetRunIdentities(runtime.runLinks);
-        persistPhase(runtime.phaseStore, workDir);
-
-        let exploreText = `🔄 explore step ${phase.stepsTaken}/${phase.maxSteps}: metric=${params.metric}`;
-        if (outcome.kind === "continue") {
-          exploreText += ` (within bounds, continue the phase)`;
-          return { content: [{ type: "text", text: exploreText }], details: { phaseStep: phase.stepsTaken, outcome: outcome.kind } };
-        }
-        if (outcome.kind === "steer_deep") {
-          exploreText += ` ⚠️ deep valley (${outcome.deltaPct.toFixed(1)}%) — consider commitPhase soon.`;
-          pi.sendUserMessage(`Phase "${phase.name}" is in a deep valley (${outcome.deltaPct.toFixed(1)}% vs baseline). Consider whether to continue or commitPhase.`, { deliverAs: "steer" });
-          return { content: [{ type: "text", text: exploreText }], details: { phaseStep: phase.stepsTaken, outcome: outcome.kind } };
-        }
-        // auto-abort cases (floor / steps / budget)
-        const reason = outcome.kind === "auto_abort_floor" ? `hard floor breached (${outcome.deltaPct.toFixed(1)}%)`
-          : outcome.kind === "auto_abort_steps" ? "maxSteps reached"
-          : "phase budget exceeded";
-        await abortPhaseGit(execAsParallel, workDir, phase);
-        clearPhase(runtime.phaseStore);
-        clearPersistedPhase(workDir);
-        return { content: [{ type: "text", text: `${exploreText}\n🛑 Phase auto-aborted: ${reason}. Reverted to phase base (autoresearch files preserved).` }], details: { phaseStep: phase.stepsTaken, outcome: outcome.kind, aborted: true } };
       }
 
       // Validate secondary metrics consistency (after first experiment establishes them)
@@ -5457,13 +5377,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // §12.4 direction-review hint (E-22): computed from files after the ledger
       // row and the sidecar attempt; at most one line (§12.3b); never on a plain
       // success without a transition; delivered in this response string only.
-      // Owner decision (spec rev.): explore rows are excluded from the S_stag/S_ser
-      // counters upstream (researchMapPreState / researchMapLogHint), so an explore
-      // row can no longer cause a transition by itself. The params.status check
-      // below is kept only as a defensive no-op (it can never suppress a hint that
-      // the counters would have fired on a non-explore row).
       try {
-        const hintLine = preResearchMap !== null && params.status !== "explore"
+        const hintLine = preResearchMap !== null
           ? researchMapLogHint(workDir, preResearchMap)
           : null;
         if (hintLine !== null) text += hintLine;
@@ -5524,7 +5439,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
-      if (params.status !== "keep" && params.status !== "budget_exceeded" && params.status !== "explore") {
+      if (params.status !== "keep" && params.status !== "budget_exceeded") {
         try {
           const revertScript = `
             git checkout -- . ':(exclude,glob)**/${AUTO_DIR}' ':(exclude,glob)**/${AUTO_DIR}/**' ':(exclude,glob)**/autoresearch.*' ':(exclude,glob)**/autoresearch.*/**'
@@ -5806,8 +5721,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         try {
           const ledgerText = fs.readFileSync(autoresearchJsonlPath(workDir), "utf-8");
           const reconstructed = reconstructJsonlState(ledgerText);
-          // Owner decision: explore rows are excluded from the S_stag/S_ser
-          // counters entirely (neither increment nor reset) — see K_STAG_RUNS.
+          // Legacy phase rows (status "explore") are excluded for compatibility;
+          // the current log_experiment schema cannot write them.
           const segRuns = reconstructed.results.filter((r) => r.segment === reconstructed.currentSegment && r.status !== "explore");
           const stateAfter = computeState(segRuns, reconstructed.bestDirection);
           const trailingAfter = trailingBestImprovements(segRuns, reconstructed.bestDirection);
@@ -5846,9 +5761,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   /**
    * §12.4 trigger thresholds (DRAFT DQ-01; K_SER counts best-improving runs).
-   * OWNER DECISION (spec rev. in progress): ledger rows with status "explore"
-   * are EXCLUDED from the S_stag and S_ser counters entirely — they neither
-   * increment nor reset them. The design §12.4a is being amended accordingly.
+   * Legacy ledger rows with status "explore" are excluded from S_stag and S_ser
+   * counters for backward compatibility; the status is no longer writable.
    */
   const K_STAG_RUNS = 8;
   const K_SER_RUNS = 3;
@@ -6868,683 +6782,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   }
 
   // -----------------------------------------------------------------------
-  // ===== Parallel modes (best-of-N / stack / space-search) =====
-  // Tools fan out worker subagents over the shared pi.events EventBus via the
-  // pi-subagents RPC bridge. The parent is the sole git mutator + log writer.
-
-  function readConfigJson(workDir: string): unknown {
-    try {
-      const p = sessionFilePath(workDir, "config");
-      const c = p && fs.existsSync(p) ? p : path.join(workDir, ".auto", "config.json");
-      if (!fs.existsSync(c)) return null;
-      return JSON.parse(fs.readFileSync(c, "utf-8"));
-    } catch { return null; }
-  }
-
-  function formatBestOfNResult(r: { baselineMetric: number; winnerIndex: number | null; ranked: Array<{ label?: string; medianMetric: number | null; status: string; improvement: number | null; within_noise?: boolean; index: number; tier?: string; notes?: string; error?: string }>; finalMetric: number | null; decision: string; reason?: string; appliedDiffSummary?: string; cpuWarning?: string; remeasure?: Array<{ index: number; decision: string; finalMetric: number | null; reason?: string }> }): string {
-    let text = `BestOfN: ${r.decision}` + (r.reason ? ` (${r.reason})` : "") + "\n";
-    text += `baseline=${r.baselineMetric}  final=${r.finalMetric ?? "-"}  winner=${r.winnerIndex ?? "none"}\n`;
-    for (const c of r.ranked) {
-      const imp = c.improvement !== null ? (c.improvement >= 0 ? "+" : "") + c.improvement.toFixed(2) : "-";
-      const flag = c.within_noise ? " [noise]" : "";
-      text += `  #${c.index + 1} ${c.label ?? ""} — ${c.status} metric=${c.medianMetric ?? "-"} Δ=${imp}${flag}${c.tier ? ` tier=${c.tier}` : ""}\n`;
-      if (c.error) text += `      error: ${c.error.slice(0, 120)}\n`;
-    }
-    if (r.remeasure && r.remeasure.length > 0) {
-      text += "re-measure cascade:\n";
-      for (const rm of r.remeasure) text += `  #${rm.index + 1} → ${rm.decision} metric=${rm.finalMetric ?? "-"}${rm.reason ? ` (${rm.reason})` : ""}\n`;
-    }
-    if (r.appliedDiffSummary) text += `applied: ${r.appliedDiffSummary}\n`;
-    if (r.cpuWarning) text += `⚠️ ${r.cpuWarning}\n`;
-    if (r.decision === "keep") text += `\n→ log_experiment(status="keep", metric=${r.finalMetric}, description="BestOfN winner")`;
-    else text += `\n→ log_experiment(status="discard", metric=0, description="BestOfN no winner")`;
-    return text;
-  }
-
-  const BestOfNParams = Type.Object({
-    candidates: Type.Array(Type.Object({
-      hypothesis: Type.String({ description: "Текст гипотезы, которую worker реализует в коде." }),
-      label: Type.Optional(Type.String()),
-      complexity: Type.Optional(Type.String({ description: "simple|medium|hard — определяет тир модели/бюджет." })),
-    })),
-    metric_name: Type.String(),
-    direction: Type.Optional(Type.String()),
-    metric_unit: Type.Optional(Type.String()),
-    model: Type.Optional(Type.String({ description: "Override тира модели для всех кандидатов." })),
-    cascade: Type.Optional(Type.Boolean()),
-    budget_seconds: Type.Optional(Type.Number()),
-    concurrency: Type.Optional(Type.Number()),
-  });
-
-  const execAsParallel = async (cmd: string, args: string[], o?: { cwd?: string; timeout?: number }) => {
-    const r = await pi.exec(cmd, args, o);
-    return { stdout: r.stdout, stderr: r.stderr, code: r.code, killed: (r as { killed?: boolean }).killed };
-  };
-  // Bash-capable runner matching the extension's Windows-aware spawn.
-  const runBashForParallel = async (cmd: string, args: string[], o: unknown) => {
-    const opts = (o ?? {}) as { cwd?: string; timeout?: number; env?: Record<string, string> };
-    const r = await execBashScript(args, opts);
-    return { stdout: r.stdout ?? "", stderr: r.stderr ?? "", code: r.code, killed: !!r.killed };
-  };
-
-  if (PARALLEL_TOOLS_ENABLED) pi.registerTool({
-    name: "BestOfN",
-    label: "Best-of-N parallel hypotheses",
-    description:
-      "Проверяет N гипотез параллельно: каждый worker реализует гипотезу в изолированном worktree и измеряет (BENCH_MODE=quick). Инструмент ранжирует по медиане, cascade-re-measure топ-кандидатов в их worktree'ах (BENCH_MODE=full, против selection-bias) и возвращает keep/discard. Parent — единственный писатель git/лога. Требует включённого autoresearch-режима и установленного pi-subagents.",
-    promptSnippet: "Run N hypothesis candidates in parallel and pick the best (re-measured)",
-    parameters: BestOfNParams,
-    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-      const runtime = getRuntime(ctx);
-      if (!runtime.autoresearchMode) {
-        return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF. Run /autoresearch on first." }], details: {} };
-      }
-      const workDir = resolveWorkDir(ctx.cwd);
-      const repoRoot = resolveRepoRoot(workDir);
-      const config = resolveConfig(readConfigJson(workDir));
-      const rpc = new RpcClient(pi.events);
-      const ready = await rpc.ping();
-      if (!ready) {
-        return { content: [{ type: "text", text: "❌ pi-subagents RPC bridge not ready. Убедитесь, что расширение pi-subagents установлено и активно." }], details: {} };
-      }
-      const _progressLines: string[] = [];
-      const onProgress = onUpdate ? (msg: string) => {
-        _progressLines.push(msg);
-        onUpdate({ content: [{ type: "text", text: _progressLines.join("\n") }], details: { phase: "bestofn" } });
-      } : undefined;
-      try {
-        const result = await runBestOfN(
-          { rpc, exec: execAsParallel, runCmd: runBashForParallel, repoRoot, workDir, config, onProgress },
-          {
-            candidates: params.candidates.map((c: { hypothesis: string; label?: string; complexity?: string }) => ({
-              hypothesis: c.hypothesis,
-              label: c.label,
-              complexity: c.complexity as "simple" | "medium" | "hard" | undefined,
-            })),
-            metricName: params.metric_name,
-            direction: (params.direction as Direction) ?? "lower",
-            metricUnit: params.metric_unit,
-            sessionName: runtime.state.name ?? "parallel-bestofn",
-            modelOverride: params.model,
-            cascade: params.cascade,
-            budgetSeconds: params.budget_seconds,
-            concurrency: params.concurrency,
-          },
-        );
-        const text = formatBestOfNResult(result);
-        return { content: [{ type: "text", text }], details: result };
-      } catch (e) {
-        return { content: [{ type: "text", text: `❌ BestOfN failed: ${e instanceof Error ? e.message : String(e)}` }], details: {} };
-      }
-    },
-  });
-
-  if (PARALLEL_TOOLS_ENABLED) pi.registerTool({
-    name: "startPhase",
-    label: "Start a multi-step phase (valley crossing)",
-    description:
-      "Начать транзакцию: внутри фазы авто-revert отключён, валидируется только финальная метрика (commitPhase). Для многошаговых оптимизаций, где нужно ухудшиться, чтобы потом улучшиться (рефакторинг, смена алгоритма, instrumentation, precompute). Hard floor (40%) и maxSteps (5) предохраняют от ухода в худшую сторону.",
-    promptSnippet: "Start a phase tolerating temporary regressions",
-    parameters: Type.Object({
-      name: Type.String(),
-      rationale: Type.Optional(Type.String()),
-      max_steps: Type.Optional(Type.Number()),
-      max_regression_pct: Type.Optional(Type.Number()),
-      hard_floor_pct: Type.Optional(Type.Number()),
-      budget_seconds: Type.Optional(Type.Number()),
-    }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const runtime = getRuntime(ctx);
-      if (!runtime.autoresearchMode) return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF." }], details: {} };
-      const workDir = resolveWorkDir(ctx.cwd);
-      const repoRoot = resolveRepoRoot(workDir);
-      const baselineMetric = runtime.state.bestMetric;
-      if (baselineMetric === null) return { content: [{ type: "text", text: "❌ No baseline metric yet — run a baseline experiment first (init_experiment + run_experiment)." }], details: {} };
-      const head = (await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: repoRoot, timeout: 5000 })).stdout.trim();
-      const res = startPhase(runtime.phaseStore, {
-        name: params.name,
-        rationale: params.rationale ?? "",
-        phaseBase: head,
-        baselineMetric,
-        maxSteps: params.max_steps,
-        maxRegressionPct: params.max_regression_pct,
-        hardFloorPct: params.hard_floor_pct,
-        budgetMs: params.budget_seconds ? params.budget_seconds * 1000 : undefined,
-      });
-      if (!res.ok) return { content: [{ type: "text", text: `❌ ${res.error}` }], details: {} };
-      persistPhase(runtime.phaseStore, workDir);
-      const p = res.phase;
-      return { content: [{ type: "text", text: `🔄 Phase "${p.name}" started. phaseBase=${p.phaseBase}, baseline=${p.baselineMetric}. maxSteps=${p.maxSteps}, hardFloor=${p.hardFloorPct}%. Log intermediate steps as status="explore" (no commit/revert). End with commitPhase or abortPhase.` }], details: { phaseId: p.id, phaseBase: p.phaseBase, baselineMetric: p.baselineMetric } };
-    },
-  });
-
-  if (PARALLEL_TOOLS_ENABLED) pi.registerTool({
-    name: "commitPhase",
-    label: "Commit a multi-step phase",
-    description:
-      "Завершить фазу: measure финальной метрики; если лучше baseline → git commit всей цепочки правок; если хуже → revert к phaseBase (или best-checkpoint). Только финальная метрика валидируется.",
-    promptSnippet: "Commit/abort a phase by its final metric",
-    parameters: Type.Object({
-      final_metric: Type.Number({ description: "Финальная метрика фазы (после всех шагов)." }),
-      description: Type.String(),
-    }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const runtime = getRuntime(ctx);
-      if (!runtime.autoresearchMode) return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF." }], details: {} };
-      const workDir = resolveWorkDir(ctx.cwd);
-      const phase = runtime.phaseStore.active;
-      if (!phase) return { content: [{ type: "text", text: "❌ No active phase. Call startPhase first." }], details: {} };
-      const direction = runtime.state.bestDirection;
-      const dec = endPhaseDecision(runtime.phaseStore, params.final_metric, direction);
-      let text = `Phase "${phase.name}": ${dec.decision}` + (dec.reason ? ` (${dec.reason})` : "") + `. baseline=${phase.baselineMetric}, final=${params.final_metric}, steps=${phase.stepsTaken}.`;
-      if (dec.decision === "keep") {
-        const r = await commitPhaseGit(execAsParallel, workDir, phase, params.description);
-        text += r.committed ? `\n📝 Git: committed (chain of ${phase.stepsTaken} steps).` : "\n📝 Git: nothing to commit.";
-        await logPhaseResult(ctx, params.final_metric, "keep", params.description);
-      } else {
-        await abortPhaseGit(execAsParallel, workDir, phase);
-        text += "\n📝 Git: reverted to phase base (autoresearch files preserved).";
-        await logPhaseResult(ctx, params.final_metric, "discard", `phase aborted: ${params.description}`);
-      }
-      clearPhase(runtime.phaseStore);
-      clearPersistedPhase(workDir);
-      return { content: [{ type: "text", text }], details: { decision: dec.decision, phaseId: phase.id } };
-    },
-  });
-
-  if (PARALLEL_TOOLS_ENABLED) pi.registerTool({
-    name: "abortPhase",
-    label: "Abort a multi-step phase",
-    description: "Прервать фазу: revert к phaseBase/best-checkpoint без валидации финальной метрики.",
-    promptSnippet: "Abort active phase, revert to base",
-    parameters: Type.Object({ reason: Type.Optional(Type.String()) }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const runtime = getRuntime(ctx);
-      const workDir = resolveWorkDir(ctx.cwd);
-      const phase = runtime.phaseStore.active;
-      if (!phase) return { content: [{ type: "text", text: "ℹ️ No active phase to abort." }], details: {} };
-      await abortPhaseGit(execAsParallel, workDir, phase);
-      clearPhase(runtime.phaseStore);
-      clearPersistedPhase(workDir);
-      return { content: [{ type: "text", text: `🛑 Phase "${phase.name}" aborted${params.reason ? `: ${params.reason}` : ""}. Reverted to base.` }], details: { aborted: true, phaseId: phase.id } };
-    },
-  });
-
-  if (PARALLEL_TOOLS_ENABLED) pi.registerTool({
-    name: "valleyProbe",
-    label: "Valley probe — escape a stuck phase",
-    description:
-      "Фаза застряла в долине (дошла до maxSteps без улучшения). Пускает параллельные worktree от best-checkpoint (или phaseBase) с разными стратегиями продолжения. Переиспользует BestOfN-инфру. Победитель возвращается как diff для apply+re-measure на main (ТЗ §11.5 М2).",
-    promptSnippet: "Spawn parallel continuations from a phase checkpoint",
-    parameters: Type.Object({
-      from_commit: Type.Optional(Type.String({ description: "Commit to probe from (default: active phase best-checkpoint, else phaseBase)." })),
-      strategies: Type.Array(Type.String()),
-      baseline_metric: Type.Optional(Type.Number()),
-      metric_name: Type.Optional(Type.String()),
-      direction: Type.Optional(Type.String()),
-      model: Type.Optional(Type.String()),
-      budget_seconds: Type.Optional(Type.Number()),
-      concurrency: Type.Optional(Type.Number()),
-    }),
-    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-      const runtime = getRuntime(ctx);
-      if (!runtime.autoresearchMode) return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF." }], details: {} };
-      const workDir = resolveWorkDir(ctx.cwd);
-      const repoRoot = resolveRepoRoot(workDir);
-      const config = resolveConfig(readConfigJson(workDir));
-      const rpc = new RpcClient(pi.events);
-      if (!await rpc.ping()) return { content: [{ type: "text", text: "❌ pi-subagents RPC bridge not ready." }], details: {} };
-      const phase = runtime.phaseStore.active;
-      const fromCommit = params.from_commit ?? phase?.bestCheckpointSha ?? phase?.phaseBase;
-      const baselineMetric = params.baseline_metric ?? phase?.baselineMetric ?? runtime.state.bestMetric;
-      if (!fromCommit || baselineMetric === null || baselineMetric === undefined) {
-        return { content: [{ type: "text", text: "❌ Need from_commit + baseline_metric (or an active phase with a checkpoint)." }], details: {} };
-      }
-      const _progressLines: string[] = [];
-      const onProgress = onUpdate ? (msg: string) => {
-        _progressLines.push(msg);
-        onUpdate({ content: [{ type: "text", text: _progressLines.join("\n") }], details: { phase: "valley" } });
-      } : undefined;
-      try {
-        const probe = await runValleyProbe(
-          { rpc, exec: execAsParallel, runCmd: runBashForParallel, repoRoot, workDir, config, onProgress },
-          {
-            fromCommit, baselineMetric, strategies: params.strategies,
-            metricName: params.metric_name ?? runtime.state.metricName,
-            direction: (params.direction as Direction) ?? runtime.state.bestDirection,
-            sessionName: runtime.state.name ?? "parallel-valley",
-            modelOverride: params.model, budgetSeconds: params.budget_seconds, concurrency: params.concurrency,
-          },
-        );
-        if (!probe.escaped || !probe.confirmed) {
-          return { content: [{ type: "text", text: `Valley probe: no strategy confirmed at full re-measure. Ranked (quick):
-` + probe.ranked.map((r) => `  #${r.index + 1} ${r.status} quick=${r.medianMetric ?? "-"}`).join("\n") + "\n→ abortPhase to revert." }], details: probe };
-        }
-        // Winner was confirmed by full re-measurement in its worktree.
-        // Apply the diff to main so the agent can log_experiment(keep).
-        try {
-          await applyDiff(execAsParallel, workDir, probe.winnerDiff);
-        } catch (e) {
-          return { content: [{ type: "text", text: `❌ valleyProbe: confirmed winner but diff apply failed: ${e instanceof Error ? e.message : String(e)}` }], details: probe };
-        }
-        const text = `Valley probe escaped! winner quick=${probe.winnerMetric}, confirmed(full)=${probe.confirmedMetric} (cascade tried ${probe.ranked.filter((r) => r.status === "ok").length} candidates).`;
-        return { content: [{ type: "text", text: text + `\n→ log_experiment(status="keep", metric=${probe.confirmedMetric}, description="valley probe confirmed")` }], details: probe };
-      } catch (e) {
-        return { content: [{ type: "text", text: `❌ valleyProbe failed: ${e instanceof Error ? e.message : String(e)}` }], details: {} };
-      }
-    },
-  });
-
-  // Helper: log a phase outcome as a normal experiment result (bestMetric-based keep/discard).
-  async function logPhaseResult(ctx: ExtensionContext, metric: number, status: "keep" | "discard", description: string): Promise<void> {
-    const runtime = getRuntime(ctx);
-    const state = runtime.state;
-    const workDir = resolveWorkDir(ctx.cwd);
-    const head = (await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: resolveRepoRoot(workDir), timeout: 5000 })).stdout.trim() || "0000000";
-    const phaseEpoch = measurementScaleStatusOfDir(workDir).epoch;
-    state.results.push({
-      commit: head.slice(0, 7), metric, metrics: {}, status, description,
-      timestamp: Date.now(), segment: state.currentSegment, epoch: phaseEpoch, confidence: null,
-    });
-    runtime.experimentsThisSession++;
-    state.bestMetric = findBaselineMetric(state.results, state.currentSegment, phaseEpoch);
-    state.confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection, phaseEpoch);
-    try {
-      const jsonlPath = autoresearchJsonlPath(resolveWorkDir(ctx.cwd));
-      ensureParentDir(jsonlPath);
-      fs.appendFileSync(jsonlPath, JSON.stringify({ run: state.results.length, commit: head.slice(0, 7), metric, status, description, segment: state.currentSegment, epoch: phaseEpoch, source: "phase" }) + "\n");
-      broadcastDashboardUpdate(resolveWorkDir(ctx.cwd));
-    } catch { /* best-effort */ }
-  }
-
-  if (PARALLEL_TOOLS_ENABLED) pi.registerTool({
-    name: "CheckOrthogonal",
-    label: "Stack orthogonal patches",
-    description:
-      "Проверяет ортогональные патчи (по фактическому file-scope из diff) и стекаёт их на main с re-measure после каждого. File-scope пересечение → отказ. Реализует ТЗ §10.",
-    promptSnippet: "Stack independent file-scoped patches with per-patch re-measure",
-    parameters: Type.Object({
-      patches: Type.Array(Type.Object({ name: Type.String(), hypothesis: Type.String(), file_scope: Type.Optional(Type.Array(Type.String())) })),
-      metric_name: Type.String(),
-      direction: Type.Optional(Type.String()),
-      metric_unit: Type.Optional(Type.String()),
-      model: Type.Optional(Type.String()),
-      budget_seconds: Type.Optional(Type.Number()),
-      concurrency: Type.Optional(Type.Number()),
-    }),
-    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-      const runtime = getRuntime(ctx);
-      if (!runtime.autoresearchMode) return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF." }], details: {} };
-      const workDir = resolveWorkDir(ctx.cwd);
-      const repoRoot = resolveRepoRoot(workDir);
-      const config = resolveConfig(readConfigJson(workDir));
-      const rpc = new RpcClient(pi.events);
-      if (!await rpc.ping()) return { content: [{ type: "text", text: "❌ pi-subagents RPC bridge not ready." }], details: {} };
-      const _progressLines: string[] = [];
-      const onProgress = onUpdate ? (msg: string) => {
-        _progressLines.push(msg);
-        onUpdate({ content: [{ type: "text", text: _progressLines.join("\n") }], details: { phase: "orthogonal" } });
-      } : undefined;
-      try {
-        const result = await runCheckOrthogonal(
-          { rpc, exec: execAsParallel, runCmd: runBashForParallel, repoRoot, workDir, config, onProgress },
-          {
-            patches: params.patches.map((p: { name: string; hypothesis: string; file_scope?: string[] }) => ({ name: p.name, hypothesis: p.hypothesis, fileScope: p.file_scope })),
-            metricName: params.metric_name,
-            direction: (params.direction as Direction) ?? "lower",
-            metricUnit: params.metric_unit,
-            sessionName: runtime.state.name ?? "parallel-orthogonal",
-            modelOverride: params.model,
-            budgetSeconds: params.budget_seconds,
-            concurrency: params.concurrency,
-          },
-        );
-        let text = `CheckOrthogonal: ${result.decision}` + (result.reason ? ` (${result.reason})` : "") + "\n";
-        text += `orthogonal=${result.independence.orthogonal}  stacked=${result.stackedMetric ?? "-"}  baseline=${result.baselineMetric}\n`;
-        if (!result.independence.orthogonal) {
-          for (const c of result.independence.conflicts) text += `  ⚠️ conflict ${c.a} ↔ ${c.b}: ${c.sharedFiles.join(", ")}\n`;
-        }
-        for (const p of result.perPatch) text += `  ${p.name} — ${p.status} metric=${p.metric ?? "-"} Δ=${p.improvement ?? "-"} files=[${p.fileScopeActual.join(",")}]\n`;
-        for (const r of result.rejected) text += `  rejected ${r.name}: ${r.reason}\n`;
-        if (result.applied.length) text += `\napplied: ${result.applied.join(", ")}\n→ log_experiment(status="keep", metric=${result.stackedMetric}, description="orthogonal stack")`;
-        else text += `\n→ log_experiment(status="discard", metric=0, description="orthogonal stack none")`;
-        return { content: [{ type: "text", text }], details: result };
-      } catch (e) {
-        return { content: [{ type: "text", text: `❌ CheckOrthogonal failed: ${e instanceof Error ? e.message : String(e)}` }], details: {} };
-      }
-    },
-  });
-
-  if (PARALLEL_TOOLS_ENABLED) pi.registerTool({
-    name: "SpaceSearch",
-    label: "Beam space search",
-    description:
-      "Stateful beam search: init → step (×K состояний × M кандидатов с diversity hints) → finish (cherry-pick цепочки лучшего state, re-measure full). С regression-lookahead pruning — beam может регрессировать до allowedRegressionSteps прежде чем быть отсечённым. Реализует ТЗ §11, §11.5 М3.",
-    promptSnippet: "Beam search across solution space (stateful: init/step/finish/status)",
-    parameters: Type.Object({
-      action: Type.String({ description: "init | step | finish | status" }),
-      beam_width: Type.Optional(Type.Number()),
-      candidates_per_state: Type.Optional(Type.Number()),
-      diversity_hints: Type.Optional(Type.Array(Type.String())),
-      metric_name: Type.Optional(Type.String()),
-      direction: Type.Optional(Type.String()),
-      metric_unit: Type.Optional(Type.String()),
-      model: Type.Optional(Type.String()),
-      budget_seconds: Type.Optional(Type.Number()),
-      allowed_regression_steps: Type.Optional(Type.Number()),
-    }),
-    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
-      const runtime = getRuntime(ctx);
-      if (!runtime.autoresearchMode) return { content: [{ type: "text", text: "❌ Autoresearch mode is OFF." }], details: {} };
-      const workDir = resolveWorkDir(ctx.cwd);
-      const repoRoot = resolveRepoRoot(workDir);
-      const config = resolveConfig(readConfigJson(workDir));
-      const rpc = new RpcClient(pi.events);
-      const _progressLines: string[] = [];
-      const onProgress = onUpdate ? (msg: string) => {
-        _progressLines.push(msg);
-        onUpdate({ content: [{ type: "text", text: _progressLines.join("\n") }], details: { phase: "spacesearch" } });
-      } : undefined;
-      const sctx = { rpc, exec: execAsParallel, runCmd: runBashForParallel, repoRoot, workDir, config, onProgress };
-      const sopts = {
-        beamWidth: params.beam_width, candidatesPerState: params.candidates_per_state, diversityHints: params.diversity_hints,
-        metricName: params.metric_name ?? runtime.state.metricName, direction: (params.direction as Direction) ?? runtime.state.bestDirection,
-        metricUnit: params.metric_unit, sessionName: runtime.state.name ?? "parallel-spacesearch",
-        modelOverride: params.model, budgetSeconds: params.budget_seconds, allowedRegressionSteps: params.allowed_regression_steps,
-      };
-      try {
-        if (params.action === "status") {
-          const s = statusBeam(workDir);
-          return { content: [{ type: "text", text: s ? `beam step=${s.step}, width=${s.beamWidth}, states=${s.states.length}\n` + s.states.map((x: { commit: string; metric: number; hypothesis: string; depth: number }) => `  ${x.commit} metric=${x.metric} depth=${x.depth} (${x.hypothesis})`).join("\n") : "No active beam." }], details: { beam: s } };
-        }
-        if (params.action === "init") {
-          if (!await rpc.ping()) return { content: [{ type: "text", text: "❌ pi-subagents RPC bridge not ready." }], details: {} };
-          const r = await initBeam(sctx, sopts);
-          if (!r.ok) return { content: [{ type: "text", text: `❌ init failed: ${r.error}` }], details: { reason: r.reason } };
-          return { content: [{ type: "text", text: `Beam initialized: width=${r.beam.beamWidth}, candidates/state=${r.beam.candidatesPerState}, baseline=${r.beam.states[0]?.metric}. Drive with action=step until converged, then action=finish.` }], details: { beam: r.beam } };
-        }
-        if (params.action === "step") {
-          if (!await rpc.ping()) return { content: [{ type: "text", text: "❌ pi-subagents RPC bridge not ready." }], details: {} };
-          const r = await stepBeam(sctx, sopts);
-          if (!r.ok) return { content: [{ type: "text", text: `❌ step failed: ${r.error}` }], details: {} };
-          let text = `step ${r.beam.step}: improved=${r.improved}, converged=${r.converged}\n`;
-          for (const x of r.beam.states) text += `  ${x.commit} metric=${x.metric} depth=${x.depth} (${x.hypothesis}) streak=${x.regressionStreak}\n`;
-          if (r.converged) text += `\nBeam converged (no improvement). Call action=finish to cherry-pick the best chain + re-measure.`;
-          return { content: [{ type: "text", text }], details: { beam: r.beam, improved: r.improved, converged: r.converged } };
-        }
-        if (params.action === "finish") {
-          const r = await finishBeam(sctx, sopts);
-          let text = `finish: ${r.decision}` + (r.reason ? ` (${r.reason})` : "") + ` final=${r.finalMetric ?? "-"}\n`;
-          if (r.decision === "keep") text += `→ log_experiment(status="keep", metric=${r.finalMetric}, description="space search winner")`;
-          else text += `→ log_experiment(status="discard", metric=0, description="space search no winner")`;
-          return { content: [{ type: "text", text }], details: r };
-        }
-        return { content: [{ type: "text", text: "❌ action must be init|step|finish|status" }], details: {} };
-      } catch (e) {
-        return { content: [{ type: "text", text: `❌ SpaceSearch failed: ${e instanceof Error ? e.message : String(e)}` }], details: {} };
-      }
-    },
-  });
-
-  // ═══════════════════════════════════════════════════════════════════
   // Experiment Tree tools (Phase 1.1–1.3)
   // ═════════════════════════════════════════════════════════════════
-
-  // ── explore_from: backtrack to any tree node ──
-  if (BRANCHING_TOOLS_ENABLED) registerGatedTool({
-    name: "explore_from",
-    label: "Backtrack to a tree node and explore from there",
-    description:
-      "Backtrack to any node in the experiment tree. Checks out the node's commit (detached HEAD) " +
-      "and sets it as the new active point for future experiments. " +
-      "Use when the current branch has many failures (6+) or when tree_status suggests a more promising node. " +
-      "After exploring, call restore_main() to return to the main branch.",
-    promptSnippet: 'Backtrack to a different part of the experiment tree',
-    promptGuidelines: [
-      "Use explore_from when the current branch has many failures or tree_status suggests a better starting point.",
-      "explore_from creates a detached HEAD — always call restore_main() when done exploring that branch.",
-      "Ghost nodes (discard/crash) cannot be explored from — they have no commit.",
-    ],
-    parameters: {
-      type: "object",
-      properties: {
-        node_id: {
-          type: "string",
-          description: 'ID of the tree node to explore from (e.g. "n2", "n6"). Use tree_status to see available nodes.',
-        },
-      },
-      required: ["node_id"],
-    } as any,
-    async execute(_toolCallId: string, params: { node_id: string }, _signal, _onUpdate, ctx: ExtensionContext) {
-      const modeGate = assertModeActive(ctx);
-      if (modeGate) return modeGate;
-      const workDir = resolveWorkDir(ctx.cwd);
-
-      if (!treeExists(workDir)) {
-        return {
-          content: [{ type: "text", text: "❌ No experiment tree found. Call init_experiment first." }],
-          details: {},
-        };
-      }
-
-      const tree = loadTree(workDir);
-      if (!tree) {
-        return {
-          content: [{ type: "text", text: "❌ Failed to load experiment tree." }],
-          details: {},
-        };
-      }
-
-      const node = tree.nodes[params.node_id];
-      if (!node) {
-        return {
-          content: [{ type: "text", text: `❌ Node ${params.node_id} not found in tree. Call tree_status() to see available nodes.` }],
-          details: {},
-        };
-      }
-
-      if (!node.commit) {
-        return {
-          content: [{ type: "text", text: `❌ Node ${params.node_id} is a ghost node (status: ${node.status}). No commit to checkout.` }],
-          details: { node },
-        };
-      }
-
-      // Verify commit is accessible
-      try {
-        const catFile = await pi.exec("git", ["cat-file", "-e", node.commit], { cwd: workDir, timeout: 5000 });
-        if (catFile.code !== 0) {
-          return {
-            content: [{ type: "text", text: `❌ Commit ${node.commit} for node ${params.node_id} is not accessible (may have been GC'd).` }],
-            details: { node },
-          };
-        }
-      } catch {
-        return {
-          content: [{ type: "text", text: `❌ Could not verify commit ${node.commit}. Is git available?` }],
-          details: { node },
-        };
-      }
-
-      // Save current branch for restore_main()
-      try {
-        const branchRes = await pi.exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: workDir, timeout: 5000 });
-        const currentBranch = (branchRes.stdout || "").trim();
-        if (currentBranch && currentBranch !== "HEAD") {
-          tree.savedBranch = currentBranch;
-        } else if (!tree.savedBranch) {
-          // Already detached — save main as fallback
-          tree.savedBranch = "main";
-        }
-      } catch {
-        // best-effort
-      }
-
-      // Checkout the node's commit (detached HEAD)
-      try {
-        const checkoutRes = await pi.exec("git", ["checkout", "--detach", node.commit], { cwd: workDir, timeout: 30000 });
-        if (checkoutRes.code !== 0) {
-          return {
-            content: [{ type: "text", text: `❌ git checkout failed: ${checkoutRes.stderr || checkoutRes.stdout}` }],
-            details: { node },
-          };
-        }
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return {
-          content: [{ type: "text", text: `❌ git checkout error: ${msg}` }],
-          details: { node },
-        };
-      }
-
-      // Update active node
-      tree.activeNodeId = params.node_id;
-      saveTree(workDir, tree);
-
-      // Build response
-      const path = getPath(tree, params.node_id);
-      const children = getChildren(tree, params.node_id);
-      const pathStr = path.join(" → ");
-
-      let text = `📍 explore_from(${params.node_id})\n`;
-      text += `Moved to node ${params.node_id} (metric: ${node.metric}, "${node.hypothesisLabel || node.hypothesis}").\n`;
-      text += `Path: ${pathStr}\n`;
-
-      if (children.length > 0) {
-        text += `\nChildren (already tried from here):\n`;
-        for (const c of children) {
-          text += `  ${c.id}  "${c.hypothesisLabel || c.hypothesis}"  ${c.status}\n`;
-        }
-      } else {
-        text += `\nNo children — this node is unexplored. Good starting point.\n`;
-      }
-
-      const fCount = countFailedChildren(tree, params.node_id);
-      if (fCount >= 6) {
-        text += `\n⚠️ ${fCount} failed attempts were tried from this node. You can still explore from here.\n`;
-      }
-
-      text += `\n⚠️ Detached HEAD. Call restore_main() to return to the main branch.\n`;
-      text += `Now experiment from here. Check tree_status() for UCB1 suggestions.\n`;
-
-      return {
-        content: [{ type: "text", text }],
-        details: { node, path, children, warning: "Detached HEAD — call restore_main() to return." },
-      };
-    },
-
-    renderCall(args, theme) {
-      let text = theme.fg("toolTitle", theme.bold("explore_from "));
-      text += theme.fg("info", args.node_id || "?");
-      return new Text(text, 0, 0);
-    },
-
-    renderResult(result, _options, theme) {
-      const t = result.content[0];
-      return new Text(t?.type === "text" ? t.text : "", 0, 0);
-    },
-  });
-
-  // ── restore_main: return from detached HEAD to main branch ──
-  if (BRANCHING_TOOLS_ENABLED) registerGatedTool({
-    name: "restore_main",
-    label: "Return to main branch from explore_from",
-    description:
-      "Return from a detached HEAD (created by explore_from) to the main branch. " +
-      "Sets the active node to the last keep-node on main. " +
-      "Always call this after explore_from when you're done exploring that branch.",
-    promptSnippet: "Return to main branch after explore_from",
-    promptGuidelines: [
-      "Always call restore_main() after explore_from when you're done exploring.",
-    ],
-    parameters: {
-      type: "object",
-      properties: {},
-    } as any,
-    async execute(_toolCallId: string, _params: Record<string, never>, _signal, _onUpdate, ctx: ExtensionContext) {
-      const modeGate = assertModeActive(ctx);
-      if (modeGate) return modeGate;
-      const workDir = resolveWorkDir(ctx.cwd);
-
-      if (!treeExists(workDir)) {
-        return {
-          content: [{ type: "text", text: "❌ No experiment tree found." }],
-          details: {},
-        };
-      }
-
-      const tree = loadTree(workDir);
-      if (!tree) {
-        return {
-          content: [{ type: "text", text: "❌ Failed to load experiment tree." }],
-          details: {},
-        };
-      }
-
-      if (!tree.savedBranch) {
-        return {
-          content: [{ type: "text", text: "ℹ️ No saved branch — already on main?" }],
-          details: { activeNodeId: tree.activeNodeId },
-        };
-      }
-
-      // Checkout the saved branch
-      try {
-        const checkoutRes = await pi.exec("git", ["checkout", tree.savedBranch], { cwd: workDir, timeout: 30000 });
-        if (checkoutRes.code !== 0) {
-          return {
-            content: [{ type: "text", text: `❌ git checkout failed: ${checkoutRes.stderr || checkoutRes.stdout}` }],
-            details: {},
-          };
-        }
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return {
-          content: [{ type: "text", text: `❌ git checkout error: ${msg}` }],
-          details: {},
-        };
-      }
-
-      // Find the last keep-node on the main branch (the one whose commit == HEAD)
-      let activeNodeId = tree.rootId;
-      try {
-        const headRes = await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: workDir, timeout: 5000 });
-        const headSha = (headRes.stdout || "").trim();
-        for (const [id, n] of Object.entries(tree.nodes)) {
-          if (n.commit === headSha && n.status === "keep") {
-            activeNodeId = id;
-            break;
-          }
-        }
-      } catch {
-        // best-effort — keep rootId
-      }
-
-      tree.activeNodeId = activeNodeId;
-      const restoredBranch = tree.savedBranch;
-      tree.savedBranch = null;
-      saveTree(workDir, tree);
-
-      const activeNode = tree.nodes[activeNodeId];
-      let text = `✅ restore_main() — returned to ${restoredBranch || "main"}\n`;
-      text += `Active node: ${activeNodeId} (metric: ${activeNode?.metric ?? "?"}, "${activeNode?.hypothesisLabel || activeNode?.hypothesis || ""}")\n`;
-      text += `Ready to continue experimenting on the main branch.`;
-
-      return {
-        content: [{ type: "text", text }],
-        details: { activeNodeId, activeNode },
-      };
-    },
-
-    renderCall(_args, theme) {
-      return new Text(theme.fg("toolTitle", theme.bold("restore_main")), 0, 0);
-    },
-
-    renderResult(result, _options, theme) {
-      const t = result.content[0];
-      return new Text(t?.type === "text" ? t.text : "", 0, 0);
-    },
-  });
 
   // ── tree_status: show tree + UCB1 suggestions ──
 
@@ -7871,133 +7110,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         content: [{ type: "text", text }],
         details: { councilSeq: seq, outcome: "manual-protocol", pending: pending !== null },
       };
-    },
-  });
-
-  // ── compose: merge orthogonal improvements from two branches ──
-  if (BRANCHING_TOOLS_ENABLED) registerGatedTool({
-    name: "compose",
-    label: "Merge orthogonal improvements from two tree branches",
-    description:
-      "Combine changes from two different tree branches by applying their diffs at the merge-base. " +
-      "Phase 1: only orthogonal changes (different files) are supported. " +
-      "Use compose when tree_status shows two promising branches that touch different files. " +
-      "After compose, benchmark and log_experiment(status='keep') to record the composed result.",
-    promptSnippet: "Combine orthogonal improvements from different branches",
-    promptGuidelines: [
-      "compose(node_a, node_b) merges diffs from two branches. Only works for orthogonal changes (different files).",
-      "Use compose when two branches show independent improvements — e.g., one optimizes parsing, another optimizes dispatch.",
-      "compose does NOT benchmark — you need to run_experiment and log_experiment after composing.",
-    ],
-    parameters: {
-      type: "object",
-      properties: {
-        node_a: { type: "string", description: 'First node ID (e.g. "n1")' },
-        node_b: { type: "string", description: 'Second node ID (e.g. "n7")' },
-      },
-      required: ["node_a", "node_b"],
-    } as any,
-    async execute(_toolCallId: string, params: { node_a: string; node_b: string }, _signal, _onUpdate, ctx: ExtensionContext) {
-      const modeGate = assertModeActive(ctx);
-      if (modeGate) return modeGate;
-      const workDir = resolveWorkDir(ctx.cwd);
-
-      if (!treeExists(workDir)) {
-        return {
-          content: [{ type: "text", text: "❌ No experiment tree found." }],
-          details: {},
-        };
-      }
-
-      const tree = loadTree(workDir);
-      if (!tree) {
-        return {
-          content: [{ type: "text", text: "❌ Failed to load experiment tree." }],
-          details: {},
-        };
-      }
-
-      const nodeA = tree.nodes[params.node_a];
-      const nodeB = tree.nodes[params.node_b];
-
-      if (!nodeA || !nodeB) {
-        const missing = !nodeA ? params.node_a : params.node_b;
-        return {
-          content: [{ type: "text", text: `❌ Node ${missing} not found in tree.` }],
-          details: {},
-        };
-      }
-
-      if (!nodeA.commit || !nodeB.commit) {
-        const ghost = !nodeA.commit ? params.node_a : params.node_b;
-        return {
-          content: [{ type: "text", text: `❌ Node ${ghost} is a ghost (no commit). Cannot compose ghost nodes.` }],
-          details: {},
-        };
-      }
-
-      if (params.node_a === params.node_b) {
-        return {
-          content: [{ type: "text", text: `❌ Cannot compose a node with itself.` }],
-          details: {},
-        };
-      }
-
-      // Execute compose
-      const execFn = (cmd: string, args: string[], opts?: { cwd?: string; timeout?: number }) =>
-        pi.exec(cmd, args, opts);
-
-      const result = await composeDiffs(execFn, workDir, workDir, tree, nodeA, nodeB);
-
-      let text = `🔗 compose(${params.node_a}, ${params.node_b})\n`;
-      text += `  ${params.node_a}  "${nodeA.hypothesisLabel || nodeA.hypothesis}"\n`;
-      text += `  ${params.node_b}  "${nodeB.hypothesisLabel || nodeB.hypothesis}"\n`;
-
-      if (result.lcaCommit) {
-        text += `  LCA: ${result.lcaCommit}\n`;
-      }
-
-      if (result.conflict) {
-        text += `  ❌ CONFLICT: both nodes modify: ${result.sharedFiles.join(", ")}\n`;
-        text += `  Phase 1 only supports orthogonal composition (different files).\n`;
-        return {
-          content: [{ type: "text", text }],
-          details: { conflict: true, sharedFiles: result.sharedFiles, applied: false },
-        };
-      }
-
-      if (!result.success) {
-        text += `  ❌ FAILED: ${result.error}\n`;
-        return {
-          content: [{ type: "text", text }],
-          details: { conflict: false, applied: false, error: result.error },
-        };
-      }
-
-      text += `  ✅ Diffs applied successfully.\n`;
-      text += `  Now run_experiment to benchmark.\n`;
-      text += `  Then log_experiment(status='keep', asi={composed_from: ["${params.node_a}", "${params.node_b}"]}) to record as a compose node.`;
-
-      return {
-        content: [{ type: "text", text }],
-        details: {
-          conflict: false,
-          applied: true,
-          lcaCommit: result.lcaCommit,
-          composedFrom: [params.node_a, params.node_b],
-        },
-      };
-    },
-
-    renderCall(args, theme) {
-      let text = theme.fg("toolTitle", theme.bold("compose "));
-      text += theme.fg("info", `${args.node_a || "?"} + ${args.node_b || "?"}`);
-      return new Text(text, 0, 0);
-    },
-
-    renderResult(result, _options, theme) {
-      const t = result.content[0];
-      return new Text(t?.type === "text" ? t.text : "", 0, 0);
     },
   });
 

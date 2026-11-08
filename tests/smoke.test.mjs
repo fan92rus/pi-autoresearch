@@ -76,10 +76,7 @@ const EXPECTED_TOOLS = [
   "research_brief", "research",
 ];
 
-// Disabled tool groups (both flags false):
-// - PARALLEL_TOOLS_ENABLED: BestOfN, startPhase, commitPhase, abortPhase,
-//   valleyProbe, CheckOrthogonal, SpaceSearch
-// - BRANCHING_TOOLS_ENABLED: explore_from, restore_main, compose
+// Legacy tools removed from this build; keep asserting that none are registered.
 const DISABLED_TOOLS = [
   "BestOfN", "startPhase", "commitPhase", "abortPhase", "valleyProbe",
   "CheckOrthogonal", "SpaceSearch", "explore_from", "restore_main", "compose",

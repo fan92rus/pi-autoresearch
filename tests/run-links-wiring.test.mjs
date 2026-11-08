@@ -9,7 +9,6 @@
  *    run_epoch proven;
  *  - legacy ledger without sidecar: log_experiment behaves as before, adds only
  *    the allowed run-link warning; the fresh row is ambiguous, old rows absent;
- *  - explore status never writes a sidecar record (BR-12/T33);
  *  - log_experiment without a prior run_experiment -> no_pending warning, no sidecar;
  *  - marker and ledger bytes are byte-identical to the pre-wiring format;
  *  - marker-write failure injection -> reason incomplete -> no sidecar + warning;
@@ -165,36 +164,7 @@ test("legacy ledger without sidecar: new instrumented run links proven; old runs
 });
 
 // ---------------------------------------------------------------------------
-// 3. Explore: no sidecar record
-// ---------------------------------------------------------------------------
-
-test("explore status: ledger row written, no sidecar record; rejection before the phase guard has no side effect", async () => {
-  const h = await setup("explore");
-  await runExp(h);
-
-  // The real startPhase tool is disabled in this build (PARALLEL_TOOLS_ENABLED
-  // false), so seed the runtime phase store directly through the registered
-  // startPhase-free surface: reuse the tool execution context to call the
-  // phases module against the runtime the explore path reads. The harness does
-  // not expose the runtime, so instead verify the two guarantees the wiring
-  // makes for explore: (a) a phaseless explore is REJECTED before any sidecar
-  // write and the pending identity survives; (b) the explore row classifies as
-  // absent (no ordinary binding, no sidecar ambiguity).
-  const res = await logExp(h, { metric: 50, status: "explore", description: "probe" });
-  assert.match(res.content[0].text, /requires an active phase/, "phaseless explore is rejected");
-  assert.equal(sidecarLines(h.dir).length, 0, "no sidecar for a rejected explore");
-
-  // The pending identity from run_experiment survived the rejection: log the
-  // run normally and it still proves (no side effect on the rejection path).
-  const logged = await logExp(h, { metric: 49, status: "discard", description: "after rejected explore" });
-  assert.doesNotMatch(logged.content[0].text, /Run link not recorded/, "pending identity survived the rejected explore");
-  assert.equal(sidecarLines(h.dir).length, 1, "the ordinary log writes its sidecar record");
-  const verdict = runLinkOf(autoDirOf(h.dir), 1);
-  assert.equal(verdict.link, "proven");
-});
-
-// ---------------------------------------------------------------------------
-// 4. No pending: log_experiment without a prior run_experiment
+// 3. No pending: log_experiment without a prior run_experiment
 // ---------------------------------------------------------------------------
 
 test("log_experiment without prior run_experiment: no sidecar, no_pending warning, row binds the fallback number", async () => {
@@ -207,7 +177,7 @@ test("log_experiment without prior run_experiment: no sidecar, no_pending warnin
 });
 
 // ---------------------------------------------------------------------------
-// 5. Byte-compat: markers and ledger rows unchanged vs the pre-wiring format
+// 4. Byte-compat: markers and ledger rows unchanged vs the pre-wiring format
 // ---------------------------------------------------------------------------
 
 test("marker and ledger bytes unchanged: run_started/run_result keys and row key order identical", async () => {
