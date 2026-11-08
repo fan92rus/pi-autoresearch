@@ -24,6 +24,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { allocateRunArtifacts, writeRunManifest } from "../extensions/pi-autoresearch/lens.ts";
 import { sessionFilePath } from "../extensions/pi-autoresearch/paths.ts";
 import { createFakePi, makeCtx } from "./fake-pi.ts";
+import { approveOptimizeBrief } from "./optimize-approve-helper.mjs";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -62,6 +63,7 @@ async function startCampaign(dir, analysisSection) {
   );
   autoresearchExtension(pi);
   await command("autoresearch").handler("on", ctx);
+  approveOptimizeBrief(ctx.cwd, { name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower" });
   await tool("init_experiment").execute("id", {
     name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower",
   }, null, null, ctx);

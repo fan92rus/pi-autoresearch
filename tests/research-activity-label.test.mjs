@@ -22,6 +22,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { createHarness } from "./fake-pi.ts";
+import { approveOptimizeBrief } from "./optimize-approve-helper.mjs";
 import { reconstructJsonlState } from "../extensions/pi-autoresearch/jsonl.ts";
 
 const ALLOWED = ["measurement", "intermediate", "verification", "attribution"];
@@ -57,6 +58,7 @@ async function setup(label) {
   const dir = makeWorkDir(label);
   const h = await createHarness({ dir, sessionId: `activity-${label}`, realGit: false });
   await h.command("autoresearch").handler("on", h.ctx);
+  approveOptimizeBrief(dir, { name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower" });
   await h.tool("init_experiment").execute("id", {
     name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower",
   }, null, null, h.ctx);

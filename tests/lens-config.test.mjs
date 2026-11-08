@@ -33,6 +33,7 @@ import {
   serializeAnalysisConfig,
 } from "../extensions/pi-autoresearch/lens-config.ts";
 import { createFakePi, makeCtx } from "./fake-pi.ts";
+import { approveOptimizeBrief } from "./optimize-approve-helper.mjs";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -94,6 +95,7 @@ async function makeCampaign(dir, analysisSection) {
 }
 
 async function callInit(session, params = { name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower" }) {
+  approveOptimizeBrief(session.ctx.cwd, params);
   return session.tool("init_experiment").execute("id", params, null, null, session.ctx);
 }
 

@@ -28,6 +28,7 @@
  * Run: node --experimental-strip-types --experimental-loader ./tests/redirect-loader.mjs --test tests/measurement-floor.test.mjs
  */
 import { test } from "node:test";
+import { markSessionStarted } from "./optimize-approve-helper.mjs";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -309,6 +310,7 @@ test("дашборд: floor_stale подавляет conf честной пом�
 
 test("keep при устаревшем floor: принят с явной пометкой, confidence подавлен", async () => {
   const dir = makeWorkDir("wiring-stale");
+  markSessionStarted(dir);
   const { tool, command, ctx } = await createHarness({ dir, sessionId: "floor-stale", realGit: true });
   await command("autoresearch").handler("on", ctx);
 
@@ -342,6 +344,7 @@ test("keep при устаревшем floor: принят с явной пом�
 
 test("после переоценки (штамп = текущая эпоха): пометка и подавление сняты", async () => {
   const dir = makeWorkDir("wiring-reeval");
+  markSessionStarted(dir);
   const { tool, command, ctx } = await createHarness({ dir, sessionId: "floor-reeval", realGit: true });
   await command("autoresearch").handler("on", ctx);
 
@@ -371,6 +374,7 @@ test("после переоценки (штамп = текущая эпоха): 
 
 test("pending-рескор + устаревший floor: обе причины в одном подавлении, пометка на месте", async () => {
   const dir = makeWorkDir("wiring-combined");
+  markSessionStarted(dir);
   const { tool, command, ctx } = await createHarness({ dir, sessionId: "floor-combined", realGit: true });
   await command("autoresearch").handler("on", ctx);
 
@@ -401,6 +405,7 @@ test("pending-рескор + устаревший floor: обе причины �
 
 test("кампания без штампа (до 2.5): keep после изменения ведёт себя как прежде", async () => {
   const dir = makeWorkDir("wiring-nostamp");
+  markSessionStarted(dir);
   const { tool, command, ctx } = await createHarness({ dir, sessionId: "floor-nostamp", realGit: true });
   await command("autoresearch").handler("on", ctx);
 
@@ -421,6 +426,7 @@ test("кампания без штампа (до 2.5): keep после изме�
 
 test("автокалибровка baseline ставит noiseFloorEpoch текущей эпохи — floor свеж", async () => {
   const dir = makeWorkDir("wiring-calibrate");
+  markSessionStarted(dir);
   fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
   fs.writeFileSync(path.join(dir, ".auto", "measure.sh"), "#!/bin/sh\necho 'METRIC ms=101'\n", "utf-8");
   const { tool, command, ctx } = await createHarness({

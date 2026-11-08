@@ -53,7 +53,7 @@ function makeWorkDir(label) {
 
 async function setup(label, { metricName = "F1" } = {}) {
   const dir = makeWorkDir(label);
-  const h = await createHarness({ dir, sessionId: `researchmap-${label}`, realGit: false });
+  const h = await createHarness({ dir, sessionId: `researchmap-${label}`, realGit: false, optimizeFixture: true });
   await h.command("autoresearch").handler("on", h.ctx);
   await h.tool("init_experiment").execute("id", {
     name: "bench", metric_name: metricName, metric_unit: "", direction: "higher",

@@ -16,6 +16,7 @@ import { pathToFileURL } from "node:url";
 
 import { mulberry32, genInt, genPick, forAll } from "./pbt-harness.mjs";
 import { createFakePi, makeCtx, readTree, readLog, readConfig } from "./fake-pi.ts";
+import { approveOptimizeBrief } from "./optimize-approve-helper.mjs";
 
 // ──────────────────────────────────────────────────────────────────────
 // RealSystem — mirrors runtime state, drives REAL tools
@@ -70,6 +71,7 @@ class RealSystem {
 
   async init() {
     await this.enableMode();
+    approveOptimizeBrief(this.ctx.cwd, { name: `bench-${this.seed}`, metric_name: "ms", metric_unit: "ms", direction: "lower" });
     const res = await this.tool("init_experiment").execute("id", {
       name: `bench-${this.seed}`,
       metric_name: "ms",

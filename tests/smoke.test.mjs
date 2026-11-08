@@ -51,7 +51,7 @@ function initGitRepo(dir) {
 }
 
 async function loadExtension(dir, sessionId = "smoke", opts = {}) {
-  const { pi, tool, command, hook } = createFakePi({ dir, sessionId, realGit: true, ...opts });
+  const { pi, tool, command, hook } = createFakePi({ dir, sessionId, realGit: true, optimizeFixture: true, ...opts });
   const ctx = makeCtx(dir, sessionId, pi);
   const { default: autoresearchExtension } = await import(
     pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")).href
@@ -66,7 +66,7 @@ async function loadExtension(dir, sessionId = "smoke", opts = {}) {
 
 console.log("## Smoke: real-extension registration");
 
-const EXPECTED_TOOLS = [
+const EXPECTED_TOOLS = ["optimize_brief", 
   "init_experiment", "propose_hypothesis", "run_experiment", "log_experiment",
   "tree_status", "finalize_research", "candidate_branch",
   "council_write_entry", "council_read_index", "council_read_entry", "council_check_consensus",
@@ -88,14 +88,14 @@ const EXPECTED_HOOKS = [
   "before_agent_start", "tool_execution_end", "tool_call",
 ];
 
-await test("registers all 25 tools (parallel + branching disabled)", async () => {
+await test("registers all 26 tools (parallel + branching disabled)", async () => {
   const dir = makeTempDir("reg");
   const { pi } = await loadExtension(dir);
   const names = pi.tools.map((t) => t.name);
   for (const expected of EXPECTED_TOOLS) {
     assert.ok(names.includes(expected), `Missing tool: ${expected}`);
   }
-  assert.strictEqual(names.length, 25, `Expected 25 tools, got ${names.length}: ${names.join(", ")}`);
+  assert.strictEqual(names.length, 26, `Expected 25 tools, got ${names.length}: ${names.join(", ")}`);
 });
 
 await test("registers all 11 hooks", async () => {

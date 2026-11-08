@@ -24,6 +24,7 @@
  * Run: node --experimental-strip-types --experimental-loader ./tests/redirect-loader.mjs --test tests/measurement-scales.test.mjs
  */
 import { test } from "node:test";
+import { markSessionStarted } from "./optimize-approve-helper.mjs";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -364,6 +365,7 @@ test("дашборд: пустое состояние показывает ст�
 
 test("index.ts: pending-изменение и keep — keep записан, ответ содержит шкалу и подавление", async () => {
   const dir = makeWorkDir("wiring");
+  markSessionStarted(dir);
   const { tool, command, ctx } = await createHarness({ dir, sessionId: "scales-wiring", realGit: true });
   await command("autoresearch").handler("on", ctx);
 
@@ -398,6 +400,7 @@ test("index.ts: pending-изменение и keep — keep записан, от
 
 test("index.ts: keep при сопоставленных шкалах показывает confidence как прежде", async () => {
   const dir = makeWorkDir("wiring-full");
+  markSessionStarted(dir);
   const { tool, command, ctx } = await createHarness({ dir, sessionId: "scales-wiring-full", realGit: true });
   await command("autoresearch").handler("on", ctx);
 

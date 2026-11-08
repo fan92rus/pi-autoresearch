@@ -42,7 +42,7 @@ function makeWorkDir(label) {
 
 async function setup(label) {
   const dir = makeWorkDir(label);
-  const h = await createHarness({ dir, sessionId: `runlinks-${label}`, realGit: false });
+  const h = await createHarness({ dir, sessionId: `runlinks-${label}`, realGit: false, optimizeFixture: true });
   await h.command("autoresearch").handler("on", h.ctx);
   await h.tool("init_experiment").execute("id", {
     name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower",
@@ -204,7 +204,7 @@ test("marker and ledger bytes unchanged: run_started/run_result keys and row key
 
 test("marker write failure: run completes, identity incomplete, no sidecar, warning present", async (t) => {
   const dir = makeWorkDir("injection");
-  const h = await createHarness({ dir, sessionId: "runlinks-injection", realGit: false });
+  const h = await createHarness({ dir, sessionId: "runlinks-injection", realGit: false, optimizeFixture: true });
   await h.command("autoresearch").handler("on", h.ctx);
   await h.tool("init_experiment").execute("id", {
     name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower",

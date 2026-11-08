@@ -23,6 +23,7 @@ import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
 import { createFakePi, makeCtx } from "./fake-pi.ts";
+import { approveOptimizeBrief } from "./optimize-approve-helper.mjs";
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -70,6 +71,7 @@ async function startCampaign(dir) {
   initGitRepo(dir);
   const session = await loadExtension(dir);
   await session.command("autoresearch").handler("on", session.ctx);
+  approveOptimizeBrief(dir, { name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower" });
   await session.tool("init_experiment").execute("id", {
     name: "bench", metric_name: "accuracy", metric_unit: "", direction: "higher",
   }, null, null, session.ctx);

@@ -1,3 +1,4 @@
+import { approveOptimizeBrief } from "./optimize-approve-helper.mjs";
 /**
  * Fake pi API harness — lets tests drive the REAL extension
  * (extensions/pi-autoresearch/index.ts) without a running pi instance.
@@ -88,6 +89,7 @@ export function createFakePi({
   realGit = false,
   execTable = {},
   extraExec,
+  optimizeFixture = false,
 } = {}) {
   const tools = [];
   const commands = [];
@@ -141,6 +143,14 @@ export function createFakePi({
     },
 
     registerTool(def) {
+      if (optimizeFixture && def.name === "init_experiment") {
+        // Fixture only: approve the ordinary-loop brief with the same args, as an owner would (optimize-two-phase-start).
+        const original = def.execute;
+        def = { ...def, execute: (id, params, signal, onUpdate, ctx) => {
+          approveOptimizeBrief(ctx.cwd, params);
+          return original(id, params, signal, onUpdate, ctx);
+        } };
+      }
       tools.push(def);
     },
 
@@ -287,7 +297,7 @@ export function makeCtx(dir, sessionId, piRef) {
  * @param {object} opts.execTable — canned exec overrides
  * @returns {{ pi, tool, command, hook, hookAll, ctx, events, cleanup }}
  */
-export async function createHarness({ dir, sessionId = "test", realGit = true, execTable = {} }) {
+export async function createHarness({ dir, sessionId = "test", realGit = true, execTable = {}, optimizeFixture = false }) {
   // Ensure dir exists
   fs.mkdirSync(dir, { recursive: true });
 
@@ -304,7 +314,7 @@ export async function createHarness({ dir, sessionId = "test", realGit = true, e
     } catch { /* may already be a repo */ }
   }
 
-  const { pi, tool, command, hook, hookAll, events } = createFakePi({ dir, sessionId, realGit, execTable });
+  const { pi, tool, command, hook, hookAll, events } = createFakePi({ dir, sessionId, realGit, execTable, optimizeFixture });
   const ctx = makeCtx(dir, sessionId, pi);
 
   // Load the REAL extension

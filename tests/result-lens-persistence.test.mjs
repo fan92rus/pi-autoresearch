@@ -32,7 +32,7 @@ function initGitRepo(dir) {
 }
 
 async function loadExtension(dir, sessionId = "lens") {
-  const { pi, tool, command, hook } = createFakePi({ dir, sessionId, realGit: true });
+  const { pi, tool, command, hook } = createFakePi({ dir, sessionId, realGit: true, optimizeFixture: true });
   const ctx = makeCtx(dir, sessionId, pi);
   const { default: autoresearchExtension } = await import(
     pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")).href

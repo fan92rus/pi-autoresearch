@@ -59,7 +59,7 @@ function firstJsonLine(text) {
 async function setupHarness(label) {
   const dir = path.join(os.tmpdir(), `pi-ar-rm-accept-${label}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
   fs.mkdirSync(dir, { recursive: true });
-  const h = await createHarness({ dir, sessionId: `rm-accept-${label}`, realGit: false });
+  const h = await createHarness({ dir, sessionId: `rm-accept-${label}`, realGit: false, optimizeFixture: true });
   await h.command("autoresearch").handler("on", h.ctx);
   await h.tool("init_experiment").execute("id", {
     name: "bench", metric_name: "F1", metric_unit: "", direction: "higher",
