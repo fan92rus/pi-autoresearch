@@ -13,7 +13,7 @@ export const SUBCOMMANDS: readonly Subcommand[] = [
   { name: "research", description: "Start a research campaign (briefing via research_brief; supports headless launch)." },
   { name: "finalize", description: "Stop the loop and turn kept experiments into reviewable branches." },
   { name: "report", description: "Write the campaign report to .auto/report.md now, without stopping the loop." },
-  { name: "clear", description: "Delete the session log (.auto/log.jsonl) and turn autoresearch mode off." },
+  { name: "clear", description: "Delete experiment session data (log, findings, observations, analysis, report, ideas, runs) and turn autoresearch mode off; refuses while a research or candidate campaign is active." },
   { name: "export", description: "Open a local live dashboard for the session log in your browser." },
   { name: "dashboard", description: "Open the fullscreen dashboard overlay in the terminal." },
   { name: "help", description: "Show this help." },

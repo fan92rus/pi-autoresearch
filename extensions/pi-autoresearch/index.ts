@@ -2722,7 +2722,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "",
       "<text> enters autoresearch mode and starts or resumes the loop.",
       "off leaves autoresearch mode.",
-      "clear deletes the session log (.auto/log.jsonl) and turns autoresearch mode off.",
+      "clear deletes experiment session data (log, findings, observations, analysis, report, ideas, runs) and turns autoresearch mode off; refuses while a research or candidate campaign is active.",
       "config opens an interactive dialog to set the experiment time limit, worker models, concurrency, and budget.",
       "limit sets the experiment time limit: limit 5 — 5 minutes per run_experiment; limit off — remove; limit — interactive dialog.",
       "export opens a local live dashboard for the session log in your browser.",
@@ -8937,6 +8937,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       if (command === "clear") {
         const workDir = resolveWorkDir(ctx.cwd);
+        // Clearing the ordinary experiment state under an active campaign
+        // would corrupt its evidence/ledger. Refuse before any runtime or disk
+        // mutation; campaign-specific commands own their cleanup lifecycle.
+        if (researchCampaignExists(workDir)) {
+          ctx.ui.notify("Research campaign active — complete or remove it first before clearing autoresearch data", "info");
+          return;
+        }
+        if (await campaignBlocksOrdinaryLoop(workDir)) {
+          ctx.ui.notify("Candidate campaign active — complete or disable it first before clearing autoresearch data", "info");
+          return;
+        }
         const jsonlPaths = sessionFileCandidates(workDir, "log");
         recordAutoresearchActivation(workDir, false);
         setAutoresearchMode(ctx, false);
@@ -8951,23 +8962,35 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         updateWidget(ctx);
 
         const deletedPaths: string[] = [];
-        for (const jsonlPath of Object.values(jsonlPaths)) {
-          if (!fs.existsSync(jsonlPath)) continue;
+        const removePath = (target: string, recursive = false): boolean => {
+          if (!fs.existsSync(target)) return true;
+          const relative = path.relative(workDir, target) || path.basename(target);
           try {
-            fs.unlinkSync(jsonlPath);
-            deletedPaths.push(path.relative(workDir, jsonlPath) || path.basename(jsonlPath));
+            if (recursive) fs.rmSync(target, { recursive: true, force: true });
+            else fs.unlinkSync(target);
+            deletedPaths.push(relative);
+            return true;
           } catch (error) {
             ctx.ui.notify(
-              `Failed to delete ${path.relative(workDir, jsonlPath) || path.basename(jsonlPath)}: ${error instanceof Error ? error.message : String(error)}`,
+              `Failed to delete ${relative}: ${error instanceof Error ? error.message : String(error)}`,
               "error"
             );
-            return;
+            return false;
           }
+        };
+        for (const jsonlPath of Object.values(jsonlPaths)) {
+          if (!removePath(jsonlPath)) return;
         }
 
-        // Also clear ideas directory
-        const ideasDir = path.join(workDir, ".auto", "ideas");
-        try { fs.rmSync(ideasDir, { recursive: true, force: true }); } catch { /* ignore */ }
+        // Per-campaign experiment artifacts are stale after clear; preserve
+        // owner configuration and research/candidate campaign history.
+        const autoDir = path.join(workDir, ".auto");
+        for (const relative of ["findings.jsonl", "observations.jsonl", "analysis.jsonl", "report.md"]) {
+          if (!removePath(path.join(autoDir, relative))) return;
+        }
+        for (const relative of ["ideas", "runs"]) {
+          if (!removePath(path.join(autoDir, relative), true)) return;
+        }
 
         if (deletedPaths.length > 0) {
           ctx.ui.notify(`Deleted ${deletedPaths.join(", ")} and turned autoresearch mode OFF`, "info");
