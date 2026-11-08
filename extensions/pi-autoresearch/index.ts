@@ -8584,7 +8584,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (!approved.ok) {
       return optimizeRefusal(`❌ init_experiment refused (${approved.reason}): ${approved.message}. Order: optimize_brief draft → propose → init_experiment.`);
     }
-    const diffs = optimizeBrief.initArgsMismatch(approved.brief, params);
+    // A pinned session (init with cwd earlier) writes to workDir even without cwd: compare what is actually written.
+    const effectiveCwd = params.cwd === undefined && workDir !== path.resolve(ctx.cwd) ? workDir : params.cwd;
+    const diffs = optimizeBrief.initArgsMismatch(approved.brief, { ...params, cwd: effectiveCwd });
     if (diffs.length > 0) {
       return optimizeRefusal(`❌ init_experiment does not match the approved brief:\n- ${diffs.join("\n- ")}\nDraft the new values with optimize_brief draft and propose them again.`);
     }

@@ -233,3 +233,31 @@ test("N5: propose refuses a brief argument instead of ignoring it", async () => 
   const text = await run(h, "optimize_brief", { action: "propose", brief: briefArgs({ metric_name: "other" }) });
   assert.match(text, /propose takes no brief/);
 });
+
+test("B2 round 2: U+2028 and U+0085 in a name are refused at draft", async () => {
+  const dir = makeWorkDir("unicode-breaks");
+  const h = await loadBare(dir, "unicode-breaks");
+  for (const name of ["liquid\u2028speed", "liquid\u0085speed"]) {
+    const text = await run(h, "optimize_brief", { action: "draft", brief: briefArgs({ name }) });
+    assert.match(text, /single line/, `name with ${JSON.stringify(name)} must be refused`);
+  }
+  assert.equal(fs.existsSync(path.join(dir, ".auto", "optimize", "brief.json")), false);
+});
+
+test("B4: a pinned session (init with cwd) refuses a cwd-less brief and writes nothing to the pinned dir", async () => {
+  const dir = makeWorkDir("pin-a");
+  const pinned = makeWorkDir("pin-b");
+  const h = await loadBare(dir, "pin");
+  h.ctx.ui.confirm = async () => true;
+  await run(h, "optimize_brief", { action: "draft", brief: briefArgs({ cwd: pinned }) });
+  await run(h, "optimize_brief", { action: "propose" });
+  const first = await run(h, "init_experiment", { name: "liquid speed", metric_name: "total_us", metric_unit: "us", direction: "lower", cwd: pinned });
+  assert.doesNotMatch(first, /refused|does not match/, first);
+  const before = readConfigHeaders(pinned).length;
+  await run(h, "optimize_brief", { action: "draft", brief: { name: "other", metric_name: "bundle_kb" } });
+  await run(h, "optimize_brief", { action: "propose" });
+  const second = await run(h, "init_experiment", { name: "other", metric_name: "bundle_kb" });
+  assert.match(second, /does not match the approved brief/, second);
+  assert.match(second, /cwd: brief ""/);
+  assert.equal(readConfigHeaders(pinned).length, before, "the pinned dir's ledger must not get a new config header");
+});

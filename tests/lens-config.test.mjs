@@ -563,7 +563,9 @@ test("init_experiment: analysis is read from ctx.cwd even when workingDir redire
     analysis: { extractors: { failures: { regex: "MISMATCH\\s+gold=(" } } },
   }));
 
-  const res = await callInit(session);
+  // The session is pinned to sub by config.json workingDir: the approved brief must name sub (absolute), like the real flow.
+  approveOptimizeBrief(dir, { name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower", cwd: sub });
+  const res = await session.tool("init_experiment").execute("id", { name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower" }, null, null, session.ctx);
   const text = initResultText(res);
   assert.ok(
     text.includes("❌"),
@@ -579,7 +581,8 @@ test("init_experiment: analysis is read from ctx.cwd even when workingDir redire
     workingDir: "sub",
     analysis: { extractors: { failures: { regex: "MISMATCH", sample: 2 } } },
   }));
-  const retry = await callInit(session);
+  approveOptimizeBrief(dir, { name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower", cwd: sub });
+  const retry = await session.tool("init_experiment").execute("id", { name: "bench", metric_name: "ms", metric_unit: "ms", direction: "lower" }, null, null, session.ctx);
   assert.ok(initResultText(retry).includes("✅"), `fixed config should init, got: ${initResultText(retry)}`);
   const header = readLedger(sub)[0];
   assert.equal(
