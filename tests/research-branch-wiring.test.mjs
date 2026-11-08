@@ -74,7 +74,7 @@ function briefFixture(overrides = {}) {
   return { ...base, ...overrides };
 }
 
-/** Loads the REAL extension on a fake pi, turns autoresearch mode on, returns the handles. */
+/** Loads the REAL extension on a fake pi, turns autoresearch mode on via the research subcommand (pins campaign c1), returns the handles. */
 async function loadExtension(dir, label) {
   const { pi, tool, command, hook } = createFakePi({ dir, sessionId: `research-${label}`, realGit: false });
   const ctx = makeCtx(dir, `research-${label}`, pi);
@@ -82,8 +82,20 @@ async function loadExtension(dir, label) {
     pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")).href
   );
   autoresearchExtension(pi);
+  await command("autoresearch").handler("research --id c1", ctx);
+  return { pi, tool, command, hook, ctx, dir };
+}
+
+/** Loads the REAL extension on a fake pi with the mode on and NO campaign pin. */
+async function loadExtensionBare(dir, label) {
+  const { pi, tool, command } = createFakePi({ dir, sessionId: `research-${label}`, realGit: false });
+  const ctx = makeCtx(dir, `research-${label}`, pi);
+  const { default: autoresearchExtension } = await import(
+    pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")).href
+  );
+  autoresearchExtension(pi);
   await command("autoresearch").handler("on", ctx);
-  return { pi, tool, hook, ctx, dir };
+  return { pi, tool, ctx, dir };
 }
 
 function call(h, name, params) {
@@ -103,12 +115,14 @@ function readLog(dir, id) {
   return text.split("\n").filter((l) => l.trim() !== "").map((l) => JSON.parse(l));
 }
 
-/** Drafts campaign c1 and approves it through the owner dialog (confirm === true). */
+/** Drafts a campaign (id auto-generated/pinned) and approves it through the owner dialog. */
 async function draftAndApprove(h, id = "c1") {
-  const draft = await call(h, "research_brief", { action: "draft", campaign_id: id, brief: briefFixture() });
+  const draft = await call(h, "research_brief", { action: "draft", brief: briefFixture() });
   assert.match(textOf(draft), /Brief draft saved/, textOf(draft));
+  const dirs = fs.readdirSync(path.join(h.dir, ".auto", "research"));
+  assert.deepEqual(dirs, [id], `single campaign dir ${id} expected, got: ${dirs}`);
   h.ctx.ui.confirm = async () => true;
-  const proposed = await call(h, "research_brief", { action: "propose", campaign_id: id });
+  const proposed = await call(h, "research_brief", { action: "propose" });
   assert.match(textOf(proposed), /Brief approved/, textOf(proposed));
   return sha256Of(fs.readFileSync(path.join(h.dir, ".auto", "research", id, "brief.json")));
 }
@@ -142,7 +156,9 @@ test("(b) agent_end during an active research campaign never steers toward the l
   await new Promise((r) => setTimeout(r, 1100)); // SETTLED_WINDOW_MS = 800
   const legacy = h.pi.sentMessages.filter((m) => LEGACY_TOOL_NAMES.test(m.text));
   assert.equal(legacy.length, 0, `no legacy-loop steers: ${JSON.stringify(legacy.map((m) => m.text))}`);
-  const research = h.pi.sentMessages.filter((m) => /research status/.test(m.text));
+  // The activation kickoff (sent at load) also mentions research status; the
+  // drift steer is its own message and must be present exactly once.
+  const research = h.pi.sentMessages.filter((m) => /Continue the research campaign/.test(m.text));
   assert.equal(research.length, 1, `research resume must be sent instead: ${JSON.stringify(h.pi.sentMessages.map((m) => m.text))}`);
 }, { timeout: 30000 });
 
@@ -196,14 +212,14 @@ test("(c) a stopped campaign blocks the loop too, and an unreadable state fails 
 test("(d) research_brief propose without UI refuses and writes no approval", async () => {
   const dir = makeWorkDir("propose-noui");
   const h = await loadExtension(dir, "propose-noui");
-  await call(h, "research_brief", { action: "draft", campaign_id: "c1", brief: briefFixture() });
+  await call(h, "research_brief", { action: "draft", brief: briefFixture() });
   h.ctx.hasUI = false;
   let dialogs = 0;
   h.ctx.ui.confirm = async () => {
     dialogs += 1;
     return true;
   };
-  const text = textOf(await call(h, "research_brief", { action: "propose", campaign_id: "c1" }));
+  const text = textOf(await call(h, "research_brief", { action: "propose" }));
   assert.match(text, /needs an interactive dialog/, text);
   assert.equal(dialogs, 0, "no dialog without UI");
   assert.equal(fs.existsSync(path.join(dir, ".auto", "research", "c1", "approval.json")), false, "no approval.json");
@@ -212,13 +228,13 @@ test("(d) research_brief propose without UI refuses and writes no approval", asy
 test("(d) research_brief propose: owner confirm === true writes approval.json with the brief hash", async () => {
   const dir = makeWorkDir("propose-yes");
   const h = await loadExtension(dir, "propose-yes");
-  await call(h, "research_brief", { action: "draft", campaign_id: "c1", brief: briefFixture() });
+  await call(h, "research_brief", { action: "draft", brief: briefFixture() });
   const dialogs = [];
   h.ctx.ui.confirm = async (title, message) => {
     dialogs.push({ title, message });
     return true;
   };
-  const text = textOf(await call(h, "research_brief", { action: "propose", campaign_id: "c1" }));
+  const text = textOf(await call(h, "research_brief", { action: "propose" }));
   const briefPath = path.join(dir, ".auto", "research", "c1", "brief.json");
   const expected = sha256Of(fs.readFileSync(briefPath));
   assert.equal(dialogs.length, 1, "exactly one owner dialog");
@@ -233,9 +249,9 @@ test("(d) research_brief propose: owner confirm === true writes approval.json wi
 test("(d) research_brief propose: any confirm other than true approves nothing", async () => {
   const dir = makeWorkDir("propose-no");
   const h = await loadExtension(dir, "propose-no");
-  await call(h, "research_brief", { action: "draft", campaign_id: "c1", brief: briefFixture() });
+  await call(h, "research_brief", { action: "draft", brief: briefFixture() });
   h.ctx.ui.confirm = async () => "yes";
-  const text = textOf(await call(h, "research_brief", { action: "propose", campaign_id: "c1" }));
+  const text = textOf(await call(h, "research_brief", { action: "propose" }));
   assert.match(text, /did not confirm/, text);
   assert.equal(fs.existsSync(path.join(dir, ".auto", "research", "c1", "approval.json")), false);
 });
@@ -243,14 +259,14 @@ test("(d) research_brief propose: any confirm other than true approves nothing",
 test("(d) research_brief rejects model-supplied approval fields without a dialog", async () => {
   const dir = makeWorkDir("propose-fields");
   const h = await loadExtension(dir, "propose-fields");
-  await call(h, "research_brief", { action: "draft", campaign_id: "c1", brief: briefFixture() });
+  await call(h, "research_brief", { action: "draft", brief: briefFixture() });
   let dialogs = 0;
   h.ctx.ui.confirm = async () => {
     dialogs += 1;
     return true;
   };
   for (const extra of ["approved", "confirmed", "operator_confirmation"]) {
-    const text = textOf(await call(h, "research_brief", { action: "propose", campaign_id: "c1", [extra]: true }));
+    const text = textOf(await call(h, "research_brief", { action: "propose", [extra]: true }));
     assert.match(text, /invalid_argument/, `${extra} must be refused: ${text}`);
   }
   assert.equal(dialogs, 0);
@@ -262,14 +278,14 @@ test("(d) an approved brief cannot be redrafted or proposed again (no second dia
   const h = await loadExtension(dir, "approved-redraft");
   await draftAndApprove(h);
   const changed = { ...briefFixture(), goal: "A different goal." };
-  const text = textOf(await call(h, "research_brief", { action: "draft", campaign_id: "c1", brief: changed }));
+  const text = textOf(await call(h, "research_brief", { action: "draft", brief: changed }));
   assert.match(text, /approved and cannot be changed/, text);
   let dialogs = 0;
   h.ctx.ui.confirm = async () => {
     dialogs += 1;
     return true;
   };
-  const again = textOf(await call(h, "research_brief", { action: "propose", campaign_id: "c1" }));
+  const again = textOf(await call(h, "research_brief", { action: "propose" }));
   assert.match(again, /already approved/, again);
   assert.equal(dialogs, 0, "an approved brief must not be shown for consent again");
 });
@@ -280,7 +296,7 @@ test("(e) research start with a wrong hash refuses and keeps the briefing phase"
   const dir = makeWorkDir("start-wrong");
   const h = await loadExtension(dir, "start-wrong");
   await draftAndApprove(h);
-  const text = textOf(await call(h, "research", { action: "start", campaign_id: "c1", expected_sha256: "0".repeat(64) }));
+  const text = textOf(await call(h, "research", { action: "start", expected_sha256: "0".repeat(64) }));
   assert.match(text, /brief_changed/, text);
   assert.equal(readJson(path.join(dir, ".auto", "research", "c1", "state.json")).phase, "briefing");
 });
@@ -289,7 +305,7 @@ test("(e) research start with the approved hash moves the campaign to the resear
   const dir = makeWorkDir("start-ok");
   const h = await loadExtension(dir, "start-ok");
   const sha = await draftAndApprove(h);
-  const text = textOf(await call(h, "research", { action: "start", campaign_id: "c1", expected_sha256: sha }));
+  const text = textOf(await call(h, "research", { action: "start", expected_sha256: sha }));
   assert.match(text, /Research phase started/, text);
   assert.equal(readJson(path.join(dir, ".auto", "research", "c1", "state.json")).phase, "research");
 });
@@ -300,23 +316,23 @@ test("(f) draft -> propose -> start -> open -> record -> close -> status shows t
   const dir = makeWorkDir("cycle");
   const h = await loadExtension(dir, "cycle");
   const sha = await draftAndApprove(h);
-  assert.match(textOf(await call(h, "research", { action: "start", campaign_id: "c1", expected_sha256: sha })), /started/);
+  assert.match(textOf(await call(h, "research", { action: "start", expected_sha256: sha })), /started/);
 
   fs.mkdirSync(path.join(dir, "evidence"), { recursive: true });
   const evidenceBytes = Buffer.from("line one\nline two\nline three\n");
   fs.writeFileSync(path.join(dir, "evidence", "run1.txt"), evidenceBytes);
 
-  assert.match(textOf(await call(h, "research", { action: "open", campaign_id: "c1", question_id: "Q1" })), /Vector Q1 opened/);
+  assert.match(textOf(await call(h, "research", { action: "open", question_id: "Q1" })), /Vector Q1 opened/);
   assert.match(
-    textOf(await call(h, "research", { action: "record", campaign_id: "c1", evidence_ref: "evidence/run1.txt:1-2" })),
+    textOf(await call(h, "research", { action: "record", evidence_ref: "evidence/run1.txt:1-2" })),
     /Evidence recorded for vector Q1/,
   );
   assert.match(
-    textOf(await call(h, "research", { action: "close", campaign_id: "c1", question_id: "Q1", rule_id: "Q1-yes", verdict: "confirmed" })),
+    textOf(await call(h, "research", { action: "close", question_id: "Q1", rule_id: "Q1-yes", verdict: "confirmed" })),
     /Vector Q1 closed: confirmed by rule Q1-yes/,
   );
 
-  const status = textOf(await call(h, "research", { action: "status", campaign_id: "c1" }));
+  const status = textOf(await call(h, "research", { action: "status" }));
   assert.match(status, /Q1: closed — verdict confirmed by rule Q1-yes; evidence hashes match \(1\)/, status);
   assert.match(status, /Q2: not opened/, status);
 
@@ -331,13 +347,13 @@ test("(f) a changed evidence file is reported by status as not reproducible", as
   const dir = makeWorkDir("evidence-changed");
   const h = await loadExtension(dir, "evidence-changed");
   const sha = await draftAndApprove(h);
-  await call(h, "research", { action: "start", campaign_id: "c1", expected_sha256: sha });
+  await call(h, "research", { action: "start", expected_sha256: sha });
   fs.mkdirSync(path.join(dir, "evidence"), { recursive: true });
   fs.writeFileSync(path.join(dir, "evidence", "run1.txt"), "original\n");
-  await call(h, "research", { action: "open", campaign_id: "c1", question_id: "Q1" });
-  await call(h, "research", { action: "record", campaign_id: "c1", evidence_ref: "evidence/run1.txt#anchor" });
+  await call(h, "research", { action: "open", question_id: "Q1" });
+  await call(h, "research", { action: "record", evidence_ref: "evidence/run1.txt#anchor" });
   fs.writeFileSync(path.join(dir, "evidence", "run1.txt"), "edited after record\n");
-  const status = textOf(await call(h, "research", { action: "status", campaign_id: "c1" }));
+  const status = textOf(await call(h, "research", { action: "status" }));
   assert.match(status, /1 of 1 evidence file\(s\) changed or missing — not reproducible/, status);
 });
 
@@ -347,15 +363,15 @@ test("(f) stop moves to stopped; report carries the caveat verbatim and no targe
   const dir = makeWorkDir("stop-report");
   const h = await loadExtension(dir, "stop-report");
   const sha = await draftAndApprove(h);
-  await call(h, "research", { action: "start", campaign_id: "c1", expected_sha256: sha });
-  const stopText = textOf(await call(h, "research", { action: "stop", campaign_id: "c1", rule_id: "S1", reason: "two rejections recorded" }));
+  await call(h, "research", { action: "start", expected_sha256: sha });
+  const stopText = textOf(await call(h, "research", { action: "stop", rule_id: "S1", reason: "two rejections recorded" }));
   assert.match(stopText, /Research stopped by S1/, stopText);
   assert.equal(readJson(path.join(dir, ".auto", "research", "c1", "state.json")).phase, "stopped");
 
-  const refusedOpen = textOf(await call(h, "research", { action: "open", campaign_id: "c1", question_id: "Q1" }));
+  const refusedOpen = textOf(await call(h, "research", { action: "open", question_id: "Q1" }));
   assert.match(refusedOpen, /phase stopped/, "no vector may open after a stop");
 
-  const report = textOf(await call(h, "research", { action: "report", campaign_id: "c1" }));
+  const report = textOf(await call(h, "research", { action: "report" }));
   assert.ok(report.includes(briefFixture().caveat_block), "caveat block must be copied verbatim");
   assert.match(report, /S1: .* — TRIGGERED \(two rejections recorded\)/, report);
   assert.match(report, /No target metric/, report);
@@ -367,8 +383,8 @@ test("(i) open, record and close refuse every rule violation", async () => {
   const dir = makeWorkDir("rules");
   const h = await loadExtension(dir, "rules");
   const sha = await draftAndApprove(h);
-  await call(h, "research", { action: "start", campaign_id: "c1", expected_sha256: sha });
-  const act = (params) => call(h, "research", { campaign_id: "c1", ...params }).then(textOf);
+  await call(h, "research", { action: "start", expected_sha256: sha });
+  const act = (params) => call(h, "research", params).then(textOf);
 
   assert.match(await act({ action: "open", question_id: "Q9" }), /not in the approved brief/);
   assert.match(await act({ action: "record", evidence_ref: "evidence/none.txt:1" }), /no vector is open/);
@@ -452,22 +468,22 @@ test("(h) research resolve requires an interactive operator dialog to clear a pe
     JSON.stringify({ name: "record evidence for Q1", started_at: new Date().toISOString() }),
   );
   const h = await loadExtension(dir, "resolve");
-  const status = textOf(await call(h, "research", { action: "status", campaign_id: "c1" }));
+  const status = textOf(await call(h, "research", { action: "status" }));
   assert.match(status, /manual_check_required/, status);
 
   h.ctx.hasUI = false;
-  const noUi = textOf(await call(h, "research", { action: "resolve", campaign_id: "c1" }));
+  const noUi = textOf(await call(h, "research", { action: "resolve" }));
   assert.match(noUi, /manual_check_required/, noUi);
   assert.equal(fs.existsSync(path.join(campaignDir, "pending-op.json")), true, "marker stays without UI");
 
   h.ctx.hasUI = true;
   h.ctx.ui.confirm = async () => false;
-  const denied = textOf(await call(h, "research", { action: "resolve", campaign_id: "c1" }));
+  const denied = textOf(await call(h, "research", { action: "resolve" }));
   assert.match(denied, /requires explicit operator consent/, denied);
   assert.equal(fs.existsSync(path.join(campaignDir, "pending-op.json")), true, "marker stays without consent");
 
   h.ctx.ui.confirm = async () => true;
-  const done = textOf(await call(h, "research", { action: "resolve", campaign_id: "c1" }));
+  const done = textOf(await call(h, "research", { action: "resolve" }));
   assert.match(done, /resolved by the operator/, done);
   assert.equal(fs.existsSync(path.join(campaignDir, "pending-op.json")), false, "marker cleared after consent");
   assert.equal(readJson(path.join(campaignDir, "state.json")).phase, "research", "state.json untouched by resolve");
@@ -511,32 +527,45 @@ test("B2: git hook catches bash -c wrappers and skips harmless prose", async () 
   }
 });
 
-test("B3: research start refuses when another campaign is already in research phase", async () => {
+test("B3: a second campaign is impossible through the tools; pre-existing multiple dirs refuse", async () => {
   const dir = makeWorkDir("two-campaigns");
   const h = await loadExtension(dir, "two-campaigns");
   // campaign 1: full brief + approval + started
-  const d1 = await call(h, "research_brief", { action: "draft", campaign_id: "c1", brief: briefFixture() });
+  const d1 = await call(h, "research_brief", { action: "draft", brief: briefFixture() });
   assert.doesNotMatch(textOf(d1), /⛔/, textOf(d1));
   const c1dir = path.join(dir, ".auto", "research", "c1");
   const hash1 = sha256Of(fs.readFileSync(path.join(c1dir, "brief.json")));
   h.ctx.hasUI = true;
   h.ctx.ui.confirm = async () => true;
-  const prop1 = await call(h, "research_brief", { action: "propose", campaign_id: "c1" });
+  const prop1 = await call(h, "research_brief", { action: "propose" });
   assert.doesNotMatch(textOf(prop1), /⛔/, textOf(prop1));
-  const start1 = await call(h, "research", { action: "start", campaign_id: "c1", expected_sha256: hash1 });
+  const start1 = await call(h, "research", { action: "start", expected_sha256: hash1 });
   assert.doesNotMatch(textOf(start1), /⛔/, textOf(start1));
 
-  // campaign 2: brief + approval ok, but start must refuse while c1 works
-  const d2 = await call(h, "research_brief", { action: "draft", campaign_id: "c2", brief: briefFixture() });
-  assert.doesNotMatch(textOf(d2), /⛔/, textOf(d2));
-  const hash2 = sha256Of(fs.readFileSync(path.join(dir, ".auto", "research", "c2", "brief.json")));
-  await call(h, "research_brief", { action: "propose", campaign_id: "c2" });
-  const start2 = await call(h, "research", { action: "start", campaign_id: "c2", expected_sha256: hash2 });
-  assert.match(textOf(start2), /only one campaign may work/, textOf(start2));
-  assert.equal(readJson(path.join(dir, ".auto", "research", "c2", "state.json")).phase, "briefing", "c2 must stay in briefing");
+  // A second campaign cannot be expressed: the tools take no campaign id and
+  // the single-campaign session reuses c1 (its draft is refused: approved).
+  const d2 = textOf(await call(h, "research_brief", { action: "draft", brief: briefFixture() }));
+  assert.match(d2, /approved and cannot be changed/, d2);
+  assert.deepEqual(fs.readdirSync(path.join(dir, ".auto", "research")), ["c1"], "no second campaign dir may appear");
+
+  // Legacy multiple dirs (pre-fix leftovers like the live bench): the pinned
+  // session still works on its own campaign; the UNPINNED tools refuse.
+  writeCampaignState(dir, "c2", "briefing");
+  const d3 = textOf(await call(h, "research_brief", { action: "draft", brief: briefFixture() }));
+  assert.match(d3, /approved and cannot be changed/, d3);
+  const dir2 = makeWorkDir("two-campaigns-unpinned");
+  writeCampaignState(dir2, "x1", "briefing");
+  writeCampaignState(dir2, "x2", "briefing");
+  const h2 = await loadExtensionBare(dir2, "two-campaigns-unpinned");
+  const statH2 = textOf(await call(h2, "research", { action: "status" }));
+  assert.match(statH2, /several campaigns exist/, statH2);
+  const d4 = textOf(await call(h2, "research_brief", { action: "draft", brief: briefFixture() }));
+  assert.match(d4, /several campaigns exist/, d4);
 
   // M1: editing the approved brief of c1 blocks its actions with brief_changed
+  // (single campaign again: the leftover c2 dir is removed first).
+  fs.rmSync(path.join(dir, ".auto", "research", "c2"), { recursive: true, force: true });
   fs.writeFileSync(path.join(c1dir, "brief.json"), JSON.stringify(briefFixture({ goal: "tampered" })));
-  const stat = textOf(await call(h, "research", { action: "status", campaign_id: "c1" }));
-  assert.match(stat, /brief_changed/, stat);
+  const stat2 = textOf(await call(h, "research", { action: "status" }));
+  assert.match(stat2, /brief_changed/, stat2);
 });

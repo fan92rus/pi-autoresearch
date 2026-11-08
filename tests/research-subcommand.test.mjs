@@ -74,7 +74,13 @@ function notifyTexts(pi) {
 }
 
 function researchKickoffs(pi) {
-  return pi.sentMessages.filter((m) => m.text.includes("Research campaign: briefing phase"));
+  // Bare kickoff (briefing) and phase-aware resume kickoffs share the tool
+  // prescriptions; a research message is any kickoff sent by the research
+  // branch (never a legacy metric-loop message).
+  return pi.sentMessages.filter((m) =>
+    m.text.includes("Research campaign: briefing phase") ||
+    m.text.includes("already has a brief draft") ||
+    m.text.includes("is already in the research phase"));
 }
 
 // ─── reserved word and kickoff ──────────────────────────────────────────────
@@ -138,9 +144,10 @@ test("the kickoff lists the seven campaign steps and asks to wait for the detail
   for (const marker of KICKOFF_MARKERS) {
     assert.ok(kickoff.text.includes(marker), `kickoff must name step: ${marker}`);
   }
-  assert.match(kickoff.text, /Wait for the next message/, "wait-for-details instruction");
-  assert.match(kickoff.text, /campaign id/, "details message carries the campaign id");
-  assert.match(kickoff.text, /SHA-256/, "details message carries the brief hash");
+  // Bare TUI kickoff is self-sufficient: no --id, so draft generates the id.
+  assert.match(kickoff.text, /campaign id is generated/, "draft generates the campaign id when no --id is passed");
+  assert.match(kickoff.text, /Formulate the brief/, "brief is formulated from the campaign description");
+  assert.doesNotMatch(kickoff.text, /Wait for the next message/, "no wait when nothing is pinned to wait for");
 });
 
 // ─── branch order and guards ────────────────────────────────────────────────
@@ -157,15 +164,21 @@ test("research while the mode is already active runs the research branch, not 'a
   assert.equal(researchKickoffs(h.pi).length, 1, "research kickoff is sent while the mode is on");
 });
 
-test("an existing briefing-phase campaign refuses research: no mode flip, no kickoff", async () => {
+test("an existing briefing-phase campaign refuses bare research: no mode flip, no kickoff; --id resumes it", async () => {
   const dir = makeWorkDir("guard");
   writeCampaignState(dir, "c1", "briefing");
   const h = await loadExtension(dir, "guard");
   await h.run("research");
 
-  assert.ok(notifyTexts(h.pi).some((t) => t.includes("Research campaign already exists")), "refusal notify");
+  assert.ok(notifyTexts(h.pi).some((t) => t.includes("resume it with /autoresearch research --id c1")), "refusal notify points at resume");
   assert.equal(activationEntries(h.pi).length, 0, "mode must not be turned on by a refused research");
   assert.equal(h.pi.sentMessages.length, 0, "no kickoff sent");
+
+  // --id c1 resumes the briefing-phase campaign: mode on + resume kickoff.
+  await h.run("research --id c1");
+  assert.equal(activationEntries(h.pi).length, 1, "resume turns the mode on once");
+  assert.equal(researchKickoffs(h.pi).length, 1, "resume kickoff sent");
+  assert.match(researchKickoffs(h.pi)[0].text, /already has a brief draft/);
 });
 
 test("an existing research campaign refuses research even when the mode is already on", async () => {
@@ -180,7 +193,7 @@ test("an existing research campaign refuses research even when the mode is alrea
 
   await h.run("research");
 
-  assert.ok(notifyTexts(h.pi).some((t) => t.includes("Research campaign already exists")), "refusal notify");
+  assert.ok(notifyTexts(h.pi).some((t) => t.includes("resume it with /autoresearch research --id c1")), "refusal notify points at resume");
   assert.equal(researchKickoffs(h.pi).length, 0, "no research kickoff on refusal");
   assert.equal(h.pi.sentMessages.length, 0, "no message of any kind on refusal");
   assert.equal(activationEntries(h.pi).length, activationsBefore, "refused research must not re-record activation");

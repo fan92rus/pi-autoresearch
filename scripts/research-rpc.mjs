@@ -215,7 +215,7 @@ async function main() {
           stage2Sent = true;
           const briefHash = sha256(briefBytes);
           const message = [
-            `Research campaign ${campaignId}.`,
+            `Research campaign ${campaignId} (the id is pinned by the launch command; never pass a campaign_id to the tools).`,
             `Brief file: ${briefPath}`,
             `Brief SHA-256: ${briefHash}`,
             "Create the campaign with research_brief draft from this file, then research_brief propose.",
@@ -311,7 +311,7 @@ async function main() {
     }
   }, stage1TimeoutMs);
 
-  requestPrompt("/autoresearch research", 1);
+  requestPrompt(`/autoresearch research --id ${campaignId}`, 1);
   const resultCode = await new Promise((resolve) => child.on("close", () => resolve(exitCode)));
   if (killTimer) clearTimeout(killTimer);
   await closeLog();

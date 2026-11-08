@@ -62,7 +62,7 @@ test("canonical brief reaches fake RPC and successful report exits 0", async () 
   const result = await run(ctx);
   assert.equal(result.code, 0, result.stderr);
   const messages = sentMessages(ctx);
-  assert.equal(messages[0], "/autoresearch research");
+  assert.equal(messages[0], "/autoresearch research --id test-campaign");
   assert.match(messages[1], /test-campaign/);
   assert.match(messages[1], /research_brief draft.*research_brief propose/s);
   assert.match(messages[1], /research start.*open.*close.*stop.*research report/s);

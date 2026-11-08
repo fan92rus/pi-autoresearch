@@ -345,6 +345,8 @@ interface LogDetails {
 
 interface AutoresearchRuntime {
   autoresearchMode: boolean;
+  /** Campaign id pinned by '/autoresearch research <id>'; research tools refuse other ids while set. */
+  researchCampaignId: string | null;
   experimentsThisSession: number;
   autoResumeTurns: number;
   lastRunChecks: { pass: boolean; output: string; duration: number } | null;
@@ -1801,6 +1803,7 @@ function createExperimentState(): ExperimentState {
 function createSessionRuntime(): AutoresearchRuntime {
   return {
     autoresearchMode: false,
+    researchCampaignId: null,
     experimentsThisSession: 0,
     autoResumeTurns: 0,
     lastRunChecks: null,
@@ -2292,6 +2295,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       content: [{ type: "text", text: "Autoresearch mode is OFF. Run /autoresearch on first." }],
     };
   };
+
+  /**
+   * Campaign-id source of truth: '/autoresearch research <id>' pins the id in
+   * the session runtime; the research tools never take an id from the model
+   * (live bench finding, bd pi-autoresearch-9o2: an agent inventing a second
+   * campaign). draft generates one when nothing is pinned; other actions use
+   * the pinned or the single existing campaign.
+   */
 
   // The one place mode flips: gated tools follow the flag, never drifting from it.
   const setAutoresearchMode = (ctx: ExtensionContext, enabled: boolean): void => {
@@ -8087,20 +8098,20 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const RESEARCH_LOG_FILE = "log.jsonl";
 
   const RESEARCH_BRIEF_ACTION_KEYS = new Map<string, string[]>([
-    ["draft", ["action", "campaign_id", "brief"]],
-    ["status", ["action", "campaign_id"]],
-    ["propose", ["action", "campaign_id"]],
+    ["draft", ["action", "brief"]],
+    ["status", ["action"]],
+    ["propose", ["action"]],
   ]);
 
   const RESEARCH_ACTION_KEYS = new Map<string, string[]>([
-    ["start", ["action", "campaign_id", "expected_sha256"]],
-    ["open", ["action", "campaign_id", "question_id"]],
-    ["record", ["action", "campaign_id", "evidence_ref"]],
-    ["close", ["action", "campaign_id", "question_id", "rule_id", "verdict", "reason"]],
-    ["stop", ["action", "campaign_id", "rule_id", "reason"]],
-    ["status", ["action", "campaign_id"]],
-    ["report", ["action", "campaign_id"]],
-    ["resolve", ["action", "campaign_id"]],
+    ["start", ["action", "expected_sha256"]],
+    ["open", ["action", "question_id"]],
+    ["record", ["action", "evidence_ref"]],
+    ["close", ["action", "question_id", "rule_id", "verdict", "reason"]],
+    ["stop", ["action", "rule_id", "reason"]],
+    ["status", ["action"]],
+    ["report", ["action"]],
+    ["resolve", ["action"]],
   ]);
 
   const researchRefusal = (reason: researchState.RefusalReason, message: string): researchState.Refusal => ({
@@ -8146,17 +8157,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return null;
   };
 
-  /** Explicit campaign_id, or the only campaign of the work directory. */
-  const resolveResearchTarget = (workDir: string, campaignId: unknown): researchState.Result<{ dir: string; id: string }> => {
-    if (campaignId !== undefined) {
-      if (typeof campaignId !== "string") return researchRefusal("invalid_argument", "campaign_id must be a string");
-      const resolved = researchState.resolveCampaignDir(workDir, campaignId);
-      return resolved.ok ? { ok: true, dir: resolved.dir, id: campaignId } : resolved;
-    }
+  /** The only campaign of the work directory (the id is never model-supplied). */
+  const resolveResearchTarget = (workDir: string): researchState.Result<{ dir: string; id: string }> => {
     const ids = listResearchCampaignIds(workDir);
     if (ids === null) return researchRefusal("state_unreadable", "the research root cannot be listed; nothing was changed");
     if (ids.length === 0) return researchRefusal("campaign_missing", "no research campaign exists; create one with research_brief draft");
-    if (ids.length > 1) return researchRefusal("invalid_argument", `several research campaigns exist (${ids.join(", ")}); pass campaign_id`);
+    if (ids.length > 1) return researchRefusal("invalid_argument", `several campaigns exist (${ids.join(", ")}); clean .auto/research first: a session works with exactly one campaign`);
     const resolved = researchState.resolveCampaignDir(workDir, ids[0]);
     return resolved.ok ? { ok: true, dir: resolved.dir, id: ids[0] } : resolved;
   };
@@ -8363,6 +8369,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "Actions: draft (validated brief saved for a new or still-unapproved campaign), status (approval and hash state), " +
       "propose (OWNER dialog showing the brief and its SHA-256; approval is written only on an explicit confirm). The model cannot " +
       "approve: approval fields are rejected. An approved brief is immutable; a changed brief means a new campaign. " +
+      "The campaign id is not a model argument: it is pinned by the launch command or generated at draft; the tool tells you the id. " +
       "In the research phase the ordinary loop and candidate_branch are blocked; briefing does not block anything.",
     promptSnippet: "Research brief: draft questions and decision rules, then the owner approves it in a dialog (propose)",
     promptGuidelines: [
@@ -8374,13 +8381,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       type: "object",
       properties: {
         action: { type: "string", enum: ["draft", "status", "propose"], description: "Brief action to perform." },
-        campaign_id: { type: "string", description: "Campaign id: [A-Za-z0-9._-], 1-64 chars, starting with a letter or digit." },
         brief: {
           type: "object",
           description: "draft only: the full brief (schema_version 1, goal, plan_source, caveat_block, data_roles {explore, validate, confirm}, questions [{id, text, decision_rules [{id, verdict, when}], needs_data}], process_metrics, stop_rules [{id, when}]).",
         },
       },
-      required: ["action", "campaign_id"],
+      required: ["action"],
     } as any,
 
     async execute(_toolCallId: string, params: any, _signal, _onUpdate, ctx: ExtensionContext) {
@@ -8397,9 +8403,30 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (!allowed) return fail("invalid_argument", `unknown action ${JSON.stringify(String(action))}; allowed: draft status propose`);
       const extra = unexpectedArgKeys(params ?? {}, allowed);
       if (extra) return fail("invalid_argument", extra);
-      if (typeof params.campaign_id !== "string") return fail("invalid_argument", "campaign_id is required");
-      const campaignId: string = params.campaign_id;
       const workDir = resolveWorkDir(ctx.cwd);
+      // The campaign id is never taken from the model: the pinned id (launch
+      // command) wins; otherwise the single existing campaign is reused (draft
+      // into an unapproved campaign stays possible); with none, draft
+      // generates one and pins it; with several, everything refuses.
+      let campaignId = getRuntime(ctx).researchCampaignId;
+      if (campaignId === null) {
+        const ids = listResearchCampaignIds(workDir);
+        if (ids === null) return fail("state_unreadable", "the research root cannot be listed; nothing was changed");
+        if (ids.length > 1) {
+          return fail("invalid_argument", `several campaigns exist (${ids.join(", ")}); clean .auto/research first: a session works with exactly one campaign`);
+        }
+        if (ids.length === 1) {
+          campaignId = ids[0];
+        } else if (action === "draft") {
+          campaignId = `bench-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}`;
+          while (fs.existsSync(path.join(researchState.researchRoot(workDir), campaignId))) {
+            campaignId = `${campaignId}-${Math.random().toString(36).slice(2, 6)}`;
+          }
+          getRuntime(ctx).researchCampaignId = campaignId;
+        } else {
+          return fail("campaign_missing", "no campaign yet: the id is pinned by the launch command or generated by research_brief draft");
+        }
+      }
       const resolved = researchState.resolveCampaignDir(workDir, campaignId);
       if (!resolved.ok) return fail(resolved.reason, resolved.message);
       const dir = resolved.dir;
@@ -8477,7 +8504,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const approved = await researchState.writeApproval(dir, sha.sha256);
       if (!approved.ok) return fail(approved.reason, approved.message);
       return reply(
-        `✅ Brief approved for campaign ${campaignId} (sha256 ${sha.sha256}). Start the research phase: research start with campaign_id "${campaignId}" and expected_sha256 "${sha.sha256}". Brief file: ${path.join(dir, researchState.BRIEF_FILE)}.`,
+        `✅ Brief approved for campaign ${campaignId} (sha256 ${sha.sha256}). Start the research phase: research start with expected_sha256 "${sha.sha256}". Brief file: ${path.join(dir, researchState.BRIEF_FILE)}.`,
       );
     },
   });
@@ -8506,7 +8533,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           enum: ["start", "open", "record", "close", "stop", "status", "report", "resolve"],
           description: "Research action to perform.",
         },
-        campaign_id: { type: "string", description: "Campaign id (optional when only one campaign exists)." },
         expected_sha256: { type: "string", description: "start only: sha256 of the approved brief (64 lowercase hex)." },
         question_id: { type: "string", description: "open/close: question id from the approved brief." },
         evidence_ref: { type: "string", description: "record only: path:lines or path#anchor inside the work directory." },
@@ -8534,9 +8560,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const extra = unexpectedArgKeys(params ?? {}, allowed);
       if (extra) return fail("invalid_argument", extra);
       const workDir = resolveWorkDir(ctx.cwd);
-      const target = resolveResearchTarget(workDir, params.campaign_id);
-      if (!target.ok) return fail(target.reason, target.message);
-      const { dir, id } = target;
+      // The campaign id is never taken from the model: the pinned id (launch
+      // command) wins; resolve stays exempt (operator-only, must reach any
+      // campaign); otherwise the single existing campaign is used.
+      const pinnedId = params?.action === "resolve" ? null : getRuntime(ctx).researchCampaignId;
+      const target = pinnedId !== null
+        ? (() => {
+            const r = researchState.resolveCampaignDir(workDir, pinnedId);
+            return r.ok ? { ok: true as const, dir: r.dir, id: pinnedId } : r;
+          })()
+        : resolveResearchTarget(workDir);
+      const resolvedTarget = await target;
+      if (!resolvedTarget.ok) return fail(resolvedTarget.reason, resolvedTarget.message);
+      const { dir, id } = resolvedTarget;
 
       if (action === "resolve") {
         // Operator-only (design §9): the model cannot clear the marker; the dialog consent is required.
@@ -8764,6 +8800,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const runtime = getRuntime(ctx);
     recordAutoresearchActivation(resolveWorkDir(ctx.cwd), false);
     setAutoresearchMode(ctx, false);
+    runtime.researchCampaignId = null;
     runtime.autoResumeTurns = 0;
     runtime.experimentsThisSession = 0;
     runtime.lastRunChecks = null;
@@ -9013,34 +9050,90 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // ===== research subcommand: a research campaign, not the metric loop =====
       // Matched before the already-active branch: a research campaign is a
       // separate campaign kind, so the loop's active flag must not block it.
+      // Syntax: /autoresearch research [--id <campaign-id>] <free description>.
+      // The description is what the campaign studies; the agent turns it into
+      // brief questions. The optional --id pins the campaign for the session
+      // (the headless wrapper passes it; TUI runs get a generated id at draft).
       if (/^research(\s|$)/.test(command)) {
         const researchWorkDir = resolveWorkDir(ctx.cwd);
-        if (researchCampaignExists(researchWorkDir)) {
-          ctx.ui.notify("Research campaign already exists — complete or remove it first; use research status.", "info");
+        let args_ = trimmedArgs.slice("research".length).trim();
+        let requestedId: string | null = null;
+        const idMatch = /^--id\s+([A-Za-z0-9][A-Za-z0-9._-]{0,63})(\s|$)/.exec(args_);
+        if (idMatch) {
+          requestedId = idMatch[1];
+          args_ = args_.slice(idMatch[0].length).trim();
+        }
+        const description = args_;
+        const existingIds = listResearchCampaignIds(researchWorkDir) ?? [];
+
+        // Explicit --id: pin it for the session. When the campaign already
+        // exists it must be resumable (briefing/research); when it does not,
+        // research_brief draft will create it under the pinned id (the
+        // headless wrapper flow). It is never created by this command.
+        if (requestedId !== null) {
+          if (existingIds.includes(requestedId)) {
+            const resumed = researchState.resolveCampaignDir(researchWorkDir, requestedId);
+            const insp = resumed.ok ? await researchState.inspectCampaign(resumed.dir) : null;
+            const phase = insp?.state?.phase ?? null;
+            if (phase === "stopped") {
+              ctx.ui.notify(`Campaign ${requestedId} is stopped (terminal); it never resumes. Create a new campaign: /autoresearch research <description>`, "info");
+              return;
+            }
+            if (phase !== "briefing" && phase !== "research") {
+              ctx.ui.notify(`Campaign ${requestedId} is in phase ${String(phase)} or unreadable; cannot resume from here`, "info");
+              return;
+            }
+          }
+        } else if (existingIds.length > 0) {
+          // No --id and campaigns exist: never silently start a second one.
+          ctx.ui.notify(existingIds.length > 1
+            ? `Several campaigns exist (${existingIds.join(", ")}); resume one with /autoresearch research --id <id> or clean .auto/research`
+            : `Campaign ${existingIds[0]} exists; resume it with /autoresearch research --id ${existingIds[0]}, or clean .auto/research to start a new campaign`, "info");
           return;
         }
         if (await campaignBlocksOrdinaryLoop(researchWorkDir)) {
           ctx.ui.notify("Candidate campaign active — use candidate_branch; the research campaign is not started.", "info");
           return;
         }
-        const description = trimmedArgs.slice("research".length).trim();
+        let resumePhase: string | null = null;
+        if (requestedId !== null) {
+          // Pin before activation: the research tools take no campaign id, so
+          // this session works with exactly this campaign (live bench finding,
+          // bd pi-autoresearch-9o2: the agent invented a second campaign).
+          runtime.researchCampaignId = requestedId;
+          const resumed = researchState.resolveCampaignDir(researchWorkDir, requestedId);
+          const insp = resumed.ok ? await researchState.inspectCampaign(resumed.dir) : null;
+          resumePhase = insp?.state?.phase === "briefing" || insp?.state?.phase === "research" ? insp.state.phase : null;
+          ctx.ui.notify(`Research mode ON — briefing phase; campaign ${requestedId} is pinned for this session (resume)`, "info");
+        } else {
+          ctx.ui.notify("Research mode ON — briefing phase; the research kickoff is sent", "info");
+        }
         recordAutoresearchActivation(researchWorkDir, true);
         setAutoresearchMode(ctx, true);
         runtime.autoResumeTurns = 0;
         runtime.consecutiveDriftResumes = 0;
         updateWidget(ctx);
-        ctx.ui.notify("Research mode ON — briefing phase; the research kickoff is sent", "info");
         // No /skill: prefix: the metric-loop skill must not be expanded into a research campaign.
-        const researchKickoff = [
-          "Research campaign: briefing phase." + (description ? ` Campaign description: ${description}.` : ""),
-          "The optimization loop does not apply here; the research_brief and research tools are the campaign tools.",
-          "Wait for the next message: it gives the campaign id, the absolute path of the brief file and its SHA-256. Then follow it in order:",
-          "1. research_brief draft from the object in the brief file,",
-          "2. research_brief propose (the owner approves the Brief SHA-256 dialog),",
-          "3. research start,",
-          "4. research open for each question, record evidence, research close with a verdict,",
-          "5. research stop, then research report.",
-        ].join("\n");
+        const researchKickoff = resumePhase === "research"
+          ? [
+              `Research campaign ${requestedId} is already in the research phase. Continue it: research status first, then open/record/close the remaining questions, research stop when the stop rule fires, research report.`,
+            ].join("\n")
+          : resumePhase === "briefing"
+            ? [
+                `Research campaign ${requestedId} already has a brief draft. Continue: research_brief propose (the owner approves the Brief SHA-256 dialog), then research start, open each question, record evidence, close each question, research stop, research report.`,
+              ].join("\n")
+            : [
+              "Research campaign: briefing phase." + (description ? ` Campaign description: ${description}.` : ""),
+              "The optimization loop does not apply here; the research_brief and research tools are the campaign tools.",
+              requestedId !== null
+                ? "Wait for the next message: it gives the brief file path and its SHA-256. Then follow it in order:"
+                : "Formulate the brief (questions, decision rules, stop rules) from the campaign description, then:",
+              "1. research_brief draft with the brief object" + (requestedId !== null ? "," : " (the campaign id is generated for you; note it from the reply),"),
+              "2. research_brief propose (the owner approves the Brief SHA-256 dialog),",
+              "3. research start,",
+              "4. research open for each question, record evidence, research close with a verdict,",
+              "5. research stop, then research report.",
+            ].join("\n");
         sendWhenReady(ctx, researchKickoff);
         return;
       }
