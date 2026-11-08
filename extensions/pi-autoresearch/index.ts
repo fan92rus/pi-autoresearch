@@ -2441,14 +2441,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // wrapper-prefixed command; harmless prose like `echo git is useful`
   // does not match. Leading whitespace and newline separators are command
   // positions too. Path-prefixed forms (`/usr/bin/git`, `C:\\...git.exe`,
-  // quoted Windows paths) and case are covered; so are cmd /c,
-  // powershell/pwsh (-Command with a quoted git command) and
+  // quoted Windows paths) and case are covered; so are cmd(.exe) /c,
+  // powershell(.exe)/pwsh(.exe) (-Command with a quoted git command),
+  // nice with flag/number adjustments (nice -n 5, nice -15), and
   // sh/bash/zsh/dash -c wrappers (fail-closed on `sh -c 'echo git'`).
   // Not a shell parser: remaining quoting tricks ({ git; }, nested quotes)
   // are documented residuals (design §8: interception at the Pi
   // command layer, not an OS sandbox).
   const RESEARCH_GIT_RE = new RegExp(
-    '(?:^|[;&|(\\n\\r])\\s*(?:(?:\\w+=\\S*|env|command|exec|sudo|nohup|xargs|time|cmd(?:\\s+/c)?|powershell(?:\\s+-\\w+)?|pwsh(?:\\s+-\\' +
+    '(?:^|[;&|(\\n\\r])\\s*(?:(?:\\w+=\\S*|env|command|exec|sudo|nohup|xargs|time|nice(?:\\s+-\\w+|\\s*?-\\d+|\\s+\\d+)*|cmd(?:\\.exe)?(?:\\s+/c)?|powershell(?:\\.exe)?(?:\\s+-\\w+)?|pwsh(?:\\.exe)?(?:\\s+-\\' +
     'w+)?)\\s+)*(?:(?:"[^"]*?[\\/\\\\]|[^";&|()]*?[\\/\\\\])?git(?:\\.exe)?"?|"\\s*git(?:\\.exe)?[^"\\n]*"|(?:ba|z|da)?sh\\s+(?:-\\w+\\s+)*' +
     '"?\\S*\\bgit(?:\\.exe)?\\b)(?=\\s|$|")',
     "i",
