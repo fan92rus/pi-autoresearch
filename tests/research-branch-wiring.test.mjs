@@ -395,11 +395,19 @@ test("(g) git through the shell is blocked while a research campaign is active",
   writeCampaignState(dir, "c1", "research");
   const h = await loadExtension(dir, "git-hook");
   const hook = h.hook("tool_call");
+  const B = String.fromCharCode(92); // single backslash for path cases
   for (const [toolName, command] of [
     ["bash", "git commit -m x"],
     ["bash", "echo ok && git status"],
     ["bash", "  git status"],
     ["bash", "cd repo\ngit status"],
+    ["bash", "git.exe status"],
+    ["bash", "GIT status"],
+    ["bash", "/usr/bin/git status"],
+    ["bash", "\"C:\\Program Files\\Git\\cmd\\git.exe\" status"],
+    ["bash", "cmd /c git status"],
+    ["bash", "powershell -c git status"],
+    ["bash", "pwsh -Command git add -A"],
     ["bash", "bash -lc \"git add -A\""],
     ["powershell", "git push"],
     ["bash", "env git log"],

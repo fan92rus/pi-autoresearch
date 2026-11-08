@@ -282,11 +282,12 @@ interface RegisterToolLike {
 export type CouncilGuard = (cwd: string) => { content: { type: "text"; text: string }[]; details: Record<string, never> } | undefined;
 
 export function registerCouncilTools(pi: RegisterToolLike, campaignGuard?: CouncilGuard): void {
-  // Review B1 (research-vectors): council_* IS gated when a research campaign is
-  // active. The gate is injected by index.ts so this file stays free of the
-  // research-state import; council participants (separate headless sessions with
-  // no campaign) are unaffected because the guard only reads the campaign dir
-  // of the caller's cwd.
+  // council_* IS gated when a research campaign is active in the caller's
+  // cwd. The gate is injected by index.ts so this file stays free of the
+  // research-state import. Council participants in the SAME project share the
+  // same campaign directory, so their blackboard writes are also gated; the
+  // council flow itself is driven through council_convene, which index.ts
+  // gates separately.
   pi.registerTool({
     name: "council_write_entry",
     label: "Council: Write Entry",

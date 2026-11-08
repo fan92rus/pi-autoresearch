@@ -912,7 +912,7 @@ export async function writeApproval(
   if (typeof confirmedBriefSha256 !== "string" || !SHA256_RE.test(confirmedBriefSha256)) {
     return refuse("invalid_argument", "confirmed brief hash must be 64 lowercase hex characters");
   }
-  return withCampaignLock(dir, async (): Promise<Result<{ approval }>> => {
+  return withCampaignLock(dir, async (): Promise<Result<{ approval: Approval }>> => {
     if (await fileMayExist(join(dir, APPROVAL_FILE))) {
       return refuse("approval_invalid", "the brief is already approved; approval.json is never rewritten");
     }

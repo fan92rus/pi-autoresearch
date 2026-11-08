@@ -88,7 +88,10 @@ campaign (`manual_check_required`). `research resolve` is
 operator-only: a dialog (`ctx.ui.confirm === true`) clears the marker;
 `state.json` is never auto-repaired, and a failed or absent dialog
 leaves the marker in place. A stale lock is likewise never removed
-automatically.
+automatically. `resolve` is deliberately exempt from the
+`brief_changed` refusal (owner decision): the operator resolves after
+inspecting the files by hand, and their explicit dialog consent is the
+recovery path.
 
 ## Not promised
 
