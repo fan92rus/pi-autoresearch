@@ -175,6 +175,76 @@ test("D1: a legacy session with a config header in log.jsonl works without any b
   assert.match(ledger, /"type":"run_started"/, "the run must be logged in this session's own directory");
 });
 
+// ── audit round 3: campaign isolation, name change, zero-width cwd ─────
+
+function writeResearchCampaign(dir, id, phase) {
+  const campaignDir = path.join(dir, ".auto", "research", id);
+  fs.mkdirSync(campaignDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(campaignDir, "state.json"),
+    JSON.stringify({ schema_version: 1, campaign_id: id, created_at: new Date().toISOString(), phase }, null, 2) + "\n",
+  );
+  return campaignDir;
+}
+
+test("campaign isolation: an active research campaign refuses optimize_brief and the optimize gates, writing nothing", async () => {
+  const dir = makeWorkDir("campaign-isolation");
+  writeResearchCampaign(dir, "c1", "research");
+  const { pi, tool, command, hook, ctx } = createFakePi({ dir, sessionId: "optimize-campaign-isolation", realGit: false });
+  const { default: autoresearchExtension } = await import(
+    pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")).href
+  );
+  autoresearchExtension(pi);
+  await command("autoresearch").handler("research --id c1", makeCtx(dir, "optimize-campaign-isolation", pi));
+  const h = { pi, tool, hook, ctx: makeCtx(dir, "optimize-campaign-isolation", pi), dir };
+  const BLOCK = /Research campaign active/;
+
+  const draft = await run(h, "optimize_brief", { action: "draft", brief: briefArgs() });
+  assert.match(draft, BLOCK, draft);
+  const propose = await run(h, "optimize_brief", { action: "propose" });
+  assert.match(propose, BLOCK, propose);
+  const init = await run(h, "init_experiment", { name: "liquid speed", metric_name: "total_us", metric_unit: "us", direction: "lower" });
+  assert.match(init, BLOCK, init);
+  const runText = await run(h, "run_experiment", { command: "echo METRIC total_us=1", timeout_seconds: 5 });
+  assert.match(runText, BLOCK, runText);
+  assert.equal(fs.existsSync(path.join(dir, ".auto", "optimize")), false, "no optimize state may be written under a research campaign");
+  assert.equal(fs.existsSync(path.join(dir, ".auto", "log.jsonl")), false, "no ordinary-loop ledger may be written under a research campaign");
+});
+
+test("name change after the start needs a new brief, and the approved new name starts a new segment", async () => {
+  const dir = makeWorkDir("name-change");
+  const h = await loadBare(dir, "name-change");
+  h.ctx.ui.confirm = async () => true;
+  await run(h, "optimize_brief", { action: "draft", brief: briefArgs() });
+  await run(h, "optimize_brief", { action: "propose" });
+  await run(h, "init_experiment", { name: "liquid speed", metric_name: "total_us", metric_unit: "us", direction: "lower" });
+  const before = readConfigHeaders(dir).length;
+
+  const refused = await run(h, "init_experiment", { name: "other goal", metric_name: "total_us", metric_unit: "us", direction: "lower" });
+  assert.match(refused, /does not match the approved brief/, refused);
+  assert.match(refused, /name: brief "liquid speed", init "other goal"/);
+  assert.equal(readConfigHeaders(dir).length, before, "a refused name change must not append a config header");
+
+  await run(h, "optimize_brief", { action: "draft", brief: briefArgs({ name: "other goal" }) });
+  await run(h, "optimize_brief", { action: "propose" });
+  const started = await run(h, "init_experiment", { name: "other goal", metric_name: "total_us", metric_unit: "us", direction: "lower" });
+  assert.doesNotMatch(started, /refused|does not match/, started);
+  const headers = readConfigHeaders(dir);
+  assert.equal(headers.length, before + 1, "the approved name change appends exactly one config header");
+  assert.equal(headers[headers.length - 1].name, "other goal");
+});
+
+test("zero-width cwd is refused as empty, like a blank one", async () => {
+  const dir = makeWorkDir("zero-width-cwd");
+  const h = await loadBare(dir, "zero-width-cwd");
+  h.ctx.ui.confirm = async () => true;
+  await run(h, "optimize_brief", { action: "draft", brief: briefArgs() });
+  await run(h, "optimize_brief", { action: "propose" });
+  const text = await run(h, "init_experiment", { name: "liquid speed", metric_name: "total_us", metric_unit: "us", direction: "lower", cwd: "​​" });
+  assert.match(text, /cwd must be a non-empty path/, text);
+  assert.equal(fs.existsSync(path.join(dir, ".auto", "log.jsonl")), false);
+});
+
 test("draft, owner approval, then init_experiment starts the session", async () => {
   const dir = makeWorkDir("happy");
   const h = await loadBare(dir, "happy");
