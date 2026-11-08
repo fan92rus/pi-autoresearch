@@ -40,6 +40,7 @@ import { spawn } from "node:child_process";
 import { getBashSpawnOptions, killTree } from "./bash-shell.ts";
 import { computeState, markIdeaTried } from "./observer.ts";
 import { briefChatMarkdown, briefConsentSummary } from "./brief-consent.ts";
+import * as optimizeBrief from "./optimize-brief.ts";
 import { registerCouncilTools } from "./council-tools.ts";
 import { registerAssessPrecedentsTool } from "./precedent-assess.ts";
 import { registerSearchPrecedentsTool } from "./precedent-report.ts";
@@ -3035,6 +3036,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   pi.on("session_start", async (_e, ctx) => {
     reconstructState(ctx);
     syncBriefPreview(ctx);
+    optimizeBriefDir = optimizeBrief.optimizeDirOf(ctx.cwd);
     ensureGatedToolsActive();
   });
   pi.on("session_tree", async (_e, ctx) => {
@@ -3388,6 +3390,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "Initialize experiment session (name, metric, unit, direction). Call once before first run. (ordinary loop; blocked during a candidate campaign)",
     promptGuidelines: [
       "Call init_experiment exactly once at the start of an autoresearch session, before the first run_experiment.",
+      "Before init_experiment, draft the brief with optimize_brief (draft) and get the owner's approval with optimize_brief propose; init_experiment starts only with that approval and the same arguments.",
       "If the session log (.auto/log.jsonl) already exists with a config, do NOT call init_experiment again.",
       "If the optimization target changes (different benchmark, metric, or workload), call init_experiment again to insert a new config header and reset the baseline.",
     ],
@@ -3411,6 +3414,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
 
+      // Two-phase start (optimize-two-phase-start): a new or changed session needs an approved brief; a resume of the same config needs none.
+      const optimizeGate = optimizeStartGate(ctx, params);
+      if (optimizeGate) return optimizeGate;
       // Task 1.2 (add-result-reflection): read + validate the `analysis`
       // section of .auto/config.json BEFORE any writes — the params.cwd block
       // below is init's first write (writeConfig + _customWorkDir), and a
@@ -4242,6 +4248,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
       if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return campaignBlockedResponse();
       if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd), ctx)) return researchBlockedResponse();
+      const optimizeRunGate = optimizeNotStartedGate(ctx);
+      if (optimizeRunGate) return optimizeRunGate as any;
       const workDir = resolveWorkDir(ctx.cwd);
       // The config (and therefore the cap) always lives in ctx.cwd — even when
       // workingDir redirects the experiment work elsewhere (see readConfig).
@@ -4992,6 +5000,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const runtime = getRuntime(ctx);
       const state = runtime.state;
 
+      const optimizeLogGate = optimizeNotStartedGate(ctx);
+      if (optimizeLogGate) return optimizeLogGate as any;
       // Input validation for the optional activity label (D-RM-03): rejected before
       // any side effect, so the ledger, git and the pending run number stay untouched.
       if (params.activity_type !== undefined && !(ACTIVITY_TYPES as readonly string[]).includes(params.activity_type)) {
@@ -8530,6 +8540,141 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (!validation.ok) return "brief.json не проходит проверку.";
     return briefChatMarkdown(validation.brief, researchState.sha256Hex(bytes), path.basename(dir));
   };
+  // ── Ordinary loop: two-phase start (openspec: optimize-two-phase-start) ──
+  // The brief view and the consent dialog follow the research_brief pattern; the
+  // dialog body comes from the shared brief-consent.ts.
+  let optimizeBriefDir: string | null = null;
+  const optimizeRefusal = (text: string) => ({ content: [{ type: "text" as const, text }], details: {} });
+  const lastConfigHeader = (jsonlPath: string): Record<string, unknown> | undefined => {
+    try {
+      if (!fs.existsSync(jsonlPath)) return undefined;
+      const lines = fs.readFileSync(jsonlPath, "utf-8").split("\n").filter(Boolean);
+      for (let i = lines.length - 1; i >= 0; i--) {
+        try {
+          const entry = JSON.parse(lines[i]) as Record<string, unknown>;
+          if (entry && entry.type === "config") return entry;
+        } catch { continue; }
+      }
+    } catch { /* unreadable ledger: treated as not started */ }
+    return undefined;
+  };
+  // init_experiment: a resume of the same config needs no brief (D1); anything else needs the approved brief and the same arguments.
+  const optimizeStartGate = (
+    ctx: ExtensionContext,
+    params: { name: string; metric_name: string; metric_unit?: string; direction?: string; cwd?: string },
+  ) => {
+    const header = lastConfigHeader(autoresearchJsonlPath(resolveWorkDir(ctx.cwd)));
+    if (
+      header &&
+      header.name === params.name &&
+      header.metricName === params.metric_name &&
+      (header.metricUnit ?? "") === (params.metric_unit ?? "") &&
+      header.bestDirection === (params.direction ?? "lower")
+    ) {
+      return undefined;
+    }
+    const approved = optimizeBrief.approvedBriefFor(optimizeBrief.optimizeDirOf(ctx.cwd));
+    if (!approved.ok) {
+      return optimizeRefusal(`❌ init_experiment refused (${approved.reason}): ${approved.message}. Order: optimize_brief draft → propose → init_experiment.`);
+    }
+    const diffs = optimizeBrief.initArgsMismatch(approved.brief, params);
+    if (diffs.length > 0) {
+      return optimizeRefusal(`❌ init_experiment does not match the approved brief:\n- ${diffs.join("\n- ")}\nDraft the new values with optimize_brief draft and propose them again.`);
+    }
+    return undefined;
+  };
+  // run_experiment / log_experiment: no measurement before a started session.
+  const optimizeNotStartedGate = (ctx: ExtensionContext) => {
+    if (lastConfigHeader(autoresearchJsonlPath(resolveWorkDir(ctx.cwd))) !== undefined) return undefined;
+    const approved = optimizeBrief.approvedBriefFor(optimizeBrief.optimizeDirOf(ctx.cwd));
+    const step = approved.ok
+      ? "init_experiment"
+      : approved.reason === "brief_missing" || approved.reason === "brief_invalid"
+        ? "optimize_brief draft"
+        : "optimize_brief propose";
+    return optimizeRefusal(`❌ The optimization session is not started: next step is ${step}. Order: optimize_brief draft → propose → init_experiment.`);
+  };
+  const optimizeBriefTranscriptText = (dir: string | null): string => {
+    if (dir === null) return "Бриф для показа не найден: в этой сессии не было optimize_brief draft.";
+    const read = optimizeBrief.readOptimizeBrief(dir);
+    return read.ok ? optimizeBrief.optimizeBriefMarkdown(read.brief, read.sha256) : `Бриф для показа не найден: ${read.message}.`;
+  };
+  registerGatedTool({
+    name: "optimize_brief",
+    label: "Optimize brief (phase 1)",
+    // The full brief is drawn as this tool call's row: shown before execute and before the owner dialog.
+    renderCall(args: any, _theme: any, _context: any) {
+      if (args?.action !== "propose") return new Text(`optimize_brief ${String(args?.action ?? "")}`, 0, 0);
+      return new Text(optimizeBriefTranscriptText(optimizeBriefDir), 0, 0);
+    },
+    description:
+      "Ordinary optimization loop, phase 1: draft the session brief (name, metric_name, metric_unit, direction, cwd), then ask the OWNER " +
+      "to approve it with propose. init_experiment starts the session only with that approval and the same arguments. The model cannot approve.",
+    promptSnippet: "Optimization brief: draft the session brief, then the owner approves it (propose); init_experiment starts only after that",
+    promptGuidelines: [
+      "Before init_experiment, call optimize_brief draft with name, metric_name, metric_unit, direction, cwd; then optimize_brief propose for the owner's approval.",
+      "Use the same name, metric_name, metric_unit, direction and cwd in init_experiment as in the approved brief.",
+    ],
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["draft", "propose"], description: "Brief action to perform." },
+        brief: {
+          type: "object",
+          description: "draft only: {name, metric_name, metric_unit?, direction? (lower|higher), cwd?}. Unknown fields are refused.",
+        },
+      },
+      required: ["action"],
+    } as any,
+
+    async execute(_toolCallId: string, params: any, _signal, _onUpdate, ctx: ExtensionContext) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
+      if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return campaignBlockedResponse();
+      if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd), ctx)) return researchBlockedResponse();
+      const action = params?.action;
+      if (action !== "draft" && action !== "propose") {
+        return optimizeRefusal(`❌ unknown action ${JSON.stringify(String(action))}; allowed: draft propose`);
+      }
+      const extra = Object.keys(params ?? {}).filter((k) => k !== "action" && k !== "brief");
+      if (extra.length > 0) {
+        return optimizeRefusal(`❌ unexpected field(s): ${extra.join(", ")}; approval and confirmation fields are not model arguments`);
+      }
+      const dir = optimizeBrief.optimizeDirOf(ctx.cwd);
+      if (action === "draft") {
+        if (params.brief === undefined) return optimizeRefusal("❌ draft requires the brief object");
+        const written = optimizeBrief.writeOptimizeBriefDraft(dir, params.brief);
+        if (!written.ok) return optimizeRefusal(`❌ brief rejected: ${written.errors.join("; ")}`);
+        optimizeBriefDir = dir;
+        return {
+          content: [{ type: "text", text: `✅ Brief draft saved (sha256 ${written.sha256}). It is NOT approved yet: the owner confirms it with optimize_brief propose.` }],
+          details: { action },
+        };
+      }
+      // propose: owner dialog. No UI or no explicit confirm === true means no approval.
+      const read = optimizeBrief.readOptimizeBrief(dir);
+      if (!read.ok) return optimizeRefusal(`❌ ${read.message}`);
+      optimizeBriefDir = dir;
+      const existing = optimizeBrief.readOptimizeApproval(dir);
+      if (existing.ok && existing.approval.confirmed === true && existing.approval.brief_sha256 === read.sha256) {
+        return { content: [{ type: "text", text: `✅ Brief already approved (sha256 ${read.sha256}). Call init_experiment with the same arguments.` }], details: { action } };
+      }
+      if (!ctx.hasUI || !ctx.ui || typeof ctx.ui.confirm !== "function") {
+        return optimizeRefusal("❌ brief approval is an owner action and needs an interactive dialog; the brief stays unapproved");
+      }
+      const confirmed = await ctx.ui.confirm(
+        "Optimization session: approve brief",
+        optimizeBrief.optimizeConsentSummary(read.brief, read.sha256),
+      );
+      optimizeBrief.writeOptimizeApproval(dir, confirmed === true, read.sha256);
+      if (confirmed !== true) return optimizeRefusal("❌ the owner did not confirm the brief; nothing was approved");
+      return {
+        content: [{ type: "text", text: `✅ Brief approved (sha256 ${read.sha256}). Call init_experiment with the same name, metric_name, metric_unit, direction and cwd.` }],
+        details: { action },
+      };
+    },
+  });
+
   registerGatedTool({
     name: "research_brief",
     label: "Research brief (phase 1)",
