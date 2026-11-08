@@ -231,7 +231,7 @@ test("(d) research_brief propose: owner confirm === true writes approval.json wi
   await call(h, "research_brief", { action: "draft", brief: briefFixture() });
   const dialogs = [];
   h.ctx.ui.confirm = async (title, message) => {
-    dialogs.push({ title, message });
+    dialogs.push({ title, message, chatBefore: h.pi.chatMessages.length });
     return true;
   };
   const text = textOf(await call(h, "research_brief", { action: "propose" }));
@@ -239,11 +239,33 @@ test("(d) research_brief propose: owner confirm === true writes approval.json wi
   const expected = sha256Of(fs.readFileSync(briefPath));
   assert.equal(dialogs.length, 1, "exactly one owner dialog");
   assert.ok(dialogs[0].message.includes(expected), "dialog must show the brief hash");
-  assert.match(dialogs[0].message, /cache layer explains the latency drop/, "dialog must show the brief JSON");
+  assert.equal(dialogs[0].chatBefore, 1, "full brief must be in the chat before the dialog opens");
+  const chat = h.pi.chatMessages[0];
+  assert.equal(chat.customType, "research-brief");
+  assert.match(chat.content, /cache layer explains the latency drop/, "chat must show the brief goal");
+  assert.ok(chat.content.includes(expected), "chat must show the brief SHA-256");
+  assert.doesNotMatch(chat.content, /"schema_version"|"questions"\s*:/, "chat must not be raw JSON");
   const approval = readJson(path.join(dir, ".auto", "research", "c1", "approval.json"));
   assert.equal(approval.confirmed, true);
   assert.equal(approval.brief_sha256, expected);
   assert.ok(text.includes(expected) && /research start/.test(text), `launch prompt must carry path and hash: ${text}`);
+});
+
+test("(d) research_brief propose: dialog is a summary of at most 10 lines starting with the SHA", async () => {
+  const dir = makeWorkDir("propose-summary");
+  const h = await loadExtension(dir, "propose-summary");
+  await call(h, "research_brief", { action: "draft", brief: briefFixture() });
+  let message = "";
+  h.ctx.ui.confirm = async (_title, msg) => {
+    message = msg;
+    return true;
+  };
+  await call(h, "research_brief", { action: "propose" });
+  const expected = sha256Of(fs.readFileSync(path.join(dir, ".auto", "research", "c1", "brief.json")));
+  const lines = message.split("\n");
+  assert.ok(lines.length <= 10, `summary has ${lines.length} lines`);
+  assert.equal(lines[0], `Brief SHA-256: ${expected}`, "first line must be the SHA line");
+  assert.doesNotMatch(message, /"schema_version"|Results are observational/, "dialog must not carry the full brief");
 });
 
 test("(d) research_brief propose: any confirm other than true approves nothing", async () => {

@@ -94,6 +94,7 @@ export function createFakePi({
   const hooks = new Map();
   const shortcuts = [];
   const sentMessages = [];
+  const chatMessages = [];
   const notifications = [];
   const entries = [];
   const execCalls = [];
@@ -111,6 +112,7 @@ export function createFakePi({
     hooks,
     shortcuts,
     sentMessages,
+    chatMessages,
     notifications,
     entries,
     execCalls,
@@ -217,6 +219,10 @@ export function createFakePi({
 
     async sendUserMessage(text, msgOpts) {
       sentMessages.push({ text, opts: msgOpts ?? {} });
+    },
+
+    sendMessage(message) {
+      chatMessages.push(message);
     },
 
     async notify(text, type) {

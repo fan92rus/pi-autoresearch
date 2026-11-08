@@ -39,6 +39,7 @@ import { createServer, type Server, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
 import { getBashSpawnOptions, killTree } from "./bash-shell.ts";
 import { computeState, markIdeaTried } from "./observer.ts";
+import { briefChatMarkdown, briefConsentSummary } from "./brief-consent.ts";
 import { registerCouncilTools } from "./council-tools.ts";
 import { registerAssessPrecedentsTool } from "./precedent-assess.ts";
 import { registerSearchPrecedentsTool } from "./precedent-report.ts";
@@ -8653,10 +8654,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
       const sha = briefSha ? { ok: true as const, sha256: briefSha } : await researchState.briefSha256(dir);
       if (!sha.ok) return fail(sha.reason, sha.message);
+      // Full brief goes to the chat as readable Markdown; the dialog carries only the summary and the SHA.
+      pi.sendMessage({
+        customType: "research-brief",
+        content: briefChatMarkdown(validation.brief, sha.sha256, campaignId),
+        display: true,
+        details: { campaign_id: campaignId, brief_sha256: sha.sha256 },
+      });
       const confirmed = await ctx.ui.confirm(
         `Research campaign ${campaignId}: approve brief`,
-        `Brief SHA-256: ${sha.sha256}\n\n${briefText.trimEnd()}\n\n` +
-          "Approval freezes this brief: questions and decision rules cannot change in this campaign. Approve?",
+        briefConsentSummary(validation.brief, sha.sha256, campaignId),
       );
       if (confirmed !== true) return fail("not_approved", "the owner did not confirm the brief; nothing was approved");
       const approved = await researchState.writeApproval(dir, sha.sha256);
