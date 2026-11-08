@@ -95,6 +95,29 @@ test("init arguments must equal the brief, with defaults applied on both sides",
 // ── wiring: the real extension ───────────────────────────────────────
 
 // Runs before any test that pins a cwd: the module-level workDir override would leak into this session.
+test("direction after start: a changed direction needs a new brief, and the approved one starts with it", async () => {
+  const dir = makeWorkDir("direction-change");
+  const h = await loadBare(dir, "direction-change");
+  h.ctx.ui.confirm = async () => true;
+  await run(h, "optimize_brief", { action: "draft", brief: briefArgs() });
+  await run(h, "optimize_brief", { action: "propose" });
+  await run(h, "init_experiment", { name: "liquid speed", metric_name: "total_us", metric_unit: "us", direction: "lower" });
+  const before = readConfigHeaders(dir).length;
+
+  const refused = await run(h, "init_experiment", { name: "liquid speed", metric_name: "total_us", metric_unit: "us", direction: "higher" });
+  assert.match(refused, /does not match the approved brief/, refused);
+  assert.match(refused, /direction: brief "lower", init "higher"/);
+  assert.equal(readConfigHeaders(dir).length, before, "a refused direction change must not append a config header");
+
+  await run(h, "optimize_brief", { action: "draft", brief: briefArgs({ direction: "higher" }) });
+  await run(h, "optimize_brief", { action: "propose" });
+  const started = await run(h, "init_experiment", { name: "liquid speed", metric_name: "total_us", metric_unit: "us", direction: "higher" });
+  assert.doesNotMatch(started, /refused|does not match/, started);
+  const headers = readConfigHeaders(dir);
+  assert.equal(headers.length, before + 1);
+  assert.equal(headers[headers.length - 1].bestDirection, "higher");
+});
+
 test("4.4: changing metric_name after the start needs a new brief; the new metric starts a new segment", async () => {
   const dir = makeWorkDir("metric-change");
   const h = await loadBare(dir, "metric-change");
@@ -313,4 +336,25 @@ test("5.1: the ordinary-loop system prompt states the order draft -> propose -> 
   const i = prompt.indexOf("init_experiment with the same", p + 1);
   assert.ok(d > 0 && p > d && i > p, `order draft -> propose -> init_experiment missing in system prompt: ${d} ${p} ${i}`);
   assert.match(prompt, /run_experiment and log_experiment are refused/);
+});
+
+// ── audit round 2: D1 and direction after start ──────────────────────
+
+test("D1: a legacy session with a config header in log.jsonl works without any brief", async () => {
+  const dir = makeWorkDir("legacy-d1");
+  // A session started before the two-phase start: the ledger has its config header, there is no .auto/optimize/.
+  fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".auto", "log.jsonl"),
+    JSON.stringify({ type: "config", name: "liquid speed", metricName: "total_us", metricUnit: "us", bestDirection: "lower" }) + "\n",
+  );
+  const h = await loadBare(dir, "legacy-d1");
+  assert.equal(fs.existsSync(path.join(dir, ".auto", "optimize")), false);
+
+  const init = await run(h, "init_experiment", { name: "liquid speed", metric_name: "total_us", metric_unit: "us", direction: "lower" });
+  assert.doesNotMatch(init, /refused|does not match|optimize_brief/, init);
+  assert.equal(fs.existsSync(path.join(dir, ".auto", "optimize")), false, "resume of the same config must not ask for a brief");
+
+  const run1 = await run(h, "run_experiment", { command: "echo METRIC total_us=1", timeout_seconds: 30 });
+  assert.doesNotMatch(run1, /not started|optimize_brief/, run1);
 });
