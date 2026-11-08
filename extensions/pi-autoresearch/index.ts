@@ -3034,9 +3034,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_e, ctx) => {
     reconstructState(ctx);
+    syncBriefPreview(ctx);
     ensureGatedToolsActive();
   });
-  pi.on("session_tree", async (_e, ctx) => reconstructState(ctx));
+  pi.on("session_tree", async (_e, ctx) => {
+    reconstructState(ctx);
+    syncBriefPreview(ctx);
+  });
   pi.on("session_before_switch", async () => {
     clearOverlay();
   });
@@ -8502,6 +8506,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   // Directory of the last drafted campaign: the transcript view of propose reads its brief.json.
   let briefPreviewDir: string | null = null;
+  // A pinned campaign (launch command or resume) has its brief on disk: point the transcript view at it.
+  const syncBriefPreview = (ctx: ExtensionContext): void => {
+    if (getRuntime(ctx).researchCampaignId === null) return;
+    const target = resolveResearchTarget(resolveWorkDir(ctx.cwd), ctx);
+    if (target.ok) briefPreviewDir = target.dir;
+  };
   const briefTranscriptText = (dir: string | null): string => {
     if (dir === null) return "Бриф для показа не найден: в этой сессии не было research_brief draft.";
     let bytes: Buffer;
@@ -9465,6 +9475,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           // this session works with exactly this campaign (live bench finding,
           // bd pi-autoresearch-9o2: the agent invented a second campaign).
           runtime.researchCampaignId = requestedId;
+          syncBriefPreview(ctx);
           const campaignDir = resolveRequestedCampaignDir(requestedId);
           const insp = campaignDir !== null ? await researchState.inspectCampaign(campaignDir) : null;
           resumePhase = insp?.state?.phase === "briefing" || insp?.state?.phase === "research" ? insp.state.phase : null;

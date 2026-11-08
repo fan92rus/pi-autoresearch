@@ -272,6 +272,14 @@ test("(d) research_brief propose: dialog is a summary of at most 10 lines starti
   assert.doesNotMatch(message, /"schema_version"|Results are observational/, "dialog must not carry the full brief");
 });
 
+test("(d) research_brief propose: a campaign drafted in an earlier session still shows its brief", async () => {
+  const dir = makeWorkDir("propose-resume");
+  const h1 = await loadExtension(dir, "propose-resume-1");
+  await call(h1, "research_brief", { action: "draft", brief: briefFixture() });
+  const h2 = await loadExtension(dir, "propose-resume-2");
+  assert.match(renderPropose(h2), /cache layer explains the latency drop/, "resumed campaign must show its brief in the transcript row");
+});
+
 test("(d) research_brief propose: any confirm other than true approves nothing", async () => {
   const dir = makeWorkDir("propose-no");
   const h = await loadExtension(dir, "propose-no");
