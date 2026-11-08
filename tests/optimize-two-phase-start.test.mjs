@@ -141,6 +141,40 @@ test("4.4: changing metric_name after the start needs a new brief; the new metri
   assert.equal(headers[headers.length - 1].metricName, "bundle_kb");
 });
 
+// Unpinned tests (5.1, D1) stay before every test that pins a cwd: the module-level _customWorkDir would leak into them.
+
+test("5.1: the ordinary-loop system prompt states the order draft -> propose -> init_experiment", async () => {
+  const dir = makeWorkDir("prompt-order");
+  const h = await loadBare(dir, "prompt-order");
+  const out = await h.hook("before_agent_start")({ systemPrompt: "BASE" }, h.ctx);
+  const prompt = out?.systemPrompt ?? "";
+  const d = prompt.indexOf("optimize_brief draft");
+  const p = prompt.indexOf("propose", d + 1);
+  const i = prompt.indexOf("init_experiment with the same", p + 1);
+  assert.ok(d > 0 && p > d && i > p, `order draft -> propose -> init_experiment missing in system prompt: ${d} ${p} ${i}`);
+  assert.match(prompt, /run_experiment and log_experiment are refused/);
+});
+
+test("D1: a legacy session with a config header in log.jsonl works without any brief", async () => {
+  const dir = makeWorkDir("legacy-d1");
+  // A session started before the two-phase start: the ledger has its config header, there is no .auto/optimize/.
+  fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".auto", "log.jsonl"),
+    JSON.stringify({ type: "config", name: "liquid speed", metricName: "total_us", metricUnit: "us", bestDirection: "lower" }) + "\n",
+  );
+  const h = await loadBare(dir, "legacy-d1");
+  const init = await run(h, "init_experiment", { name: "liquid speed", metric_name: "total_us", metric_unit: "us", direction: "lower" });
+  assert.doesNotMatch(init, /refused|does not match|optimize_brief/, init);
+  assert.equal(fs.existsSync(path.join(dir, ".auto", "optimize")), false, "resume of the same config must not ask for a brief");
+
+  const run1 = await run(h, "run_experiment", { command: "echo METRIC total_us=1", timeout_seconds: 30 });
+  assert.doesNotMatch(run1, /not started|optimize_brief/, run1);
+  // The run must land in this session's own ledger, not in a directory pinned by an earlier test.
+  const ledger = fs.readFileSync(path.join(dir, ".auto", "log.jsonl"), "utf-8");
+  assert.match(ledger, /"type":"run_started"/, "the run must be logged in this session's own directory");
+});
+
 test("draft, owner approval, then init_experiment starts the session", async () => {
   const dir = makeWorkDir("happy");
   const h = await loadBare(dir, "happy");
@@ -322,39 +356,4 @@ test("B4 round 3: init with cwd \"\" is refused on a pinned session and writes n
   assert.match(text, /cwd must be a non-empty path/, text);
   assert.equal(readConfigHeaders(pinned).length, before, "the pinned dir's ledger must not get a new config header");
   assert.equal(readConfigHeaders(dir).length, 0, "the session dir must not get a config header from the refused call");
-});
-
-// ── audit round (goal mw81w6xg): 4.4 and 5.1 ─────────────────────────
-
-test("5.1: the ordinary-loop system prompt states the order draft -> propose -> init_experiment", async () => {
-  const dir = makeWorkDir("prompt-order");
-  const h = await loadBare(dir, "prompt-order");
-  const out = await h.hook("before_agent_start")({ systemPrompt: "BASE" }, h.ctx);
-  const prompt = out?.systemPrompt ?? "";
-  const d = prompt.indexOf("optimize_brief draft");
-  const p = prompt.indexOf("propose", d + 1);
-  const i = prompt.indexOf("init_experiment with the same", p + 1);
-  assert.ok(d > 0 && p > d && i > p, `order draft -> propose -> init_experiment missing in system prompt: ${d} ${p} ${i}`);
-  assert.match(prompt, /run_experiment and log_experiment are refused/);
-});
-
-// ── audit round 2: D1 and direction after start ──────────────────────
-
-test("D1: a legacy session with a config header in log.jsonl works without any brief", async () => {
-  const dir = makeWorkDir("legacy-d1");
-  // A session started before the two-phase start: the ledger has its config header, there is no .auto/optimize/.
-  fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
-  fs.writeFileSync(
-    path.join(dir, ".auto", "log.jsonl"),
-    JSON.stringify({ type: "config", name: "liquid speed", metricName: "total_us", metricUnit: "us", bestDirection: "lower" }) + "\n",
-  );
-  const h = await loadBare(dir, "legacy-d1");
-  assert.equal(fs.existsSync(path.join(dir, ".auto", "optimize")), false);
-
-  const init = await run(h, "init_experiment", { name: "liquid speed", metric_name: "total_us", metric_unit: "us", direction: "lower" });
-  assert.doesNotMatch(init, /refused|does not match|optimize_brief/, init);
-  assert.equal(fs.existsSync(path.join(dir, ".auto", "optimize")), false, "resume of the same config must not ask for a brief");
-
-  const run1 = await run(h, "run_experiment", { command: "echo METRIC total_us=1", timeout_seconds: 30 });
-  assert.doesNotMatch(run1, /not started|optimize_brief/, run1);
 });
