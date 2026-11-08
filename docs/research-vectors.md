@@ -100,7 +100,17 @@ recovery path.
   style paths, quoting tricks and other shell-parsing bypasses are
   documented residuals. State files under `.auto/research/` are plain
   files — protection against hand-editing them is rule-based, not
-  enforced.
+  enforced. Specifically, the interception regex is best-effort
+  (owner decision after three review rounds): blocked forms cover
+  command-position git, path-prefixed/case/.exe variants, quoted
+  Windows paths, cmd(.exe) /c, powershell(.exe)/pwsh(.exe) with flags
+  (-NoProfile -Command, quoted payloads), sh/bash/zsh/dash -c,
+  env/command/xargs with options, sudo with -u/-g targets, nice with
+  flag/number adjustments, and `VAR=x` prefixes. Known residuals:
+  `find . -exec git ...`, nested quoting tricks (`{ git; }`, payload
+  quoting inside `/bin/sh -c`). A regex cannot fully parse shell;
+  review acceptance criterion is the documented boundary, not
+  absolute coverage.
 - Campaign phases: `briefing` (draft, not yet approved) does not
   block the ordinary loop — the block starts with the research phase
   (accepted residual). `stopped` blocks the ordinary loop and Git
