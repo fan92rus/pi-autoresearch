@@ -56,10 +56,11 @@ node scripts/research-rpc.mjs --cwd <dir> --mode research|optimize
   отправляет research-kickoff (правила кампании). Обёртка НЕ отправляет
   `/autoresearch on` (не подкоманда) и никогда не отправляет
   `/skill:autoresearch-create`.
-- Sequencing (по ревью раунда 4): extension-команда всегда даёт disposition
-  `handled`, а её собственный kickoff-запуск стримится в той же сессии.
-  После stage-1 ответа обёртка ждёт цикл `agent_start` → `agent_settled`
-  (kickoff-прогон, выполняющий draft); нет `agent_start` за
+- Sequencing (по ревью раундов 4-5): extension-команда всегда даёт disposition
+  `handled`, а её собственный kickoff-запуск стримится в той же сессии
+  (kickoff только активирует режим; draft — в stage 2). Ожидание стартует В
+  МОМЕНТ отправки stage-1 (ответ и agent_start могут прийти в любом порядке):
+  ждём цикл `agent_start` → `agent_settled`; нет `agent_settled` за
   `--stage1-timeout-sec` (по умолчанию 30) → stage 1 отказала (guard/ошибка),
   exit 2. Stage 2 отправляется только после `agent_settled`; `queued` или
   `success:false` на stage-2 prompt (стриминг) — ошибка обёртки, exit 1.
@@ -68,7 +69,7 @@ node scripts/research-rpc.mjs --cwd <dir> --mode research|optimize
   и шагами: прочитать файл брифа → `research_brief draft` (campaign_id, объект
   из JSON файла) → `propose` → `research start` (campaign_id, expected_sha256)
   → open по одному вопросу → close по правилам → stop → report.
-- `--mode optimize "<goal>"` (цель в `--goal`; без неё exit 2): ОДНО сообщение
+- `--mode optimize` (цель в `--goal`; без неё exit 2): ОДНО сообщение
   `/autoresearch optimize <goal>` (явный алиас metric-loop). Никогда не
   `/autoresearch <goal>` голым текстом — цель, начинающаяся с `research`, иначе
   попала бы в зарезервированную ветку. Стоп-условие: exit 0 — агент сообщил
@@ -79,15 +80,23 @@ node scripts/research-rpc.mjs --cwd <dir> --mode research|optimize
   `confirmed: false` + лог; exit 1 даёт только отказ по хешу брифа.
 - Таймаут: незакрытый request → `confirmed: false`/`cancelled: true`, shutdown
   pi (kill после 10 с), exit 3, причина в логе.
-- Exit codes: 0 — успех (research: успешный report; optimize: агент сообщил
-  завершение цикла); 1 — отказ по хешу брифа (abort сессии); 2 — ошибки
-  аргументов (research без `--brief`/`--approve-sha`; неканонический,
-  непарсируемый — пустой/BOM — или отсутствующий `--brief`; `--approve-sha` не
-  `^[0-9a-f]{64}$`; `--campaign-id` не `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`;
-  `optimize` без `--goal`) и отказ stage-1 (нет agent_start за таймаут);
-  3 — таймаут. Тестовая опция `--hold-dialog-ms <n>` (по умолчанию 0)
-  задерживает ответ на диалог — воспроизведение мутации файла при висящем
-  диалоге. Момент отсечки «после отказа» в логе = запись `confirmed:false`.
+- Exit codes: 0 — успех (research: успешный report — `tool_execution_start`
+  с toolName=research, action=report + `tool_execution_end` без isError,
+  корреляция по id; optimize: цикл завершён и финальное сообщение содержит
+  маркер `OPTIMIZE-CYCLE-COMPLETE`, добавляемый к kickoff после verbatim-части);
+  1 — отказ по хешу брифа (abort сессии) и протокольные/sequencing-ошибки
+  обёртки (stage-2 при стриминге); 2 — ошибки аргументов (research без
+  `--brief`/`--approve-sha`; неканонический, непарсируемый — пустой/BOM — или
+  отсутствующий `--brief`; `--approve-sha` не `^[0-9a-f]{64}$`; `--campaign-id`
+  не `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`; `optimize` без `--goal`) и отказ
+  stage-1; 3 — таймаут. Не-брифовый confirm — false + лог, код не меняет.
+  В optimize-режиме диалог с `Brief SHA-256:` — всегда false + лог.
+  Отсечка «после отказа» в логе = запись `confirmed:false`.
+  Тестовая опция `--hold-dialog-ms <n>` (по умолчанию 0) задерживает ответ
+  на диалог — воспроизведение мутации файла при висящем диалоге. Штатный
+  shutdown pi — закрытие stdin; kill после 10 с. Остаточный риск:
+  LLM-транскрипция объекта брифа может дать другие байты draft → propose
+  покажет другой хеш → отказ (exit 1); fail-closed, принято.
 - Лог: сырой JSONL всех записей stdout + консольный tail tool-вызовов.
 
 ### 2. Изменения в `extensions/pi-autoresearch/index.ts` и `commands.ts`

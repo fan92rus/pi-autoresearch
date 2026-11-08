@@ -21,19 +21,32 @@
 
 `/autoresearch research` — extension-команда: её prompt-ответ всегда имеет
 disposition `handled`, а собственный kickoff-запуск стримится внутри той же
-сессии. Обёртка SHALL после stage-1 ответа ждать цикл `agent_start` →
-`agent_settled`; если `agent_start` не наступил за `--stage1-timeout-sec`
-(по умолчанию 30) — stage 1 отказала (exit 2).
+сессии (kickoff только активирует режим; draft выполняется в stage 2).
+Ожидание завершения stage 1 MUST стартовать В МОМЕНТ отправки stage-1 prompt
+(ответ `handled` и `agent_start` могут прийти в любом порядке); таймаут —
+`--stage1-timeout-sec` (по умолчанию 30) от момента отправки.
 
 #### Scenario: Sequencing stage 1 → stage 2
-- **WHEN** stage-1 сообщение отправлено, ответ `handled`, затем пришёл
-  `agent_start` и завершился `agent_settled`
+- **WHEN** stage-1 сообщение отправлено, ответ `handled` и `agent_start` могут
+  прийти в любом порядке; пришёл `agent_start` и завершился `agent_settled`
 - **THEN** stage 2 отправлена после этого `agent_settled`.
 
 #### Scenario: Stage 1 отказала (guard или ошибка)
-- **WHEN** после stage-1 ответа `agent_start` не наступил за
-  `--stage1-timeout-sec`
+- **WHEN** `agent_settled` не наступил за `--stage1-timeout-sec` от момента
+  отправки stage-1
 - **THEN** обёртка завершается с кодом 2, причина в логе (кампания не создана).
+
+### Requirement: Отправка stage 2 и её протокольные ошибки
+
+Stage 2 MUST отправляться только после `agent_settled` stage-1. Ответ
+`queued`/`success:false` на stage-2 prompt (отправка во время стриминга —
+не должен происходить при верном sequencing) — ошибка обёртки (exit 1),
+причина в логе.
+
+#### Scenario: Stage 2 при стриминге
+- **WHEN** stage-2 prompt отправлен во время стриминга и вернулся `queued` или
+  `success:false`
+- **THEN** ошибка обёртки: exit 1, причина в логе.
 
 ### Requirement: Research-режим требует канонический бриф и хеш
 
@@ -57,6 +70,46 @@ JSON (включая пустой файл и BOM), отсутствующий �
 - **WHEN** `--approve-sha` не по `^[0-9a-f]{64}$` или `--campaign-id` не по
   `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`
 - **THEN** завершение с ошибкой (exit 2) до спавна pi.
+
+#### Scenario: Stage 2 при стриминге
+- **WHEN** stage-2 prompt отправлен во время стриминга (не должен происходить
+  при верном sequencing) и вернулся `queued` или `success:false`
+- **THEN** ошибка обёртки: exit 1, причина в логе.
+
+### Requirement: Коды выхода
+
+Скрипт SHALL использовать: 0 — успех (наблюдаемое завершение, см. ниже); 1 —
+отказ по хешу брифа (abort сессии) ИЛИ протокольная/sequencing-ошибка обёртки
+(stage-2 при стриминге); 2 — ошибки аргументов и отказ guard-а/stage-1;
+3 — таймаут.
+
+#### Scenario: Код для отказа по хешу
+- **WHEN** сработал отказ по хешу
+- **THEN** код выхода 1 (не 0 и не 3).
+
+#### Scenario: Код для протокольной ошибки stage 2
+- **WHEN** stage-2 prompt вернул `queued`/`success:false`
+- **THEN** код выхода 1, причина в логе.
+
+### Requirement: Успешное завершение наблюдаемо
+
+Research: exit 0 SHALL ставиться при наблюдении `tool_execution_start` с
+`toolName=research` и параметром `action=report`, за которым последовал
+`tool_execution_end` того же call без `isError` (корреляция по id).
+Optimize: exit 0 SHALL ставиться при завершённом цикле `agent_start` →
+`agent_settled`, после которого финальное сообщение ассистента содержит
+маркер `OPTIMIZE-CYCLE-COMPLETE` (kickoff optimize-алиаса дополняется этой
+инструкцией — единственное добавление к verbatim-тексту).
+
+#### Scenario: Research exit 0
+- **WHEN** зафиксированы `tool_execution_start` (research, action=report) и
+  соответствующий `tool_execution_end` без isError
+- **THEN** после `agent_settled` скрипт выходит с кодом 0.
+
+#### Scenario: Optimize exit 0
+- **WHEN** цикл `agent_start` → `agent_settled` завершён и последнее сообщение
+  ассистента содержит `OPTIMIZE-CYCLE-COMPLETE`
+- **THEN** скрипт выходит с кодом 0.
 
 #### Scenario: Stage 2 при стриминге
 - **WHEN** stage-2 prompt отправлен во время стриминга (не должен происходить
@@ -103,15 +156,21 @@ JSON (включая пустой файл и BOM), отсутствующий �
 ### Requirement: Последствия отказа по хешу
 
 При любом несовпадении хешей скрипт MUST после `confirmed: false` немедленно
-отправить RPC-команду abort, дождаться выхода pi (kill после 10 с) и выйти
-с кодом 1; в логе после отказа MUST отсутствовать вызовы
-`research_brief`/`research`. Любой confirm без `Brief SHA-256:` в сообщении
-MUST отклоняться (`confirmed: false`) с записью в лог. Поведение TUI-диалогов
-инструментов (`ctx.ui.confirm === true` как единственный сигнал) не меняется.
+отправить RPC-команду abort, дождаться выхода pi (orderly: закрытие stdin;
+kill после 10 с) и выйти с кодом 1; в логе после записи `confirmed: false`
+MUST отсутствовать вызовы `research_brief`/`research` (отсечка — момент
+записи `confirmed: false`). Если в момент ответа файл `--brief` удалён или
+нечитаем — файловый хеш недоступен: это отказ (`confirmed: false`, abort,
+exit 1).
 
 #### Scenario: После отказа нет research-вызовов
 - **WHEN** отказ по хешу обработан и сессия завершена
-- **THEN** в логе после abort отсутствуют вызовы `research_brief` и `research`.
+- **THEN** в логе после записи `confirmed: false` отсутствуют вызовы
+  `research_brief` и `research`.
+
+#### Scenario: Бриф удалён при висящем диалоге
+- **WHEN** файл `--brief` удалён/нечитаем в момент ответа на диалог
+- **THEN** `confirmed: false`, abort, exit 1 (fail-closed).
 
 ### Requirement: Таймаут сессии с незакрытым диалогом
 
@@ -122,19 +181,8 @@ MUST отклоняться (`confirmed: false`) с записью в лог. П
 
 #### Scenario: Висящий confirm при таймауте
 - **WHEN** `--timeout-sec` истёк при незакрытом confirm
-- **THEN** скрипт ответил `confirmed: false`, pi завершён, код выхода 3,
-  причина `timeout` в логе.
-
-### Requirement: Коды выхода
-
-Скрипт SHALL использовать: 0 — успех (research: получен успешный `report`;
-optimize: агент сообщил завершение цикла в финальном тексте); 1 — отказ по
-хешу брифа (с abort сессии); 2 — ошибки аргументов и отказ guard-а на stage 1;
-3 — таймаут.
-
-#### Scenario: Код для отказа по хешу
-- **WHEN** сработал отказ по хешу
-- **THEN** код выхода 1 (не 0 и не 3).
+- **THEN** скрипт ответил `confirmed: false`, pi завершён ( orderly: закрытие
+  stdin; kill после 10 с), код выхода 3, причина `timeout` в логе.
 
 ### Requirement: Диалоги в optimize-режиме
 
@@ -183,14 +231,21 @@ run_experiment/log_experiment.
 - **WHEN** оператор вызывает `/autoresearch research something`
 - **THEN** это research-кампания с описанием `something`.
 
+### Requirement: Отклонение не-брифовых диалогов
+
+Любой confirm без `Brief SHA-256:` в сообщении MUST отклоняться
+(`confirmed: false`) с записью в лог. Поведение TUI-диалогов инструментов
+(`ctx.ui.confirm === true` как единственный сигнал) не меняется.
+
+#### Scenario: Не-брифовый диалог не подтверждается
+- **WHEN** расширение эмитит confirm без строки `Brief SHA-256:`
+- **THEN** скрипт отвечает `confirmed: false` и пишет событие в лог.
+
 ### Requirement: Алиас optimize
 
 Новый алиас `/autoresearch optimize <goal>` MUST проверяться ДО зарезервированной
-ветки: слово `optimize` отбрасывается, хвост — полная цель metric-loop. Kickoff
-алиаса — РОВНО тот же, что у существующего free-text optimize-потока сегодня:
-`/skill:autoresearch-create <goal> BENCHMARK_GUARDRAIL` (при отсутствии
-`.auto/prompt.md`) или «Autoresearch mode active. <goal> ...» (при наличии);
-цель в kickoff — исходный хвост без слова `optimize`.
+ветки: слово `optimize` отбрасывается (алиас минует зарезервированную ветку),
+хвост — полная цель metric-loop. Kickoff алиаса и его guard-ы — см. Requirement «Kickoff алиаса optimize».
 
 #### Scenario: Алиас optimize сохраняет выразимость целей
 - **WHEN** оператор вызывает `/autoresearch optimize research habits`
@@ -200,12 +255,27 @@ run_experiment/log_experiment.
 - **WHEN** оператор вызывает `/autoresearch optimize`
 - **THEN** отказ с сообщением об отсутствии цели.
 
+### Requirement: Kickoff алиаса optimize
+
+Kickoff алиаса — как у существующего free-text optimize-потока (точные
+формулировки заданы кодом index.ts:9912-9920 и 9936-9941; спека не
+переопределяет). Алиас MUST переиспользовать guard-ы free-text потока
+(`researchBlocksOrdinaryLoop`, `campaignBlocksOrdinaryLoop`). Маркер
+`OPTIMIZE-CYCLE-COMPLETE` добавляется к kickoff после verbatim-части —
+единственное добавление к тексту.
+
+#### Scenario: Kickoff алиаса совпадает с free-text потоком
+- **WHEN** вызван `/autoresearch optimize research habits`
+- **THEN** kickoff — тот же, что у free-text цели «research habits»,
+  плюс маркер `OPTIMIZE-CYCLE-COMPLETE` в конце.
+
 ### Requirement: Регистрация подкоманд и edge-кейсы парсера
 
 Подкоманды `research` и `optimize` MUST быть зарегистрированы в SUBCOMMANDS
 (help/completions). Подкоманда распознаётся на lowercased trimmed command;
-разделитель — `/^research(\s|$)/` (хвост берётся из исходного регистра
-аргументов); `optimize` без цели — отказ; сравнение регистронезависимо.
+разделитель research — `/^research(\s|$)/`, разделитель optimize —
+`/^optimize(\s|$)/` (хвост — из исходного регистра аргументов); `optimize`
+без цели — отказ; сравнение регистронезависимо.
 
 #### Scenario: Регистрация в help
 - **WHEN** оператор открывает help/completions `/autoresearch`
@@ -214,6 +284,10 @@ run_experiment/log_experiment.
 #### Scenario: Tab после зарезервированного слова
 - **WHEN** оператор вызывает `/autoresearch research\ttab-desc`
 - **THEN** распознаётся research-кампания с описанием `tab-desc`.
+
+#### Scenario: Оптимизатор не матчится на алиас
+- **WHEN** оператор вызывает `/autoresearch optimizer x`
+- **THEN** это free-text цель «optimizer x», а не алиас optimize.
 
 ### Requirement: Оптимизационный запуск headless
 
@@ -231,9 +305,10 @@ exit 2): отправка `/autoresearch optimize <goal>` без интерак�
 
 ### Requirement: Headless-запуск не является песочницей briefing-фазы
 
-Документация headless-запуска MUST повторять принятую границу: briefing-фаза
-research-кампании не блокирует ordinary loop и shell (git-блок включается только
-в фазе research); перехват команд Pi — best-effort, не песочница ОС.
+Документация headless-запуска MUST повторять принятую границу: git-блок
+включается в фазе research, а также на stopped/pending-op/повреждённом
+состоянии (см. researchBlocksOrdinaryLoop); briefing-фаза не блокирует
+ordinary loop и shell; перехват команд Pi — best-effort, не песочница ОС.
 
 #### Scenario: Документирование границы
 - **WHEN** docs headless-запуска описывают research-режим
@@ -243,12 +318,33 @@ research-кампании не блокирует ordinary loop и shell (git-б
 ### Requirement: Handoff брифа и каноническая форма
 
 Kickoff research-режима MUST инструктировать агента создать `research_brief
-draft` из содержимого файла `--brief` (объект из его JSON). Поскольку draft
-записывается в канонической форме (`JSON.stringify(brief, null, 2) + "\n"`) и
-одобряемый хеш считается по этим байтам, байт-тождество файла и draft
-достигается требованием канонической формы файла (см. Requirement research-режима).
+draft` (writeBriefDraft, research-state.ts) из содержимого файла `--brief`
+(объект из его JSON). Поскольку draft записывается в канонической форме
+(`JSON.stringify(brief, null, 2) + "\n"`) и одобряемый хеш считается по этим
+байтам, байт-тождество файла и draft достигается требованием канонической формы файла.
 
 #### Scenario: Handoff брифа в draft
 - **WHEN** агент получает research-kickoff с путём к `--brief`
 - **THEN** вызов `research_brief draft` использует объект из этого файла,
   и бриф в propose-диалоге совпадает с зафиксированным хешем (файл канонический).
+
+#### Scenario: LLM-транскрипция изменила байты
+- **WHEN** агент передал объект, сериализация которого отличается от
+  канонических байтов файла
+- **THEN** propose-диалог показывает другой хеш → отказ обёртки (exit 1),
+  approval не записан; это fail-closed поведение.
+
+### Requirement: Остаточный риск транскрипции брифа
+
+LLM-транскрипция объекта (перестановка ключей/изменение литералов) может
+дать другие байты draft: тогда propose-диалог покажет другой хеш и MUST
+сработать отказ (exit 1). Риск принят: отказ — fail-closed поведение, а не
+сбой; обёртка никогда не подтверждает расходящийся бриф; отклонение
+фиксируется в логе для диагностики.
+
+#### Scenario: Транскрипция даёт другой хеш
+- **WHEN** сериализация объекта, переданного агентом в draft, отличается от
+  канонических байтов `--brief`
+- **THEN** propose-диалог показывает другой хеш, обёртка отвечает
+  `confirmed:false` и завершается с exit 1.
+

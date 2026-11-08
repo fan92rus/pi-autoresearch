@@ -70,16 +70,18 @@ Research-кампании (research-vectors) сейчас стартуют то�
 2. Чужой `--approve-sha` (≠ диалоговому хешу): `confirmed:false`, abort,
    exit 1, после отказа в логе нет research-вызовов. Мутация файла при висящем
    диалоге: отказ при ответе (файловый хеш пересчитывается в этот момент).
-3. `--mode optimize "<goal>"`: цикл init/run/log выполняется, `.auto/log.jsonl`
-   наполняется (покрыто E2E-задачей); входящий confirm → `false` + лог, цикл
-   может остановиться (документированное поведение).
-4. Таймаут при висящем confirm: `false`, shutdown pi (kill после 10 с), exit 3.
-   Exit codes: 0 успех / 1 отказ по хешу / 2 ошибки аргументов (в т.ч.
-   неканонический бриф, research без `--brief`) / 3 таймаут.
-5. Полный npm test зелёный; openspec strict valid; юнит- и wiring-тесты задач
-   3.1–3.2 (обёртка: каноничность, три хеша, таймаут, exit codes, sequencing,
-   stage-2 текст; wiring: research/optimize парсер, guard, SUBCOMMANDS) и
-   E2E (research + optimize ledger).
+3. `--mode optimize --goal "<goal>"`: цикл init/run/log выполняется,
+   `.auto/log.jsonl` наполняется (покрыто E2E-задачей); входящий confirm →
+   `false` + лог, цикл может остановиться (документированное поведение);
+   exit 0 — по маркеру `OPTIMIZE-CYCLE-COMPLETE` в финальном сообщении.
+4. Таймаут при висящем confirm: `false`, shutdown pi (закрытие stdin, kill
+   после 10 с), exit 3. Exit codes: 0 успех / 1 отказ по хешу или
+   протокольная ошибка stage 2 / 2 ошибки аргументов (в т.ч. неканонический
+   бриф, research без `--brief`) и отказ stage 1 / 3 таймаут.
+5. Полный npm test зелёный (включая test:upstream); openspec strict valid;
+   юнит- и wiring-тесты (обёртка: каноничность, три хеша, таймаут, exit codes,
+   sequencing, stage-2 текст; wiring: research/optimize парсер, guard,
+   SUBCOMMANDS, upstream-тест activation) и E2E (research + optimize ledger).
 
 ## Risks / Trade-offs
 
@@ -87,5 +89,7 @@ Research-кампании (research-vectors) сейчас стартуют то�
   fail-closed.
 - Substring `Brief SHA-256:` в message — сознательно хрупкий контракт: смена
   формата диалога → отказ.
-- Алиас `optimize` меняет kickoff-формулировки двух документированных примеров
-  (commands.ts:30, index.ts:2742) — обновление в task 4.2.
+- Алиас `optimize` меняет kickoff-формулировки всех документированных примеров
+  (commands.ts:30, index.ts:2742, README.md:34/87/202,
+  site/scripts/generate-casts.mjs:64-67, site/public/index.html:92) —
+  обновление в task 4.2; upstream-тест activation.test.mjs тоже обновляется (2.4).
