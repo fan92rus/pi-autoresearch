@@ -81,7 +81,8 @@ node scripts/research-rpc.mjs --cwd <dir> --mode research|optimize
 - Таймаут: незакрытый request → `confirmed: false`/`cancelled: true`, shutdown
   pi (kill после 10 с), exit 3, причина в логе.
 - Exit codes: 0 — успех (research: успешный report — `tool_execution_start`
-  с toolName=research, action=report + `tool_execution_end` без isError,
+  с toolName=research, args.action=report + `tool_execution_end` того же call
+  с isError !== true И пустым details.reason (отказы fail() не ставят isError),
   корреляция по id; optimize: цикл завершён и финальное сообщение содержит
   маркер `OPTIMIZE-CYCLE-COMPLETE`, добавляемый к kickoff после verbatim-части);
   1 — отказ по хешу брифа (abort сессии) и протокольные/sequencing-ошибки
@@ -118,12 +119,11 @@ node scripts/research-rpc.mjs --cwd <dir> --mode research|optimize
   минует зарезервированное слово, и его kickoff-формулировки меняют смысл
   двух документированных примеров (`commands.ts:30`, `index.ts:2742` —
   «/autoresearch optimize unit test runtime…», а также README.md:34,87,202 и
-  site/scripts/generate-casts.mjs:64-67) — обновить (task 4.2).
+  site/scripts/generate-casts.mjs:64-67, site/public/index.html:92) — обновить (task 4.2).
 - Регистрация обеих подкоманд в `commands.ts` `SUBCOMMANDS` (help/completions).
 - Ветвление `research` — ДО ветки already-active; распознавание подкоманды —
   на lowercased trimmed command, разделитель `/^research(\s|$)/` (хвост —
   исходный регистр); сравнение регистронезависимо.
-- Никаких изменений в `ctx.ui.confirm`-гейтах инструментов.
 - Никаких изменений в `ctx.ui.confirm`-гейтах инструментов.
 
 ### 3. Что НЕ меняется

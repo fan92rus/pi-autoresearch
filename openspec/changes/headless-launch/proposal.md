@@ -78,10 +78,9 @@ Research-кампании (research-vectors) сейчас стартуют то�
    после 10 с), exit 3. Exit codes: 0 успех / 1 отказ по хешу или
    протокольная ошибка stage 2 / 2 ошибки аргументов (в т.ч. неканонический
    бриф, research без `--brief`) и отказ stage 1 / 3 таймаут.
-5. Полный npm test зелёный (включая test:upstream); openspec strict valid;
-   юнит- и wiring-тесты (обёртка: каноничность, три хеша, таймаут, exit codes,
-   sequencing, stage-2 текст; wiring: research/optimize парсер, guard,
-   SUBCOMMANDS, upstream-тест activation) и E2E (research + optimize ledger).
+5. Гейты зелёные по задачам 2.4 (upstream activation-тест), 2.5 (wiring),
+   3.1 (юнит обёртки), 3.2 (E2E research+optimize), 5.1 (npm test + npm run
+   test:upstream, оба exit 0; openspec strict valid).
 
 ## Risks / Trade-offs
 

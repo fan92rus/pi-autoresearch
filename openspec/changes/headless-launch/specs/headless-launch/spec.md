@@ -19,22 +19,22 @@
 
 ### Requirement: Sequencing stage 1 → stage 2
 
-`/autoresearch research` — extension-команда: её prompt-ответ всегда имеет
-disposition `handled`, а собственный kickoff-запуск стримится внутри той же
-сессии (kickoff только активирует режим; draft выполняется в stage 2).
-Ожидание завершения stage 1 MUST стартовать В МОМЕНТ отправки stage-1 prompt
-(ответ `handled` и `agent_start` могут прийти в любом порядке); таймаут —
-`--stage1-timeout-sec` (по умолчанию 30) от момента отправки.
+Два таймера: (а) `agent_start` MUST наступить за `--stage1-timeout-sec`
+(по умолчанию 30) от отправки stage-1; иначе отказ — exit 2; (б) `agent_settled`
+ограничен общим `--timeout-sec` (exit 3). Stage 2 — только после `agent_settled`.
 
 #### Scenario: Sequencing stage 1 → stage 2
 - **WHEN** stage-1 сообщение отправлено, ответ `handled` и `agent_start` могут
   прийти в любом порядке; пришёл `agent_start` и завершился `agent_settled`
 - **THEN** stage 2 отправлена после этого `agent_settled`.
 
-#### Scenario: Stage 1 отказала (guard или ошибка)
-- **WHEN** `agent_settled` не наступил за `--stage1-timeout-sec` от момента
-  отправки stage-1
+#### Scenario: Stage 1 отказала (нет agent_start за дедлайн)
+- **WHEN** `agent_start` не наступил за `--stage1-timeout-sec` от отправки
 - **THEN** обёртка завершается с кодом 2, причина в логе (кампания не создана).
+
+#### Scenario: Медленный kickoff-ход не даёт ложный отказ
+- **WHEN** `agent_start` пришёл вовремя, но `agent_settled` длится дольше 30 с
+- **THEN** exit 2 не ставится; действует общий `--timeout-sec` (exit 3).
 
 ### Requirement: Отправка stage 2 и её протокольные ошибки
 
@@ -78,10 +78,12 @@ JSON (включая пустой файл и BOM), отсутствующий �
 
 ### Requirement: Коды выхода
 
-Скрипт SHALL использовать: 0 — успех (наблюдаемое завершение, см. ниже); 1 —
-отказ по хешу брифа (abort сессии) ИЛИ протокольная/sequencing-ошибка обёртки
-(stage-2 при стриминге); 2 — ошибки аргументов и отказ guard-а/stage-1;
-3 — таймаут.
+Скрипт SHALL использовать: 0 — успех (наблюдаемое завершение, см.
+«Успешное завершение наблюдаемо»); 1 — отказ по хешу брифа (abort сессии) ИЛИ
+протокольная/sequencing-ошибка обёртки (stage-2 при стриминге); 2 — ошибки
+аргументов и отказ guard-а/stage-1 (нет `agent_start` за дедлайн); 3 — таймаут
+(общий `--timeout-sec`, по умолчанию 3600; включая `agent_settled` без
+наблюдаемого успеха).
 
 #### Scenario: Код для отказа по хешу
 - **WHEN** сработал отказ по хешу
@@ -91,25 +93,38 @@ JSON (включая пустой файл и BOM), отсутствующий �
 - **WHEN** stage-2 prompt вернул `queued`/`success:false`
 - **THEN** код выхода 1, причина в логе.
 
+#### Scenario: Settled без наблюдаемого успеха
+- **WHEN** `agent_settled` наступил, но наблюдаемый успех не зафиксирован
+  (research без успешного report / optimize без маркера)
+- **THEN** обёртка ждёт до общего таймаута, затем exit 3 (а не 0).
+
 ### Requirement: Успешное завершение наблюдаемо
 
-Research: exit 0 SHALL ставиться при наблюдении `tool_execution_start` с
-`toolName=research` и параметром `action=report`, за которым последовал
-`tool_execution_end` того же call без `isError` (корреляция по id).
-Optimize: exit 0 SHALL ставиться при завершённом цикле `agent_start` →
-`agent_settled`, после которого финальное сообщение ассистента содержит
-маркер `OPTIMIZE-CYCLE-COMPLETE` (kickoff optimize-алиаса дополняется этой
-инструкцией — единственное добавление к verbatim-тексту).
+Exit 0 SHALL ставиться при: research — `tool_execution_start` (toolName=research,
+args.action=report) + `tool_execution_end` того же call с `isError !== true` и пустым
+`details.reason` (отказы возвращают fail()-результаты без isError — reason обязателен);
+optimize — `agent_settled` + маркер `OPTIMIZE-CYCLE-COMPLETE` в финальном сообщении
+(инструкция выводить маркер добавляется к kickoff; settled без маркера — ждать до
+общего таймаута, exit 3).
 
 #### Scenario: Research exit 0
 - **WHEN** зафиксированы `tool_execution_start` (research, action=report) и
   соответствующий `tool_execution_end` без isError
 - **THEN** после `agent_settled` скрипт выходит с кодом 0.
 
+#### Scenario: Отказавший report не даёт exit 0
+- **WHEN** research report отклонён (mode OFF, not_approved — отказ без isError,
+  с details.reason)
+- **THEN** exit 0 не ставится; сессия завершается по таймауту (exit 3).
+
 #### Scenario: Optimize exit 0
 - **WHEN** цикл `agent_start` → `agent_settled` завершён и последнее сообщение
   ассистента содержит `OPTIMIZE-CYCLE-COMPLETE`
 - **THEN** скрипт выходит с кодом 0.
+
+#### Scenario: Optimize settled без маркера
+- **WHEN** `agent_settled` наступил, но маркера нет
+- **THEN** обёртка ждёт до общего `--timeout-sec`, затем exit 3.
 
 #### Scenario: Stage 2 при стриминге
 - **WHEN** stage-2 prompt отправлен во время стриминга (не должен происходить
@@ -128,7 +143,7 @@ Optimize: exit 0 SHALL ставиться при завершённом цикл
 ### Requirement: Трёхсторонняя сверка хеша в момент диалога
 
 При ответе на propose-confirm скрипт MUST сверить три хеша: из текста диалога
-(первое вхождение `Brief SHA-256: <hex>` от начала message), зафиксированный
+(regex `^Brief SHA-256: ([0-9a-f]{64})` на message), зафиксированный
 оператором (`--approve-sha`) и пересчитанный из файла `--brief` в этот момент.
 Совпадение всех трёх — `confirmed: true`; любое несовпадение — `confirmed: false`
 и немедленная RPC-команда abort процессу pi. Тестовая опция `--hold-dialog-ms <n>`
@@ -201,7 +216,10 @@ exit 1).
 Подкоманда `/autoresearch research` (точное слово или префикс `research `,
 хвост — описание кампании) MUST активировать autoresearch-режим и отправить
 research-kickoff, НЕ отправляя `/skill:autoresearch-create` и не предписывая
-run_experiment/log_experiment.
+run_experiment/log_experiment. Содержание kickoff: campaign_id, путь брифа
+и последовательность `research_brief draft` → `propose` → `research start`
+→ `open` → `close` → `stop` → `report` (точный текст задан реализацией,
+тест ассертит по этим маркерам).
 
 #### Scenario: Активация research-режима
 - **WHEN** оператор вызывает `/autoresearch research`
