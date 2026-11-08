@@ -119,6 +119,70 @@ recovery path.
 - No per-question time or token limit (owner decision 3).
 - No automatic computation of rule conditions; no new data collection.
 
+## Headless launch (research)
+
+`scripts/research-rpc.mjs` launches a research campaign without an interactive
+session. It spawns `pi --mode rpc` in the target directory, activates the mode
+with one message (`/autoresearch research`), sends the campaign details as a
+second message after the kickoff settles, answers the brief-confirm dialog
+itself, and writes a full JSONL session log.
+
+```
+node scripts/research-rpc.mjs \
+  --mode research \
+  --brief D:/path/brief.json \
+  --approve-sha <sha256-of-brief-bytes> \
+  --campaign-id bench-20261108 \
+  --cwd D:/path/target \
+  [--pi <path>] [--timeout-sec 3600] [--stage1-timeout-sec 30] [--log <path>]
+```
+
+Exit codes: `0` campaign reached an accepted `research report`; `1` brief-hash
+refusal (session aborted) or a wrapper protocol error; `2` argument errors
+(missing options, non-canonical brief) or stage-1 refusal; `3` timeout or an
+unexpected pi exit (the reason is in the log).
+
+### Consent model
+
+The wrapper confirms the brief proposal only when all three hashes match AT THE
+MOMENT of the dialog: the hash shown in the dialog, `--approve-sha`, and the
+hash of the brief file re-read from disk. Any mismatch (including the file
+being modified or deleted while the dialog is pending) answers `confirmed:false`,
+aborts the session, exits 1. `--approve-sha` is the operator's fixed consent: the
+model cannot alter its own argv. Non-brief dialogs are always refused.
+
+### Canonical brief recipe (important)
+
+The brief file must be in canonical form: its bytes must equal
+`JSON.stringify(JSON.parse(bytes), null, 2) + "
+"`. More importantly, the bytes
+must match what the agent will TYPE into `research_brief draft`: an LLM
+re-serializing JSON typically sorts keys alphabetically and coerces strings to
+arrays where the schema allows lists, so a hand-written brief usually FAILS the
+hash check (verified live: the first bench run was refused with exit 1 - this is
+the documented fail-closed behaviour, not a bug). Reliable recipe:
+
+1. Run the wrapper once; let the agent build the draft (`research_brief draft`).
+   The refusal (if any) happens at `propose`, after the draft is written.
+2. Copy `.auto/research/<campaign>/brief.json` - the agent's own draft bytes -
+   over your `--brief` file and compute its sha256 (e.g. via python hashlib).
+3. Delete the campaign directory and rerun the wrapper with the new `--brief`
+   and `--approve-sha`; the dialog hash now matches and the campaign proceeds.
+
+### Boundaries
+
+- Headless-optimize (candidate campaigns) is NOT part of this build: the wrapper
+  rejects `--mode optimize` with a scope-split message. Headless consent for
+  candidate policy dialogs would need its own mechanism.
+- Briefing phase does not block git or the ordinary loop (accepted residual);
+  the wrapper is not an OS sandbox - command interception stays best-effort
+  (see Not promised below).
+- `research` is a reserved word in the `/autoresearch` parser: `/autoresearch
+  research <desc>` starts a campaign; `optimize ...` free-text goals keep the
+  legacy metric-loop flow unchanged.
+
+Tests: `node --test tests/research-rpc-wrapper.test.mjs` (16, includes a real
+win32 `.cmd`-shim end-to-end) and `tests/research-subcommand.test.mjs` (11).
 ## Run: `node --experimental-strip-types --experimental-loader ./tests/redirect-loader.mjs --test tests/research-state.test.mjs tests/research-branch-wiring.test.mjs`
 
 Module and wiring suites: `tests/research-state.test.mjs` (52),

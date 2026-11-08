@@ -7,8 +7,7 @@
 Система SHALL предоставлять скрипт `scripts/research-rpc.mjs`, который запускает
 `pi --mode rpc` в указанном каталоге и обслуживает запросы extension UI
 (`extension_ui_request`) от Pi, записывая полный JSONL-лог сессии в файл.
-Активация кампании SHALL выполняться одним сообщением: `/autoresearch research`
-(для research) или `/autoresearch optimize <goal>` (для optimize).
+Активация кампании SHALL выполняться одним сообщением: `/autoresearch research`.
 
 #### Scenario: Запуск research-кампании headless
 - **WHEN** оператор вызывает скрипт с `--mode research --brief <канонический файл>
@@ -95,17 +94,15 @@ JSON (включая пустой файл и BOM), отсутствующий �
 
 #### Scenario: Settled без наблюдаемого успеха
 - **WHEN** `agent_settled` наступил, но наблюдаемый успех не зафиксирован
-  (research без успешного report / optimize без маркера)
+  (research без успешного report)
 - **THEN** обёртка ждёт до общего таймаута, затем exit 3 (а не 0).
 
 ### Requirement: Успешное завершение наблюдаемо
 
-Exit 0 SHALL ставиться при: research — `tool_execution_start` (toolName=research,
+Exit 0 SHALL ставиться при наблюдении `tool_execution_start` (toolName=research,
 args.action=report) + `tool_execution_end` того же call с `isError !== true` и пустым
-`details.reason` (отказы возвращают fail()-результаты без isError — reason обязателен);
-optimize — `agent_settled` + маркер `OPTIMIZE-CYCLE-COMPLETE` в финальном сообщении
-(инструкция выводить маркер добавляется к kickoff; settled без маркера — ждать до
-общего таймаута, exit 3).
+`details.reason` (research-отказы возвращают fail()-результаты без isError —
+пустой reason обязателен).
 
 #### Scenario: Research exit 0
 - **WHEN** зафиксированы `tool_execution_start` (research, action=report) и
@@ -116,15 +113,6 @@ optimize — `agent_settled` + маркер `OPTIMIZE-CYCLE-COMPLETE` в фин�
 - **WHEN** research report отклонён (mode OFF, not_approved — отказ без isError,
   с details.reason)
 - **THEN** exit 0 не ставится; сессия завершается по таймауту (exit 3).
-
-#### Scenario: Optimize exit 0
-- **WHEN** цикл `agent_start` → `agent_settled` завершён и последнее сообщение
-  ассистента содержит `OPTIMIZE-CYCLE-COMPLETE`
-- **THEN** скрипт выходит с кодом 0.
-
-#### Scenario: Optimize settled без маркера
-- **WHEN** `agent_settled` наступил, но маркера нет
-- **THEN** обёртка ждёт до общего `--timeout-sec`, затем exit 3.
 
 #### Scenario: Stage 2 при стриминге
 - **WHEN** stage-2 prompt отправлен во время стриминга (не должен происходить
@@ -199,18 +187,6 @@ exit 1).
 - **THEN** скрипт ответил `confirmed: false`, pi завершён ( orderly: закрытие
   stdin; kill после 10 с), код выхода 3, причина `timeout` в логе.
 
-### Requirement: Диалоги в optimize-режиме
-
-В optimize-режиме обёртка MUST отвечать `confirmed:false` на любой диалог с
-`Brief SHA-256:` (нет `--approve-sha`) и логировать его. Не-брифовый confirm
-получает `confirmed:false` и лог; exit 1 даётся только отказом по хешу брифа
-(abort сессии), штатное завершение — 0/3.
-
-#### Scenario: Не-брифовый confirm не меняет код
-- **WHEN** в optimize-режиме пришёл confirm без `Brief SHA-256:`
-- **THEN** `confirmed:false`, лог; код выхода определяется штатным завершением
-  (0/3), а не этим диалогом.
-
 ### Requirement: Kickoff для research-кампании не использует metric-loop skill
 
 Подкоманда `/autoresearch research` (точное слово или префикс `research `,
@@ -259,67 +235,25 @@ run_experiment/log_experiment. Содержание kickoff: campaign_id, пут
 - **WHEN** расширение эмитит confirm без строки `Brief SHA-256:`
 - **THEN** скрипт отвечает `confirmed: false` и пишет событие в лог.
 
-### Requirement: Алиас optimize
+### Requirement: Регистрация подкоманды и edge-кейсы парсера
 
-Новый алиас `/autoresearch optimize <goal>` MUST проверяться ДО зарезервированной
-ветки: слово `optimize` отбрасывается (алиас минует зарезервированную ветку),
-хвост — полная цель metric-loop. Kickoff алиаса и его guard-ы — см. Requirement «Kickoff алиаса optimize».
-
-#### Scenario: Алиас optimize сохраняет выразимость целей
-- **WHEN** оператор вызывает `/autoresearch optimize research habits`
-- **THEN** отправляется metric-loop kickoff с полной целью «research habits».
-
-#### Scenario: Optimize без цели
-- **WHEN** оператор вызывает `/autoresearch optimize`
-- **THEN** отказ с сообщением об отсутствии цели.
-
-### Requirement: Kickoff алиаса optimize
-
-Kickoff алиаса — как у существующего free-text optimize-потока (точные
-формулировки заданы кодом index.ts:9912-9920 и 9936-9941; спека не
-переопределяет). Алиас MUST переиспользовать guard-ы free-text потока
-(`researchBlocksOrdinaryLoop`, `campaignBlocksOrdinaryLoop`). Маркер
-`OPTIMIZE-CYCLE-COMPLETE` добавляется к kickoff после verbatim-части —
-единственное добавление к тексту.
-
-#### Scenario: Kickoff алиаса совпадает с free-text потоком
-- **WHEN** вызван `/autoresearch optimize research habits`
-- **THEN** kickoff — тот же, что у free-text цели «research habits»,
-  плюс маркер `OPTIMIZE-CYCLE-COMPLETE` в конце.
-
-### Requirement: Регистрация подкоманд и edge-кейсы парсера
-
-Подкоманды `research` и `optimize` MUST быть зарегистрированы в SUBCOMMANDS
-(help/completions). Подкоманда распознаётся на lowercased trimmed command;
-разделитель research — `/^research(\s|$)/`, разделитель optimize —
-`/^optimize(\s|$)/` (хвост — из исходного регистра аргументов); `optimize`
-без цели — отказ; сравнение регистронезависимо.
+Подкоманда `research` MUST быть зарегистрирована в SUBCOMMANDS (help/completions).
+Подкоманда распознаётся на lowercased trimmed command; разделитель —
+`/^research(\s|$)/` (хвост — из исходного регистра аргументов); сравнение
+регистронезависимо. `optimize` остаётся free-text потоком (headless-optimize —
+документированный scope split, не входит в эту сборку).
 
 #### Scenario: Регистрация в help
 - **WHEN** оператор открывает help/completions `/autoresearch`
-- **THEN** видны обе подкоманды `research` и `optimize` с описаниями.
+- **THEN** видна подкоманда `research` с описанием.
 
 #### Scenario: Tab после зарезервированного слова
 - **WHEN** оператор вызывает `/autoresearch research\ttab-desc`
 - **THEN** распознаётся research-кампания с описанием `tab-desc`.
 
-#### Scenario: Оптимизатор не матчится на алиас
-- **WHEN** оператор вызывает `/autoresearch optimizer x`
-- **THEN** это free-text цель «optimizer x», а не алиас optimize.
-
-### Requirement: Оптимизационный запуск headless
-
-Скрипт SHALL поддерживать `--mode optimize` с целью в `--goal` (без `--goal` —
-exit 2): отправка `/autoresearch optimize <goal>` без интерактивного UI;
-неизвестные диалоги отклоняются с записью в лог; отклонение может остановить
-цикл — документированное поведение, а не сбой. E2E SHALL проверять наполнение
-`.auto/log.jsonl` и стоп-условие завершения (exit 0 — агент сообщил завершение
-цикла в финальном тексте; иначе плановый таймаут — exit 3).
-
-#### Scenario: Обычный цикл без UI
-- **WHEN** скрипт запущен с `--mode optimize` и целью
-- **THEN** агент выполняет init/run/log цикл; `.auto/log.jsonl` наполняется;
-  входящий confirm → `false` + лог.
+#### Scenario: Оптимизатор не матчится на префикс
+- **WHEN** оператор вызывает `/autoresearch researcher x`
+- **THEN** это free-text цель «researcher x», а не research-кампания.
 
 ### Requirement: Headless-запуск не является песочницей briefing-фазы
 

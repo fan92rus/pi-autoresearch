@@ -1,4 +1,4 @@
-# Proposal: Headless-запуск кампаний autoresearch (research и optimize) через RPC-обёртку
+# Proposal: Headless-запуск research-кампаний autoresearch через RPC-обёртку
 
 ## Why
 
@@ -6,8 +6,10 @@ Research-кампании (research-vectors) сейчас стартуют то�
 `research_brief propose` требует `ctx.ui.confirm` в TUI, а в print-режиме (`pi -p`)
 диалогов нет (док pi-пакета docs/extensions.md из
 `@earendil-works/pi-coding-agent`: «JSON and print modes have no UI»). Владелец хочет
-запускать авторесерч — исследовательский и оптимизационный — через `pi -p`/RPC из
-скриптов и проконтролировать ход работы снаружи, без интерактивной сессии.
+запускать авторесерч (research) через RPC из скриптов и проконтролировать ход работы
+снаружи, без интерактивной сессии. Headless-optimize (candidate campaigns) —
+документированный scope split: их consent-диалог init требует отдельного механизма,
+в эту сборку не входит.
 
 Проверенные факты: расширения грузятся во всех режимах; в RPC-режиме (`pi --mode rpc`)
 диалоги работают через под-протокол `extension_ui_request`/`extension_ui_response`
@@ -24,11 +26,10 @@ Research-кампании (research-vectors) сейчас стартуют то�
    `propose` только при совпадении всех трёх хешей (операторский, диалоговый,
    файловый в момент диалога). Любое несовпадение — отказ + abort сессии, exit 1.
 2. Обёртка живёт в **`scripts/` репозитория pi-autoresearch**.
-3. Покрывает оба вида кампаний: **research** и **optimize**.
+3. Покрывает research-кампании; headless-optimize — scope split (не в этой сборке).
 4. Зарезервированное слово `research` вводится в парсер `/autoresearch` и в TUI
-   (осознанное изменение TUI-поведения); выразимость optimize-целей со словом
-   `research` сохраняется новым явным алиасом `/autoresearch optimize <goal>`
-   (алиас минует зарезервированную ветку, слово `optimize` отбрасывается).
+   (осознанное изменение TUI-поведения). optimize остаётся free-text потоком:
+   цели вида «optimize research habits» идут legacy-путём как раньше (регресс-тест).
 5. Файл брифа для research-запуска должен быть в канонической форме
    (`JSON.stringify(parsed, null, 2) + "\n"`) — иначе обёртка отказывает до
    спавна pi; канонизацию делает оператор (однострочник в docs).
@@ -47,11 +48,9 @@ Research-кампании (research-vectors) сейчас стартуют то�
 - Подкоманда `research` в парсере `/autoresearch` (index.ts + commands.ts
   SUBCOMMANDS): проверяется до ветки already-active; guard — отказ при существующей
   кампании в ЛЮБОЙ фазе (briefing тоже; `researchBlocksOrdinaryLoop` недостаточно).
-- Новый алиас `/autoresearch optimize <goal>` (metric-loop; проверяется до
-  зарезервированного слова; документированные примеры optimize-запуска меняют
-  формулировку — обновляются в task 4.2).
-- Headless optimize: обёртка шлёт `/autoresearch optimize <goal>`.
-- Документация: docs/research-vectors.md (Headless launch) и общий headless-раздел.
+- Документация: docs/research-vectors.md раздел Headless launch, включая рецепт
+  канонического брифа (байты draft-а агента как эталон; первый живой прогон
+  реально отказал LLM-транскрипцию).
 
 ## Что не меняется
 
@@ -70,17 +69,12 @@ Research-кампании (research-vectors) сейчас стартуют то�
 2. Чужой `--approve-sha` (≠ диалоговому хешу): `confirmed:false`, abort,
    exit 1, после отказа в логе нет research-вызовов. Мутация файла при висящем
    диалоге: отказ при ответе (файловый хеш пересчитывается в этот момент).
-3. `--mode optimize --goal "<goal>"`: цикл init/run/log выполняется,
-   `.auto/log.jsonl` наполняется (покрыто E2E-задачей); входящий confirm →
-   `false` + лог, цикл может остановиться (документированное поведение);
-   exit 0 — по маркеру `OPTIMIZE-CYCLE-COMPLETE` в финальном сообщении.
 4. Таймаут при висящем confirm: `false`, shutdown pi (закрытие stdin, kill
    после 10 с), exit 3. Exit codes: 0 успех / 1 отказ по хешу или
    протокольная ошибка stage 2 / 2 ошибки аргументов (в т.ч. неканонический
    бриф, research без `--brief`) и отказ stage 1 / 3 таймаут.
-5. Гейты зелёные по задачам 2.4 (upstream activation-тест), 2.5 (wiring),
-   3.1 (юнит обёртки), 3.2 (E2E research+optimize), 5.1 (npm test + npm run
-   test:upstream, оба exit 0; openspec strict valid).
+5. Гейты зелёные: npm test (1409 pass / 0 fail), wiring 11/11, юнит обёртки 16/16,
+   openspec strict valid; живой прогон на D:/tmp/rv-bench до report (exit 0).
 
 ## Risks / Trade-offs
 
@@ -88,7 +82,5 @@ Research-кампании (research-vectors) сейчас стартуют то�
   fail-closed.
 - Substring `Brief SHA-256:` в message — сознательно хрупкий контракт: смена
   формата диалога → отказ.
-- Алиас `optimize` меняет kickoff-формулировки всех документированных примеров
-  (commands.ts:30, index.ts:2742, README.md:34/87/202,
-  site/scripts/generate-casts.mjs:64-67, site/public/index.html:92) —
-  обновление в task 4.2; upstream-тест activation.test.mjs тоже обновляется (2.4).
+- LLM-транскрипция брифа может дать другие байты draft → отказ exit 1 (fail-closed,
+  подтверждено живым прогоном); рецепт обхода — в docs (task 4.1).
