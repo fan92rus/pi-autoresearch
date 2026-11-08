@@ -3324,6 +3324,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\n- Do not commit or revert manually: keep auto-commits; discard/crash/checks_failed auto-revert (autoresearch files preserved)." +
       "\n- Experiment rules: " + mdPath + " \u2014 read at session start and after compaction. Ideas backlog: " + ideasPath + " \u2014 write promising deferred ideas there (one .md per idea)." +
       "\n- " + experimentLimitClause(ctx.cwd) + "\n- " + BENCHMARK_GUARDRAIL +
+      "\n- Session start (optimize-two-phase-start): optimize_brief draft → propose (the owner approves the brief) → init_experiment with the same name, metric_name, metric_unit, direction and cwd. Until init_experiment succeeds, run_experiment and log_experiment are refused. A change of metric_name, direction or target after the start needs a new draft → propose → init_experiment." +
       "\n- Follow-on user message mid-experiment? Finish the current run_experiment + log_experiment cycle first, address it next iteration." +
       "\n- EVERYTHING within the active goal is PRE-APPROVED — experiments (expensive included), code edits, script fixes, retries after failures: do NOT ask the owner before acting — decide yourself, record assumptions in the hypothesis/ASI, and keep the loop running. Ask the owner ONLY when stepping outside the goal's frame: new external data, foreign resources, goal/metric change, irreversible damage." +
       "\n\n## Result Findings (route by theme)" +

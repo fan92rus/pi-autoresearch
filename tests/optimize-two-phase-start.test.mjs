@@ -94,6 +94,30 @@ test("init arguments must equal the brief, with defaults applied on both sides",
 
 // ── wiring: the real extension ───────────────────────────────────────
 
+// Runs before any test that pins a cwd: the module-level workDir override would leak into this session.
+test("4.4: changing metric_name after the start needs a new brief; the new metric starts a new segment", async () => {
+  const dir = makeWorkDir("metric-change");
+  const h = await loadBare(dir, "metric-change");
+  h.ctx.ui.confirm = async () => true;
+  await run(h, "optimize_brief", { action: "draft", brief: briefArgs() });
+  await run(h, "optimize_brief", { action: "propose" });
+  await run(h, "init_experiment", { name: "liquid speed", metric_name: "total_us", metric_unit: "us", direction: "lower" });
+  const before = readConfigHeaders(dir).length;
+
+  const refused = await run(h, "init_experiment", { name: "liquid speed", metric_name: "bundle_kb", metric_unit: "us", direction: "lower" });
+  assert.match(refused, /does not match the approved brief/, refused);
+  assert.match(refused, /metric_name: brief "total_us", init "bundle_kb"/);
+  assert.equal(readConfigHeaders(dir).length, before, "a refused metric change must not append a config header");
+
+  await run(h, "optimize_brief", { action: "draft", brief: { name: "liquid speed", metric_name: "bundle_kb", metric_unit: "kb" } });
+  await run(h, "optimize_brief", { action: "propose" });
+  const started = await run(h, "init_experiment", { name: "liquid speed", metric_name: "bundle_kb", metric_unit: "kb" });
+  assert.doesNotMatch(started, /refused|does not match/, started);
+  const headers = readConfigHeaders(dir);
+  assert.equal(headers.length, before + 1, "the approved metric change appends exactly one config header");
+  assert.equal(headers[headers.length - 1].metricName, "bundle_kb");
+});
+
 test("draft, owner approval, then init_experiment starts the session", async () => {
   const dir = makeWorkDir("happy");
   const h = await loadBare(dir, "happy");
@@ -275,4 +299,18 @@ test("B4 round 3: init with cwd \"\" is refused on a pinned session and writes n
   assert.match(text, /cwd must be a non-empty path/, text);
   assert.equal(readConfigHeaders(pinned).length, before, "the pinned dir's ledger must not get a new config header");
   assert.equal(readConfigHeaders(dir).length, 0, "the session dir must not get a config header from the refused call");
+});
+
+// ── audit round (goal mw81w6xg): 4.4 and 5.1 ─────────────────────────
+
+test("5.1: the ordinary-loop system prompt states the order draft -> propose -> init_experiment", async () => {
+  const dir = makeWorkDir("prompt-order");
+  const h = await loadBare(dir, "prompt-order");
+  const out = await h.hook("before_agent_start")({ systemPrompt: "BASE" }, h.ctx);
+  const prompt = out?.systemPrompt ?? "";
+  const d = prompt.indexOf("optimize_brief draft");
+  const p = prompt.indexOf("propose", d + 1);
+  const i = prompt.indexOf("init_experiment with the same", p + 1);
+  assert.ok(d > 0 && p > d && i > p, `order draft -> propose -> init_experiment missing in system prompt: ${d} ${p} ${i}`);
+  assert.match(prompt, /run_experiment and log_experiment are refused/);
 });
