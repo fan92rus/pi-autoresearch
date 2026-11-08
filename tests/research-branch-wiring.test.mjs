@@ -88,14 +88,14 @@ async function loadExtension(dir, label) {
 
 /** Loads the REAL extension on a fake pi with the mode on and NO campaign pin. */
 async function loadExtensionBare(dir, label) {
-  const { pi, tool, command } = createFakePi({ dir, sessionId: `research-${label}`, realGit: false });
+  const { pi, tool, command, hook } = createFakePi({ dir, sessionId: `research-${label}`, realGit: false });
   const ctx = makeCtx(dir, `research-${label}`, pi);
   const { default: autoresearchExtension } = await import(
     pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")).href
   );
   autoresearchExtension(pi);
   await command("autoresearch").handler("on", ctx);
-  return { pi, tool, ctx, dir };
+  return { pi, tool, hook, ctx, dir };
 }
 
 function call(h, name, params) {
@@ -278,6 +278,16 @@ test("(d) research_brief propose: a campaign drafted in an earlier session still
   await call(h1, "research_brief", { action: "draft", brief: briefFixture() });
   const h2 = await loadExtension(dir, "propose-resume-2");
   assert.match(renderPropose(h2), /cache layer explains the latency drop/, "resumed campaign must show its brief in the transcript row");
+});
+
+test("(d) research_brief propose: an unpinned new session shows the brief after session_start", async () => {
+  const dir = makeWorkDir("propose-unpinned");
+  const h1 = await loadExtension(dir, "propose-unpinned-1");
+  await call(h1, "research_brief", { action: "draft", brief: briefFixture() });
+  const h2 = await loadExtensionBare(dir, "propose-unpinned-2");
+  assert.match(renderPropose(h2), /не найден/, "before session_start the view is empty");
+  await h2.hook("session_start")({ reason: "resume" }, h2.ctx);
+  assert.match(renderPropose(h2), /cache layer explains the latency drop/, "unpinned session must show the single campaign's brief after session_start");
 });
 
 test("(d) research_brief propose: any confirm other than true approves nothing", async () => {

@@ -8507,8 +8507,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // Directory of the last drafted campaign: the transcript view of propose reads its brief.json.
   let briefPreviewDir: string | null = null;
   // A pinned campaign (launch command or resume) has its brief on disk: point the transcript view at it.
+  // Without a pin, resolveResearchTarget still picks the single campaign on disk; with 0 or several it fails and the view is left alone.
   const syncBriefPreview = (ctx: ExtensionContext): void => {
-    if (getRuntime(ctx).researchCampaignId === null) return;
     const target = resolveResearchTarget(resolveWorkDir(ctx.cwd), ctx);
     if (target.ok) briefPreviewDir = target.dir;
   };
