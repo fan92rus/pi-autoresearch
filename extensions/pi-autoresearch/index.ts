@@ -8410,6 +8410,32 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
    * Evidence reference: "path:lines" or "path#anchor" (path relative to the work
    * directory or absolute inside it). Returns the path and the SHA-256 of the file.
    */
+  /**
+   * Test-split gate (brief.evidence_gate): a record whose evidence path matches a
+   * blocked glob is refused until gate_file exists inside the work directory and
+   * contains gate_contains. Returns the refusal text, or null when the record may pass.
+   */
+  const evidenceGateProblem = async (
+    workDir: string,
+    brief: researchState.ResearchBrief,
+    evidencePath: string,
+  ): Promise<string | null> => {
+    const gate = brief.evidence_gate;
+    if (!gate || !gate.blocked_globs.some((glob) => researchState.matchesGlob(evidencePath, glob))) return null;
+    const gateAbs = path.resolve(workDir, gate.gate_file);
+    const rel = path.relative(workDir, gateAbs);
+    if (rel === "" || path.isAbsolute(rel) || rel.split(path.sep)[0] === "..") {
+      return `evidence_gate.gate_file ${gate.gate_file} resolves outside the work directory`;
+    }
+    try {
+      const text = await fs.promises.readFile(gateAbs, "utf8");
+      if (text.includes(gate.gate_contains)) return null;
+    } catch {
+      // no gate file yet: the refusal below applies
+    }
+    return `evidence ${evidencePath} is in the blocked test split (evidence_gate) until ${gate.gate_file} exists and contains the gate marker`;
+  };
+
   const locateEvidence = async (workDir: string, ref: string): Promise<researchState.Result<{ path: string; sha256: string }>> => {
     const hashAt = ref.indexOf("#");
     const lineRef = /^(.*):(\d+(?:-\d+)?)$/.exec(ref);
@@ -8483,7 +8509,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         action: { type: "string", enum: ["draft", "status", "propose"], description: "Brief action to perform." },
         brief: {
           type: "object",
-          description: "draft only: the full brief (schema_version 1, goal, plan_source, caveat_block, data_roles {explore, validate, confirm}, questions [{id, text, decision_rules [{id, verdict, when}], needs_data}], process_metrics, stop_rules [{id, when}]).",
+          description: "draft only: the full brief (schema_version 1, goal, plan_source, caveat_block, data_roles {explore, validate, confirm}, questions [{id, text, decision_rules [{id, verdict, when}], needs_data}], process_metrics, stop_rules [{id, when}]). Optional: verdicts (array of declared verdict names; absent = confirmed, rejected, inconclusive, waiting_for_data; every rule verdict must be declared and every question needs a rule per declared verdict) and evidence_gate {blocked_globs, gate_file, gate_contains} (record on a blocked path is refused until gate_file exists in the work directory and contains gate_contains).",
         },
       },
       required: ["action"],
@@ -8657,7 +8683,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         question_id: { type: "string", description: "open/close: question id from the approved brief." },
         evidence_ref: { type: "string", description: "record only: path:lines or path#anchor inside the work directory." },
         rule_id: { type: "string", description: "close: decision rule id of the question; stop: stop rule id of the brief." },
-        verdict: { type: "string", enum: ["confirmed", "rejected", "inconclusive", "waiting_for_data"], description: "close only." },
+        verdict: { type: "string", description: "close only: one of the brief's declared verdicts (default confirmed, rejected, inconclusive, waiting_for_data)." },
         reason: { type: "string", description: "close: required for inconclusive and waiting_for_data. stop: the stop condition you mark as met." },
       },
       required: ["action"],
@@ -8855,6 +8881,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (openId === null) return fail("invalid_transition", "no vector is open; open a question before recording evidence");
         const located = await locateEvidence(workDir, ref);
         if (!located.ok) return fail(located.reason, located.message);
+        const gateProblem = await evidenceGateProblem(workDir, brief, located.path);
+        if (gateProblem !== null) return fail("evidence_gate_blocked", gateProblem);
         const done = await researchState.updateState(
           dir,
           `record evidence for ${openId}`,
@@ -8875,8 +8903,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (action === "close") {
         const { question_id: qid, rule_id: rid, verdict, reason } = params;
         if (typeof qid !== "string" || typeof rid !== "string") return fail("invalid_argument", "close requires question_id and rule_id");
-        if (typeof verdict !== "string" || !(researchState.VERDICTS as readonly string[]).includes(verdict)) {
-          return fail("invalid_argument", `verdict must be one of ${researchState.VERDICTS.join(", ")}`);
+        const declaredVerdicts = researchState.briefVerdicts(brief);
+        if (typeof verdict !== "string" || !declaredVerdicts.includes(verdict)) {
+          return fail("invalid_argument", `verdict must be one of the brief's declared verdicts: ${declaredVerdicts.join(", ")}`);
         }
         const needsReason = verdict === "inconclusive" || verdict === "waiting_for_data";
         if (needsReason && (typeof reason !== "string" || reason.trim() === "")) {

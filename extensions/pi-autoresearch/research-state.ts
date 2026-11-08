@@ -53,8 +53,12 @@ export const STATE_FILE = "state.json";
 export const LOCK_FILE = "lock.json";
 export const PENDING_OP_FILE = "pending-op.json";
 
-export const VERDICTS = ["confirmed", "rejected", "inconclusive", "waiting_for_data"] as const;
-export type Verdict = (typeof VERDICTS)[number];
+/** Verdict names used when a brief does not declare its own (brief.verdicts absent). */
+export const DEFAULT_VERDICTS = ["confirmed", "rejected", "inconclusive", "waiting_for_data"] as const;
+export const VERDICTS = DEFAULT_VERDICTS;
+export type Verdict = (typeof DEFAULT_VERDICTS)[number];
+/** Token shape of a declared verdict name. */
+const VERDICT_TOKEN_RE = /^[a-z][a-z0-9_-]{0,31}$/;
 
 /** Explicit operator token required by manualResolvePendingOp (spec: manual recovery). */
 export const OPERATOR_CONFIRMATION = "operator-manual-check-done";
@@ -76,6 +80,9 @@ const BRIEF_KEYS = [
   "process_metrics",
   "stop_rules",
 ];
+/** Optional brief fields: absent is valid. */
+const BRIEF_OPTIONAL_KEYS = ["verdicts", "evidence_gate"];
+const GATE_KEYS = ["blocked_globs", "gate_file", "gate_contains"];
 const DATA_ROLE_KEYS = ["explore", "validate", "confirm"];
 const QUESTION_KEYS = ["id", "text", "decision_rules", "needs_data"];
 const RULE_KEYS = ["id", "verdict", "when"];
@@ -95,7 +102,8 @@ export interface CampaignState {
 
 export interface DecisionRule {
   id: string;
-  verdict: Verdict;
+  /** Must be one of the brief's declared verdicts (see briefVerdicts). */
+  verdict: string;
   when: string;
 }
 
@@ -120,6 +128,16 @@ export interface ResearchBrief {
   questions: BriefQuestion[];
   process_metrics: string[];
   stop_rules: StopRule[];
+  /** Declared verdict names; absent means DEFAULT_VERDICTS. */
+  verdicts?: string[];
+  /** Optional test-split gate, checked by research record. */
+  evidence_gate?: EvidenceGate;
+}
+
+export interface EvidenceGate {
+  blocked_globs: string[];
+  gate_file: string;
+  gate_contains: string;
 }
 
 export interface Approval {
@@ -136,6 +154,7 @@ export interface PendingOp {
 
 export type RefusalReason =
   | "invalid_argument"
+  | "evidence_gate_blocked"
   | "campaign_missing"
   | "campaign_exists"
   | "not_initialized"
@@ -647,7 +666,10 @@ export function validateBrief(raw: unknown): BriefValidation {
   const errors: string[] = [];
   const ids = new Map<string, string>();
 
-  errors.push(...fieldSetProblems(raw, BRIEF_KEYS, "brief"));
+  errors.push(
+    ...missingFieldProblems(raw, BRIEF_KEYS, "brief"),
+    ...unknownFieldProblems(raw, [...BRIEF_KEYS, ...BRIEF_OPTIONAL_KEYS], "brief"),
+  );
   if (raw.schema_version !== BRIEF_SCHEMA_VERSION) {
     errors.push(`brief.schema_version must be ${BRIEF_SCHEMA_VERSION}`);
   }
@@ -664,10 +686,13 @@ export function validateBrief(raw: unknown): BriefValidation {
     errors.push("brief.data_roles must be an object with explore, validate and confirm");
   }
 
+  const declared = declaredVerdicts(raw, errors);
+  validateEvidenceGate(raw.evidence_gate, errors);
+
   if (!Array.isArray(raw.questions) || raw.questions.length === 0) {
     errors.push("brief.questions must be a non-empty array");
   } else {
-    raw.questions.forEach((q, i) => validateQuestion(q, `brief.questions[${i}]`, ids, errors));
+    raw.questions.forEach((q, i) => validateQuestion(q, `brief.questions[${i}]`, ids, declared, errors));
   }
 
   requireStringList(raw.process_metrics, "brief.process_metrics", errors);
@@ -682,7 +707,13 @@ export function validateBrief(raw: unknown): BriefValidation {
   return { ok: true, brief: raw as unknown as ResearchBrief };
 }
 
-function validateQuestion(q: unknown, where: string, ids: Map<string, string>, errors: string[]): void {
+function validateQuestion(
+  q: unknown,
+  where: string,
+  ids: Map<string, string>,
+  declared: readonly string[],
+  errors: string[],
+): void {
   if (!isRecord(q)) {
     errors.push(`${where} must be an object`);
     return;
@@ -706,16 +737,94 @@ function validateQuestion(q: unknown, where: string, ids: Map<string, string>, e
     }
     errors.push(...fieldSetProblems(r, RULE_KEYS, rw));
     requireId(r.id, `${rw}.id`, ids, errors);
-    if (typeof r.verdict === "string" && (VERDICTS as readonly string[]).includes(r.verdict)) {
+    if (typeof r.verdict === "string" && declared.includes(r.verdict)) {
       verdicts.add(r.verdict);
     } else {
-      errors.push(`${rw}.verdict must be one of ${VERDICTS.join(", ")}`);
+      errors.push(`${rw}.verdict ${JSON.stringify(r.verdict)} is not declared in brief.verdicts (${declared.join(", ")})`);
     }
     requireText(r.when, `${rw}.when`, errors);
   });
-  for (const verdict of VERDICTS) {
+  for (const verdict of declared) {
     if (!verdicts.has(verdict)) errors.push(`${where} has no decision rule with verdict "${verdict}"`);
   }
+}
+
+/** Verdict names a brief declares: brief.verdicts when present, otherwise the defaults. */
+export function briefVerdicts(brief: { verdicts?: unknown }): string[] {
+  return Array.isArray(brief.verdicts) ? (brief.verdicts as string[]) : [...DEFAULT_VERDICTS];
+}
+
+function declaredVerdicts(raw: Record<string, unknown>, errors: string[]): string[] {
+  if (!("verdicts" in raw)) return [...DEFAULT_VERDICTS];
+  const list = raw.verdicts;
+  if (!Array.isArray(list) || list.length === 0) {
+    errors.push("brief.verdicts must be a non-empty array of verdict names");
+    return [...DEFAULT_VERDICTS];
+  }
+  const declared: string[] = [];
+  list.forEach((name, i) => {
+    if (typeof name !== "string" || !VERDICT_TOKEN_RE.test(name)) {
+      errors.push(`brief.verdicts[${i}] must match ${VERDICT_TOKEN_RE.source}`);
+    } else if (declared.includes(name)) {
+      errors.push(`brief.verdicts[${i}] duplicates "${name}"`);
+    } else {
+      declared.push(name);
+    }
+  });
+  return declared;
+}
+
+function validateEvidenceGate(raw: unknown, errors: string[]): void {
+  if (raw === undefined) return;
+  if (!isRecord(raw)) {
+    errors.push("brief.evidence_gate must be an object");
+    return;
+  }
+  errors.push(...missingFieldProblems(raw, GATE_KEYS, "brief.evidence_gate"));
+  errors.push(...unknownFieldProblems(raw, GATE_KEYS, "brief.evidence_gate"));
+  const globs = raw.blocked_globs;
+  if (!Array.isArray(globs) || globs.length === 0 || globs.some((g) => typeof g !== "string" || g.trim() === "")) {
+    errors.push("brief.evidence_gate.blocked_globs must be a non-empty array of non-empty strings");
+  }
+  if (typeof raw.gate_file !== "string" || !isRelativeInsidePath(raw.gate_file)) {
+    errors.push("brief.evidence_gate.gate_file must be a relative path inside the work directory (no absolute path, no '..')");
+  }
+  requireText(raw.gate_contains, "brief.evidence_gate.gate_contains", errors);
+}
+
+function isRelativeInsidePath(p: string): boolean {
+  if (p.trim() === "" || p.startsWith("/") || p.startsWith("\\") || /^[A-Za-z]:/.test(p)) return false;
+  return !p.split(/[\\/]/).includes("..");
+}
+
+/**
+ * Glob match for evidence paths. `*` matches inside one segment, `**` matches zero or
+ * more whole segments. Slashes are normalized; a leading `./` is ignored.
+ */
+export function matchesGlob(path: string, glob: string): boolean {
+  const p = path.replace(/\\/g, "/").replace(/^\.\//, "").split("/");
+  const g = glob.replace(/\\/g, "/").replace(/^\.\//, "").split("/");
+  const segmentRe = (seg: string): RegExp =>
+    new RegExp(`^${seg.split("*").map((s) => s.replace(/[.+^${}()|[\]\\]/g, "\\$&")).join("[^/]*")}$`);
+  const from = (pi: number, gi: number): boolean => {
+    if (gi === g.length) return pi === p.length;
+    if (g[gi] === "**") {
+      for (let k = pi; k <= p.length; k++) if (from(k, gi + 1)) return true;
+      return false;
+    }
+    return pi < p.length && segmentRe(g[gi]).test(p[pi]) && from(pi + 1, gi + 1);
+  };
+  return from(0, 0);
+}
+
+function missingFieldProblems(obj: Record<string, unknown>, keys: readonly string[], where: string): string[] {
+  return keys.filter((key) => !(key in obj)).map((key) => `${where} is missing field ${quote(key)}`);
+}
+
+function unknownFieldProblems(obj: Record<string, unknown>, allowed: readonly string[], where: string): string[] {
+  return Object.keys(obj)
+    .filter((key) => !allowed.includes(key))
+    .map((key) => `${where} has unknown field ${quote(key)}`);
 }
 
 function validateStopRule(s: unknown, where: string, ids: Map<string, string>, errors: string[]): void {
