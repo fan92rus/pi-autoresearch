@@ -169,6 +169,55 @@ the documented fail-closed behaviour, not a bug). Reliable recipe:
 3. Delete the campaign directory and rerun the wrapper with the new `--brief`
    and `--approve-sha`; the dialog hash now matches and the campaign proceeds.
 
+### Auto-adopt retry (--auto-adopt-draft)
+
+`--auto-adopt-draft` automates the recipe above on the SAME live pi process:
+on a brief-hash refusal the wrapper reads `.auto/research/<campaign>/brief.json`,
+adopts it only when the file's sha256 equals the hash shown in the dialog AND
+the bytes are canonical JSON (else `auto_adopt_skipped`, exit 1), then re-sends
+stage 2 with the adopted path/sha and a verbatim-transcription instruction after
+the refused turn settles. Exactly one retry per run; a second refusal logs
+`auto_adopt_exhausted` and exits 1. The JSONL log carries a
+`{type:"auto_adopt",from_sha,to_sha}` audit event. Without the flag the refusal
+path is byte-identical to the pre-flag behaviour. Trade-off to know: the adopted
+brief is the AGENT's transcription, not the operator's intended text - the
+dialog consent now certifies the agent's bytes. Review them before relying on
+the run's verdicts.
+
+### Projects with their own research protocol (--state-root)
+
+Some target repos forbid writing outside a designated directory (e.g. a
+protocol that allows only `runs/<run-id>/`). `--state-root <dir>` (also accepted
+by `/autoresearch research --id <id> --state-root <dir>` in-session) moves where
+the campaign state lives: `researchRoot(base)` becomes `<state-root>/.auto/research/<id>/`
+instead of `<workDir>/.auto/research/<id>/`. Constraints:
+
+- The state root must be a directory INSIDE the work directory (refused before
+  any activation otherwise: `..`, absolute-outside and cross-drive paths).
+- Evidence citations still resolve from the work directory, so the agent can
+  record `lob/...` or `audit/...` artifacts while all campaign writes land
+  under `runs/<run-id>/.auto/research/<id>/` - satisfying write-constrained
+  protocols without losing the ability to cite source data.
+- Without `--state-root` the default flow is byte-identical to the pre-flag
+  behaviour (state in `<workDir>/.auto/research/`).
+- Within one session the pin is honoured by the launch guard, the ordinary-loop
+  block, auto-resume suppression and resume composers; a SECOND pi session must
+  pass the same `--state-root` to see the campaign (accepted limitation: the
+  default-root scan does not know about custom roots). A research/candidate
+  campaign in a custom root still blocks the ordinary loop in its own session;
+  after `/autoresearch off` the pin clears and the block lifts.
+
+### Report and findings artifacts
+
+`research report` now also writes `<campaign dir>/report.md` (the tool text is
+returned as before, with a saved-to line; a write failure warns but does not
+fail the report; report does not require a prior `stop`). `research close` with
+verdict `confirmed` or `rejected` additionally appends a compact finding to
+`.auto/findings.jsonl` in the work directory (theme `behavior`, status `open`,
+evidence_ref from the vector's first evidence), so research verdicts become
+visible to ordinary-loop tooling that reads findings; a findings write failure
+warns and does not fail the close.
+
 ### Boundaries
 
 - Headless-optimize (candidate campaigns) is NOT part of this build: the wrapper

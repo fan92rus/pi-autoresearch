@@ -82,6 +82,7 @@ import {
   FINDING_THEMES,
   recordFinding,
   updateFinding,
+  parseEvidenceRef,
 } from "./findings.ts";
 import { inspectResults } from "./lens-inspect.ts";
 import { buildReport } from "./report.ts";
@@ -347,6 +348,21 @@ interface AutoresearchRuntime {
   autoresearchMode: boolean;
   /** Campaign id pinned by '/autoresearch research <id>'; research tools refuse other ids while set. */
   researchCampaignId: string | null;
+  /**
+   * Custom base directory pinned by '/autoresearch research --state-root <path>':
+   * campaign state lives under <stateRoot>/.auto/research/<id>/ instead of
+   * <workDir>/.auto/research/<id>/ (project layouts that only allow writes into
+   * runs/<id>/). Evidence still resolves from the project root. Cleared on off.
+   *
+   * Session awareness: the launch guard, researchCampaignExists,
+   * researchBlocksOrdinaryLoop, campaignNeedsManualCheck, the resume composers
+   * and the send-time resume re-check all consult this pin, so a state-root
+   * campaign blocks the ordinary loop and suppresses auto-resume inside THIS
+   * session. DOCUMENTED LIMITATION: OTHER sessions' scans read only the default
+   * <workDir>/.auto/research root; a second session must pass the same
+   * --state-root to see the campaign.
+   */
+  researchStateRoot: string | null;
   experimentsThisSession: number;
   autoResumeTurns: number;
   lastRunChecks: { pass: boolean; output: string; duration: number } | null;
@@ -1804,6 +1820,7 @@ function createSessionRuntime(): AutoresearchRuntime {
   return {
     autoresearchMode: false,
     researchCampaignId: null,
+    researchStateRoot: null,
     experimentsThisSession: 0,
     autoResumeTurns: 0,
     lastRunChecks: null,
@@ -2356,7 +2373,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // (design §5: unclear state -> stop; active campaign -> candidate wording only.)
     const workDirNow = resolveWorkDir(ctx.cwd);
     const researchNow = researchScanSync(workDirNow);
-    if (campaignPendingOpSync(workDirNow) || researchNow.halted) {
+    const researchStateRootNow = getRuntime(ctx).researchStateRoot;
+    const stateRootHalted = researchStateRootNow !== null && researchStateRootNow !== workDirNow && researchScanSync(researchStateRootNow).halted;
+    if (campaignPendingOpSync(workDirNow) || researchNow.halted || stateRootHalted) {
       cancelPendingResume(runtime);
       return;
     }
@@ -2492,18 +2511,24 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return { blocks, halted };
   };
 
-  const researchBlocksOrdinaryLoop = async (workDir: string): Promise<boolean> => researchScanSync(workDir).blocks;
+  const researchBlocksOrdinaryLoop = async (workDir: string, ctx?: ExtensionContext): Promise<boolean> => {
+    if (researchScanSync(workDir).blocks) return true;
+    // Session-aware: a campaign pinned under --state-root also blocks inside
+    // THIS session (cross-session invisibility is the documented limitation).
+    const stateRoot = ctx ? getRuntime(ctx).researchStateRoot : null;
+    if (stateRoot && stateRoot !== workDir && researchScanSync(stateRoot).blocks) return true;
+    return false;
+  };
   // Guard for starting a new research campaign: any campaign directory in any
   // phase (briefing included) refuses. Unlike researchBlocksOrdinaryLoop, which
   // leaves briefing campaigns unblocked for the ordinary loop and git.
-  const researchCampaignExists = (workDir: string): boolean => {
-    const root = researchState.researchRoot(workDir);
-    if (!fs.existsSync(root)) return false;
-    try {
-      return fs.readdirSync(root, { withFileTypes: true }).some((d) => d.isDirectory());
-    } catch {
-      return true; // fail closed: an unreadable research root blocks a new campaign
+  // Session-aware variant (ctx): also checks the pinned --state-root base, so
+  // a state-root campaign is visible to clear/launch guards in THIS session.
+  const researchCampaignExists = (workDir: string, ctx?: ExtensionContext): boolean => {
+    if (ctx && getRuntime(ctx).researchStateRoot) {
+      if (baseHasCampaign(getRuntime(ctx).researchStateRoot)) return true;
     }
+    return baseHasCampaign(workDir);
   };
 
   const researchBlockedResponse = () => ({
@@ -2543,20 +2568,28 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   };
 
   /** Campaign-mode default resume used by ensurePendingResume when no explicit
-   *  composer is given: never mentions the blocked legacy tools. */
-  const composeCampaignResumeMessage = (ctx: ExtensionContext): string =>
-    researchScanSync(resolveWorkDir(ctx.cwd)).blocks
-      ? RESEARCH_RESUME_TEXT
+   *  composer is given: never mentions the blocked legacy tools. Session-aware
+   *  sync variant: also consults the pinned --state-root base. */
+  const composeCampaignResumeMessage = (ctx: ExtensionContext): string => {
+    const workDir = resolveWorkDir(ctx.cwd);
+    const stateRoot = getRuntime(ctx).researchStateRoot;
+    const research =
+      researchScanSync(workDir).blocks ||
+      (stateRoot !== null && stateRoot !== workDir && researchScanSync(stateRoot).blocks);
+    return research ? RESEARCH_RESUME_TEXT
       : [
           "Continue the candidate campaign now: candidate_branch status, then run/checkpoint on the active candidate.",
           "The ordinary experiment tools are blocked while the campaign is active.",
           "If status reports manual_check_required: STOP — report the pending operation and wait for the operator (resolve).",
         ].join(" ");
+  };
 
   /** Corrective resume for a settled turn that did no loop work (bounded — see MAX_CONSECUTIVE_DRIFT_RESUMES). */
-  const composeDriftResumeMessage = async (cwd: string): Promise<string> => {
+  const composeDriftResumeMessage = async (cwd: string, ctx?: ExtensionContext): Promise<string> => {
     // Research campaign active (design §8): resume the research campaign only.
-    if (researchScanSync(resolveWorkDir(cwd)).blocks) return composeResearchDriftMessage();
+    // Session-aware: the pinned --state-root campaign counts in THIS session
+    // (review B2), so a state-root campaign gets research wording too.
+    if ((await researchBlocksOrdinaryLoop(resolveWorkDir(cwd), ctx))) return composeResearchDriftMessage();
     // Candidate-branch campaign active (design §5): do NOT prescribe the legacy
     // cycle; the campaign has its own loop and its own stop rules. resolveWorkDir
     // (not the raw cwd): the campaign may live under a configured workingDir.
@@ -2577,7 +2610,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   };
 
   const composeCompactionResumeMessage = async (ctx: ExtensionContext): Promise<string> => {
-    if (researchScanSync(resolveWorkDir(ctx.cwd)).blocks) return composeResearchCompactionMessage();
+    if ((await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd), ctx))) return composeResearchCompactionMessage();
     // Candidate-branch campaign active (design §5): resume the campaign, not
     // the legacy experiment loop; compaction must not reintroduce run_experiment.
     // resolveWorkDir (not the raw cwd): the campaign may live under a configured
@@ -3030,7 +3063,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       return;
     }
     if (!gate(runtime)) return;
-    if (await campaignNeedsManualCheck(resolveWorkDir(ctx.cwd))) {
+    if (await campaignNeedsManualCheck(resolveWorkDir(ctx.cwd), ctx)) {
       // Unclear campaign state: stop and let the operator decide (design §5).
       return;
     }
@@ -3049,7 +3082,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (composeMessage) {
       composed = composeMessage(ctx);
     } else if (
-      (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) ||
+      (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd), ctx)) ||
       (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd)))
     ) {
       composed = composeCampaignResumeMessage(ctx);
@@ -3098,14 +3131,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
       if (runtime.consecutiveDriftResumes < MAX_CONSECUTIVE_DRIFT_RESUMES) {
         // Unclear campaign state (pending operation): stop, do not auto-resume (design §5).
-        if (await campaignNeedsManualCheck(resolveWorkDir(ctx.cwd))) return;
+        if (await campaignNeedsManualCheck(resolveWorkDir(ctx.cwd), ctx)) return;
         runtime.consecutiveDriftResumes++;
         markAutoResumeSent(runtime);
         // composeDriftResumeMessage branches by campaign mode: under an active
         // candidate campaign it emits candidate-campaign wording only (design §5).
         // resolveWorkDir: the campaign may live under a configured workingDir,
         // so the campaign check must not use the raw session cwd.
-        schedulePendingResume(ctx, runtime, await composeDriftResumeMessage(resolveWorkDir(ctx.cwd)));
+        schedulePendingResume(ctx, runtime, await composeDriftResumeMessage(resolveWorkDir(ctx.cwd), ctx));
         return;
       }
       // Under an active candidate campaign the notice must not prescribe the
@@ -3156,7 +3189,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       ? (event.input as { command: string }).command
       : "";
     // Research campaign (design §8): no Git through the shell, regardless of the loop mode.
-    if (cmd && RESEARCH_GIT_RE.test(cmd) && (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd)))) {
+    if (cmd && RESEARCH_GIT_RE.test(cmd) && (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd), ctx))) {
       return {
         block: true,
         reason:
@@ -3227,7 +3260,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     // Research campaign active (design §8): the legacy loop and candidate text must NOT be
     // prescribed. Inject only the research-mode rules.
-    if (await researchBlocksOrdinaryLoop(workDir)) {
+    if (await researchBlocksOrdinaryLoop(workDir, ctx)) {
       const researchExtra =
         "\n\n## Research Campaign (ACTIVE)" +
         "\nWork through the research and research_brief tools only. Sequence: research_brief draft → propose (brief confirmed by the USER in a dialog) → research start (expected brief sha256) → open (one question from the brief) → record (evidence_ref) → close (verdict with a rule_id of that question) → stop (stop rule) → report." +
@@ -3357,7 +3390,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return campaignBlockedResponse();
-      if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return researchBlockedResponse();
+      if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd), ctx)) return researchBlockedResponse();
       const modeGate = assertModeActive(ctx);
       if (modeGate) return modeGate;
       const runtime = getRuntime(ctx);
@@ -3630,7 +3663,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // The ordinary loop is blocked under a candidate campaign; this tool writes
       // refs/exp/* into the user's repository (design §5: incompatible tools).
       if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return campaignBlockedResponse();
-      if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return researchBlockedResponse();
+      if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd), ctx)) return researchBlockedResponse();
 
       // ── Read hypothesis text ──
       let hypothesisText: string;
@@ -4203,7 +4236,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
       if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return campaignBlockedResponse();
-      if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return researchBlockedResponse();
+      if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd), ctx)) return researchBlockedResponse();
       const workDir = resolveWorkDir(ctx.cwd);
       // The config (and therefore the cap) always lives in ctx.cwd — even when
       // workingDir redirects the experiment work elsewhere (see readConfig).
@@ -4950,7 +4983,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (validateWorkDir(ctx.cwd) === null && (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd)))) {
         return campaignBlockedResponse();
       }
-      if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return researchBlockedResponse();
+      if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd), ctx)) return researchBlockedResponse();
       const runtime = getRuntime(ctx);
       const state = runtime.state;
 
@@ -6965,7 +6998,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const modeGate = assertModeActive(ctx);
       if (modeGate) return modeGate;
       const workDir = resolveWorkDir(ctx.cwd);
-      if (await researchBlocksOrdinaryLoop(workDir)) return researchBlockedResponse();
+      if (await researchBlocksOrdinaryLoop(workDir, ctx)) return researchBlockedResponse();
       const state = getRuntime(ctx).state;
       const cfg = readCouncilConfig(workDir);
       if (!cfg.enabled) {
@@ -7147,7 +7180,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     } as any,
     async execute(_toolCallId: string, params: { reason: string; evidence?: string; confidence?: number }, _signal, _onUpdate, ctx: ExtensionContext) {
       if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return campaignBlockedResponse();
-      if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return researchBlockedResponse();
+      if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd), ctx)) return researchBlockedResponse();
       assertModeActive(ctx);
       const workDir = resolveWorkDir(ctx.cwd);
       const runtime = getRuntime(ctx);
@@ -7363,11 +7396,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
    * automatic resume messages are then not scheduled. A stale lock and an
    * unreadable state do not suppress steers; the tools refuse in those cases.
    */
-  const campaignNeedsManualCheck = async (workDir: string): Promise<boolean> => {
+  const campaignNeedsManualCheck = async (workDir: string, ctx?: ExtensionContext): Promise<boolean> => {
     // Scoped to an interrupted operation (the pending-op marker). An unreadable
     // state still blocks the ordinary loop tools (campaignBlocksOrdinaryLoop), but
     // does not by itself suppress steers, which would hide the real state from the agent.
     // A research campaign that is stopped, unreadable or pending never auto-continues (design §8, §9).
+    // Session-aware: a campaign pinned under --state-root is scanned too, so a
+    // halted/pending state-root campaign also suppresses auto-resume in THIS
+    // session (review B2). Candidate pending-op markers live under the work
+    // directory only, so the state-root check uses researchScanSync alone.
+    if (ctx && getRuntime(ctx).researchStateRoot) {
+      const stateRoot = getRuntime(ctx).researchStateRoot;
+      if (stateRoot !== workDir && researchScanSync(stateRoot).halted) return true;
+    }
     return researchScanSync(workDir).halted || campaignPendingOpSync(workDir);
   };
 
@@ -7502,7 +7543,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (workDirError) return { content: [{ type: "text", text: `❌ ${workDirError}` }], details: {} };
       const workDir = resolveWorkDir(ctx.cwd);
       const campDir = campaignDirOf(workDir);
-      if (await researchBlocksOrdinaryLoop(workDir)) return researchBlockedResponse();
+      if (await researchBlocksOrdinaryLoop(workDir, ctx)) return researchBlockedResponse();
       const action = params?.action;
 
       const fail = (reason: string, message: string, extra = "") => ({
@@ -8127,8 +8168,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return `unexpected field(s) ${extra.map((k) => JSON.stringify(k)).join(", ")}; this action accepts only ${allowed.join(", ")}. Approval and operator confirmation are never accepted from the model`;
   };
 
-  const listResearchCampaignIds = (workDir: string): string[] | null => {
-    const root = researchState.researchRoot(workDir);
+  const listResearchCampaignIds = (base: string): string[] | null => {
+    const root = researchState.researchRoot(base);
     if (!fs.existsSync(root)) return [];
     try {
       return fs.readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name).sort();
@@ -8137,15 +8178,49 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
   };
 
+  /** Base the campaign state lives under: the pinned --state-root (resolved
+   *  absolute) or the work directory itself. Byte-identical to the previous
+   *  behavior when no pin is set. */
+  const effectiveResearchBase = (workDir: string, ctx: ExtensionContext): string =>
+    getRuntime(ctx).researchStateRoot ?? workDir;
+
+  /** Ids of every campaign visible to this session: the effective base the
+   *  tools use, plus the default root (so a pinned state root never hides a
+   *  default-root campaign from discovery). null = an unreadable root. */
+  const sessionResearchCampaignIds = (workDir: string, ctx: ExtensionContext): string[] | null => {
+    const base = effectiveResearchBase(workDir, ctx);
+    const ids = listResearchCampaignIds(base);
+    if (ids === null) return null;
+    if (base !== workDir) {
+      const defaults = listResearchCampaignIds(workDir);
+      if (defaults === null) return null;
+      return [...new Set([...ids, ...defaults])].sort();
+    }
+    return ids;
+  };
+
+  /** Whether any campaign directory exists in a given base (fail closed on
+   *  an unreadable root). */
+  const baseHasCampaign = (base: string): boolean => {
+    const root = researchState.researchRoot(base);
+    if (!fs.existsSync(root)) return false;
+    try {
+      return fs.readdirSync(root, { withFileTypes: true }).some((d) => d.isDirectory());
+    } catch {
+      return true;
+    }
+  };
+
   /** Review B3: only one campaign may work at a time. Returns a reason string
    *  when any OTHER campaign under the research root is in phase research or
    *  holds a pending operation; null when the start may proceed. */
-  const otherCampaignBusyReason = async (workDir: string, selfId: string): Promise<string | null> => {
-    const ids = listResearchCampaignIds(workDir);
+  const otherCampaignBusyReason = async (workDir: string, ctx: ExtensionContext, selfId: string): Promise<string | null> => {
+    const base = effectiveResearchBase(workDir, ctx);
+    const ids = listResearchCampaignIds(base);
     if (ids === null) return "the research root cannot be listed; start is refused (fail closed)";
     for (const other of ids) {
       if (other === selfId) continue;
-      const resolved = researchState.resolveCampaignDir(workDir, other);
+      const resolved = researchState.resolveCampaignDir(base, other);
       if (!resolved.ok) continue;
       const insp = await researchState.inspectCampaign(resolved.dir);
       if (insp.status === "invalid_argument" || insp.status === "state_unreadable") {
@@ -8157,14 +8232,39 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return null;
   };
 
-  /** The only campaign of the work directory (the id is never model-supplied). */
-  const resolveResearchTarget = (workDir: string): researchState.Result<{ dir: string; id: string }> => {
-    const ids = listResearchCampaignIds(workDir);
-    if (ids === null) return researchRefusal("state_unreadable", "the research root cannot be listed; nothing was changed");
-    if (ids.length === 0) return researchRefusal("campaign_missing", "no research campaign exists; create one with research_brief draft");
-    if (ids.length > 1) return researchRefusal("invalid_argument", `several campaigns exist (${ids.join(", ")}); clean .auto/research first: a session works with exactly one campaign`);
-    const resolved = researchState.resolveCampaignDir(workDir, ids[0]);
-    return resolved.ok ? { ok: true, dir: resolved.dir, id: ids[0] } : resolved;
+  /** The campaign this session works on (the id is never model-supplied).
+   *  Resolution uses the effective base first, then the default root. */
+  const resolveResearchTarget = (workDir: string, ctx: ExtensionContext): researchState.Result<{ dir: string; id: string }> => {
+    const pinned = getRuntime(ctx).researchCampaignId;
+    if (pinned !== null) {
+      const base = effectiveResearchBase(workDir, ctx);
+      const resolved = researchState.resolveCampaignDir(base, pinned);
+      if (resolved.ok) return { ok: true, dir: resolved.dir, id: pinned };
+      // A pinned id that does not exist under the state root: fall back to the
+      // default root only when the pin is a state-root pin (base differs).
+      if (base !== workDir) {
+        const fallback = researchState.resolveCampaignDir(workDir, pinned);
+        if (fallback.ok) return { ok: true, dir: fallback.dir, id: pinned };
+      }
+      return researchRefusal("campaign_missing", `campaign ${pinned} does not exist under the pinned state root or the default root`);
+    }
+    const bases = effectiveResearchBase(workDir, ctx) !== workDir ? [effectiveResearchBase(workDir, ctx), workDir] : [workDir];
+    // HEAD semantics preserved for stray directories: every directory under
+    // the root counts, a single invalid-named one surfaces the resolveCampaignDir
+    // refusal instead of being skipped, and two or more refuse as several
+    // campaigns (review M3).
+    const unionIds: string[] = [];
+    for (const base of bases) {
+      const ids = listResearchCampaignIds(base);
+      if (ids === null) return researchRefusal("state_unreadable", "the research root cannot be listed; nothing was changed");
+      for (const id of ids) if (!unionIds.includes(id)) unionIds.push(id);
+    }
+    if (unionIds.length === 0) return researchRefusal("campaign_missing", "no research campaign exists; create one with research_brief draft");
+    if (unionIds.length > 1) return researchRefusal("invalid_argument", `several campaigns exist (${unionIds.join(", ")}); clean .auto/research first: a session works with exactly one campaign`);
+    const singleId = unionIds[0];
+    const singleBase = bases.find((b) => researchState.resolveCampaignDir(b, singleId).ok) ?? bases[0];
+    const resolved = researchState.resolveCampaignDir(singleBase, singleId);
+    return resolved.ok ? { ok: true, dir: resolved.dir, id: singleId } : resolved;
   };
 
   interface ResearchEvidence {
@@ -8408,9 +8508,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // command) wins; otherwise the single existing campaign is reused (draft
       // into an unapproved campaign stays possible); with none, draft
       // generates one and pins it; with several, everything refuses.
+      // Campaign STATE lives under the effective base (pinned --state-root or
+      // the work directory): resolveCampaignDir/createCampaign take that base.
+      const stateBase = effectiveResearchBase(workDir, ctx);
       let campaignId = getRuntime(ctx).researchCampaignId;
       if (campaignId === null) {
-        const ids = listResearchCampaignIds(workDir);
+        const ids = sessionResearchCampaignIds(workDir, ctx);
         if (ids === null) return fail("state_unreadable", "the research root cannot be listed; nothing was changed");
         if (ids.length > 1) {
           return fail("invalid_argument", `several campaigns exist (${ids.join(", ")}); clean .auto/research first: a session works with exactly one campaign`);
@@ -8419,7 +8522,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           campaignId = ids[0];
         } else if (action === "draft") {
           campaignId = `bench-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}`;
-          while (fs.existsSync(path.join(researchState.researchRoot(workDir), campaignId))) {
+          while (fs.existsSync(path.join(researchState.researchRoot(stateBase), campaignId))) {
             campaignId = `${campaignId}-${Math.random().toString(36).slice(2, 6)}`;
           }
           getRuntime(ctx).researchCampaignId = campaignId;
@@ -8427,9 +8530,26 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           return fail("campaign_missing", "no campaign yet: the id is pinned by the launch command or generated by research_brief draft");
         }
       }
-      const resolved = researchState.resolveCampaignDir(workDir, campaignId);
-      if (!resolved.ok) return fail(resolved.reason, resolved.message);
-      const dir = resolved.dir;
+      // Resolve against the effective base first, then the default root: the
+      // pinned id may exist under --state-root only (launch flow) or in the
+      // default root (TUI flow without a state root). A brand-new campaign
+      // (draft) exists in neither yet: create under the state base.
+      const resolveDirOf = (base: string) => researchState.resolveCampaignDir(base, campaignId as string);
+      const stateRootDir = resolveDirOf(stateBase);
+      const defaultRootDir = stateBase !== workDir ? resolveDirOf(workDir) : null;
+      const dirFromState = stateRootDir.ok && fs.existsSync(stateRootDir.dir) ? stateRootDir.dir : null;
+      const dirFromDefault = defaultRootDir && defaultRootDir.ok && fs.existsSync(defaultRootDir.dir) ? defaultRootDir.dir : null;
+      if (dirFromState === null && dirFromDefault === null) {
+        if (!stateRootDir.ok && (defaultRootDir === null || !defaultRootDir.ok)) {
+          return fail(stateRootDir.reason, stateRootDir.message);
+        }
+        // Valid path, no directory yet: only draft creates a campaign.
+        if (action !== "draft") {
+          return fail("campaign_missing", `campaign ${campaignId} does not exist yet; only research_brief draft creates a campaign`);
+        }
+      }
+      const campaignBase = dirFromState !== null ? stateBase : dirFromDefault !== null ? workDir : stateBase;
+      const dir = dirFromState ?? dirFromDefault ?? (stateRootDir.ok ? stateRootDir.dir : path.join(researchState.researchRoot(stateBase), campaignId!));
 
       if (action === "draft") {
         if (params.brief === undefined) return fail("invalid_argument", "draft requires the brief object");
@@ -8437,7 +8557,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (!validation.ok) {
           return fail("brief_invalid", `brief rejected (${validation.errors.length} problem(s)): ${validation.errors.join("; ")}`);
         }
-        const created = await researchState.createCampaign(workDir, campaignId);
+        const created = await researchState.createCampaign(campaignBase, campaignId);
         if (!created.ok && created.reason !== "campaign_exists") return fail(created.reason, created.message);
         const written = await researchState.writeBriefDraft(dir, params.brief);
         if (!written.ok) return fail(written.reason, written.message);
@@ -8562,14 +8682,22 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const workDir = resolveWorkDir(ctx.cwd);
       // The campaign id is never taken from the model: the pinned id (launch
       // command) wins; resolve stays exempt (operator-only, must reach any
-      // campaign); otherwise the single existing campaign is used.
+      // campaign); otherwise the single existing campaign is used. Campaign
+      // state resolves under the effective base (pinned --state-root) first,
+      // then the default root.
       const pinnedId = params?.action === "resolve" ? null : getRuntime(ctx).researchCampaignId;
       const target = pinnedId !== null
         ? (() => {
-            const r = researchState.resolveCampaignDir(workDir, pinnedId);
-            return r.ok ? { ok: true as const, dir: r.dir, id: pinnedId } : r;
+            const stateBase = effectiveResearchBase(workDir, ctx);
+            const r = researchState.resolveCampaignDir(stateBase, pinnedId);
+            if (r.ok && (fs.existsSync(r.dir) || stateBase === workDir)) return { ok: true as const, dir: r.dir, id: pinnedId };
+            if (stateBase !== workDir) {
+              const fallback = researchState.resolveCampaignDir(workDir, pinnedId);
+              if (fallback.ok && fs.existsSync(fallback.dir)) return { ok: true as const, dir: fallback.dir, id: pinnedId };
+            }
+            return r.ok && fs.existsSync(r.dir) ? { ok: true as const, dir: r.dir, id: pinnedId } : r;
           })()
-        : resolveResearchTarget(workDir);
+        : resolveResearchTarget(workDir, ctx);
       const resolvedTarget = await target;
       if (!resolvedTarget.ok) return fail(resolvedTarget.reason, resolvedTarget.message);
       const { dir, id } = resolvedTarget;
@@ -8602,7 +8730,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // One campaign works at a time (review B3): refuse the start when any
         // other campaign under the research root is already in the research
         // phase or holds a pending operation.
-        const otherBusy = await otherCampaignBusyReason(workDir, id);
+        const otherBusy = await otherCampaignBusyReason(workDir, ctx, id);
         if (otherBusy) return fail("invalid_transition", otherBusy);
         const checked = await researchState.checkBriefApproval(dir, expected);
         if (!checked.ok) return fail(checked.reason, checked.message);
@@ -8668,7 +8796,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           `Evidence records: ${evidenceStates.length}; changed or missing: ${changed}`,
           "No target metric: the campaign answers only the questions of its brief.",
         ];
-        return reply(lines.join("\n"));
+        const reportText = lines.join("\n");
+        // Persist the report next to state.json: the campaign leaves a durable
+        // artifact (bd pi-autoresearch-7ii). A write failure only warns — the
+        // report text is still returned. Report is NOT gated on stop.
+        const reportPath = path.join(dir, "report.md");
+        let savedNote: string;
+        try {
+          await researchState.writeFileAtomic(reportPath, reportText + "\n");
+          savedNote = `Report saved to ${path.relative(workDir, reportPath)}`;
+        } catch (err) {
+          savedNote = `warning: the report could not be saved to ${path.relative(workDir, reportPath)} (${err instanceof Error ? err.message : String(err)})`;
+        }
+        return reply(reportText + "\n\n" + savedNote);
       }
 
       // Vector actions: the brief must be approved and the campaign in phase research.
@@ -8700,6 +8840,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const ref = params.evidence_ref;
         if (typeof ref !== "string" || ref.trim() === "") {
           return fail("invalid_argument", "record requires evidence_ref: path:lines or path#anchor inside the work directory");
+        }
+        // Format gate (review M2): a bare path that parseEvidenceRef cannot
+        // parse would later break the findings routing on close (which stores
+        // the recorded ref verbatim); refuse it here with the expected format.
+        if (!parseEvidenceRef(ref).ok) {
+          return fail(
+            "invalid_argument",
+            `evidence_ref must be path:lines or path#anchor (e.g. logs/app.log:5-9 or logs/app.log#anchor-substring), not a bare path: ${JSON.stringify(ref)}`,
+          );
         }
         if (snap.state.phase !== "research") return phaseRefusal();
         const openId = snap.replay.open;
@@ -8763,7 +8912,26 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             }),
         );
         if (!done.ok) return fail(done.reason, done.message);
-        return reply(`✅ Vector ${qid} closed: ${verdict} by rule ${rid}.`);
+        // Findings routing (bd pi-autoresearch-7ii): decisive verdicts
+        // (confirmed/rejected) append a finding to the PROJECT root
+        // .auto/findings.jsonl, so campaign verdicts become searchable
+        // precedents for later sessions. inconclusive/waiting_for_data route
+        // nothing. A routing failure NEVER fails the close: warn only.
+        let findingNote = "";
+        if (verdict === "confirmed" || verdict === "rejected") {
+          const qText = question.text.length > 200 ? question.text.slice(0, 197) + "..." : question.text;
+          try {
+            const res = recordFinding(workDir, {
+              theme: "behavior",
+              description: `${id}/${qid}: ${verdict} by ${rid} — ${qText}`,
+              evidence_ref: vector.evidence[0].evidence_ref,
+            });
+            findingNote = res.ok ? ` Finding recorded: ${res.value.id}.` : ` (warning: the finding could not be recorded — ${res.errors.join("; ")})`;
+          } catch {
+            findingNote = " (warning: the finding could not be recorded)";
+          }
+        }
+        return reply(`✅ Vector ${qid} closed: ${verdict} by rule ${rid}.` + findingNote);
       }
 
       if (action === "stop") {
@@ -8801,6 +8969,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     recordAutoresearchActivation(resolveWorkDir(ctx.cwd), false);
     setAutoresearchMode(ctx, false);
     runtime.researchCampaignId = null;
+    runtime.researchStateRoot = null;
     runtime.autoResumeTurns = 0;
     runtime.experimentsThisSession = 0;
     runtime.lastRunChecks = null;
@@ -8867,7 +9036,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       if (command === "finalize") {
-        if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) {
+        if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd), ctx)) {
           ctx.ui.notify("Research campaign active — use research status; the legacy finalize flow is not started.", "info");
           return;
         }
@@ -8907,7 +9076,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // context has no executeTool, so the agent performs the blocking call.
         const note = trimmedArgs.replace(/^council\b\s*/i, "").trim();
         const workDir = resolveWorkDir(ctx.cwd);
-        if (await researchBlocksOrdinaryLoop(workDir)) {
+        if (await researchBlocksOrdinaryLoop(workDir, ctx)) {
           ctx.ui.notify("Research campaign active — the council is blocked in this mode; use research status.", "info");
           return;
         }
@@ -8940,7 +9109,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // Clearing the ordinary experiment state under an active campaign
         // would corrupt its evidence/ledger. Refuse before any runtime or disk
         // mutation; campaign-specific commands own their cleanup lifecycle.
-        if (researchCampaignExists(workDir)) {
+        if (researchCampaignExists(workDir, ctx)) {
           ctx.ui.notify("Research campaign active — complete or remove it first before clearing autoresearch data", "info");
           return;
         }
@@ -9048,7 +9217,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // ===== parallel subcommands: activate mode + inject the parallel skill =====
       const parallelMatch = command.match(/^parallel-(best-of-n|stack|search)\b/);
       if (parallelMatch) {
-        if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) {
+        if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd), ctx)) {
           ctx.ui.notify("Research campaign active — the legacy parallel flow is not started; use research status.", "info");
           return;
         }
@@ -9073,10 +9242,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // ===== research subcommand: a research campaign, not the metric loop =====
       // Matched before the already-active branch: a research campaign is a
       // separate campaign kind, so the loop's active flag must not block it.
-      // Syntax: /autoresearch research [--id <campaign-id>] <free description>.
+      // Syntax: /autoresearch research [--id <campaign-id>] [--state-root <path>] <free description>.
       // The description is what the campaign studies; the agent turns it into
       // brief questions. The optional --id pins the campaign for the session
       // (the headless wrapper passes it; TUI runs get a generated id at draft).
+      // The optional --state-root pins where campaign STATE lives (under
+      // <stateRoot>/.auto/research/<id>/) for project layouts that only allow
+      // writes into a run directory; evidence still resolves from the work dir.
+      //
+      // DOCUMENTED LIMITATION: a state-root campaign is invisible to OTHER
+      // sessions' scans (they read only <workDir>/.auto/research); the launch
+      // guard, ordinary-loop blocks, manual-check suppression and resume
+      // composers in this session all consult the pin. A second session must
+      // pass the same --state-root to see the campaign.
       if (/^research(\s|$)/.test(command)) {
         const researchWorkDir = resolveWorkDir(ctx.cwd);
         let args_ = trimmedArgs.slice("research".length).trim();
@@ -9086,17 +9264,67 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           requestedId = idMatch[1];
           args_ = args_.slice(idMatch[0].length).trim();
         }
+        let requestedStateRoot: string | null = null;
+        const stateRootMatch = /^--state-root\s+(\S+)(\s|$)/.exec(args_);
+        if (stateRootMatch) {
+          requestedStateRoot = stateRootMatch[1];
+          args_ = args_.slice(stateRootMatch[0].length).trim();
+        }
+        // Validate the state root BEFORE any mutation: it must resolve inside
+        // the work directory (same confinement pattern as locateEvidence).
+        if (requestedStateRoot !== null) {
+          if (requestedStateRoot.startsWith('"') || requestedStateRoot.startsWith("'")) {
+            ctx.ui.notify(
+              `--state-root does not accept quoted values (got ${requestedStateRoot}); pass the path unquoted or without spaces`,
+              "error",
+            );
+            return;
+          }
+          const abs = path.resolve(researchWorkDir, requestedStateRoot);
+          const rel = path.relative(researchWorkDir, abs);
+          if (rel === "" || path.isAbsolute(rel) || rel.split(path.sep)[0] === "..") {
+            ctx.ui.notify(
+              `--state-root must be a directory inside the work directory (got ${requestedStateRoot}); nothing was started`,
+              "error",
+            );
+            return;
+          }
+          requestedStateRoot = abs;
+        }
         const description = args_;
-        const existingIds = listResearchCampaignIds(researchWorkDir) ?? [];
+        // Discovery for the launch guards: the default root, the requested
+        // (not yet pinned) state root, AND the session's already-pinned state
+        // root, so a state-root campaign also refuses a second launch in this
+        // session (review B1: the same-session pin must be honored here).
+        const pinnedStateRoot = runtime.researchStateRoot;
+        const launchBases = [
+          researchWorkDir,
+          ...[requestedStateRoot, pinnedStateRoot].filter((b) => b !== null) as string[],
+        ];
+        const uniqueLaunchBases = [...new Set(launchBases)];
+        const existingIds = [...new Set(uniqueLaunchBases.flatMap((b) => listResearchCampaignIds(b) ?? []))].sort();
 
         // Explicit --id: pin it for the session. When the campaign already
         // exists it must be resumable (briefing/research); when it does not,
         // research_brief draft will create it under the pinned id (the
         // headless wrapper flow). It is never created by this command.
+        // Resolve the campaign directory for an --id: effective (state-root)
+        // base first, then the default root. Returns the dir when the campaign
+        // exists in either root, else null.
+        const resolveRequestedCampaignDir = (id: string): string | null => {
+          const bases = requestedStateRoot !== null
+            ? [requestedStateRoot, researchWorkDir]
+            : [researchWorkDir];
+          for (const base of bases) {
+            const resolved = researchState.resolveCampaignDir(base, id);
+            if (resolved.ok && fs.existsSync(resolved.dir)) return resolved.dir;
+          }
+          return null;
+        };
         if (requestedId !== null) {
-          if (existingIds.includes(requestedId)) {
-            const resumed = researchState.resolveCampaignDir(researchWorkDir, requestedId);
-            const insp = resumed.ok ? await researchState.inspectCampaign(resumed.dir) : null;
+          const campaignDir = resolveRequestedCampaignDir(requestedId);
+          if (campaignDir !== null) {
+            const insp = await researchState.inspectCampaign(campaignDir);
             const phase = insp?.state?.phase ?? null;
             if (phase === "stopped") {
               ctx.ui.notify(`Campaign ${requestedId} is stopped (terminal); it never resumes. Create a new campaign: /autoresearch research <description>`, "info");
@@ -9119,18 +9347,72 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           return;
         }
         let resumePhase: string | null = null;
+        // The session may already hold a pin (an earlier launch in THIS
+        // session). A pinned campaign still in briefing/research must not be
+        // silently dropped: guard before any runtime mutation (review B1b).
+        const pinnedId = runtime.researchCampaignId;
+        if (pinnedId !== null) {
+          const pinnedBases = [
+            ...new Set((
+              [...[requestedStateRoot, pinnedStateRoot].filter((b) => b !== null) as string[]]).concat(researchWorkDir)
+            ),
+          ];
+          let pinnedDir: string | null = null;
+          for (const base of pinnedBases) {
+            const resolved = researchState.resolveCampaignDir(base, pinnedId);
+            if (resolved.ok && fs.existsSync(resolved.dir)) {
+              pinnedDir = resolved.dir;
+              break;
+            }
+          }
+          let pinnedPhase: string | null = null;
+          if (pinnedDir !== null) {
+            const insp = await researchState.inspectCampaign(pinnedDir);
+            pinnedPhase = insp.state?.phase ?? null;
+          }
+          if (pinnedPhase === "briefing" || pinnedPhase === "research") {
+            const resumingSameId = requestedId === pinnedId;
+            // requestedStateRoot and pinnedStateRoot are both absolute here
+            // (both pass the confinement resolve), so string equality is the
+            // exact "same base" check; a null request matches a null pin only.
+            const sameBase = requestedStateRoot !== null
+              ? requestedStateRoot === (pinnedStateRoot ?? researchWorkDir)
+              : pinnedStateRoot === null;
+            if (!resumingSameId || !sameBase) {
+              ctx.ui.notify(
+                `Campaign ${pinnedId} is active for this session (phase ${pinnedPhase}); the pin is not replaced. ` +
+                  (resumingSameId
+                    ? "Pass the same --state-root as the pinned campaign, or /autoresearch off to drop the pin"
+                    : `Resume it with /autoresearch research --id ${pinnedId}` +
+                      (pinnedStateRoot !== null ? " --state-root <the pinned root>" : "") +
+                      ", or /autoresearch off to drop the pin"),
+                "error",
+              );
+              return;
+            }
+          }
+        }
         if (requestedId !== null) {
           // Pin before activation: the research tools take no campaign id, so
           // this session works with exactly this campaign (live bench finding,
           // bd pi-autoresearch-9o2: the agent invented a second campaign).
           runtime.researchCampaignId = requestedId;
-          const resumed = researchState.resolveCampaignDir(researchWorkDir, requestedId);
-          const insp = resumed.ok ? await researchState.inspectCampaign(resumed.dir) : null;
+          const campaignDir = resolveRequestedCampaignDir(requestedId);
+          const insp = campaignDir !== null ? await researchState.inspectCampaign(campaignDir) : null;
           resumePhase = insp?.state?.phase === "briefing" || insp?.state?.phase === "research" ? insp.state.phase : null;
-          ctx.ui.notify(`Research mode ON — briefing phase; campaign ${requestedId} is pinned for this session (resume)`, "info");
+          ctx.ui.notify(
+            `Research mode ON — briefing phase; campaign ${requestedId} is pinned for this session (resume)` +
+              (requestedStateRoot !== null ? `; campaign state under ${requestedStateRoot}` : ""),
+            "info",
+          );
         } else {
-          ctx.ui.notify("Research mode ON — briefing phase; the research kickoff is sent", "info");
+          ctx.ui.notify(
+            "Research mode ON — briefing phase; the research kickoff is sent" +
+              (requestedStateRoot !== null ? `; campaign state under ${requestedStateRoot}` : ""),
+            "info",
+          );
         }
+        runtime.researchStateRoot = requestedStateRoot;
         recordAutoresearchActivation(researchWorkDir, true);
         setAutoresearchMode(ctx, true);
         runtime.autoResumeTurns = 0;
@@ -9176,7 +9458,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       updateWidget(ctx);
       // A candidate campaign is active: the legacy create kickoff prescribes the
       // ordinary loop (run/log), which is blocked. Point to the campaign instead.
-      if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) {
+      if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd), ctx)) {
         ctx.ui.notify("Research campaign active — continue it with research status; the legacy autoresearch kickoff is not sent.", "info");
         return;
       }

@@ -391,13 +391,15 @@ test("(i) open, record and close refuse every rule violation", async () => {
   assert.match(await act({ action: "open", question_id: "Q1" }), /Vector Q1 opened/);
   assert.match(await act({ action: "open", question_id: "Q2" }), /vector Q1 is open/);
   assert.match(await act({ action: "record", evidence_ref: "evidence/none.txt:1" }), /cannot be read/);
-  assert.match(await act({ action: "record", evidence_ref: "../outside.txt" }), /inside the work directory/);
+  // Bare paths are refused at record (review M2: the findings routing on close
+  // stores the recorded ref verbatim, so it must already be lines/anchor form).
+  assert.match(await act({ action: "record", evidence_ref: "../outside.txt" }), /path:lines or path#anchor/);
   assert.match(await act({ action: "close", question_id: "Q1", rule_id: "Q2-yes", verdict: "confirmed" }), /is not a decision rule of question Q1/);
   assert.match(await act({ action: "close", question_id: "Q1", rule_id: "Q1-no", verdict: "confirmed" }), /has verdict rejected, not confirmed/);
   assert.match(await act({ action: "close", question_id: "Q1", rule_id: "Q1-yes", verdict: "confirmed" }), /no evidence recorded/);
   fs.mkdirSync(path.join(dir, "evidence"), { recursive: true });
   fs.writeFileSync(path.join(dir, "evidence", "run1.txt"), "data\n");
-  assert.match(await act({ action: "record", evidence_ref: "evidence/run1.txt" }), /Evidence recorded/);
+  assert.match(await act({ action: "record", evidence_ref: "evidence/run1.txt:1" }), /Evidence recorded/);
   assert.match(await act({ action: "close", question_id: "Q1", rule_id: "Q1-unknown", verdict: "inconclusive" }), /requires a reason/);
   assert.match(await act({ action: "close", question_id: "Q1", rule_id: "Q1-unknown", verdict: "inconclusive", reason: "noisy" }), /Vector Q1 closed: inconclusive/);
   assert.match(await act({ action: "open", question_id: "Q1" }), /already closed/, "a closed vector is never reopened");
