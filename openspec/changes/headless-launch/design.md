@@ -38,13 +38,20 @@ node scripts/research-rpc.mjs --cwd <dir> --mode research|optimize
      [--pi <путь к pi>] [--log <файл>] [--timeout-sec N]
 ```
 
+- `--mode research` ТРЕБУЕТ `--brief` (и `--approve-sha`): без файла брифа
+  скрипт завершается с ошибкой аргументов до спавна pi (research-кампания
+  без зафиксированного брифа не запускается).
+
 - `--mode research`: шлёт `/autoresearch on`, дожидается observable-подтверждения
   активации режима (первый `agent_end`/`agent_settled` после команды), затем
-  отправляет kickoff: инструкция с путём брифа, его SHA-256 (скрипт считает
-  sha256 байтов файла тем же алгоритмом, что `sha256Hex` в research-state.ts:
-  sha256 от сырых байтов, hex-строка) и последовательностью draft → propose →
-  start `expected_sha256=<hash>` → open по одному вопросу → close по правилам
-  → stop → report.
+  отправляет kickoff: инструкцию прочитать файл брифа (`--brief`, путь передаётся
+  агенту дословно), его SHA-256 (скрипт считает sha256 байтов файла тем же
+  алгоритмом, что `sha256Hex` в research-state.ts: sha256 от сырых байтов,
+  hex-строка) и последовательностью: прочитать бриф → `research_brief draft`
+  с содержимым этого файла (объект из JSON) → `propose` → `research start`
+  `expected_sha256=<hash>` → open по одному вопросу → close по правилам →
+  stop → report. Так одобряемый draft по построению совпадает с файлом,
+  чей хеш зафиксирован (решение по ревью раунда 2: явная передача handoff).
 - `--mode optimize "<goal>"`: `/autoresearch <goal>` — обычный цикл.
 - Лог: сырой JSONL всех записей stdout-потока + сводка tool-вызовов в консоль.
 - Завершение: `agent_settled` после report/финиша цикла, или таймаут.
@@ -66,9 +73,11 @@ approval атомарна на стороне расширения).
   как точное слово `research` или префикс `research ` (с последующим текстом —
   он становится описанием кампании). Free-text цель «research something»
   поэтому интерпретируется как research-кампания с темой «something» — это
-  документированное поведение (см. spec); цель optimize, начинающаяся с этих
-  форм, задаётся через обёртку `--mode optimize`. Остальные аргументы —
-  без изменений.
+  документированное поведение (см. spec); ЕДИНСТВЕННОЕ изменение поведения
+  TUI (решение владельца). Цель optimize со словом `research` остаётся
+  выразимой через новый явный алиас `/autoresearch optimize <goal>` —
+  синтаксический сахар над существующим free-text потоком (тот же kickoff,
+  что и у free-text цели сегодня). Остальные аргументы — без изменений.
 - Ветка `research`: активирует режим, затем отправляет research-kickoff
   (перечисление шагов кампании, БЕЗ `/skill:autoresearch-create`); guard
   против существующей research-кампании (reuse `researchBlocksOrdinaryLoop`).
@@ -112,4 +121,6 @@ approval атомарна на стороне расширения).
   confirm.
 - Wiring: `/autoresearch research` не отправляет `/skill:autoresearch-create`;
   `/autoresearch research something` трактуется как research-кампания с темой
-  `something` (документированное поведение парсера).
+  `something` (документированное поведение парсера); `/autoresearch optimize
+  <goal>` отправляет metric-loop kickoff с целью `<goal>` (алиас работает);
+  foreign-hash E2E также проверяет завершение обёртки с ненулевым кодом.

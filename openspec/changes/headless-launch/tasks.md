@@ -8,15 +8,16 @@
 
 ## 2. Расширение: kickoff для research
 - [ ] 2.1 `/autoresearch research` (точное слово или префикс `research `; хвост — описание кампании): активирует режим, отправляет research-kickoff БЕЗ `/skill:autoresearch-create`; guard против существующей research-кампании (reuse `researchBlocksOrdinaryLoop`).
-- [ ] 2.2 Тесты wiring: `/autoresearch research` НЕ содержит `/skill:autoresearch-create` и содержит последовательность research_brief/research; `/autoresearch research something` = research-кампания с темой `something` (зарезервированное слово, документировано).
+- [ ] 2.2 Новый явный алиас `/autoresearch optimize <goal>`: тот же metric-loop kickoff, что и существующий free-text поток (цели со словом `research` остаются выразимыми).
+- [ ] 2.3 Тесты wiring: `/autoresearch research` НЕ содержит `/skill:autoresearch-create` и содержит последовательность research_brief/research; `/autoresearch research something` = research-кампания с темой `something` (зарезервированное слово, документировано); `/autoresearch optimize research habits` = metric-loop kickoff с целью «research habits» (алиас работает).
 
 ## 3. Тесты обёртки
-- [ ] 3.1 Юнит: парсер запросов; решение confirm (совпал / чужой диалоговый / файловый ≠ диалоговый → отказ с ненулевым кодом / не-брифовый → false); timeout с висящим confirm (false → shutdown → kill → код 3); сборка kickoff-текстов; последовательность mode-flip → agent_end → kickoff.
-- [ ] 3.2 E2E (спавн настоящего pi; CLI из `--pi`, иначе `pi` из PATH; `skip` без `PI_RPC_E2E=1`): research-сессия с auto-approve доходит до phase research, в логе нет отказов «mode OFF»; чужой sha — кампания остаётся briefing; файл брифа изменён после kickoff — отказ до confirm.
+- [ ] 3.1 Юнит: парсер запросов; решение confirm (совпал / чужой диалоговый → false + завершение с ненулевым кодом / файловый ≠ диалоговый → отказ до confirm + ненулевой код / не-брифовый → false); timeout с висящим confirm (false → shutdown → kill → код 3); запуск без `--brief`/`--approve-sha` в research-режиме → ошибка аргументов до спавна; сборка kickoff-текста с draft из содержимого файла `--brief`; последовательность mode-flip → agent_end → kickoff.
+- [ ] 3.2 E2E (спавн настоящего pi; CLI из `--pi`, иначе `pi` из PATH; `skip` без `PI_RPC_E2E=1`): research-сессия с auto-approve доходит до phase research, в логе нет отказов «mode OFF»; чужой sha — кампания остаётся briefing, обёртка завершается с ненулевым кодом; файл брифа изменён после kickoff — отказ до confirm.
 
 ## 4. Документация
-- [ ] 4.1 `docs/research-vectors.md`: раздел Headless launch (RPC, auto-approve по трёхсторонней сверке хеша, границы: briefing не блокирует git, перехват best-effort).
-- [ ] 4.2 Общий headless-раздел (optimize + research) — в docs; примеры команд; ограничение зарезервированного слова `research`.
+- [ ] 4.1 `docs/research-vectors.md`: раздел Headless launch (RPC, auto-approve по трёхсторонней сверке хеша, границы: briefing не блокирует git, перехват best-effort, `--brief` обязателен).
+- [ ] 4.2 Общий headless-раздел (optimize + research) — в docs; примеры команд; зарезервированное слово `research` и алиас `optimize` — в том числе для TUI-пользователей (изменение TUI-поведения задокументировано).
 
 ## 5. Проверка
 - [ ] 5.1 Полный npm test зелёный; openspec validate --strict valid.
