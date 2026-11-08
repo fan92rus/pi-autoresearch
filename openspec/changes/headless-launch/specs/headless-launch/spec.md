@@ -19,38 +19,67 @@
 
 ### Requirement: Sequencing stage 1 → stage 2
 
-Вторая стадия (research: путь брифа, хеш, campaign_id, шаги) SHALL отправляться
-только после завершения первой: при `data.disposition == "started"` — после
-`agent_settled`, при `handled` — немедленно. Скрипт MUST НЕ отправлять
-`/autoresearch on` и `/skill:autoresearch-create`.
+`/autoresearch research` — extension-команда: её prompt-ответ всегда имеет
+disposition `handled`, а собственный kickoff-запуск стримится внутри той же
+сессии. Обёртка SHALL после stage-1 ответа ждать цикл `agent_start` →
+`agent_settled`; если `agent_start` не наступил за `--stage1-timeout-sec`
+(по умолчанию 30) — stage 1 отказала (exit 2).
 
 #### Scenario: Sequencing stage 1 → stage 2
-- **WHEN** stage-1 сообщение отправлено и вернулся disposition `started`
-- **THEN** stage 2 отправлена после `agent_settled`; при disposition `handled`
-  stage 2 отправлена немедленно.
+- **WHEN** stage-1 сообщение отправлено, ответ `handled`, затем пришёл
+  `agent_start` и завершился `agent_settled`
+- **THEN** stage 2 отправлена после этого `agent_settled`.
+
+#### Scenario: Stage 1 отказала (guard или ошибка)
+- **WHEN** после stage-1 ответа `agent_start` не наступил за
+  `--stage1-timeout-sec`
+- **THEN** обёртка завершается с кодом 2, причина в логе (кампания не создана).
 
 ### Requirement: Research-режим требует канонический бриф и хеш
 
 `--mode research` MUST требовать `--brief` и `--approve-sha`; без них — ошибка
 аргументов (exit 2) до спавна pi. Файл `--brief` MUST быть в канонической форме
-`JSON.stringify(JSON.parse(bytes), null, 2) + "\n"`; неканонический файл —
-отказ (exit 2) до спавна pi.
+`JSON.stringify(JSON.parse(bytes), null, 2) + "\n"`; неканонический файл, непарсируемый
+JSON (включая пустой файл и BOM), отсутствующий файл, а также `--approve-sha` не
+по маске `^[0-9a-f]{64}$` или `--campaign-id` не по маске
+`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` — отказ (exit 2) до спавна pi.
 
 #### Scenario: Запуск без брифа
 - **WHEN** скрипт вызван с `--mode research` без `--brief` или без `--approve-sha`
 - **THEN** завершение с ошибкой аргументов (exit 2); pi не запускается.
 
-#### Scenario: Неканонический бриф
-- **WHEN** байты `--brief` не равны `JSON.stringify(JSON.parse(bytes), null, 2) + "\n"`
+#### Scenario: Неканонический или непарсируемый бриф
+- **WHEN** байты `--brief` не равны канонической форме, или файл отсутствует, или
+  JSON не парсится (пустой файл, BOM)
 - **THEN** завершение с ошибкой (exit 2) до спавна pi.
+
+#### Scenario: Невалидный approve-sha или campaign-id
+- **WHEN** `--approve-sha` не по `^[0-9a-f]{64}$` или `--campaign-id` не по
+  `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`
+- **THEN** завершение с ошибкой (exit 2) до спавна pi.
+
+#### Scenario: Stage 2 при стриминге
+- **WHEN** stage-2 prompt отправлен во время стриминга (не должен происходить
+  при верном sequencing) и вернулся `queued` или `success:false`
+- **THEN** ошибка обёртки: exit 1, причина в логе.
+
+### Requirement: Запрет legacy-команд активации
+
+Скрипт MUST НЕ отправлять `/autoresearch on` и `/skill:autoresearch-create`.
+
+#### Scenario: Ни одна отправка не содержит legacy-команд
+- **WHEN** обёртка отработала любой режим
+- **THEN** в логе отправленных сообщений нет `/autoresearch on` и
+  `/skill:autoresearch-create`.
 
 ### Requirement: Трёхсторонняя сверка хеша в момент диалога
 
 При ответе на propose-confirm скрипт MUST сверить три хеша: из текста диалога
-(`Brief SHA-256: <hex>`), зафиксированный оператором (`--approve-sha`) и
-пересчитанный из файла `--brief` в этот момент. Совпадение всех трёх —
-`confirmed: true`; любое несовпадение — `confirmed: false` и немедленная
-RPC-команда abort процессу pi.
+(первое вхождение `Brief SHA-256: <hex>` от начала message), зафиксированный
+оператором (`--approve-sha`) и пересчитанный из файла `--brief` в этот момент.
+Совпадение всех трёх — `confirmed: true`; любое несовпадение — `confirmed: false`
+и немедленная RPC-команда abort процессу pi. Тестовая опция `--hold-dialog-ms <n>`
+(по умолчанию 0) задерживает ответ на диалог для теста мутации файла.
 
 #### Scenario: Файл брифа изменён при висящем диалоге
 - **WHEN** файл `--brief` изменён после kickoff, и диалог ещё открыт
@@ -98,13 +127,26 @@ MUST отклоняться (`confirmed: false`) с записью в лог. П
 
 ### Requirement: Коды выхода
 
-Скрипт SHALL использовать: 0 — успех (report/финиш цикла); 1 — отказ по хешу
-или диалогу (с abort сессии); 2 — ошибки аргументов (research без `--brief`/
-`--approve-sha`, неканонический бриф); 3 — таймаут.
+Скрипт SHALL использовать: 0 — успех (research: получен успешный `report`;
+optimize: агент сообщил завершение цикла в финальном тексте); 1 — отказ по
+хешу брифа (с abort сессии); 2 — ошибки аргументов и отказ guard-а на stage 1;
+3 — таймаут.
 
 #### Scenario: Код для отказа по хешу
 - **WHEN** сработал отказ по хешу
 - **THEN** код выхода 1 (не 0 и не 3).
+
+### Requirement: Диалоги в optimize-режиме
+
+В optimize-режиме обёртка MUST отвечать `confirmed:false` на любой диалог с
+`Brief SHA-256:` (нет `--approve-sha`) и логировать его. Не-брифовый confirm
+получает `confirmed:false` и лог; exit 1 даётся только отказом по хешу брифа
+(abort сессии), штатное завершение — 0/3.
+
+#### Scenario: Не-брифовый confirm не меняет код
+- **WHEN** в optimize-режиме пришёл confirm без `Brief SHA-256:`
+- **THEN** `confirmed:false`, лог; код выхода определяется штатным завершением
+  (0/3), а не этим диалогом.
 
 ### Requirement: Kickoff для research-кампании не использует metric-loop skill
 
@@ -144,10 +186,11 @@ run_experiment/log_experiment.
 ### Requirement: Алиас optimize
 
 Новый алиас `/autoresearch optimize <goal>` MUST проверяться ДО зарезервированной
-ветки: слово `optimize` отбрасывается, хвост — полная цель metric-loop. Обе
-подкоманды MUST быть зарегистрированы в SUBCOMMANDS (help/completions).
-Edge-кейсы: таб/пробелы после `research` — разделитель; `optimize` без цели —
-отказ; сравнение подкоманд регистронезависимо.
+ветки: слово `optimize` отбрасывается, хвост — полная цель metric-loop. Kickoff
+алиаса — РОВНО тот же, что у существующего free-text optimize-потока сегодня:
+`/skill:autoresearch-create <goal> BENCHMARK_GUARDRAIL` (при отсутствии
+`.auto/prompt.md`) или «Autoresearch mode active. <goal> ...» (при наличии);
+цель в kickoff — исходный хвост без слова `optimize`.
 
 #### Scenario: Алиас optimize сохраняет выразимость целей
 - **WHEN** оператор вызывает `/autoresearch optimize research habits`
@@ -157,13 +200,29 @@ Edge-кейсы: таб/пробелы после `research` — раздели�
 - **WHEN** оператор вызывает `/autoresearch optimize`
 - **THEN** отказ с сообщением об отсутствии цели.
 
+### Requirement: Регистрация подкоманд и edge-кейсы парсера
+
+Подкоманды `research` и `optimize` MUST быть зарегистрированы в SUBCOMMANDS
+(help/completions). Подкоманда распознаётся на lowercased trimmed command;
+разделитель — `/^research(\s|$)/` (хвост берётся из исходного регистра
+аргументов); `optimize` без цели — отказ; сравнение регистронезависимо.
+
+#### Scenario: Регистрация в help
+- **WHEN** оператор открывает help/completions `/autoresearch`
+- **THEN** видны обе подкоманды `research` и `optimize` с описаниями.
+
+#### Scenario: Tab после зарезервированного слова
+- **WHEN** оператор вызывает `/autoresearch research\ttab-desc`
+- **THEN** распознаётся research-кампания с описанием `tab-desc`.
+
 ### Requirement: Оптимизационный запуск headless
 
-Скрипт SHALL поддерживать `--mode optimize "<goal>"`: отправка
-`/autoresearch optimize <goal>` без интерактивного UI; неизвестные диалоги
-отклоняются с записью в лог; отклонение может остановить цикл — это
-документированное поведение, а не сбой. E2E SHALL проверять наполнение
-`.auto/log.jsonl`.
+Скрипт SHALL поддерживать `--mode optimize` с целью в `--goal` (без `--goal` —
+exit 2): отправка `/autoresearch optimize <goal>` без интерактивного UI;
+неизвестные диалоги отклоняются с записью в лог; отклонение может остановить
+цикл — документированное поведение, а не сбой. E2E SHALL проверять наполнение
+`.auto/log.jsonl` и стоп-условие завершения (exit 0 — агент сообщил завершение
+цикла в финальном тексте; иначе плановый таймаут — exit 3).
 
 #### Scenario: Обычный цикл без UI
 - **WHEN** скрипт запущен с `--mode optimize` и целью

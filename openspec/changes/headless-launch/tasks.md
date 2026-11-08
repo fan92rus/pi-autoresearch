@@ -3,7 +3,7 @@
 ## 1. Обёртка `scripts/research-rpc.mjs`
 - [ ] 1.1 Скрипт: спавн `pi --mode rpc`, JSONL-фрейминг по LF (без readline; U+2028/29 не границы), лог всех записей, консольный tail tool-вызовов.
 - [ ] 1.2 Каноничность: `--mode research` требует `--brief` + `--approve-sha` (иначе exit 2 до спавна); проверка `bytes === JSON.stringify(JSON.parse(bytes), null, 2) + "\n"` (неканонический → exit 2); трёхсторонняя сверка В МОМЕНТ диалога (диалоговый / `--approve-sha` / пересчитанный из файла): несовпадение → `confirmed:false` → RPC abort → kill после 10с → exit 1, тест ассертит отсутствие research-вызовов после отказа; не-брифовый confirm → `false`.
-- [ ] 1.3 Sequencing: stage 1 = `/autoresearch research`; ожидание — `data.disposition` (`started` → `agent_settled`, `handled` → сразу), затем stage 2: путь `--brief`, его sha256, campaign_id (`--campaign-id` или `bench-<yyyymmdd-hhmmss>`), шаги (draft из файла → propose → start expected_sha256 → open → close → stop → report). `--mode optimize "<goal>"` = `/autoresearch optimize <goal>`. Никогда `/autoresearch on` и `/skill:autoresearch-create`.
+- [ ] 1.3 Sequencing: stage 1 = `/autoresearch research`; после ответа (`handled`) ждать цикл `agent_start` → `agent_settled` (`--stage1-timeout-sec`, по умолчанию 30; нет agent_start → stage 1 отказала, exit 2), затем stage 2: путь `--brief`, его sha256, campaign_id (`--campaign-id` или `bench-<yyyymmdd-hhmmss>`), шаги (draft из файла → propose → start expected_sha256 → open → close → stop → report). `queued`/`success:false` на stage-2 prompt → exit 1. `--mode optimize` = `/autoresearch optimize <goal>` (цель в `--goal`). Никогда `/autoresearch on` и `/skill:autoresearch-create`.
 - [ ] 1.4 CLI-парсер (`--pi` или `pi` из PATH), таймаут (false → shutdown → kill 10с → exit 3, причина в лог), exit codes 0/1/2/3, сводка в конце.
 
 ## 2. Расширение: парсер и kickoff
@@ -13,12 +13,12 @@
 - [ ] 2.4 Тесты wiring: `research` без `/skill:autoresearch-create`; `research something` = кампания `something`; research до already-active; guard на briefing-кампанию; `optimize research habits` = metric-loop с полной целью; SUBCOMMANDS содержит обе; edge-кейсы: tab после `research`, `optimize` без цели, lowercase.
 
 ## 3. Тесты обёртки
-- [ ] 3.1 Юнит: каноничность файла (exit 2); три хеша (совпали → true; операторский ≠ диалоговый → false+abort+exit 1; диалоговый ≠ файловый в момент ответа → false+abort+exit 1; не-брифовый → false); timeout → exit 3; exit codes 0/1/2/3; sequencing disposition+agent_settled и ветка handled; сборка stage-2 (путь, хеш, campaign_id, шаги).
-- [ ] 3.2 E2E (`PI_RPC_E2E=1`, иначе skip; CLI из `--pi` или PATH): research до phase research без «mode OFF» отказов; чужой sha → отказ + abort + exit 1 + нет research-вызовов после; мутация файла при висящем диалоге → отказ при ответе; optimize-прогон наполняет `.auto/log.jsonl`.
+- [ ] 3.1 Юнит: каноничность файла (exit 2; пустой/BOM → exit 2); валидация `--approve-sha` (`^[0-9a-f]{64}$`) и `--campaign-id` (`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`) → exit 2; три хеша (совпали → true; операторский ≠ диалоговый → false+abort+exit 1; диалоговый ≠ файловый в момент ответа → false+abort+exit 1; не-брифовый → false без exit 1); timeout → exit 3; exit codes 0/1/2/3; sequencing: agent_start→agent_settled, таймаут stage 1 → exit 2, queued/success:false на stage 2 → exit 1; `--hold-dialog-ms`; research без `--brief`/`--approve-sha` → exit 2; сборка stage-2 (путь, хеш, campaign_id, шаги); draft-байты == байтам `--brief` (канонический файл).
+- [ ] 3.2 E2E (`PI_RPC_E2E=1`, иначе skip; CLI из `--pi` или PATH; файлы тестов в tests/, harness tests/fake-pi.ts): research до phase research без «mode OFF» отказов; чужой sha → отказ + abort + exit 1, после записи `confirmed:false` в логе нет research-вызовов; мутация файла при висящем диалоге (`--hold-dialog-ms`) → отказ при ответе; optimize-прогон наполняет `.auto/log.jsonl` и завершается по стоп-условию.
 
 ## 4. Документация
-- [ ] 4.1 `docs/research-vectors.md`: раздел Headless launch (RPC, трёхсторонняя сверка, канонизация брифа однострочником, границы: briefing не блокирует git, перехват best-effort, `--brief` обязателен).
-- [ ] 4.2 Общий headless-раздел (optimize + research): примеры команд; зарезервированное слово `research` и алиас `optimize` — в том числе для TUI-пользователей (изменение TUI-поведения и обновлённые примеры задокументированы).
+- [ ] 4.1 `docs/research-vectors.md`: раздел Headless launch (RPC, трёхсторонняя сверка, канонизация брифа однострочником, границы: briefing не блокирует git, перехват best-effort, `--brief` обязателен; доки pi-пакета — внешний источник).
+- [ ] 4.2 Общий headless-раздел (optimize + research): примеры команд; зарезервированное слово `research` и алиас `optimize` — в том числе для TUI-пользователей; обновление ВСЕХ документированных примеров optimize-запуска (commands.ts:30, index.ts:2742, README.md:34,87,202, site/scripts/generate-casts.mjs:64-67).
 
 ## 5. Проверка
 - [ ] 5.1 Полный npm test зелёный; openspec validate --strict valid.

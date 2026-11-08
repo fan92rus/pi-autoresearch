@@ -7,7 +7,7 @@
                 │                                    │
                 │  stage 1: /autoresearch research   │
                 │  (extension: mode + research rules)│
-                │  wait: disposition + agent_settled │
+                │  wait: agent_start→agent_settled   │
                 │  stage 2: brief path/hash/steps    │
                 │<── extension_ui_request (confirm) ──┤
                 │──> extension_ui_response (confirmed)│
@@ -41,7 +41,8 @@
 ### 1. `scripts/research-rpc.mjs` (новый)
 
 Node-скрипт без внешних зависимостей. JSONL-фрейминг по LF, сплит только по
-`\n` (U+2028/29 не границы, как требует docs/rpc.md).
+`\n` (U+2028/29 не границы, как требует док pi-пакета rpc.md из
+`@earendil-works/pi-coding-agent`).
 
 ```
 node scripts/research-rpc.mjs --cwd <dir> --mode research|optimize
@@ -55,24 +56,38 @@ node scripts/research-rpc.mjs --cwd <dir> --mode research|optimize
   отправляет research-kickoff (правила кампании). Обёртка НЕ отправляет
   `/autoresearch on` (не подкоманда) и никогда не отправляет
   `/skill:autoresearch-create`.
-- Sequencing: после отправки stage 1 обёртка ждёт ответ prompt
-  (`data.disposition`): `started` — ждёт `agent_settled`; `handled` — режим
-  активирован без запуска LLM-хода, переходим к stage 2 немедленно. Один
-  сигнал во всех файлах: disposition + agent_settled.
+- Sequencing (по ревью раунда 4): extension-команда всегда даёт disposition
+  `handled`, а её собственный kickoff-запуск стримится в той же сессии.
+  После stage-1 ответа обёртка ждёт цикл `agent_start` → `agent_settled`
+  (kickoff-прогон, выполняющий draft); нет `agent_start` за
+  `--stage1-timeout-sec` (по умолчанию 30) → stage 1 отказала (guard/ошибка),
+  exit 2. Stage 2 отправляется только после `agent_settled`; `queued` или
+  `success:false` на stage-2 prompt (стриминг) — ошибка обёртки, exit 1.
 - Stage 2 (после stage-1 завершения): текст с путём `--brief`, его SHA-256,
   `campaign_id` (из `--campaign-id`, иначе сгенерированный `bench-<yyyymmdd-hhmmss>`)
   и шагами: прочитать файл брифа → `research_brief draft` (campaign_id, объект
   из JSON файла) → `propose` → `research start` (campaign_id, expected_sha256)
   → open по одному вопросу → close по правилам → stop → report.
-- `--mode optimize "<goal>"`: ОДНО сообщение `/autoresearch optimize <goal>`
-  (явный алиас metric-loop). Никогда не `/autoresearch <goal>` голым текстом —
-  цель, начинающаяся с `research`, иначе попала бы в зарезервированную ветку.
+- `--mode optimize "<goal>"` (цель в `--goal`; без неё exit 2): ОДНО сообщение
+  `/autoresearch optimize <goal>` (явный алиас metric-loop). Никогда не
+  `/autoresearch <goal>` голым текстом — цель, начинающаяся с `research`, иначе
+  попала бы в зарезервированную ветку. Стоп-условие: exit 0 — агент сообщил
+  завершение цикла в финальном тексте; иначе плановый таймаут — exit 3.
 - Диалоги: см. раздел хешей; не-брифовые confirm — `confirmed: false` + лог
-  (оптимизационный цикл может остановиться — документированное поведение).
+  (оптимизационный цикл может остановиться — документированное поведение);
+  в optimize-режиме диалог с `Brief SHA-256:` (нет `--approve-sha`) — всегда
+  `confirmed: false` + лог; exit 1 даёт только отказ по хешу брифа.
 - Таймаут: незакрытый request → `confirmed: false`/`cancelled: true`, shutdown
   pi (kill после 10 с), exit 3, причина в логе.
-- Exit codes: 0 — успех (report/финиш цикла); 1 — отказ по хешу/диалогу;
-  2 — ошибки аргументов; 3 — таймаут.
+- Exit codes: 0 — успех (research: успешный report; optimize: агент сообщил
+  завершение цикла); 1 — отказ по хешу брифа (abort сессии); 2 — ошибки
+  аргументов (research без `--brief`/`--approve-sha`; неканонический,
+  непарсируемый — пустой/BOM — или отсутствующий `--brief`; `--approve-sha` не
+  `^[0-9a-f]{64}$`; `--campaign-id` не `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`;
+  `optimize` без `--goal`) и отказ stage-1 (нет agent_start за таймаут);
+  3 — таймаут. Тестовая опция `--hold-dialog-ms <n>` (по умолчанию 0)
+  задерживает ответ на диалог — воспроизведение мутации файла при висящем
+  диалоге. Момент отсечки «после отказа» в логе = запись `confirmed:false`.
 - Лог: сырой JSONL всех записей stdout + консольный tail tool-вызовов.
 
 ### 2. Изменения в `extensions/pi-autoresearch/index.ts` и `commands.ts`
@@ -85,14 +100,21 @@ node scripts/research-rpc.mjs --cwd <dir> --mode research|optimize
   `researchBlocksOrdinaryLoop` блокирует только research/stopped/pending, его
   недостаточно). Kickoff — research-правила, БЕЗ `/skill:autoresearch-create`.
 - Подкоманда `optimize` (алиас): `/autoresearch optimize <goal>` — явный вход
-  в metric-loop: слово `optimize` отбрасывается, хвост — цель. Проверяется
-  ДО зарезервированного слова `research`, поэтому
-  `/autoresearch optimize research habits` даёт metric-loop с полной целью
-  «research habits». Это НЕ чистый сахар: алиас минует зарезервированное
-  слово. Два документированных примера (`commands.ts:30`, `index.ts:2742` —
-  «/autoresearch optimize unit test runtime…») меняют смысл: их kickoff-цель
-  теперь без слова `optimize` — обновить примеры (task 4.2).
+  в metric-loop: слово `optimize` отбрасывается, хвост — цель, kickoff РОВНО
+  тот же, что у существующего free-text потока (`/skill:autoresearch-create
+  <goal> BENCHMARK_GUARDRAIL` при отсутствии `.auto/prompt.md`, иначе
+  «Autoresearch mode active. <goal> …»). Проверяется ДО зарезервированного
+  слова `research`, поэтому `/autoresearch optimize research habits` даёт
+  metric-loop с полной целью «research habits». Это НЕ чистый сахар: алиас
+  минует зарезервированное слово, и его kickoff-формулировки меняют смысл
+  двух документированных примеров (`commands.ts:30`, `index.ts:2742` —
+  «/autoresearch optimize unit test runtime…», а также README.md:34,87,202 и
+  site/scripts/generate-casts.mjs:64-67) — обновить (task 4.2).
 - Регистрация обеих подкоманд в `commands.ts` `SUBCOMMANDS` (help/completions).
+- Ветвление `research` — ДО ветки already-active; распознавание подкоманды —
+  на lowercased trimmed command, разделитель `/^research(\s|$)/` (хвост —
+  исходный регистр); сравнение регистронезависимо.
+- Никаких изменений в `ctx.ui.confirm`-гейтах инструментов.
 - Никаких изменений в `ctx.ui.confirm`-гейтах инструментов.
 
 ### 3. Что НЕ меняется
@@ -106,7 +128,8 @@ node scripts/research-rpc.mjs --cwd <dir> --mode research|optimize
 ### Research (headless)
 1. Оператор канонизирует бриф-JSON и считает `sha256(файла)`.
 2. Обёртка `--mode research --brief --approve-sha [--campaign-id] [--goal]`.
-3. Stage 1 `/autoresearch research` → disposition/agent_settled.
+3. Stage 1 `/autoresearch research` → ответ `handled`; ждать цикл
+   `agent_start` → `agent_settled` (таймаут → exit 2).
 4. Stage 2: путь брифа + хеш + campaign_id + шаги.
 5. Агент: draft (объект из файла; записанные байты = каноническая форма =
    байты файла, т.к. файл уже канонический) → propose → confirm → обёртка
@@ -123,7 +146,8 @@ node scripts/research-rpc.mjs --cwd <dir> --mode research|optimize
 - Юнит обёртки: каноничность файла (не канонический → exit 2); решение confirm
   (три совпали / операторский ≠ диалоговый → false+abort+exit 1 / диалоговый ≠
   файловый в момент ответа → false+abort+exit 1 / не-брифовый → false);
-  timeout → exit 3; exit codes 0/1/2/3; sequencing disposition+agent_settled,
+  timeout → exit 3; exit codes 0/1/2/3; sequencing agent_start→agent_settled
+  (таймаут stage 1 → exit 2; queued/success:false на stage 2 → exit 1),
   ветка handled; сборка stage-2 текста (путь, хеш, campaign_id, шаги).
 - Wiring: `/autoresearch research` без `/skill:autoresearch-create`;
   `research something` = кампания с темой something; `research` до ветки

@@ -4,7 +4,8 @@
 
 Research-кампании (research-vectors) сейчас стартуют только в интерактивной сессии:
 `research_brief propose` требует `ctx.ui.confirm` в TUI, а в print-режиме (`pi -p`)
-диалогов нет (docs/extensions.md: «JSON and print modes have no UI»). Владелец хочет
+диалогов нет (док pi-пакета docs/extensions.md из
+`@earendil-works/pi-coding-agent`: «JSON and print modes have no UI»). Владелец хочет
 запускать авторесерч — исследовательский и оптимизационный — через `pi -p`/RPC из
 скриптов и проконтролировать ход работы снаружи, без интерактивной сессии.
 
@@ -38,8 +39,11 @@ Research-кампании (research-vectors) сейчас стартуют то�
   одним сообщением `/autoresearch research` (stage 1), затем stage 2 — текст
   с путём брифа, хешем, campaign_id (`--campaign-id` или сгенерированный) и
   шагами (draft из содержимого файла → propose → start → open → close → stop
-  → report). Sequencing: stage 2 после `data.disposition` (`started` → ждать
-  `agent_settled`; `handled` → сразу). Полный JSONL-лог; exit codes 0/1/2/3.
+  → report). Sequencing (extension-команда всегда даёт `handled`, а её kickoff
+  стримится): stage 2 после цикла `agent_start` → `agent_settled`; нет
+  `agent_start` за `--stage1-timeout-sec` → stage 1 отказала (exit 2); `queued`/
+  `success:false` на stage-2 prompt — ошибка обёртки (exit 1). Полный JSONL-лог;
+  exit codes 0/1/2/3.
 - Подкоманда `research` в парсере `/autoresearch` (index.ts + commands.ts
   SUBCOMMANDS): проверяется до ветки already-active; guard — отказ при существующей
   кампании в ЛЮБОЙ фазе (briefing тоже; `researchBlocksOrdinaryLoop` недостаточно).
