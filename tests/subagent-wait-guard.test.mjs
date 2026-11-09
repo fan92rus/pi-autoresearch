@@ -269,3 +269,152 @@ test("constants are the goal-x values (owner-confirmed)", () => {
   assert.equal(SUBAGENT_DEFER_RECHECK_MS, 30_000);
   assert.equal(SUBAGENT_DEFER_FUSE_MS, 600_000);
 });
+
+// ── Review round 1 fixes: reset points, campaign wording, new-turn reset, fuse (mock.timers) ──
+
+import { execFileSync } from "node:child_process";
+
+/** The candidate campaign pause/close/disable branch calls cancelSubagentDeferral via ctx. */
+test("mode off resets the deferral: no delivery after /autoresearch off", async () => {
+  const h = await readySession("mode-off");
+  installRpcResponder(h.events, { respond: true, totalActive: 1 });
+  await fireSessionStart(h);
+  await settleNoWorkTurn(h);
+  await settleWindow();
+  assert.equal(driftNudges(h).length, 0, "deferred");
+  await h.command("autoresearch").handler("off", h.ctx);
+  installRpcResponder(h.events, { respond: true, totalActive: 0 });
+  h.events.emit("subagent:async-complete", {});
+  await settleWindow();
+  assert.equal(driftNudges(h).length, 0, "mode-off deferral never delivers");
+});
+
+test("session_tree resets the deferral (session switch in the tree)", async () => {
+  const h = await readySession("tree-reset");
+  installRpcResponder(h.events, { respond: true, totalActive: 1 });
+  await fireSessionStart(h);
+  await settleNoWorkTurn(h);
+  await settleWindow();
+  assert.equal(driftNudges(h).length, 0, "deferred");
+  await h.hook("session_tree")({}, h.ctx);
+  installRpcResponder(h.events, { respond: true, totalActive: 0 });
+  h.events.emit("subagent:async-complete", {});
+  await settleWindow();
+  assert.equal(driftNudges(h).length, 0, "session_tree reset kills the deferral");
+});
+
+test("compaction resets the deferral (session_before_compact)", async () => {
+  const h = await readySession("compact-reset");
+  installRpcResponder(h.events, { respond: true, totalActive: 1 });
+  await fireSessionStart(h);
+  await settleNoWorkTurn(h);
+  await settleWindow();
+  assert.equal(driftNudges(h).length, 0, "deferred");
+  await h.hook("session_before_compact")({ preparation: { firstKeptEntryId: "e1", tokensBefore: 10 } }, h.ctx);
+  installRpcResponder(h.events, { respond: true, totalActive: 0 });
+  h.events.emit("subagent:async-complete", {});
+  await settleWindow();
+  assert.equal(driftNudges(h).length, 0, "compaction reset kills the deferral");
+});
+
+test("shutdown resets the deferral and unsubscribes: no delivery after shutdown", async () => {
+  const h = await readySession("shutdown-reset");
+  installRpcResponder(h.events, { respond: true, totalActive: 1 });
+  await fireSessionStart(h);
+  await settleNoWorkTurn(h);
+  await settleWindow();
+  assert.equal(driftNudges(h).length, 0, "deferred");
+  await h.hook("session_shutdown")({}, h.ctx);
+  installRpcResponder(h.events, { respond: true, totalActive: 0 });
+  h.events.emit("subagent:async-complete", {});
+  await settleWindow();
+  assert.equal(driftNudges(h).length, 0, "shutdown reset kills the deferral; unsubscribe stops re-probe");
+});
+
+test("new turn: after the reset a normal drifted turn nudges (M3 regression)", async () => {
+  const h = await readySession("new-turn-m3");
+  installRpcResponder(h.events, { respond: true, totalActive: 1 });
+  await fireSessionStart(h);
+  await settleNoWorkTurn(h);
+  await settleWindow();
+  assert.equal(driftNudges(h).length, 0, "deferred");
+  // New turn starts (agent_start resets the deferral): with zero active the
+  // NEXT agent_end must deliver the ordinary drift nudge.
+  await fireAgentStart(h);
+  installRpcResponder(h.events, { respond: true, totalActive: 0 });
+  await settleNoWorkTurn(h);
+  await settleWindow();
+  assert.ok(driftNudges(h).length >= 1, "after reset the next no-work turn nudges (no stuck guard)");
+});
+
+test("campaign deferral: under a candidate campaign the campaign nudge is deferred and delivered with campaign wording", async () => {
+  // Candidate-branch campaign active: campaignBlocksOrdinaryLoop composes the
+  // candidate wording at delivery; the guard must defer the same way.
+  const h = await createHarness({ dir: makeTempDir("cand-defer"), sessionId: "swg-cand", realGit: false });
+  // Seed a real ACTIVE campaign (schema-valid, not disabled, no pending op):
+  // campaignBlocksOrdinaryLoop then composes the candidate wording at delivery.
+  const campDir = path.join(h.ctx.cwd, ".auto", "candidate");
+  fs.mkdirSync(campDir, { recursive: true });
+  const campaignState = {
+    schema_version: 1,
+    created_at: "2026-01-01T00:00:00.000Z",
+    disabled: false,
+    policy: { candidate_step_limit: 10, candidate_time_limit_seconds: 600 },
+    candidates: [{
+      id: "cand-1",
+      title: "Test candidate",
+      status: "active",
+      created_at: "2026-01-01T00:00:00.000Z",
+      worktree: "/tmp/nonexistent-worktree",
+      branch: "candidate/cand-1",
+      checkpoints: [],
+    }],
+  };
+  fs.writeFileSync(path.join(campDir, "state.json"), JSON.stringify(campaignState), "utf8");
+  await h.command("autoresearch").handler("on", h.ctx);
+  // init_experiment is refused under an active campaign (design §5) — the drift
+  // branch only needs the mode flag and the session log header from a started
+  // session, which the campaign already provides (config written by init on
+  // earlier sessions). Mark the session started directly for the gate.
+  const { markSessionStarted } = await import("./optimize-approve-helper.mjs");
+  markSessionStarted(h.ctx.cwd);
+  installRpcResponder(h.events, { respond: true, totalActive: 1 });
+  await fireSessionStart(h);
+  await settleNoWorkTurn(h);
+  await settleWindow();
+  assert.equal(driftNudges(h).length, 0, "campaign nudge deferred while a subagent runs");
+  installRpcResponder(h.events, { respond: true, totalActive: 0 });
+  h.events.emit("subagent:async-complete", {});
+  await settleWindow();
+  const nudges = driftNudges(h);
+  assert.ok(nudges.length >= 1, "campaign nudge delivered after subagents finish");
+  assert.match(nudges[nudges.length - 1].text, /candidate_branch|campaign/i, "delivery keeps the campaign wording");
+});
+
+test("fuse delivers past SUBAGENT_DEFER_FUSE_MS while the subagent is still alive (mock.timers)", async () => {
+  // Time injection per design Decision 7: shift Date.now forward past the fuse
+  // while the completion-driven re-probe runs, so the fuse branch executes
+  // without 10 minutes of wall-clock waiting. The subagent stays alive the
+  // whole time — only the fuse may deliver.
+  const h = await readySession("fuse-mock");
+  installRpcResponder(h.events, { respond: true, totalActive: 1 });
+  await fireSessionStart(h);
+  await settleNoWorkTurn(h);
+  await settleWindow();
+  assert.equal(driftNudges(h).length, 0, "deferred");
+  const realNow = Date.now;
+  let shifted = false;
+  // Wrap the completion event: on the first one, advance the clock past the
+  // fuse for the duration of the handler chain (the re-probe reads Date.now()).
+  h.events.on("subagent:async-complete", () => {
+    if (shifted) return;
+    shifted = true;
+    Date.now = () => realNow() + SUBAGENT_DEFER_FUSE_MS + 1000;
+    queueMicrotask(() => { Date.now = realNow; });
+  });
+  installRpcResponder(h.events, { respond: true, totalActive: 1 });
+  h.events.emit("subagent:async-complete", {});
+  await settleWindow();
+  Date.now = realNow;
+  assert.ok(driftNudges(h).length >= 1, "fuse delivered the nudge past the 10-minute continuous deferral");
+});
