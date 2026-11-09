@@ -12,8 +12,7 @@ const CLIP_LIST = 160;
 
 /** One line, no newlines, at most `max` characters. */
 function clip(text: string, max: number): string {
-  // U+0085 (NEL) is a line break for the dialog budget but not for JS \s, so it is flattened here too.
-  const flat = text.replace(/[\s\u0085]+/g, " ").trim();
+  const flat = text.replace(/\s+/g, " ").trim();
   return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
 }
 
@@ -128,6 +127,9 @@ export function briefChatMarkdown(brief: ResearchBrief, sha256: string, campaign
  * the first line is `Brief SHA-256: <hex>`, the rest is the mode's summary. Enforces the line budget.
  */
 /** The footer names what the SHA covers; each mode uses its own wording. */
+/** How the dialog line budget is counted: physical lines (optimize) or array items (research, unchanged). */
+export type ConsentBudget = "physical" | "items";
+
 export const CONSENT_FOOTER_OPTIMIZE = "Подтверждение фиксирует этот SHA-256: поля брифа не меняются.";
 export const CONSENT_FOOTER_RESEARCH = "Подтверждение фиксирует этот SHA-256: вопросы и правила не меняются.";
 
@@ -141,10 +143,14 @@ export function consentDialogBody(
   summaryLines: string[],
   question: string,
   footer: string = CONSENT_FOOTER_OPTIMIZE,
+  budget: ConsentBudget = "physical",
 ): string {
-  const body = [`Brief SHA-256: ${sha256}`, ...summaryLines, footer, question].join("\n");
-  // Budget counts physical lines, not array items: an embedded newline must not slip past it.
-  if (body.split(/\r\n|[\n\r\u2028\u2029\u0085]/).length > CONSENT_SUMMARY_MAX_LINES) throw new Error("consent summary exceeds the line budget");
+  const items = [`Brief SHA-256: ${sha256}`, ...summaryLines, footer, question];
+  const body = items.join("\n");
+  // "physical" (optimize): an embedded line break must not slip past the budget.
+  // "items" (research): the rule research has always used, kept so its output does not change.
+  const count = budget === "items" ? items.length : body.split(/\r\n|[\n\r\u2028\u2029\u0085]/).length;
+  if (count > CONSENT_SUMMARY_MAX_LINES) throw new Error("consent summary exceeds the line budget");
   return body;
 }
 
@@ -171,5 +177,6 @@ export function briefConsentSummary(brief: ResearchBrief, sha256: string, campai
     ],
     "Подтвердить согласование?",
     CONSENT_FOOTER_RESEARCH,
+    "items",
   );
 }

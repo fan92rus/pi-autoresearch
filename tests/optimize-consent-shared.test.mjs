@@ -131,10 +131,12 @@ test("B6: the research dialog is assembled by consentDialogBody with its own foo
   assert.ok(body.startsWith(`Brief SHA-256: ${sha}\n`));
 });
 
-test("B7: a research goal with many U+0085 (NEL) builds a dialog within the line budget, without throwing", () => {
-  const brief = {
+// U+0085 in the research goal: the output must stay byte-for-byte what the parent commit printed (7924514^).
+// The parent counted array items (9 here), so a line break inside a field does not change the budget.
+function nelBrief(goal) {
+  return {
     schema_version: 1,
-    goal: "x\u0085y\u0085z\u0085a\u0085b\u0085c\u0085d\u0085e\u0085f\u0085g",
+    goal,
     plan_source: "p",
     caveat_block: "c",
     data_roles: { explore: ["e"], validate: [], confirm: [] },
@@ -142,27 +144,13 @@ test("B7: a research goal with many U+0085 (NEL) builds a dialog within the line
     process_metrics: ["m"],
     stop_rules: [{ id: "s1", when: "w" }],
   };
-  const body = bc.briefConsentSummary(brief, "a".repeat(64), "camp-1");
-  assert.ok(body.split(/\r\n|[\n\r\u2028\u2029\u0085]/).length <= bc.CONSENT_SUMMARY_MAX_LINES);
-  assert.ok(body.includes("Цель: x y z a b c d e f g"));
-});
+}
 
-// Golden bytes captured from the research dialog before the shared-builder change (parent 7924514^) on the same brief.
-test("B8: golden research dialog bytes for a plain brief are unchanged from the parent commit", () => {
-  const brief = {
-    schema_version: 1,
-    goal: "Найти причину деградации",
-    plan_source: "p",
-    caveat_block: "c",
-    data_roles: { explore: ["e"], validate: [], confirm: [] },
-    questions: [{ id: "q1", text: "t", decision_rules: [{ id: "r1", verdict: "confirmed", when: "w" }] }],
-    process_metrics: ["m"],
-    stop_rules: [{ id: "s1", when: "w" }],
-  };
-  const expected = [
+function researchLines(goalLine) {
+  return [
     "Brief SHA-256: " + "a".repeat(64),
     "Кампания: camp-1",
-    "Цель: Найти причину деградации",
+    goalLine,
     "Вопросов: 1 (q1); правил: 1",
     "Вердикты: confirmed, rejected, inconclusive, waiting_for_data",
     "Стоп-правил: 1; метрик процесса: 1",
@@ -170,21 +158,15 @@ test("B8: golden research dialog bytes for a plain brief are unchanged from the 
     "Подтверждение фиксирует этот SHA-256: вопросы и правила не меняются.",
     "Подтвердить согласование?",
   ].join("\n");
-  assert.equal(bc.briefConsentSummary(brief, "a".repeat(64), "camp-1"), expected);
+}
+
+test("B7: a single U+0085 in the research goal is kept as the parent printed it", () => {
+  const body = bc.briefConsentSummary(nelBrief("xy"), "a".repeat(64), "camp-1");
+  assert.equal(body, researchLines("Цель: xy"));
 });
 
-test("B9: a single U+0085 in the research goal is flattened (documented deviation: the parent printed 10 physical lines)", () => {
-  const brief = {
-    schema_version: 1,
-    goal: "x\u0085y",
-    plan_source: "p",
-    caveat_block: "c",
-    data_roles: { explore: ["e"], validate: [], confirm: [] },
-    questions: [{ id: "q1", text: "t", decision_rules: [{ id: "r1", verdict: "confirmed", when: "w" }] }],
-    process_metrics: ["m"],
-    stop_rules: [{ id: "s1", when: "w" }],
-  };
-  const body = bc.briefConsentSummary(brief, "a".repeat(64), "camp-1");
-  assert.ok(body.includes("Цель: x y"));
-  assert.equal(body.split(/\r\n|[\n\r\u2028\u2029\u0085]/).length, 9);
+test("B9: nine U+0085 in the research goal do not throw and are kept as the parent printed them", () => {
+  const goal = "xyzabcdefg";
+  const body = bc.briefConsentSummary(nelBrief(goal), "a".repeat(64), "camp-1");
+  assert.equal(body, researchLines("Цель: " + goal));
 });
