@@ -20,7 +20,7 @@ Change `optimize-two-phase-start` ввёл согласование брифа �
 ## What
 
 1. **Целостность `approval.json` для optimize.** Файл читается по тем же правилам, что у
-   research: версия схемы, формат SHA-256, `approved_at`, `confirmed` строго `true`.
+   research: версия схемы, формат SHA-256, `decided_at` (ISO 8601), `confirmed` строго `true`.
    Невалидный файл означает «не одобрено», а не «одобрено».
 2. **Атомарная запись.** `approval.json` и `brief.json` пишутся через временный файл и
    переименование (тот же приём, что `writeFileAtomic` в `research-state.ts`).

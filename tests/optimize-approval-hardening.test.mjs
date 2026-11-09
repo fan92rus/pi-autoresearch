@@ -85,6 +85,16 @@ test("A1: a wrong or missing schema_version is invalid", () => {
   }
 });
 
+test("A1: decided_at must be an ISO 8601 timestamp, not any text", () => {
+  for (const v of ["x", "   ", "2026-13-45T99:00:00Z", "yesterday"]) {
+    const dir = makeWorkDir("iso");
+    const od = writeApprovalRaw(dir, JSON.stringify(validApproval({ decided_at: v })));
+    const r = ob.readOptimizeApproval(od);
+    assert.equal(r.ok, false, `decided_at ${JSON.stringify(v)} must be refused`);
+    assert.equal(r.reason, "approval_invalid");
+  }
+});
+
 test("A1: decided_at must be a non-empty string", () => {
   for (const v of ["", 0, undefined]) {
     const dir = makeWorkDir("decided");

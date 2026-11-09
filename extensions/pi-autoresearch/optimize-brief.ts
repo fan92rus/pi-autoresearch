@@ -106,19 +106,17 @@ export function writeTextAtomicSync(
   rename: (from: string, to: string) => void = fs.renameSync,
 ): void {
   const tmp = `${target}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
-  const fd = fs.openSync(tmp, "wx");
+  let fd: number | null = null;
   try {
+    fd = fs.openSync(tmp, "wx");
     fs.writeFileSync(fd, text, "utf-8");
     fs.fsyncSync(fd);
-  } catch (err) {
     fs.closeSync(fd);
-    fs.rmSync(tmp, { force: true });
-    throw err;
-  }
-  fs.closeSync(fd);
-  try {
+    fd = null;
     rename(tmp, target);
   } catch (err) {
+    // Any failure, including a failed close, leaves the previous target and no temporary file.
+    if (fd !== null) fs.closeSync(fd);
     fs.rmSync(tmp, { force: true });
     throw err;
   }
@@ -166,6 +164,7 @@ export interface OptimizeApproval {
 
 const APPROVAL_KEYS = new Set(["schema_version", "confirmed", "brief_sha256", "decided_at"]);
 const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+const ISO_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
 
 /** Strict rules shared in spirit with research approval: exact fields, typed values, lowercase hex hash. */
 export function approvalProblem(v: unknown): string | null {
@@ -179,7 +178,9 @@ export function approvalProblem(v: unknown): string | null {
     return "brief_sha256 must be 64 lowercase hex characters";
   }
   if (typeof o.confirmed !== "boolean") return "confirmed must be a boolean";
-  if (typeof o.decided_at !== "string" || o.decided_at === "") return "decided_at must be a non-empty string";
+  if (typeof o.decided_at !== "string" || !ISO_TIMESTAMP_RE.test(o.decided_at) || Number.isNaN(Date.parse(o.decided_at))) {
+    return "decided_at must be an ISO 8601 timestamp";
+  }
   return null;
 }
 
