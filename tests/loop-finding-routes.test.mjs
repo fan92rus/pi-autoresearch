@@ -21,8 +21,10 @@ import { createFakePi, makeCtx } from "./fake-pi.ts";
 // add ~1270 chars, and the precedent-search guidance (agent-guidance.test.mjs)
 // adds ~1100 more. The budget is chosen by the implementation, not the spec:
 // it stays a hard upper bound that is checked on every run.
-// 7300 (was 7000): the two-phase start instruction (optimize-two-phase-start, owner decision) adds ~260 chars to a fresh session's section.
-const AUTORESEARCH_SECTION_MAX_CHARS = 7300;
+// 7300 (was 7000): the two-phase start instruction adds ~260 chars.
+// 7500 (was 7300): the subagent-wait-guard bg_wait instruction adds ~250 chars
+// (owner decision 2026-11-09: no shrinking of existing lines, one-time raise).
+const AUTORESEARCH_SECTION_MAX_CHARS = 7500;
 // Budget for the finding-routes block alone (short lines, per design.md).
 const FINDING_ROUTES_MAX_CHARS = 1400;
 

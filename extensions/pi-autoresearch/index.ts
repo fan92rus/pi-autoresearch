@@ -87,6 +87,12 @@ import {
   parseEvidenceRef,
   loadFindings,
 } from "./findings.ts";
+import {
+  probeSubagentActivity,
+  probeShowsActive,
+  SUBAGENT_DEFER_FUSE_MS,
+  SUBAGENT_DEFER_RECHECK_MS,
+} from "./subagent-probe.ts";
 import { inspectResults } from "./lens-inspect.ts";
 import { buildReport } from "./report.ts";
 import {
@@ -382,6 +388,8 @@ interface AutoresearchRuntime {
   lastTurnUsedExperimentTools: boolean;
   /** Consecutive settled turns that did no loop work and were nudged. After MAX_CONSECUTIVE_DRIFT_RESUMES the loop stops instead of nudging again (anti chat-loop bound, goal-x pattern). Reset whenever a loop tool fires. */
   consecutiveDriftResumes: number;
+  /** Subagent-wait guard (subagent-wait-guard): deferral state for the drift branch while async subagents run. */
+  subagentDeferral: { since: number; timer: ReturnType<typeof setTimeout> | null } | null;
   /** Provenance warning from the LAST log_experiment (e.g. "manual"/"unmeasured"). Null when the last log was measured. Re-injected into every resume until an honest (measured) log lands — goal-x [AUDITOR REJECTION] pattern. */
   lastLogFlag: string | null;
   /** What run_experiment actually measured last: parsed primary metric (or null if no METRIC line) + wall-clock fallback. Reset to null on init/compact. Read by log_experiment to flag agent-claimed metrics. */
@@ -1835,6 +1843,7 @@ function createSessionRuntime(): AutoresearchRuntime {
     treeViewMode: false,
     lastTurnUsedExperimentTools: false,
     consecutiveDriftResumes: 0,
+    subagentDeferral: null,
     lastLogFlag: null,
     lastMeasurement: null,
     lastRunNumber: null,
@@ -2242,6 +2251,50 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const BENCHMARK_GUARDRAIL =
     "Be careful not to overfit to the benchmarks and do not cheat on the benchmarks.";
 
+  // ── Subagent-wait guard (subagent-wait-guard, task 2.2) ──
+  // Armed when pi-subagents RPC is confirmed: the ready event OR a successful
+  // ping on session_start (covers late extension load — ready fired before we
+  // subscribed). Ping only proves RPC availability; every decision still comes
+  // from the status probe (error/missing fleet → unknown → fail open).
+  let subagentGuardArmed = false;
+  let subagentProbeInFlight = false;
+  const unsubscribeSubagentEvents: Array<() => void> = [];
+  if (pi.events?.on) {
+    unsubscribeSubagentEvents.push(
+      pi.events.on("subagents:rpc:v1:ready", () => {
+        subagentGuardArmed = true;
+      }),
+    );
+    // A completed async run triggers a re-probe: the deferred drift nudge is
+    // delivered only when NO live subagents remain (re-probe, not delivery —
+    // sibling completions may be batched). Ignored while a probe is in flight:
+    // the 30 s re-check timer bounds the reaction, the fuse bounds the wait.
+    unsubscribeSubagentEvents.push(
+      pi.events.on("subagent:async-complete", () => {
+        if (subagentRecheck) subagentRecheck();
+      }),
+    );
+  }
+
+  /** Re-probe the deferral: deliver when zero active, else re-arm the timer. Set after the helpers below are defined. */
+  let subagentRecheck: (() => void) | null = null;
+  /** Latest session context, set on session_start/agent_start; used by event-driven re-checks that carry no ctx. */
+  let subagentCtx: ExtensionContext | null = null;
+
+  const sendSubagentPing = (): void => {
+    if (!pi.events?.on || !pi.events?.emit) return;
+    const requestId = `ping-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const replyEvent = `subagents:rpc:v1:reply:${requestId}`;
+    const off = pi.events.on(replyEvent, (payload: unknown) => {
+      const rec = payload as { success?: boolean } | undefined;
+      if (rec?.success === true) subagentGuardArmed = true;
+      (typeof off === "function") && off();
+    });
+    pi.events.emit("subagents:rpc:v1:request", { version: 1, requestId, method: "ping", params: {} });
+    // Unsubscribe when no reply arrives (pi-subagents absent).
+    setTimeout(() => (typeof off === "function") && off(), 1000);
+  };
+
   const MEASUREMENT_GUARDRAIL =
     "Every measurement goes through run_experiment -> log_experiment; never run the benchmark via bash — bash runs are invisible to the ledger and get blocked.";
 
@@ -2327,6 +2380,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // The one place mode flips: gated tools follow the flag, never drifting from it.
   const setAutoresearchMode = (ctx: ExtensionContext, enabled: boolean): void => {
     getRuntime(ctx).autoresearchMode = enabled;
+    // Mode off: a pending deferral must not fire later (design Decision 6 reset points).
+    if (!enabled) cancelSubagentDeferral(getRuntime(ctx));
     // Keep gated tools always-active (see ensureGatedToolsActive). The mode flag
     // itself gates execution inside each handler, so we no longer add/remove
     // tools from the active set here — that path is unreliable in headless
@@ -2610,6 +2665,121 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       experimentLimitClause(cwd),
       BENCHMARK_GUARDRAIL,
     ].join(" ");
+  };
+
+  // ── Subagent-wait guard (task 2.2): defer the drift branch while async subagents run ──
+  const cancelSubagentDeferral = (runtime: AutoresearchRuntime): void => {
+    if (!runtime.subagentDeferral) return;
+    if (runtime.subagentDeferral.timer) clearTimeout(runtime.subagentDeferral.timer);
+    runtime.subagentDeferral = null;
+  };
+
+  /**
+   * Deliver a deferred drift nudge now: exactly one drift counter increment and
+   * one markAutoResumeSent (moved here from agent_end, design Decision 3), the
+   * drift-branch conditions are re-evaluated at delivery (manual-check, drift
+   * limit, stop-reason, send-time gates). Returns true when delivered/decided,
+   * false when the deferral was cleared for a retry later.
+   */
+  const deliverDeferredDriftNudge = async (
+    ctx: ExtensionContext,
+    runtime: AutoresearchRuntime,
+  ): Promise<void> => {
+    cancelSubagentDeferral(runtime);
+    if (!runtime.autoresearchMode || runtime.experimentsThisSession !== 0 || hasPendingResume(runtime)) return;
+    if (runtime.consecutiveDriftResumes >= MAX_CONSECUTIVE_DRIFT_RESUMES) {
+      // The drift limit is checked BEFORE the probe in agent_end; reaching it
+      // while deferred behaves like the ordinary path: stop with a notice.
+      ctx.ui.notify(
+        researchScanSync(resolveWorkDir(ctx.cwd)).blocks
+          ? "Autoresearch paused — the last turns did no research-campaign work. Use research status to see the state, then resume the campaign."
+          : campaignActiveSync(resolveWorkDir(ctx.cwd))
+          ? "Autoresearch paused — the last turns did no candidate-campaign work. Use candidate_branch status to see the state, then resume the campaign."
+          : "Autoresearch paused — the last turns did no experiment work (no run_experiment/log_experiment). Run /autoresearch <goal> to resume the loop.",
+        "info",
+      );
+      return;
+    }
+    if (await campaignNeedsManualCheck(resolveWorkDir(ctx.cwd), ctx)) return;
+    const stopReason = autoResumeStopReasonFor(runtime);
+    if (stopReason !== null) {
+      notifyAutoResumeLimitReached(ctx, stopReason);
+      return;
+    }
+    runtime.consecutiveDriftResumes++;
+    markAutoResumeSent(runtime);
+    schedulePendingResume(ctx, runtime, await composeDriftResumeMessage(resolveWorkDir(ctx.cwd), ctx));
+  };
+
+  /** Re-probe a deferral: deliver when zero active (or fail-open unknown), else re-arm the re-check timer (or fire the fuse). */
+  const reprobeSubagentDeferral = async (ctx: ExtensionContext, runtime: AutoresearchRuntime): Promise<void> => {
+    if (!runtime.subagentDeferral || subagentProbeInFlight) return;
+    if (!subagentGuardArmed) {
+      // Guard disarmed mid-wait (pi-subagents unloaded): fail open — deliver now.
+      await deliverDeferredDriftNudge(ctx, runtime);
+      return;
+    }
+    subagentProbeInFlight = true;
+    let probe;
+    try {
+      probe = await probeSubagentActivity(pi.events);
+    } finally {
+      subagentProbeInFlight = false;
+    }
+    if (!runtime.subagentDeferral) return; // reset while probing
+    if (!probe.available || probe.active === null || probe.active === 0) {
+      // Absent RPC, unknown fleet, or all subagents done: deliver now.
+      await deliverDeferredDriftNudge(ctx, runtime);
+      return;
+    }
+    // Still active: fuse check, then re-arm the re-check timer.
+    const since = runtime.subagentDeferral.since;
+    if (Date.now() - since >= SUBAGENT_DEFER_FUSE_MS) {
+      await deliverDeferredDriftNudge(ctx, runtime);
+      return;
+    }
+    if (runtime.subagentDeferral.timer) clearTimeout(runtime.subagentDeferral.timer);
+    runtime.subagentDeferral.timer = setTimeout(() => {
+      void reprobeSubagentDeferral(ctx, runtime);
+    }, SUBAGENT_DEFER_RECHECK_MS);
+  };
+
+  /**
+   * The drift branch entry: when async subagents are alive, defer instead of
+   * nudging (subagent-wait-guard). Returns true when the turn was deferred
+   * (caller must return early), false when the normal path continues.
+   */
+  const maybeDeferDriftForSubagents = async (
+    ctx: ExtensionContext,
+    runtime: AutoresearchRuntime,
+  ): Promise<boolean> => {
+    if (!subagentGuardArmed || subagentProbeInFlight) return false;
+    if (runtime.subagentDeferral) {
+      // Already deferred: an agent_end during the deferral window — keep waiting.
+      return true;
+    }
+    subagentProbeInFlight = true;
+    let probe;
+    try {
+      probe = await probeSubagentActivity(pi.events);
+    } finally {
+      subagentProbeInFlight = false;
+    }
+    if (!probeShowsActive(probe)) return false;
+    // Live async subagents: defer. No drift increment, no auto-resume tick here —
+    // both happen exactly once at delivery (design Decision 3).
+    runtime.subagentDeferral = { since: Date.now(), timer: null };
+    runtime.subagentDeferral.timer = setTimeout(() => {
+      void reprobeSubagentDeferral(ctx, runtime);
+    }, SUBAGENT_DEFER_RECHECK_MS);
+    return true;
+  };
+  subagentRecheck = () => {
+    // A completion event during ANY turn: re-probe the deferral of the latest session.
+    const ctx = subagentCtx;
+    if (!ctx) return;
+    const runtime = getRuntime(ctx);
+    if (runtime.subagentDeferral && !subagentProbeInFlight) void reprobeSubagentDeferral(ctx, runtime);
   };
 
   const composeCompactionResumeMessage = async (ctx: ExtensionContext): Promise<string> => {
@@ -3039,10 +3209,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     syncBriefPreview(ctx);
     optimizeBriefDir = optimizeBrief.optimizeDirOf(ctx.cwd);
     ensureGatedToolsActive();
+    // Late load coverage (subagent-wait-guard): ready may have fired before we
+    // subscribed — a successful ping arms the guard on every session start.
+    subagentCtx = ctx;
+    sendSubagentPing();
+    cancelSubagentDeferral(getRuntime(ctx));
   });
   pi.on("session_tree", async (_e, ctx) => {
     reconstructState(ctx);
     syncBriefPreview(ctx);
+    cancelSubagentDeferral(getRuntime(ctx));
   });
   pi.on("session_before_switch", async () => {
     clearOverlay();
@@ -3050,14 +3226,23 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", async (_e, ctx) => {
     clearSessionUi(ctx);
     cancelPendingResume(getRuntime(ctx));
+    cancelSubagentDeferral(getRuntime(ctx));
     runtimeStore.clear(getSessionKey(ctx));
     stopDashboardServer();
+    for (const off of unsubscribeSubagentEvents) {
+      try { off(); } catch { /* already detached */ }
+    }
+    unsubscribeSubagentEvents.length = 0;
+    subagentCtx = null;
   });
 
   pi.on("agent_start", async (_event, ctx) => {
     const runtime = getRuntime(ctx);
     runtime.experimentsThisSession = 0;
     pausePendingResume(runtime);
+    // New turn: a deferral from the previous settled turn must not fire into it.
+    cancelSubagentDeferral(runtime);
+    subagentCtx = ctx;
   });
 
   const ensurePendingResume = async (
@@ -3108,6 +3293,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   pi.on("session_before_compact", async (event, ctx) => {
     pausePendingResume(getRuntime(ctx));
+    cancelSubagentDeferral(getRuntime(ctx));
     return autoresearchCompactionFor(ctx, event);
   });
 
@@ -3140,6 +3326,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (runtime.consecutiveDriftResumes < MAX_CONSECUTIVE_DRIFT_RESUMES) {
         // Unclear campaign state (pending operation): stop, do not auto-resume (design §5).
         if (await campaignNeedsManualCheck(resolveWorkDir(ctx.cwd), ctx)) return;
+        // Subagent-wait guard (subagent-wait-guard): async subagents alive →
+        // defer; counters move to delivery (design Decision 3). Guard disarmed
+        // or zero/unknown active → fall through to the ordinary nudge.
+        if (await maybeDeferDriftForSubagents(ctx, runtime)) return;
         runtime.consecutiveDriftResumes++;
         markAutoResumeSent(runtime);
         // composeDriftResumeMessage branches by campaign mode: under an active
@@ -3328,6 +3518,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\n- Start: optimize_brief draft → propose (owner approves) → init_experiment with the same args; run_experiment and log_experiment are refused until then. Changing metric_name, direction or target: draft → propose → init again." +
       "\n- Follow-on user message mid-experiment? Finish the current run_experiment + log_experiment cycle first, address it next iteration." +
       "\n- EVERYTHING within the active goal is PRE-APPROVED — experiments (expensive included), code edits, script fixes, retries after failures: do NOT ask the owner before acting — decide yourself, record assumptions in the hypothesis/ASI, and keep the loop running. Ask the owner ONLY when stepping outside the goal's frame: new external data, foreign resources, goal/metric change, irreversible damage." +
+      "\n- Async subagent in flight and nothing productive? Hold the turn open with bg_wait, re-arm it on every return until done; do NOT end the turn with a \"waiting\" reply — empty turns burn the allowance. Your message still interrupts the wait." +
       "\n\n## Result Findings (route by theme)" +
       "\nAfter reading raw results (inspect_results), record each finding with record_finding({theme, description, evidence_ref}). evidence_ref must cite a concrete case (path:lines or path#anchor); generalizations without examples are rejected." +
       "\n- behavior (the model/code does the wrong thing) \u2192 an ordinary hypothesis: propose_hypothesis (describe what you noticed, what changes, what you will learn; optionally pass finding_id) citing the finding id, then the normal cycle." +
@@ -7976,6 +8167,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             ? await candidateState.pauseCandidate(campDir, String(params.candidate_id ?? ""))
             : await candidateState.closeCandidate(campDir, String(params.candidate_id ?? ""));
         if (!res.ok) return fail(res.reason, res.message);
+        // Owner pause/close/disable resets a pending deferral (design Decision 6).
+        if (action !== "run") cancelSubagentDeferral(getRuntime(ctx));
         return { content: [{ type: "text", text: `✅ ${action} done. Checkpoints and refs are kept.` }], details: { action } };
       }
 

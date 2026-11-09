@@ -186,3 +186,14 @@ test("existing autoresearch guardrails and the finding routes are kept", () => {
   assert.ok(prompt.includes("## Hypothesis-First Workflow (EVERY iteration)"), "hypothesis workflow kept");
   assert.ok(prompt.includes("PRE-APPROVED"), "pre-approval rule kept");
 });
+
+test("subagent-wait guard: the prompt tells the agent to hold the turn with bg_wait (openspec subagent-wait-guard, task 1.1)", () => {
+  const start = prompt.indexOf("## Autoresearch Mode");
+  assert.ok(start >= 0, "autoresearch section present");
+  const section = prompt.slice(start);
+  const line = section.split("\n").find((l) => l.includes("bg_wait") && l.includes("Async subagent"));
+  assert.ok(line, "a dedicated bg_wait line exists in the autoresearch section");
+  assert.match(line, /re-arm/i, "re-arm on every return is stated");
+  assert.match(line, /waiting/i, "the 'waiting' anti-pattern is named");
+  assert.match(line, /interrupts the wait/, "user interjection still interrupts");
+});
