@@ -86,7 +86,7 @@ test("A1: a wrong or missing schema_version is invalid", () => {
 });
 
 test("A1: decided_at must be an ISO 8601 timestamp, not any text", () => {
-  for (const v of ["x", "   ", "2026-13-45T99:00:00Z", "yesterday"]) {
+  for (const v of ["x", "   ", "2026-13-45T99:00:00Z", "yesterday", "2026-02-30T00:00:00Z", "2026-04-31T00:00:00Z", "2026-11-09T24:00:00Z", "2026-11-09T10:60:00Z"]) {
     const dir = makeWorkDir("iso");
     const od = writeApprovalRaw(dir, JSON.stringify(validApproval({ decided_at: v })));
     const r = ob.readOptimizeApproval(od);
@@ -132,10 +132,31 @@ test("A2: a failed rename keeps the previous file content and leaves no temporar
   fs.writeFileSync(target, "OLD", "utf-8");
   assert.throws(
     () =>
-      ob.writeTextAtomicSync(target, "NEW", () => {
-        throw new Error("simulated rename failure");
+      ob.writeTextAtomicSync(target, "NEW", {
+        rename: () => {
+          throw new Error("simulated rename failure");
+        },
       }),
     /simulated rename failure/,
+  );
+  assert.equal(fs.readFileSync(target, "utf-8"), "OLD");
+  assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith(".tmp")), []);
+});
+
+test("A2: a failed close keeps the previous content, leaves no temporary file, and reports the close error", () => {
+  const dir = makeWorkDir("closefail");
+  const target = path.join(dir, "approval.json");
+  fs.writeFileSync(target, "OLD", "utf-8");
+  const ioError = Object.assign(new Error("simulated EIO on close"), { code: "EIO" });
+  assert.throws(
+    () =>
+      ob.writeTextAtomicSync(target, "NEW", {
+        close: (fd) => {
+          fs.closeSync(fd);
+          throw ioError;
+        },
+      }),
+    (err) => err === ioError,
   );
   assert.equal(fs.readFileSync(target, "utf-8"), "OLD");
   assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith(".tmp")), []);

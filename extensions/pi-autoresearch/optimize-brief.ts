@@ -100,23 +100,34 @@ export type DraftResult = { ok: true; sha256: string } | { ok: false; errors: st
  * Atomic text write: a temporary file (wx), fsync, then rename over the target. A failure keeps the
  * previous target content and removes the temporary file. `rename` is injectable for the failure test.
  */
-export function writeTextAtomicSync(
-  target: string,
-  text: string,
-  rename: (from: string, to: string) => void = fs.renameSync,
-): void {
+export interface AtomicWriteOps {
+  rename?: (from: string, to: string) => void;
+  close?: (fd: number) => void;
+}
+
+export function writeTextAtomicSync(target: string, text: string, ops: AtomicWriteOps = {}): void {
+  const rename = ops.rename ?? fs.renameSync;
+  const close = ops.close ?? fs.closeSync;
   const tmp = `${target}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
   let fd: number | null = null;
   try {
     fd = fs.openSync(tmp, "wx");
     fs.writeFileSync(fd, text, "utf-8");
     fs.fsyncSync(fd);
-    fs.closeSync(fd);
+    const toClose = fd;
     fd = null;
+    close(toClose);
     rename(tmp, target);
   } catch (err) {
-    // Any failure, including a failed close, leaves the previous target and no temporary file.
-    if (fd !== null) fs.closeSync(fd);
+    // Any failure leaves the previous target and no temporary file. A secondary failure while
+    // releasing the descriptor must not hide the original error or keep the temporary file.
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // the descriptor is already unusable; the original error is the one to report
+      }
+    }
     fs.rmSync(tmp, { force: true });
     throw err;
   }
@@ -164,7 +175,18 @@ export interface OptimizeApproval {
 
 const APPROVAL_KEYS = new Set(["schema_version", "confirmed", "brief_sha256", "decided_at"]);
 const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
-const ISO_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+const ISO_TIMESTAMP_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+
+/** A real calendar instant: fields in range, and the date exists (no 2026-02-30, no 24:00, no 10:60). */
+function isCalendarIso(text: string): boolean {
+  const m = ISO_TIMESTAMP_RE.exec(text);
+  if (!m) return false;
+  const [y, mo, d, h, mi, s] = m.slice(1, 7).map(Number);
+  if (mo < 1 || mo > 12 || d < 1 || h > 23 || mi > 59 || s > 59) return false;
+  const probe = new Date(Date.UTC(y, mo - 1, d));
+  if (probe.getUTCMonth() !== mo - 1 || probe.getUTCDate() !== d) return false;
+  return !Number.isNaN(Date.parse(text));
+}
 
 /** Strict rules shared in spirit with research approval: exact fields, typed values, lowercase hex hash. */
 export function approvalProblem(v: unknown): string | null {
@@ -178,7 +200,7 @@ export function approvalProblem(v: unknown): string | null {
     return "brief_sha256 must be 64 lowercase hex characters";
   }
   if (typeof o.confirmed !== "boolean") return "confirmed must be a boolean";
-  if (typeof o.decided_at !== "string" || !ISO_TIMESTAMP_RE.test(o.decided_at) || Number.isNaN(Date.parse(o.decided_at))) {
+  if (typeof o.decided_at !== "string" || !isCalendarIso(o.decided_at)) {
     return "decided_at must be an ISO 8601 timestamp";
   }
   return null;
