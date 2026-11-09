@@ -8197,6 +8197,41 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
   };
 
+  /** Moves every FINISHED (phase stopped) campaign of the session's bases into
+   *  <base>/.auto/research-archive/<id>-<stamp>. A move, never a delete. Returns
+   *  the archived names, or null when any campaign is active, unreadable or
+   *  unlistable: then nothing is moved and the caller keeps its refusal. */
+  const archiveFinishedCampaigns = async (workDir: string, stateBase: string): Promise<string[] | null> => {
+    const bases = [...new Set([stateBase, workDir])];
+    const found: { base: string; id: string; dir: string }[] = [];
+    for (const base of bases) {
+      const ids = listResearchCampaignIds(base);
+      if (ids === null) return null;
+      for (const id of ids) {
+        const resolved = researchState.resolveCampaignDir(base, id);
+        if (!resolved.ok) return null;
+        const read = await researchState.readState(resolved.dir);
+        if (!read.ok || read.state.phase !== "stopped") return null;
+        found.push({ base, id, dir: resolved.dir });
+      }
+    }
+    try {
+      const archived: string[] = [];
+      for (const { base, id, dir } of found) {
+        const archiveRoot = path.join(base, ".auto", "research-archive");
+        fs.mkdirSync(archiveRoot, { recursive: true });
+        const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
+        let target = path.join(archiveRoot, `${id}-${stamp}`);
+        while (fs.existsSync(target)) target = path.join(archiveRoot, `${id}-${stamp}-${Math.random().toString(36).slice(2, 6)}`);
+        fs.renameSync(dir, target);
+        archived.push(path.basename(target));
+      }
+      return archived;
+    } catch {
+      return null;
+    }
+  };
+
   /** Base the campaign state lives under: the pinned --state-root (resolved
    *  absolute) or the work directory itself. Byte-identical to the previous
    *  behavior when no pin is set. */
@@ -8279,7 +8314,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       for (const id of ids) if (!unionIds.includes(id)) unionIds.push(id);
     }
     if (unionIds.length === 0) return researchRefusal("campaign_missing", "no research campaign exists; create one with research_brief draft");
-    if (unionIds.length > 1) return researchRefusal("invalid_argument", `several campaigns exist (${unionIds.join(", ")}); clean .auto/research first: a session works with exactly one campaign`);
+    if (unionIds.length > 1) return researchRefusal("invalid_argument", `several campaigns exist (${unionIds.join(", ")}); stop the active one or move the others: a session works with exactly one campaign`);
     const singleId = unionIds[0];
     const singleBase = bases.find((b) => researchState.resolveCampaignDir(b, singleId).ok) ?? bases[0];
     const resolved = researchState.resolveCampaignDir(singleBase, singleId);
@@ -8752,10 +8787,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const stateBase = effectiveResearchBase(workDir, ctx);
       let campaignId = getRuntime(ctx).researchCampaignId;
       if (campaignId === null) {
+        // A draft starts a NEW campaign: finished (stopped) campaigns are moved
+        // to .auto/research-archive/ first. An active one keeps the refusal below.
+        if (action === "draft") {
+          const before = sessionResearchCampaignIds(workDir, ctx);
+          if (before !== null && before.length > 0) await archiveFinishedCampaigns(workDir, stateBase);
+        }
         const ids = sessionResearchCampaignIds(workDir, ctx);
         if (ids === null) return fail("state_unreadable", "the research root cannot be listed; nothing was changed");
         if (ids.length > 1) {
-          return fail("invalid_argument", `several campaigns exist (${ids.join(", ")}); clean .auto/research first: a session works with exactly one campaign`);
+          return fail("invalid_argument", `several campaigns exist (${ids.join(", ")}); stop the active one or move the others: a session works with exactly one campaign`);
         }
         if (ids.length === 1) {
           campaignId = ids[0];
@@ -9584,8 +9625,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         } else if (existingIds.length > 0) {
           // No --id and campaigns exist: never silently start a second one.
           ctx.ui.notify(existingIds.length > 1
-            ? `Several campaigns exist (${existingIds.join(", ")}); resume one with /autoresearch research --id <id> or clean .auto/research`
-            : `Campaign ${existingIds[0]} exists; resume it with /autoresearch research --id ${existingIds[0]}, or clean .auto/research to start a new campaign`, "info");
+            ? `Several campaigns exist (${existingIds.join(", ")}); resume one with /autoresearch research --id <id>; finished campaigns are archived automatically on the next draft`
+            : `Campaign ${existingIds[0]} exists; resume it with /autoresearch research --id ${existingIds[0]}, stop it first to start a new campaign (finished campaigns are archived automatically on draft)`, "info");
           return;
         }
         if (await campaignBlocksOrdinaryLoop(researchWorkDir)) {
