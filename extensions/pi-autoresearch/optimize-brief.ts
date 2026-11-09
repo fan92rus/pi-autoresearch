@@ -7,7 +7,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomBytes } from "node:crypto";
-import { consentDialogBody, CONSENT_SUMMARY_MAX_LINES } from "./brief-consent.ts";
+import { canonicalize, consentDialogBody, CONSENT_SUMMARY_MAX_LINES, unknownKeys } from "./brief-consent.ts";
+
+export { canonicalize };
 import { sha256Hex } from "./research-state.ts";
 
 export const OPTIMIZE_DIR_SEGMENTS = [".auto", "optimize"] as const;
@@ -39,19 +41,6 @@ export interface OptimizeBrief {
 
 export type BriefValidation = { ok: true; brief: OptimizeBrief } | { ok: false; errors: string[] };
 
-/** Recursively sorts object keys; arrays keep their order. */
-export function canonicalize(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonicalize);
-  if (value !== null && typeof value === "object") {
-    const out: Record<string, unknown> = {};
-    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
-      out[key] = canonicalize((value as Record<string, unknown>)[key]);
-    }
-    return out;
-  }
-  return value;
-}
-
 /** Validates an untrusted brief object. Unknown fields are refused, never dropped. */
 export function validateOptimizeBrief(input: unknown): BriefValidation {
   if (input === null || typeof input !== "object" || Array.isArray(input)) {
@@ -59,8 +48,8 @@ export function validateOptimizeBrief(input: unknown): BriefValidation {
   }
   const obj = input as Record<string, unknown>;
   const errors: string[] = [];
-  for (const key of Object.keys(obj)) {
-    if (!BRIEF_KEYS.has(key)) errors.push(`unknown field "${key}" (allowed: ${[...BRIEF_KEYS].join(", ")})`);
+  for (const key of unknownKeys(obj, BRIEF_KEYS)) {
+    errors.push(`unknown field "${key}" (allowed: ${[...BRIEF_KEYS].join(", ")})`);
   }
   if (obj.schema_version !== undefined && obj.schema_version !== 1) errors.push("schema_version must be 1");
   for (const key of ["name", "metric_name"] as const) {

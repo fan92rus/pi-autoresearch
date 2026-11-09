@@ -39,7 +39,7 @@ import { createServer, type Server, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
 import { getBashSpawnOptions, killTree } from "./bash-shell.ts";
 import { computeState, markIdeaTried } from "./observer.ts";
-import { briefChatMarkdown, briefConsentSummary } from "./brief-consent.ts";
+import { askConsent, briefChatMarkdown, briefConsentSummary } from "./brief-consent.ts";
 import * as optimizeBrief from "./optimize-brief.ts";
 import { registerCouncilTools } from "./council-tools.ts";
 import { registerAssessPrecedentsTool } from "./precedent-assess.ts";
@@ -8677,19 +8677,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (existing.ok && existing.approval.confirmed === true && existing.approval.brief_sha256 === read.sha256) {
         return { content: [{ type: "text", text: `✅ Brief already approved (sha256 ${read.sha256}). Call init_experiment with the same arguments.` }], details: { action } };
       }
-      if (!ctx.hasUI || !ctx.ui || typeof ctx.ui.confirm !== "function") {
-        return optimizeRefusal("❌ brief approval is an owner action and needs an interactive dialog; the brief stays unapproved");
-      }
-      const confirmed = await ctx.ui.confirm(
-        "Optimization session: approve brief",
-        optimizeBrief.optimizeConsentSummary(read.brief, read.sha256),
-      );
-      if (confirmed !== true) {
-        optimizeBrief.writeOptimizeApproval(dir, false, read.sha256);
-        return optimizeRefusal("❌ the owner did not confirm the brief; nothing was approved");
-      }
-      const written = optimizeBrief.writeOptimizeApproval(dir, true, read.sha256);
-      if (!written.ok) return optimizeRefusal(`❌ ${written.message}; nothing was approved`);
+      const outcome = await askConsent<{ ok: boolean; message: string }>({
+        hasUi: !!(ctx.hasUI && ctx.ui && typeof ctx.ui.confirm === "function"),
+        title: "Optimization session: approve brief",
+        body: optimizeBrief.optimizeConsentSummary(read.brief, read.sha256),
+        confirm: (title, body) => ctx.ui.confirm(title, body),
+        record: async (confirmed) => optimizeBrief.writeOptimizeApproval(dir, confirmed, read.sha256),
+      });
+      if (outcome.status === "no_ui") return optimizeRefusal("❌ brief approval is an owner action and needs an interactive dialog; the brief stays unapproved");
+      if (outcome.status === "refused") return optimizeRefusal("❌ the owner did not confirm the brief; nothing was approved");
+      if (outcome.status === "write_failed") return optimizeRefusal(`❌ ${outcome.failure.message}; nothing was approved`);
       return {
         content: [{ type: "text", text: `✅ Brief approved (sha256 ${read.sha256}). Call init_experiment with the same name, metric_name, metric_unit, direction and cwd.` }],
         details: { action },
@@ -8858,13 +8855,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const sha = briefSha ? { ok: true as const, sha256: briefSha } : await researchState.briefSha256(dir);
       if (!sha.ok) return fail(sha.reason, sha.message);
       // The full brief is in this tool call's transcript row (renderCall), above this dialog.
-      const confirmed = await ctx.ui.confirm(
-        `Research campaign ${campaignId}: approve brief`,
-        briefConsentSummary(validation.brief, sha.sha256, campaignId),
-      );
-      if (confirmed !== true) return fail("not_approved", "the owner did not confirm the brief; nothing was approved");
-      const approved = await researchState.writeApproval(dir, sha.sha256);
-      if (!approved.ok) return fail(approved.reason, approved.message);
+      const outcome = await askConsent<{ ok: boolean; reason?: string; message: string }>({
+        hasUi: true,
+        title: `Research campaign ${campaignId}: approve brief`,
+        body: briefConsentSummary(validation.brief, sha.sha256, campaignId),
+        confirm: (title, body) => ctx.ui.confirm(title, body),
+        // A refusal writes nothing for research: its approval.json exists only for a confirmed brief.
+        record: async (confirmed) => (confirmed ? researchState.writeApproval(dir, sha.sha256) : { ok: true as const, message: "" }),
+      });
+      if (outcome.status === "refused") return fail("not_approved", "the owner did not confirm the brief; nothing was approved");
+      if (outcome.status === "write_failed") return fail(outcome.failure.reason ?? "approval_invalid", outcome.failure.message);
       return reply(
         `✅ Brief approved for campaign ${campaignId} (sha256 ${sha.sha256}). Start the research phase: research start with expected_sha256 "${sha.sha256}". Brief file: ${path.join(dir, researchState.BRIEF_FILE)}.`,
       );

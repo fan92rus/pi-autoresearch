@@ -20,6 +20,61 @@ function verdictsOf(brief: ResearchBrief): string[] {
   return brief.verdicts ?? ["confirmed", "rejected", "inconclusive", "waiting_for_data"];
 }
 
+/** Recursively sorts object keys; arrays keep their order. Shared by every brief that is written as JSON. */
+export function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value !== null && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      out[key] = canonicalize((value as Record<string, unknown>)[key]);
+    }
+    return out;
+  }
+  return value;
+}
+
+/** Keys of `obj` outside `allowed`, in input order. Used to refuse unknown fields, never to drop them. */
+export function unknownKeys(obj: Record<string, unknown>, allowed: ReadonlySet<string>): string[] {
+  return Object.keys(obj).filter((key) => !allowed.has(key));
+}
+
+/** Every character that starts a new physical line in a dialog or a Markdown list. */
+const LINE_BREAK_RE = /[\n\r\u0085\u2028\u2029]/;
+
+export function hasLineBreak(text: string): boolean {
+  return LINE_BREAK_RE.test(text);
+}
+
+export type ConsentOutcome<F> =
+  | { status: "no_ui" }
+  | { status: "refused" }
+  | { status: "recorded" }
+  | { status: "write_failed"; failure: F };
+
+/**
+ * The consent flow shared by both modes, after each mode has validated its brief and computed its hash.
+ * Without a UI nothing is asked and nothing is recorded. The owner's answer is recorded either way
+ * (`record(false)` for a refusal; a mode may ignore a refusal). A confirmation goes through `record(true)`,
+ * which each mode implements with its own binding check (the brief the owner saw must still be on disk).
+ */
+export async function askConsent<F extends { ok: boolean }>(deps: {
+  hasUi: boolean;
+  title: string;
+  body: string;
+  confirm: (title: string, body: string) => Promise<boolean>;
+  record: (confirmed: boolean) => Promise<F>;
+}): Promise<ConsentOutcome<F & { ok: false }>> {
+  if (!deps.hasUi) return { status: "no_ui" };
+  const confirmed = (await deps.confirm(deps.title, deps.body)) === true;
+  if (!confirmed) {
+    await deps.record(false);
+    return { status: "refused" };
+  }
+  const written = await deps.record(true);
+  if (!written.ok) return { status: "write_failed", failure: written as F & { ok: false } };
+  return { status: "recorded" };
+}
+
 /** Full brief as readable Markdown for the chat transcript (not JSON). */
 export function briefChatMarkdown(brief: ResearchBrief, sha256: string, campaignId: string): string {
   const lines: string[] = [];
