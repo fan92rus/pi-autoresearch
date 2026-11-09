@@ -279,7 +279,7 @@ export function writeOptimizeApproval(dir: string, confirmed: boolean, sha256: s
 
 export type ApprovalResult =
   | { ok: true; approval: OptimizeApproval }
-  | { ok: false; reason: "not_approved" | "approval_invalid"; message: string };
+  | { ok: false; reason: "not_approved" | "approval_invalid"; message: string; detail?: string };
 
 export function readOptimizeApproval(dir: string): ApprovalResult {
   let raw: string;
@@ -295,10 +295,10 @@ export function readOptimizeApproval(dir: string): ApprovalResult {
     return { ok: false, reason: "approval_invalid", message: "approval.json is not valid JSON" };
   }
   if (hasDuplicateTopLevelKeys(raw)) {
-    return { ok: false, reason: "approval_invalid", message: "approval.json has no confirmed flag or hash (duplicate key)" };
+    return { ok: false, reason: "approval_invalid", message: "approval.json has no confirmed flag or hash", detail: "duplicate key" };
   }
   const problem = approvalProblem(parsed);
-  if (problem) return { ok: false, reason: "approval_invalid", message: `approval.json has no confirmed flag or hash (${problem})` };
+  if (problem) return { ok: false, reason: "approval_invalid", message: "approval.json has no confirmed flag or hash", detail: problem };
   return { ok: true, approval: parsed as OptimizeApproval };
 }
 

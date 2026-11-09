@@ -60,7 +60,8 @@ test("A1: an extra field makes approval.json invalid", () => {
   const r = ob.readOptimizeApproval(od);
   assert.equal(r.ok, false);
   assert.equal(r.reason, "approval_invalid");
-  assert.match(r.message, /approved_by/);
+  assert.equal(r.message, "approval.json has no confirmed flag or hash", "the hint text stays the old one");
+  assert.match(r.detail, /approved_by/);
 });
 
 test("A1: a brief hash that is not 64 lowercase hex is invalid", () => {
@@ -241,7 +242,8 @@ test("A1: the approval_invalid hint keeps the text the optimize module has alway
   const od = writeApprovalRaw(dir, JSON.stringify({ schema_version: 1, confirmed: "yes", brief_sha256: HEX, decided_at: "2026-11-09T10:00:00Z" }));
   const r = ob.readOptimizeApproval(od);
   assert.equal(r.reason, "approval_invalid");
-  assert.match(r.message, /^approval\.json has no confirmed flag or hash/);
+  assert.equal(r.message, "approval.json has no confirmed flag or hash", "the hint text must match the old module exactly");
+  assert.match(r.detail, /confirmed must be a boolean/, "the problem goes to detail, not into the hint");
 });
 
 test("A2: a successful draft write leaves no temporary file and the bytes match the hash", () => {
