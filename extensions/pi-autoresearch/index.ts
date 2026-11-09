@@ -9092,6 +9092,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         } catch (err) {
           savedNote = `warning: the report could not be saved to ${path.relative(workDir, reportPath)} (${err instanceof Error ? err.message : String(err)})`;
         }
+        // A report of a STOPPED campaign is the campaign's last step: leave
+        // research mode now (the report is already on disk).
+        if (snap.state.phase === "stopped") {
+          exitResearchMode(ctx, id);
+          return reply(reportText + "\n\n" + savedNote + "\nResearch mode is OFF.");
+        }
         return reply(reportText + "\n\n" + savedNote);
       }
 
@@ -9241,7 +9247,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           async () => appendResearchEvent(dir, { event: "stop", rule_id: rid, stop_when: stopRule.when, reason }),
         );
         if (!done.ok) return fail(done.reason, done.message);
-        return reply(`🛑 Research stopped by ${rid}. No vector can be opened in this campaign; a new campaign needs a new brief.`);
+        return reply(`🛑 Research stopped by ${rid}. No vector can be opened in this campaign; a new campaign needs a new brief. Next: research report; it writes the final report and leaves research mode.`);
       }
 
       return fail("invalid_argument", `unknown action ${JSON.stringify(String(action))}`);
@@ -9266,6 +9272,22 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     stopDashboardServer();
     clearSessionUi(ctx);
     if (!ctx.isIdle()) ctx.abort();
+  }
+
+  /** Leaves research mode after a campaign stop. Unlike stopAutoresearchLoop it
+   *  does not abort or tear down UI: the stop runs inside a tool call. The OFF
+   *  activation is persisted; the campaign pin is released so the next draft
+   *  archives the finished campaign. The state-root pin stays, so the final
+   *  report still finds the campaign. Research tools are not mode-gated, so
+   *  research report keeps working. */
+  function exitResearchMode(ctx: ExtensionContext, campaignId: string): void {
+    const runtime = getRuntime(ctx);
+    recordAutoresearchActivation(resolveWorkDir(ctx.cwd), false);
+    setAutoresearchMode(ctx, false);
+    runtime.researchCampaignId = null;
+    runtime.autoResumeTurns = 0;
+    cancelPendingResume(runtime);
+    ctx.ui.notify(`Research campaign ${campaignId} stopped — research mode OFF. The final report stays available: research report.`, "info");
   }
 
   function turnAutoresearchOff(ctx: ExtensionContext): void {
