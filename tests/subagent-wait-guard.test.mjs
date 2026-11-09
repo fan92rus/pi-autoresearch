@@ -368,6 +368,9 @@ test("campaign deferral: under a candidate campaign the campaign nudge is deferr
       worktree: "/tmp/nonexistent-worktree",
       branch: "candidate/cand-1",
       checkpoints: [],
+      steps_used: 0,
+      time_used_seconds: 0,
+      selected_checkpoint: null,
     }],
   };
   fs.writeFileSync(path.join(campDir, "state.json"), JSON.stringify(campaignState), "utf8");
@@ -417,4 +420,61 @@ test("fuse delivers past SUBAGENT_DEFER_FUSE_MS while the subagent is still aliv
   await settleWindow();
   Date.now = realNow;
   assert.ok(driftNudges(h).length >= 1, "fuse delivered the nudge past the 10-minute continuous deferral");
+});
+
+// ── Review round 2 fixes: candidate pause/close/disable reset, shutdown re-check window ──
+
+test("candidate_branch pause resets the deferral: no delivery after completion", async () => {
+  const h = await readySession("cand-pause");
+  // Seed the same ACTIVE campaign as the campaign-deferral test (pause needs it).
+  const campDir = path.join(h.ctx.cwd, ".auto", "candidate");
+  fs.mkdirSync(campDir, { recursive: true });
+  fs.writeFileSync(path.join(campDir, "state.json"), JSON.stringify({
+    schema_version: 1,
+    created_at: "2026-01-01T00:00:00.000Z",
+    disabled: false,
+    policy: { candidate_step_limit: 10, candidate_time_limit_seconds: 600 },
+    candidates: [{
+      id: "cand-1",
+      title: "Test candidate",
+      status: "active",
+      created_at: "2026-01-01T00:00:00.000Z",
+      worktree: "/tmp/nonexistent-worktree",
+      branch: "candidate/cand-1",
+      checkpoints: [],
+      steps_used: 0,
+      time_used_seconds: 0,
+      selected_checkpoint: null,
+    }],
+  }), "utf8");
+  const cb = h.tool("candidate_branch");
+  assert.ok(cb, "candidate_branch registered");
+  // The deferral turn first: guard armed, one live subagent → deferred.
+  installRpcResponder(h.events, { respond: true, totalActive: 1 });
+  await fireSessionStart(h);
+  await settleNoWorkTurn(h);
+  await settleWindow();
+  assert.equal(driftNudges(h).length, 0, "deferred");
+  // Owner pauses the active candidate: the pending deferral must reset.
+  await cb.execute("id", { action: "pause", candidate_id: "cand-1" }, null, null, h.ctx);
+  installRpcResponder(h.events, { respond: true, totalActive: 0 });
+  h.events.emit("subagent:async-complete", {});
+  await settleWindow();
+  assert.equal(driftNudges(h).length, 0, "candidate pause reset kills the deferral");
+  await fireAgentStart(h);
+});
+
+test("shutdown clears the re-check timer: nothing fires after the re-check window", async () => {
+  const h = await readySession("shutdown-timer");
+  installRpcResponder(h.events, { respond: true, totalActive: 1 });
+  await fireSessionStart(h);
+  await settleNoWorkTurn(h);
+  await settleWindow();
+  assert.equal(driftNudges(h).length, 0, "deferred");
+  await h.hook("session_shutdown")({}, h.ctx);
+  // Wait PAST the re-check interval: a surviving timer would fire its probe and
+  // (after the responder flips to zero) deliver into the dead session.
+  installRpcResponder(h.events, { respond: true, totalActive: 0 });
+  await new Promise((r) => setTimeout(r, SUBAGENT_DEFER_RECHECK_MS + 1500));
+  assert.equal(driftNudges(h).length, 0, "shutdown cancelled the re-check timer: no delivery past the window");
 });

@@ -18,7 +18,7 @@
 
 Команда: `node --experimental-strip-types --experimental-loader ./tests/redirect-loader.mjs --test <файл>`.
 
-- `tests/subagent-wait-guard.test.mjs` — 14 тестов: 13 pass, 1 skipped (fuse — реальное ожидание 10 мин; выполняется вручную с `RUN_FUSE_TEST=1`), 0 fail, ~54 c.
+- `tests/subagent-wait-guard.test.mjs` — 23 теста: 22 pass, 1 skipped (wall-clock fuse, `RUN_FUSE_TEST=1`; mock-вариант fuse исполняется в обычном прогоне), 0 fail, ~104 c.
 - `tests/agent-guidance.test.mjs` + `tests/loop-finding-routes.test.mjs` + `tests/smoke.test.mjs` (один прогон): 31/31.
 - `tests/hypothesis-finding-links.test.mjs` (регресс соседнего change, общий index.ts): 11/11.
 - `openspec validate --all`: 14 passed, 0 failed.
