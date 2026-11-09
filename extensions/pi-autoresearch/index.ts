@@ -8587,7 +8587,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
     const approved = optimizeBrief.approvedBriefFor(optimizeBrief.optimizeDirOf(ctx.cwd));
     if (!approved.ok) {
-      return optimizeRefusal(`❌ init_experiment refused (${approved.reason}): ${approved.message}. Order: optimize_brief draft → propose → init_experiment.`);
+      const detail = "detail" in approved && approved.detail ? ` (${approved.detail})` : "";
+      return optimizeRefusal(`❌ init_experiment refused (${approved.reason}): ${approved.message}${detail}. Order: optimize_brief draft → propose → init_experiment.`);
     }
     // A pinned session (init with cwd earlier) writes to workDir even without cwd: compare what is actually written.
     const effectiveCwd = params.cwd === undefined && workDir !== path.resolve(ctx.cwd) ? workDir : params.cwd;

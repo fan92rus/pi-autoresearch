@@ -303,11 +303,11 @@ export function readOptimizeApproval(dir: string): ApprovalResult {
 }
 
 /** Phase 2 gate: an approved brief whose bytes still match the approval. */
-export function approvedBriefFor(dir: string): { ok: true; brief: OptimizeBrief; sha256: string } | { ok: false; reason: string; message: string } {
+export function approvedBriefFor(dir: string): { ok: true; brief: OptimizeBrief; sha256: string } | { ok: false; reason: string; message: string; detail?: string } {
   const brief = readOptimizeBrief(dir);
   if (!brief.ok) return { ok: false, reason: brief.reason, message: brief.message };
   const approval = readOptimizeApproval(dir);
-  if (!approval.ok) return { ok: false, reason: approval.reason, message: approval.message };
+  if (!approval.ok) return { ok: false, reason: approval.reason, message: approval.message, ...(approval.detail ? { detail: approval.detail } : {}) };
   if (approval.approval.confirmed !== true) {
     return { ok: false, reason: "not_approved", message: "the owner refused this brief: draft a new one and propose it again" };
   }

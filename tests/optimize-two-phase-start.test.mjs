@@ -157,6 +157,7 @@ test("approval_invalid blocks init_experiment: the approval file is corrupted, a
   const out = await run(h, "init_experiment", briefArgs());
   assert.match(out, /approval_invalid/, out);
   assert.match(out, /approval\.json/, out);
+  assert.match(out, /brief_sha256 must be 64 lowercase hex/, "the owner must see the reason, not only the hint");
   assert.equal(readConfigHeaders(dir).length, before, "an invalid approval must not start the session");
 });
 
