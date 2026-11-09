@@ -423,7 +423,7 @@ The result lens keeps each run's raw output, lets the agent read it in bounded p
 
 | Theme | Meaning | Route |
 |-------|---------|-------|
-| `behavior` | The model or code does the wrong thing | An ordinary hypothesis that cites the finding id |
+| `behavior` | The model or code does the wrong thing | An ordinary hypothesis: propose_hypothesis (what you noticed, what changes, what you will learn; optionally pass finding_id), citing the finding id |
 | `capability` | The system cannot do it yet (new data, resources or abilities) | Not a hypothesis and not a run: an owner-input idea that waits for the owner's go-ahead |
 | `tradeoff` | Gaining on one side costs another | A question to the owner; the cost is tracked as a secondary metric until answered |
 | `measurement` | The scorer, gold or metric itself is wrong | `log_measurement_change` (see [Measurement track](#measurement-track)) |

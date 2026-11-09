@@ -69,6 +69,8 @@ export interface TreeNode {
   simhashFull: string | null;
   /** Backlog idea_id from ASI (if the agent tracks ideas). */
   ideaId: string | null;
+  /** Optional explicit finding id this hypothesis is based on (hypothesis-evidence-context). */
+  findingId?: string | null;
   /** Depth from root (0 = baseline). */
   depth: number;
   /** Unix timestamp (ms) when the node was created. */
@@ -231,6 +233,7 @@ export function createHypothesisNode(
   hypothesis: string,
   status: "untested" | "duplicate",
   asi: Record<string, unknown> | null,
+  findingId: string | null = null,
 ): TreeNode {
   const label = extractLabel(hypothesis);
   const ideaId = asi && typeof asi.idea_id === "string" ? asi.idea_id : null;
@@ -248,6 +251,7 @@ export function createHypothesisNode(
     simhashLabel: label ? computeSimhash(label) : null,
     simhashFull: computeSimhash(hypothesis),
     ideaId,
+    findingId,
     depth: parentDepth + 1,
     createdAt: Date.now(),
     exhausted: false,

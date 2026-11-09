@@ -85,6 +85,7 @@ import {
   recordFinding,
   updateFinding,
   parseEvidenceRef,
+  loadFindings,
 } from "./findings.ts";
 import { inspectResults } from "./lens-inspect.ts";
 import { buildReport } from "./report.ts";
@@ -426,8 +427,8 @@ const RunParams = Type.Object({
   hypothesis: Type.Optional(
     Type.String({
       description:
-        "Brief hypothesis description (1-2 sentences). Used for pre-run repeat detection via SimHash. " +
-        "Strongly recommended — without it the system cannot warn about duplicate hypotheses. " +
+        "Brief hypothesis description (1-2 sentences). Recorded for context; the pre-registered hypothesis_id is the link used for checks. " +
+        "Strongly recommended — without it the run lacks a readable summary. " +
         "Example: 'Replace switch/case dispatch with lookup table for O(1) access'",
     })
   ),
@@ -3329,7 +3330,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\n- EVERYTHING within the active goal is PRE-APPROVED — experiments (expensive included), code edits, script fixes, retries after failures: do NOT ask the owner before acting — decide yourself, record assumptions in the hypothesis/ASI, and keep the loop running. Ask the owner ONLY when stepping outside the goal's frame: new external data, foreign resources, goal/metric change, irreversible damage." +
       "\n\n## Result Findings (route by theme)" +
       "\nAfter reading raw results (inspect_results), record each finding with record_finding({theme, description, evidence_ref}). evidence_ref must cite a concrete case (path:lines or path#anchor); generalizations without examples are rejected." +
-      "\n- behavior (the model/code does the wrong thing) \u2192 an ordinary hypothesis: propose_hypothesis whose description cites the finding id, then the normal cycle." +
+      "\n- behavior (the model/code does the wrong thing) \u2192 an ordinary hypothesis: propose_hypothesis (describe what you noticed, what changes, what you will learn; optionally pass finding_id) citing the finding id, then the normal cycle." +
       "\n- capability (the system cannot do it yet: needs new data, resources or abilities) \u2192 NOT a hypothesis and NOT a run: write it to " + ideasPath + " marked owner-input. It is an owner gate: wait for the owner's go-ahead on resume." +
       "\n- tradeoff (gaining on one side costs another) \u2192 ask the owner which side to prefer (a goal decision); until answered, track the cost as a secondary metric in log_experiment metrics." +
       "\n- measurement (the scorer, gold or metric itself is wrong) \u2192 log_measurement_change with mandatory accounting: diff, reproducible rescore artifact with both scores, justification = finding id. The change stays provisional until independently verified. Stage note: this tool arrives in stage S3; until it is among your tools, keep the finding open and do NOT edit the scorer or gold silently." +
@@ -3653,6 +3654,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     force: Type.Optional(Type.Boolean({
       description: "Register even if SimHash detects a possible duplicate.",
     })),
+    finding_id: Type.Optional(Type.String({
+      description: "Optional finding id (e.g. \"f3\") this hypothesis is based on. Stored as an explicit link; text mentions are not auto-linked.",
+    })),
   });
 
   registerGatedTool({
@@ -3661,6 +3665,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     description:
       "Register a hypothesis in the experiment tree BEFORE calling run_experiment (ordinary loop; while a candidate campaign is active, use candidate_branch instead). " +
       "Takes either a description string (saved to .auto/ideas/<nodeId>.md) or a path to an existing file. " +
+      "Optionally pass finding_id to link the hypothesis to a finding; the link is explicit and text mentions are not auto-linked. " +
       "SimHash checks against all existing nodes; duplicates get status=duplicate unless force=true. " +
       "Returns the node_id to pass to run_experiment(hypothesis_id).",
     promptSnippet: "Register a hypothesis in the tree before run_experiment (ordinary loop; blocked during a candidate campaign)",
@@ -3669,6 +3674,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "SimHash duplicate detection runs at registration time, not at run time.",
       "Use the returned node_id in run_experiment(hypothesis_id: \"nX\").",
       "Use force=true to override SimHash duplicate detection if the idea is genuinely different.",
+      "When proposing, briefly state what you noticed, what changes, and what you will learn; optionally pass finding_id when the idea is based on a finding.",
     ],
     parameters: ProposeHypothesisParams,
 
@@ -3717,6 +3723,23 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       const workDir = resolveWorkDir(ctx.cwd);
+
+      // ── Optional explicit link to a finding (hypothesis-evidence-context) ──
+      const findingId = typeof params.finding_id === "string" ? params.finding_id.trim() : null;
+      let findingWarning = "";
+      if (findingId) {
+        const loadedFindings = loadFindings(workDir);
+        if (!loadedFindings.ok) {
+          findingWarning = `\nℹ️ Hypothesis linked to finding ${findingId}; its current status is unknown (findings store unreadable).`;
+        } else {
+          const view = loadedFindings.value.findings.get(findingId);
+          if (!view) {
+            findingWarning = `\nℹ️ Hypothesis linked to finding ${findingId}; its current status is unknown (finding not found).`;
+          } else if (view.status === "revised") {
+            findingWarning = `\n⚠️ Linked finding ${findingId} is revised — check whether the hypothesis is still relevant.`;
+          }
+        }
+      }
 
       // ── Load tree ──
       if (!treeExists(workDir)) {
@@ -3812,6 +3835,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
+      // ── Append finding-revision warning so it survives duplicate message ──
+      if (findingWarning) {
+        warning = warning + findingWarning;
+      }
+
       // ── Create tree node ──
       const nodeId = nextNodeId(tree);
       const hypothesisNode = createHypothesisNode(
@@ -3821,6 +3849,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         hypothesisText,
         nodeStatus,
         null,
+        findingId,
       );
       appendChild(tree, parentId, hypothesisNode);
       saveTree(workDir, tree);
@@ -3836,6 +3865,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           `id: ${nodeId}`,
           `status: ${nodeStatus}`,
           `created_at: ${new Date().toISOString()}`,
+          ...(findingId ? [`finding_id: ${findingId}`] : []),
           "---",
         ].join("\n");
         fs.writeFileSync(filePath, frontmatter + "\n\n" + hypothesisText + "\n", "utf8");
@@ -3936,7 +3966,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     name: "update_finding",
     label: "Update Finding",
     description:
-      "Change a finding's status (append-only transition in .auto/findings.jsonl). verified and revised require evidence_ref.",
+      "Change a finding's status (append-only transition in .auto/findings.jsonl). verified and revised require evidence_ref. " +
+      "Moving a finding to revised may trigger a soft warning on hypotheses explicitly linked to it.",
     promptSnippet: "Move a finding through open/verified/revised/deferred",
     promptGuidelines: [
       "verified requires evidence_ref to an independent check; revised requires evidence_ref to a counterexample.",
@@ -4334,6 +4365,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Required for all non-baseline experiments. Baseline exception: when
       // the tree root has no experiment/hypothesis children yet (first run).
       let repeatWarning = "";
+      let findingRunWarning = "";
       let runningNodeId: string | null = null;
 
       if (params.hypothesis_id) {
@@ -4370,6 +4402,21 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             details: {},
           };
         }
+        // Finding-revision warning (hypothesis-evidence-context)
+        if (node.findingId) {
+          const loadedFindings = loadFindings(workDir);
+          if (!loadedFindings.ok) {
+            findingRunWarning = `\nℹ️ Hypothesis linked to finding ${node.findingId}; its current status is unknown (findings store unreadable).`;
+          } else {
+            const view = loadedFindings.value.findings.get(node.findingId);
+            if (!view) {
+              findingRunWarning = `\nℹ️ Hypothesis linked to finding ${node.findingId}; its current status is unknown (finding not found).`;
+            } else if (view.status === "revised") {
+              findingRunWarning = `\n⚠️ Linked finding ${node.findingId} is revised — check whether the hypothesis is still relevant.`;
+            }
+          }
+        }
+
         // Warn if hypothesis was proposed under a different branch (code diverged)
         const td = treeDist(tree, tree.activeNodeId, node.id);
         if (td > 2) {
@@ -4834,6 +4881,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Append pre-run warnings (diverged branch, etc.)
       if (repeatWarning) {
         text += repeatWarning;
+      }
+      if (findingRunWarning) {
+        text += findingRunWarning;
       }
 
       // Include hypothesis node info
@@ -6927,6 +6977,22 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (referenceLine) text += `${referenceLine}\n`;
 
       text += renderTree(view.scoped, 60, 3, 7);
+
+      // Linked findings (hypothesis-evidence-context): show current status
+      const linkedNodes = Object.values(view.scoped.nodes).filter((n) => n.findingId);
+      if (linkedNodes.length > 0) {
+        const loadedFindings = loadFindings(workDir);
+        text += `\nLinked findings:\n`;
+        for (const n of linkedNodes) {
+          let fStatus = "unknown";
+          if (loadedFindings.ok) {
+            const v = loadedFindings.value.findings.get(n.findingId!);
+            if (v) fStatus = v.status;
+          }
+          const mark = fStatus === "revised" ? "⚠️" : fStatus === "unknown" ? "ℹ️" : "•";
+          text += `  ${mark} ${n.id} → ${n.findingId} (${fStatus})\n`;
+        }
+      }
 
       // Failure streak since last keep (NOT the total — flat trees accumulate
       // the whole campaign on the root and the total always looks catastrophic)
