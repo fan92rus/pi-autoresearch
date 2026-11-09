@@ -1,0 +1,412 @@
+{
+  "source": "extensions/pi-autoresearch/brief-consent.ts at commit 395d345 (parent of step A, = 43c9ba8~1)",
+  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "cases": {
+    "plain": {
+      "brief": {
+        "schema_version": 1,
+        "goal": "Найти причину деградации",
+        "plan_source": "p",
+        "caveat_block": "c",
+        "data_roles": {
+          "explore": [
+            "e"
+          ],
+          "validate": [],
+          "confirm": []
+        },
+        "questions": [
+          {
+            "id": "q1",
+            "text": "t",
+            "decision_rules": [
+              {
+                "id": "r1",
+                "verdict": "confirmed",
+                "when": "w"
+              }
+            ]
+          }
+        ],
+        "process_metrics": [
+          "m"
+        ],
+        "stop_rules": [
+          {
+            "id": "s1",
+            "when": "w"
+          }
+        ]
+      },
+      "campaignId": "camp-1",
+      "expected": "Brief SHA-256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nКампания: camp-1\nЦель: Найти причину деградации\nВопросов: 1 (q1); правил: 1\nВердикты: confirmed, rejected, inconclusive, waiting_for_data\nСтоп-правил: 1; метрик процесса: 1\nЗамок тестовых данных: нет\nПодтверждение фиксирует этот SHA-256: вопросы и правила не меняются.\nПодтвердить согласование?"
+    },
+    "exact160": {
+      "brief": {
+        "schema_version": 1,
+        "goal": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "plan_source": "p",
+        "caveat_block": "c",
+        "data_roles": {
+          "explore": [
+            "e"
+          ],
+          "validate": [],
+          "confirm": []
+        },
+        "questions": [
+          {
+            "id": "q1",
+            "text": "t",
+            "decision_rules": [
+              {
+                "id": "r1",
+                "verdict": "confirmed",
+                "when": "w"
+              }
+            ]
+          }
+        ],
+        "process_metrics": [
+          "m"
+        ],
+        "stop_rules": [
+          {
+            "id": "s1",
+            "when": "w"
+          }
+        ]
+      },
+      "campaignId": "camp-1",
+      "expected": "Brief SHA-256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nКампания: camp-1\nЦель: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nВопросов: 1 (q1); правил: 1\nВердикты: confirmed, rejected, inconclusive, waiting_for_data\nСтоп-правил: 1; метрик процесса: 1\nЗамок тестовых данных: нет\nПодтверждение фиксирует этот SHA-256: вопросы и правила не меняются.\nПодтвердить согласование?"
+    },
+    "over160": {
+      "brief": {
+        "schema_version": 1,
+        "goal": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "plan_source": "p",
+        "caveat_block": "c",
+        "data_roles": {
+          "explore": [
+            "e"
+          ],
+          "validate": [],
+          "confirm": []
+        },
+        "questions": [
+          {
+            "id": "q1",
+            "text": "t",
+            "decision_rules": [
+              {
+                "id": "r1",
+                "verdict": "confirmed",
+                "when": "w"
+              }
+            ]
+          }
+        ],
+        "process_metrics": [
+          "m"
+        ],
+        "stop_rules": [
+          {
+            "id": "s1",
+            "when": "w"
+          }
+        ]
+      },
+      "campaignId": "camp-1",
+      "expected": "Brief SHA-256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nКампания: camp-1\nЦель: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb…\nВопросов: 1 (q1); правил: 1\nВердикты: confirmed, rejected, inconclusive, waiting_for_data\nСтоп-правил: 1; метрик процесса: 1\nЗамок тестовых данных: нет\nПодтверждение фиксирует этот SHA-256: вопросы и правила не меняются.\nПодтвердить согласование?"
+    },
+    "lf": {
+      "brief": {
+        "schema_version": 1,
+        "goal": "x\ny",
+        "plan_source": "p",
+        "caveat_block": "c",
+        "data_roles": {
+          "explore": [
+            "e"
+          ],
+          "validate": [],
+          "confirm": []
+        },
+        "questions": [
+          {
+            "id": "q1",
+            "text": "t",
+            "decision_rules": [
+              {
+                "id": "r1",
+                "verdict": "confirmed",
+                "when": "w"
+              }
+            ]
+          }
+        ],
+        "process_metrics": [
+          "m"
+        ],
+        "stop_rules": [
+          {
+            "id": "s1",
+            "when": "w"
+          }
+        ]
+      },
+      "campaignId": "camp-1",
+      "expected": "Brief SHA-256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nКампания: camp-1\nЦель: x y\nВопросов: 1 (q1); правил: 1\nВердикты: confirmed, rejected, inconclusive, waiting_for_data\nСтоп-правил: 1; метрик процесса: 1\nЗамок тестовых данных: нет\nПодтверждение фиксирует этот SHA-256: вопросы и правила не меняются.\nПодтвердить согласование?"
+    },
+    "crlf": {
+      "brief": {
+        "schema_version": 1,
+        "goal": "x\r\ny",
+        "plan_source": "p",
+        "caveat_block": "c",
+        "data_roles": {
+          "explore": [
+            "e"
+          ],
+          "validate": [],
+          "confirm": []
+        },
+        "questions": [
+          {
+            "id": "q1",
+            "text": "t",
+            "decision_rules": [
+              {
+                "id": "r1",
+                "verdict": "confirmed",
+                "when": "w"
+              }
+            ]
+          }
+        ],
+        "process_metrics": [
+          "m"
+        ],
+        "stop_rules": [
+          {
+            "id": "s1",
+            "when": "w"
+          }
+        ]
+      },
+      "campaignId": "camp-1",
+      "expected": "Brief SHA-256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nКампания: camp-1\nЦель: x y\nВопросов: 1 (q1); правил: 1\nВердикты: confirmed, rejected, inconclusive, waiting_for_data\nСтоп-правил: 1; метрик процесса: 1\nЗамок тестовых данных: нет\nПодтверждение фиксирует этот SHA-256: вопросы и правила не меняются.\nПодтвердить согласование?"
+    },
+    "ls2028": {
+      "brief": {
+        "schema_version": 1,
+        "goal": "x y",
+        "plan_source": "p",
+        "caveat_block": "c",
+        "data_roles": {
+          "explore": [
+            "e"
+          ],
+          "validate": [],
+          "confirm": []
+        },
+        "questions": [
+          {
+            "id": "q1",
+            "text": "t",
+            "decision_rules": [
+              {
+                "id": "r1",
+                "verdict": "confirmed",
+                "when": "w"
+              }
+            ]
+          }
+        ],
+        "process_metrics": [
+          "m"
+        ],
+        "stop_rules": [
+          {
+            "id": "s1",
+            "when": "w"
+          }
+        ]
+      },
+      "campaignId": "camp-1",
+      "expected": "Brief SHA-256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nКампания: camp-1\nЦель: x y\nВопросов: 1 (q1); правил: 1\nВердикты: confirmed, rejected, inconclusive, waiting_for_data\nСтоп-правил: 1; метрик процесса: 1\nЗамок тестовых данных: нет\nПодтверждение фиксирует этот SHA-256: вопросы и правила не меняются.\nПодтвердить согласование?"
+    },
+    "nel1": {
+      "brief": {
+        "schema_version": 1,
+        "goal": "xy",
+        "plan_source": "p",
+        "caveat_block": "c",
+        "data_roles": {
+          "explore": [
+            "e"
+          ],
+          "validate": [],
+          "confirm": []
+        },
+        "questions": [
+          {
+            "id": "q1",
+            "text": "t",
+            "decision_rules": [
+              {
+                "id": "r1",
+                "verdict": "confirmed",
+                "when": "w"
+              }
+            ]
+          }
+        ],
+        "process_metrics": [
+          "m"
+        ],
+        "stop_rules": [
+          {
+            "id": "s1",
+            "when": "w"
+          }
+        ]
+      },
+      "campaignId": "camp-1",
+      "expected": "Brief SHA-256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nКампания: camp-1\nЦель: xy\nВопросов: 1 (q1); правил: 1\nВердикты: confirmed, rejected, inconclusive, waiting_for_data\nСтоп-правил: 1; метрик процесса: 1\nЗамок тестовых данных: нет\nПодтверждение фиксирует этот SHA-256: вопросы и правила не меняются.\nПодтвердить согласование?"
+    },
+    "nel9": {
+      "brief": {
+        "schema_version": 1,
+        "goal": "xyzabcdefg",
+        "plan_source": "p",
+        "caveat_block": "c",
+        "data_roles": {
+          "explore": [
+            "e"
+          ],
+          "validate": [],
+          "confirm": []
+        },
+        "questions": [
+          {
+            "id": "q1",
+            "text": "t",
+            "decision_rules": [
+              {
+                "id": "r1",
+                "verdict": "confirmed",
+                "when": "w"
+              }
+            ]
+          }
+        ],
+        "process_metrics": [
+          "m"
+        ],
+        "stop_rules": [
+          {
+            "id": "s1",
+            "when": "w"
+          }
+        ]
+      },
+      "campaignId": "camp-1",
+      "expected": "Brief SHA-256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nКампания: camp-1\nЦель: xyzabcdefg\nВопросов: 1 (q1); правил: 1\nВердикты: confirmed, rejected, inconclusive, waiting_for_data\nСтоп-правил: 1; метрик процесса: 1\nЗамок тестовых данных: нет\nПодтверждение фиксирует этот SHA-256: вопросы и правила не меняются.\nПодтвердить согласование?"
+    },
+    "withGate": {
+      "brief": {
+        "schema_version": 1,
+        "goal": "Цель",
+        "plan_source": "p",
+        "caveat_block": "c",
+        "data_roles": {
+          "explore": [
+            "e"
+          ],
+          "validate": [],
+          "confirm": []
+        },
+        "questions": [
+          {
+            "id": "q1",
+            "text": "t",
+            "decision_rules": [
+              {
+                "id": "r1",
+                "verdict": "confirmed",
+                "when": "w"
+              }
+            ]
+          }
+        ],
+        "process_metrics": [
+          "m"
+        ],
+        "stop_rules": [
+          {
+            "id": "s1",
+            "when": "w"
+          }
+        ],
+        "evidence_gate": {
+          "blocked_globs": [
+            "data/test*.jsonl"
+          ],
+          "gate_file": "gate/g.json",
+          "gate_contains": "OPEN"
+        }
+      },
+      "campaignId": "camp-2",
+      "expected": "Brief SHA-256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nКампания: camp-2\nЦель: Цель\nВопросов: 1 (q1); правил: 1\nВердикты: confirmed, rejected, inconclusive, waiting_for_data\nСтоп-правил: 1; метрик процесса: 1\nЗамок тестовых данных: есть (data/test*.jsonl)\nПодтверждение фиксирует этот SHA-256: вопросы и правила не меняются.\nПодтвердить согласование?"
+    },
+    "customVerdicts": {
+      "brief": {
+        "schema_version": 1,
+        "goal": "Цель",
+        "plan_source": "p",
+        "caveat_block": "c",
+        "data_roles": {
+          "explore": [
+            "e"
+          ],
+          "validate": [],
+          "confirm": []
+        },
+        "questions": [
+          {
+            "id": "q1",
+            "text": "t",
+            "decision_rules": [
+              {
+                "id": "r1",
+                "verdict": "test-consistent",
+                "when": "w"
+              },
+              {
+                "id": "r2",
+                "verdict": "rejected",
+                "when": "w"
+              }
+            ]
+          }
+        ],
+        "process_metrics": [
+          "m"
+        ],
+        "stop_rules": [
+          {
+            "id": "s1",
+            "when": "w"
+          }
+        ],
+        "verdicts": [
+          "test-consistent",
+          "rejected"
+        ]
+      },
+      "campaignId": "camp-3",
+      "expected": "Brief SHA-256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nКампания: camp-3\nЦель: Цель\nВопросов: 1 (q1); правил: 2\nВердикты: test-consistent, rejected\nСтоп-правил: 1; метрик процесса: 1\nЗамок тестовых данных: нет\nПодтверждение фиксирует этот SHA-256: вопросы и правила не меняются.\nПодтвердить согласование?"
+    }
+  }
+}
