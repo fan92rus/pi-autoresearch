@@ -1,7 +1,7 @@
 /**
  * Shared consent primitives (openspec: optimize-approval-hardening, step B).
- * canonicalize, unknown-field detection, line-break detection and the common consent flow
- * live in brief-consent.ts and are used by both the ordinary loop and research mode.
+ * canonicalize, unknown-field detection, control/line-break detection, the dialog body and the common
+ * consent flow live in brief-consent.ts and are used by both the ordinary loop and research mode.
  *
  * Run: timeout 180 node --experimental-strip-types --experimental-loader ./tests/redirect-loader.mjs --test tests/optimize-consent-shared.test.mjs
  */
@@ -26,11 +26,18 @@ test("B2: unknownKeys returns only the keys outside the allowed set, in input or
   assert.deepEqual(bc.unknownKeys({ a: 1 }, new Set(["a"])), []);
 });
 
-test("B3: hasLineBreak sees every physical line break, and nothing else", () => {
-  for (const s of ["a\nb", "a\rb", "a\r\nb", "a\u2028b", "a\u2029b", "a\u0085b"]) {
-    assert.equal(bc.hasLineBreak(s), true, JSON.stringify(s));
+test("B3: hasControlOrLineBreak sees every line break and control character, and nothing else", () => {
+  const cases = ["a\nb", "a\rb", "a\r\nb", "a\u2028b", "a\u2029b", "a\u0085b", "a\u0000b", "a\u007fb"];
+  for (const s of cases) {
+    assert.equal(bc.hasControlOrLineBreak(s), true, JSON.stringify(s));
   }
-  assert.equal(bc.hasLineBreak("plain text"), false);
+  assert.equal(bc.hasControlOrLineBreak("plain text"), false);
+});
+
+test("B3: optimize refuses a control character in name even when it is not a line break", () => {
+  const r = ob.validateOptimizeBrief({ name: "a\u0007b", metric_name: "m" });
+  assert.equal(r.ok, false);
+  assert.match(r.errors.join(";"), /single line/);
 });
 
 test("B4: askConsent without a UI asks nothing and records nothing", async () => {
@@ -91,4 +98,35 @@ test("B4: a failed record after confirmation is reported with its own failure", 
 
 test("B5: the consent body budget holds for every mode (shared 10-line rule)", () => {
   assert.throws(() => bc.consentDialogBody("a".repeat(64), Array.from({ length: 12 }, (_, i) => `l${i}`), "q"), /line budget/);
+});
+
+test("B6: the research dialog is assembled by consentDialogBody with its own footer (one place, same bytes)", () => {
+  const brief = {
+    schema_version: 1,
+    goal: "g",
+    plan_source: "p",
+    caveat_block: "c",
+    data_roles: { explore: ["e"], validate: [], confirm: [] },
+    questions: [{ id: "q1", text: "t", decision_rules: [{ id: "r1", verdict: "confirmed", when: "w" }] }],
+    process_metrics: ["m"],
+    stop_rules: [{ id: "s1", when: "w" }],
+  };
+  const sha = "a".repeat(64);
+  const body = bc.briefConsentSummary(brief, sha, "camp-1");
+  const expected = bc.consentDialogBody(
+    sha,
+    [
+      "Кампания: camp-1",
+      "Цель: g",
+      "Вопросов: 1 (q1); правил: 1",
+      "Вердикты: confirmed, rejected, inconclusive, waiting_for_data",
+      "Стоп-правил: 1; метрик процесса: 1",
+      "Замок тестовых данных: нет",
+    ],
+    "Подтвердить согласование?",
+    bc.CONSENT_FOOTER_RESEARCH,
+  );
+  assert.equal(body, expected);
+  assert.ok(body.split("\n").length <= bc.CONSENT_SUMMARY_MAX_LINES);
+  assert.ok(body.startsWith(`Brief SHA-256: ${sha}\n`));
 });

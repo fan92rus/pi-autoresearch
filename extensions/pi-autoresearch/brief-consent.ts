@@ -38,11 +38,14 @@ export function unknownKeys(obj: Record<string, unknown>, allowed: ReadonlySet<s
   return Object.keys(obj).filter((key) => !allowed.has(key));
 }
 
-/** Every character that starts a new physical line in a dialog or a Markdown list. */
-const LINE_BREAK_RE = /[\n\r\u0085\u2028\u2029]/;
+/**
+ * A character that breaks a single-line field: every physical line break and every control character
+ * (C0, DEL, C1; the C1 range includes U+0085). Shared by the optimize brief check and the dialog budget.
+ */
+const NOT_SINGLE_LINE_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
-export function hasLineBreak(text: string): boolean {
-  return LINE_BREAK_RE.test(text);
+export function hasControlOrLineBreak(text: string): boolean {
+  return NOT_SINGLE_LINE_RE.test(text);
 }
 
 export type ConsentOutcome<F> =
@@ -123,8 +126,22 @@ export function briefChatMarkdown(brief: ResearchBrief, sha256: string, campaign
  * Shared consent dialog body for every brief mode (research campaigns and the ordinary loop):
  * the first line is `Brief SHA-256: <hex>`, the rest is the mode's summary. Enforces the line budget.
  */
-export function consentDialogBody(sha256: string, summaryLines: string[], question: string): string {
-  const body = [`Brief SHA-256: ${sha256}`, ...summaryLines, "Подтверждение фиксирует этот SHA-256: поля брифа не меняются.", question].join("\n");
+/** The footer names what the SHA covers; each mode uses its own wording. */
+export const CONSENT_FOOTER_OPTIMIZE = "Подтверждение фиксирует этот SHA-256: поля брифа не меняются.";
+export const CONSENT_FOOTER_RESEARCH = "Подтверждение фиксирует этот SHA-256: вопросы и правила не меняются.";
+
+/**
+ * Shared consent dialog body for every brief mode: the first line is `Brief SHA-256: <hex>`, then the
+ * mode's summary, the footer and the question. This is the only place the dialog is assembled, and it
+ * enforces the line budget on physical lines.
+ */
+export function consentDialogBody(
+  sha256: string,
+  summaryLines: string[],
+  question: string,
+  footer: string = CONSENT_FOOTER_OPTIMIZE,
+): string {
+  const body = [`Brief SHA-256: ${sha256}`, ...summaryLines, footer, question].join("\n");
   // Budget counts physical lines, not array items: an embedded newline must not slip past it.
   if (body.split(/\r\n|[\n\r\u2028\u2029\u0085]/).length > CONSENT_SUMMARY_MAX_LINES) throw new Error("consent summary exceeds the line budget");
   return body;
@@ -141,17 +158,17 @@ export function briefConsentSummary(brief: ResearchBrief, sha256: string, campai
   const gate = brief.evidence_gate
     ? `есть (${clip(brief.evidence_gate.blocked_globs.join(", "), CLIP_LIST)})`
     : "нет";
-  const lines = [
-    `Brief SHA-256: ${sha256}`,
-    `Кампания: ${campaignId}`,
-    `Цель: ${clip(brief.goal, CLIP_GOAL)}`,
-    `Вопросов: ${brief.questions.length} (${clip(questionIds, CLIP_LIST)}); правил: ${rules}`,
-    `Вердикты: ${clip(verdicts.join(", "), CLIP_LIST)}`,
-    `Стоп-правил: ${brief.stop_rules.length}; метрик процесса: ${brief.process_metrics.length}`,
-    `Замок тестовых данных: ${gate}`,
-    "Подтверждение фиксирует этот SHA-256: вопросы и правила не меняются.",
+  return consentDialogBody(
+    sha256,
+    [
+      `Кампания: ${campaignId}`,
+      `Цель: ${clip(brief.goal, CLIP_GOAL)}`,
+      `Вопросов: ${brief.questions.length} (${clip(questionIds, CLIP_LIST)}); правил: ${rules}`,
+      `Вердикты: ${clip(verdicts.join(", "), CLIP_LIST)}`,
+      `Стоп-правил: ${brief.stop_rules.length}; метрик процесса: ${brief.process_metrics.length}`,
+      `Замок тестовых данных: ${gate}`,
+    ],
     "Подтвердить согласование?",
-  ];
-  if (lines.length > CONSENT_SUMMARY_MAX_LINES) throw new Error("consent summary exceeds the line budget");
-  return lines.join("\n");
+    CONSENT_FOOTER_RESEARCH,
+  );
 }

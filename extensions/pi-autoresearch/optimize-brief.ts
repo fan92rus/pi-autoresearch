@@ -7,7 +7,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomBytes } from "node:crypto";
-import { canonicalize, consentDialogBody, CONSENT_SUMMARY_MAX_LINES, unknownKeys } from "./brief-consent.ts";
+import { canonicalize, consentDialogBody, CONSENT_SUMMARY_MAX_LINES, hasControlOrLineBreak, unknownKeys } from "./brief-consent.ts";
 
 export { canonicalize };
 import { sha256Hex } from "./research-state.ts";
@@ -66,7 +66,7 @@ export function validateOptimizeBrief(input: unknown): BriefValidation {
   // Every string field is one physical line: a newline would break the dialog budget and the markdown list.
   for (const key of ["name", "metric_name", "metric_unit", "cwd"] as const) {
     const v = obj[key];
-    if (typeof v === "string" && /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(v)) errors.push(`${key} must be a single line (no control characters)`);
+    if (typeof v === "string" && hasControlOrLineBreak(v)) errors.push(`${key} must be a single line (no control characters)`);
   }
   if (errors.length > 0) return { ok: false, errors };
   const brief: OptimizeBrief = {
@@ -128,7 +128,12 @@ export function writeTextAtomicSync(target: string, text: string, ops: AtomicWri
         // the descriptor is already unusable; the original error is the one to report
       }
     }
-    fs.rmSync(tmp, { force: true });
+    // Removing the temporary file must not replace the original error; a leftover .tmp is the lesser failure.
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      // the original error below is the one to report
+    }
     throw err;
   }
 }
@@ -183,9 +188,45 @@ function isCalendarIso(text: string): boolean {
   if (!m) return false;
   const [y, mo, d, h, mi, s] = m.slice(1, 7).map(Number);
   if (mo < 1 || mo > 12 || d < 1 || h > 23 || mi > 59 || s > 59) return false;
-  const probe = new Date(Date.UTC(y, mo - 1, d));
-  if (probe.getUTCMonth() !== mo - 1 || probe.getUTCDate() !== d) return false;
+  // setUTCFullYear, not Date.UTC: Date.UTC maps years 0-99 to 1900-1999 and would refuse 0000-02-29.
+  const probe = new Date(0);
+  probe.setUTCFullYear(y, mo - 1, d);
+  if (probe.getUTCFullYear() !== y || probe.getUTCMonth() !== mo - 1 || probe.getUTCDate() !== d) return false;
   return !Number.isNaN(Date.parse(text));
+}
+
+/**
+ * True when the raw object text repeats a top-level key. JSON.parse keeps the last value silently, so the
+ * approval reader checks the text too. Call only on text that already parsed as JSON.
+ */
+export function hasDuplicateTopLevelKeys(raw: string): boolean {
+  const seen = new Set<string>();
+  let depth = 0;
+  let expectKey = false;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (c === '"') {
+      let j = i + 1;
+      while (j < raw.length && raw[j] !== '"') j += raw[j] === "\\" ? 2 : 1;
+      if (depth === 1 && expectKey) {
+        const key = JSON.parse(raw.slice(i, j + 1)) as string;
+        if (seen.has(key)) return true;
+        seen.add(key);
+      }
+      expectKey = false;
+      i = j;
+    } else if (c === "{" || c === "[") {
+      depth++;
+      if (c === "{" && depth === 1) expectKey = true;
+    } else if (c === "}" || c === "]") {
+      depth--;
+    } else if (c === ",") {
+      if (depth === 1) expectKey = true;
+    } else if (c === ":") {
+      expectKey = false;
+    }
+  }
+  return false;
 }
 
 /** Strict rules shared in spirit with research approval: exact fields, typed values, lowercase hex hash. */
@@ -246,6 +287,9 @@ export function readOptimizeApproval(dir: string): ApprovalResult {
     parsed = JSON.parse(raw);
   } catch {
     return { ok: false, reason: "approval_invalid", message: "approval.json is not valid JSON" };
+  }
+  if (hasDuplicateTopLevelKeys(raw)) {
+    return { ok: false, reason: "approval_invalid", message: "approval.json failed validation: duplicate key" };
   }
   const problem = approvalProblem(parsed);
   if (problem) return { ok: false, reason: "approval_invalid", message: `approval.json failed validation: ${problem}` };

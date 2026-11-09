@@ -124,6 +124,27 @@ test("A1: an invalid approval.json blocks the start gate with approval_invalid",
   assert.equal(gate.reason, "approval_invalid");
 });
 
+test("A1: a duplicate key in approval.json is approval_invalid (JSON.parse would keep the last value)", () => {
+  const dir = makeWorkDir("dupkey");
+  const raw = `{"schema_version":1,"confirmed":false,"confirmed":true,"brief_sha256":"${HEX}","decided_at":"2026-11-09T10:00:00Z"}`;
+  const od = writeApprovalRaw(dir, raw);
+  const r = ob.readOptimizeApproval(od);
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "approval_invalid");
+});
+
+test("A1: a real leap day in year 0000 is a valid decided_at (no 1900 shift)", () => {
+  const dir = makeWorkDir("year0");
+  const od = writeApprovalRaw(dir, JSON.stringify(validApproval({ decided_at: "0000-02-29T00:00:00Z" })));
+  assert.equal(ob.readOptimizeApproval(od).ok, true);
+});
+
+test("A1: a non-existent day in year 0000 is still refused", () => {
+  const dir = makeWorkDir("year0bad");
+  const od = writeApprovalRaw(dir, JSON.stringify(validApproval({ decided_at: "0001-02-29T00:00:00Z" })));
+  assert.equal(ob.readOptimizeApproval(od).reason, "approval_invalid");
+});
+
 // ── A2: atomic writes ────────────────────────────────────────────────
 
 test("A2: a failed rename keeps the previous file content and leaves no temporary file", () => {
