@@ -25,9 +25,9 @@
 ## 4. Гейты и изоляция
 
 - [x] 4.1 `run_experiment` до старта отказывает с подсказкой шага. Тест: next step is optimize_brief draft. `log_experiment` защищён тем же гейтом (чтением кода).
-- [x] 4.2 Проверки кампаний идут раньше гейтов этой спеки: чтением кода. Поведение кампаний: серийный прогон research-суит зелёный.
+- [x] 4.2 Кампании: тест "campaign isolation" (tests/optimize-two-phase-start.test.mjs) — активная research-кампания отказывает optimize_brief, init и run без записи optimize-состояния и журнала. Тесты research-суит зелёные отдельно.
 - [x] 4.3 `scripts/research-rpc.mjs` не менялся: `git diff -- scripts/` пуст.
-- [x] 4.4 Смена `metric_name`, `direction` или цели после старта требует нового согласования. Тесты: "4.4: changing metric_name" (метрика) и "direction after start" (направление: отказ без новой строки в журнале, одобренная смена даёт заголовок с новым bestDirection). Смена цели (name) проверяется тем же сравнением заголовка и initArgsMismatch, отдельного теста на name нет. Тесты стоят в начале файла: модульное _customWorkDir от закрепляющих тестов иначе протекает в сессию.
+- [x] 4.4 Смена `metric_name`, `direction` или `name` (цели) после старта требует нового согласования. Тесты: "4.4: changing metric_name", "direction after start", "name change after the start" — отказ без новой строки в журнале, одобренная смена даёт ровно один новый заголовок. Тесты стоят в начале файла (модульное _customWorkDir).
 
 ## 5. Промпт и документация
 
