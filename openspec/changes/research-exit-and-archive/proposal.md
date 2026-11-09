@@ -33,8 +33,9 @@
 
 ## Status
 
-Черновик. Текст спеки ещё не согласован владельцем; по правилам проекта после согласия
-спека замораживается. Код частично расходится с ней (см. `tasks.md`, раздел 2).
+Согласовано владельцем (2026-11-09, «согласен»). Спека заморожена: реализация идёт по ней,
+текст не меняется. Правки только новым проходом цикла (новое изменение или amendment).
+Код приведён к спеке в коммите `6d0a124` (см. `tasks.md`, раздел 2).
 
 ## Impact
 
@@ -42,4 +43,4 @@
   `specs/headless-launch/spec.md` (MODIFIED guard запуска).
 - Код: `extensions/pi-autoresearch/index.ts` (draft/archive, `exitResearchMode`, `report`).
 - Тесты: `tests/research-archive-finished.test.mjs`, `tests/research-auto-exit.test.mjs`.
-- Документация: `docs/research-vectors.md` (строки про архив и выход пока нет).
+- Документация: `docs/research-vectors.md` (раздел «Finished campaigns and leaving research mode»).
