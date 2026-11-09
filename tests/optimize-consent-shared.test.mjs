@@ -146,3 +146,45 @@ test("B7: a research goal with many U+0085 (NEL) builds a dialog within the line
   assert.ok(body.split(/\r\n|[\n\r\u2028\u2029\u0085]/).length <= bc.CONSENT_SUMMARY_MAX_LINES);
   assert.ok(body.includes("Цель: x y z a b c d e f g"));
 });
+
+// Golden bytes captured from the research dialog before the shared-builder change (parent 7924514^) on the same brief.
+test("B8: golden research dialog bytes for a plain brief are unchanged from the parent commit", () => {
+  const brief = {
+    schema_version: 1,
+    goal: "Найти причину деградации",
+    plan_source: "p",
+    caveat_block: "c",
+    data_roles: { explore: ["e"], validate: [], confirm: [] },
+    questions: [{ id: "q1", text: "t", decision_rules: [{ id: "r1", verdict: "confirmed", when: "w" }] }],
+    process_metrics: ["m"],
+    stop_rules: [{ id: "s1", when: "w" }],
+  };
+  const expected = [
+    "Brief SHA-256: " + "a".repeat(64),
+    "Кампания: camp-1",
+    "Цель: Найти причину деградации",
+    "Вопросов: 1 (q1); правил: 1",
+    "Вердикты: confirmed, rejected, inconclusive, waiting_for_data",
+    "Стоп-правил: 1; метрик процесса: 1",
+    "Замок тестовых данных: нет",
+    "Подтверждение фиксирует этот SHA-256: вопросы и правила не меняются.",
+    "Подтвердить согласование?",
+  ].join("\n");
+  assert.equal(bc.briefConsentSummary(brief, "a".repeat(64), "camp-1"), expected);
+});
+
+test("B9: a single U+0085 in the research goal is flattened (documented deviation: the parent printed 10 physical lines)", () => {
+  const brief = {
+    schema_version: 1,
+    goal: "x\u0085y",
+    plan_source: "p",
+    caveat_block: "c",
+    data_roles: { explore: ["e"], validate: [], confirm: [] },
+    questions: [{ id: "q1", text: "t", decision_rules: [{ id: "r1", verdict: "confirmed", when: "w" }] }],
+    process_metrics: ["m"],
+    stop_rules: [{ id: "s1", when: "w" }],
+  };
+  const body = bc.briefConsentSummary(brief, "a".repeat(64), "camp-1");
+  assert.ok(body.includes("Цель: x y"));
+  assert.equal(body.split(/\r\n|[\n\r\u2028\u2029\u0085]/).length, 9);
+});

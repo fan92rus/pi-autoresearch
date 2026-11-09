@@ -141,7 +141,24 @@ test("4.4: changing metric_name after the start needs a new brief; the new metri
   assert.equal(headers[headers.length - 1].metricName, "bundle_kb");
 });
 
-// Unpinned tests (5.1, D1) stay before every test that pins a cwd: the module-level _customWorkDir would leak into them.
+// Unpinned tests (5.1, D1, approval refusal) stay before every test that pins a cwd: the module-level _customWorkDir would leak into them.
+
+test("approval_invalid blocks init_experiment: the approval file is corrupted, and no config header is appended", async () => {
+  const dir = makeWorkDir("init-approval-invalid");
+  const h = await loadBare(dir, "init-approval-invalid");
+  h.ctx.ui.confirm = async () => true;
+  await run(h, "optimize_brief", { action: "draft", brief: briefArgs() });
+  await run(h, "optimize_brief", { action: "propose" });
+  fs.writeFileSync(
+    path.join(dir, ".auto", "optimize", "approval.json"),
+    JSON.stringify({ schema_version: 1, confirmed: "yes", brief_sha256: "x", decided_at: "nope" }),
+  );
+  const before = readConfigHeaders(dir).length;
+  const out = await run(h, "init_experiment", briefArgs());
+  assert.match(out, /approval_invalid/, out);
+  assert.match(out, /approval\.json/, out);
+  assert.equal(readConfigHeaders(dir).length, before, "an invalid approval must not start the session");
+});
 
 test("5.1: the ordinary-loop system prompt states the order draft -> propose -> init_experiment", async () => {
   const dir = makeWorkDir("prompt-order");

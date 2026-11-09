@@ -101,19 +101,25 @@ export type DraftResult = { ok: true; sha256: string } | { ok: false; errors: st
  * previous target content and removes the temporary file. `rename` is injectable for the failure test.
  */
 export interface AtomicWriteOps {
-  rename?: (from: string, to: string) => void;
+  write?: (fd: number, text: string) => void;
+  fsync?: (fd: number) => void;
   close?: (fd: number) => void;
+  rename?: (from: string, to: string) => void;
+  remove?: (file: string) => void;
 }
 
 export function writeTextAtomicSync(target: string, text: string, ops: AtomicWriteOps = {}): void {
-  const rename = ops.rename ?? fs.renameSync;
+  const write = ops.write ?? ((fd: number, text: string) => fs.writeFileSync(fd, text, "utf-8"));
+  const fsync = ops.fsync ?? fs.fsyncSync;
   const close = ops.close ?? fs.closeSync;
+  const rename = ops.rename ?? fs.renameSync;
+  const remove = ops.remove ?? ((file: string) => fs.rmSync(file, { force: true }));
   const tmp = `${target}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
   let fd: number | null = null;
   try {
     fd = fs.openSync(tmp, "wx");
-    fs.writeFileSync(fd, text, "utf-8");
-    fs.fsyncSync(fd);
+    write(fd, text);
+    fsync(fd);
     const toClose = fd;
     fd = null;
     close(toClose);
@@ -130,7 +136,7 @@ export function writeTextAtomicSync(target: string, text: string, ops: AtomicWri
     }
     // Removing the temporary file must not replace the original error; a leftover .tmp is the lesser failure.
     try {
-      fs.rmSync(tmp, { force: true });
+      remove(tmp);
     } catch {
       // the original error below is the one to report
     }
@@ -289,10 +295,10 @@ export function readOptimizeApproval(dir: string): ApprovalResult {
     return { ok: false, reason: "approval_invalid", message: "approval.json is not valid JSON" };
   }
   if (hasDuplicateTopLevelKeys(raw)) {
-    return { ok: false, reason: "approval_invalid", message: "approval.json failed validation: duplicate key" };
+    return { ok: false, reason: "approval_invalid", message: "approval.json has no confirmed flag or hash (duplicate key)" };
   }
   const problem = approvalProblem(parsed);
-  if (problem) return { ok: false, reason: "approval_invalid", message: `approval.json failed validation: ${problem}` };
+  if (problem) return { ok: false, reason: "approval_invalid", message: `approval.json has no confirmed flag or hash (${problem})` };
   return { ok: true, approval: parsed as OptimizeApproval };
 }
 

@@ -183,6 +183,67 @@ test("A2: a failed close keeps the previous content, leaves no temporary file, a
   assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith(".tmp")), []);
 });
 
+test("A2: a failed write keeps the previous content, leaves no temporary file, and reports the write error", () => {
+  const dir = makeWorkDir("writefail");
+  const target = path.join(dir, "approval.json");
+  fs.writeFileSync(target, "OLD", "utf-8");
+  assert.throws(
+    () =>
+      ob.writeTextAtomicSync(target, "NEW", {
+        write: () => {
+          throw new Error("simulated ENOSPC on write");
+        },
+      }),
+    /simulated ENOSPC on write/,
+  );
+  assert.equal(fs.readFileSync(target, "utf-8"), "OLD");
+  assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith(".tmp")), []);
+});
+
+test("A2: a failed fsync keeps the previous content and reports the fsync error", () => {
+  const dir = makeWorkDir("fsyncfail");
+  const target = path.join(dir, "approval.json");
+  fs.writeFileSync(target, "OLD", "utf-8");
+  assert.throws(
+    () =>
+      ob.writeTextAtomicSync(target, "NEW", {
+        fsync: () => {
+          throw new Error("simulated EIO on fsync");
+        },
+      }),
+    /simulated EIO on fsync/,
+  );
+  assert.equal(fs.readFileSync(target, "utf-8"), "OLD");
+  assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith(".tmp")), []);
+});
+
+test("A2: when the temporary file cannot be removed, the original write error still wins", () => {
+  const dir = makeWorkDir("rmfail");
+  const target = path.join(dir, "approval.json");
+  fs.writeFileSync(target, "OLD", "utf-8");
+  assert.throws(
+    () =>
+      ob.writeTextAtomicSync(target, "NEW", {
+        write: () => {
+          throw new Error("simulated ENOSPC on write");
+        },
+        remove: () => {
+          throw new Error("simulated EPERM on remove");
+        },
+      }),
+    /simulated ENOSPC on write/,
+  );
+  assert.equal(fs.readFileSync(target, "utf-8"), "OLD");
+});
+
+test("A1: the approval_invalid hint keeps the text the optimize module has always shown for a bad approval", () => {
+  const dir = makeWorkDir("hint");
+  const od = writeApprovalRaw(dir, JSON.stringify({ schema_version: 1, confirmed: "yes", brief_sha256: HEX, decided_at: "2026-11-09T10:00:00Z" }));
+  const r = ob.readOptimizeApproval(od);
+  assert.equal(r.reason, "approval_invalid");
+  assert.match(r.message, /^approval\.json has no confirmed flag or hash/);
+});
+
 test("A2: a successful draft write leaves no temporary file and the bytes match the hash", () => {
   const dir = makeWorkDir("draftatomic");
   const od = ob.optimizeDirOf(dir);
