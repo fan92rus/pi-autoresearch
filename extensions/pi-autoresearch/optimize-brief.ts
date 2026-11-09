@@ -62,7 +62,7 @@ export function validateOptimizeBrief(input: unknown): BriefValidation {
   if (obj.direction !== undefined && (typeof obj.direction !== "string" || !DIRECTIONS.has(obj.direction))) {
     errors.push('direction must be "lower" or "higher"');
   }
-  if (obj.cwd !== undefined && (typeof obj.cwd !== "string" || !/[^\s\u200B-\u200D\uFEFF]/.test(obj.cwd))) {
+  if (obj.cwd !== undefined && (typeof obj.cwd !== "string" || !/[^\s\p{Cf}]/u.test(obj.cwd))) {
     errors.push("cwd must be a non-empty string");
   }
   // Every string field is one physical line: a newline would break the dialog budget and the markdown list.

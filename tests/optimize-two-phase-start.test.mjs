@@ -234,6 +234,19 @@ test("name change after the start needs a new brief, and the approved new name s
   assert.equal(headers[headers.length - 1].name, "other goal");
 });
 
+test("invisible-format cwd (U+2060, U+180E, U+00AD, U+200E) is refused as empty", async () => {
+  const dir = makeWorkDir("invisible-cwd");
+  const h = await loadBare(dir, "invisible-cwd");
+  h.ctx.ui.confirm = async () => true;
+  await run(h, "optimize_brief", { action: "draft", brief: briefArgs() });
+  await run(h, "optimize_brief", { action: "propose" });
+  for (const cwd of ["\u2060", "\u180E", "\u00AD", "\u200E"]) {
+    const text = await run(h, "init_experiment", { name: "liquid speed", metric_name: "total_us", metric_unit: "us", direction: "lower", cwd });
+    assert.match(text, /cwd must be a non-empty path/, `${JSON.stringify(cwd)} must be refused: ${text}`);
+  }
+  assert.equal(fs.existsSync(path.join(dir, ".auto", "log.jsonl")), false);
+});
+
 test("zero-width cwd is refused as empty, like a blank one", async () => {
   const dir = makeWorkDir("zero-width-cwd");
   const h = await loadBare(dir, "zero-width-cwd");
