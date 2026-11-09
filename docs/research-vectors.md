@@ -265,6 +265,19 @@ warns and does not fail the close.
 
 Tests: `node --test tests/research-rpc-wrapper.test.mjs` (16, includes a real
 win32 `.cmd`-shim end-to-end) and `tests/research-subcommand.test.mjs` (11).
+## Finished campaigns and leaving research mode
+
+A finished campaign (`phase: stopped`) is kept, never deleted.
+
+- **Archive on a new draft.** `research_brief draft` that creates a new campaign directory first checks the brief. Then every finished campaign under the research root moves to `.auto/research-archive/<id>-<stamp>/` as a whole: report, log, briefs and state. This applies to the unpinned draft and to a pinned new id (`/autoresearch research --id <new>`).
+- **Refusal.** If another campaign is briefing, researching or unreadable, the draft refuses and nothing moves. A single briefing campaign found without a pinned id is reused, as before.
+- **Launch.** A bare `/autoresearch research <description>` is not refused by a finished campaign. It is refused only by a briefing, researching or unreadable one.
+- **Stop does not leave the mode.** `research stop` keeps research mode on, so `status` and `report` still work.
+- **Exit after the report.** `research report` of a stopped campaign writes `report.md` first. Only after a successful save does autoresearch mode go OFF: the OFF activation is recorded in the session, the pin is released and no automatic continuation follows. If the save fails, the mode stays on and the report says so.
+- **Restoring an archived campaign** is manual: move its directory back under `.auto/research/`.
+
+Spec: `openspec/changes/research-exit-and-archive/`.
+
 ## Run: `node --experimental-strip-types --experimental-loader ./tests/redirect-loader.mjs --test tests/research-state.test.mjs tests/research-branch-wiring.test.mjs`
 
 Module and wiring suites: `tests/research-state.test.mjs` (52),

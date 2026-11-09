@@ -8197,6 +8197,31 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
   };
 
+  /** Campaign ids under the bases that do NOT count as finished: briefing,
+   *  research, or unreadable (also an unlistable base). A finished (stopped)
+   *  campaign never blocks a launch; the draft that starts a new campaign
+   *  archives it. */
+  const blockingCampaignIds = async (bases: string[]): Promise<string[]> => {
+    const out: string[] = [];
+    for (const base of bases) {
+      const ids = listResearchCampaignIds(base);
+      if (ids === null) {
+        out.push(`(unreadable root ${base})`);
+        continue;
+      }
+      for (const id of ids) {
+        const resolved = researchState.resolveCampaignDir(base, id);
+        if (!resolved.ok) {
+          out.push(id);
+          continue;
+        }
+        const insp = await researchState.inspectCampaign(resolved.dir);
+        if (insp.state?.phase !== "stopped") out.push(id);
+      }
+    }
+    return [...new Set(out)].sort();
+  };
+
   /** Moves every FINISHED (phase stopped) campaign of the session's bases into
    *  <base>/.auto/research-archive/<id>-<stamp>. A move, never a delete. Returns
    *  the archived names, or null when any campaign is active, unreadable or
@@ -8784,6 +8809,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // generates one and pins it; with several, everything refuses.
       // Campaign STATE lives under the effective base (pinned --state-root or
       // the work directory): resolveCampaignDir/createCampaign take that base.
+      // A refused brief must move nothing: validate before any archive step.
+      if (action === "draft") {
+        if (params.brief === undefined) return fail("invalid_argument", "draft requires the brief object");
+        const early = researchState.validateBrief(params.brief);
+        if (!early.ok) {
+          return fail("brief_invalid", `brief rejected (${early.errors.length} problem(s)): ${early.errors.join("; ")}`);
+        }
+      }
       const stateBase = effectiveResearchBase(workDir, ctx);
       let campaignId = getRuntime(ctx).researchCampaignId;
       if (campaignId === null) {
@@ -8832,10 +8865,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const dir = dirFromState ?? dirFromDefault ?? (stateRootDir.ok ? stateRootDir.dir : path.join(researchState.researchRoot(stateBase), campaignId!));
 
       if (action === "draft") {
-        if (params.brief === undefined) return fail("invalid_argument", "draft requires the brief object");
-        const validation = researchState.validateBrief(params.brief);
-        if (!validation.ok) {
-          return fail("brief_invalid", `brief rejected (${validation.errors.length} problem(s)): ${validation.errors.join("; ")}`);
+        // A NEW campaign directory (pinned or generated) moves the finished
+        // campaigns to the archive first; an active or unreadable one refuses.
+        if (dirFromState === null && dirFromDefault === null) {
+          const moved = await archiveFinishedCampaigns(workDir, stateBase);
+          if (moved === null) {
+            return fail("invalid_argument", `a research campaign other than ${campaignId} is active or unreadable; finish it first: a session works with exactly one campaign`);
+          }
         }
         const created = await researchState.createCampaign(campaignBase, campaignId);
         if (!created.ok && created.reason !== "campaign_exists") return fail(created.reason, created.message);
@@ -9086,17 +9122,22 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // report text is still returned. Report is NOT gated on stop.
         const reportPath = path.join(dir, "report.md");
         let savedNote: string;
+        let saved = false;
         try {
           await researchState.writeFileAtomic(reportPath, reportText + "\n");
+          saved = true;
           savedNote = `Report saved to ${path.relative(workDir, reportPath)}`;
         } catch (err) {
           savedNote = `warning: the report could not be saved to ${path.relative(workDir, reportPath)} (${err instanceof Error ? err.message : String(err)})`;
         }
         // A report of a STOPPED campaign is the campaign's last step: leave
         // research mode now (the report is already on disk).
-        if (snap.state.phase === "stopped") {
+        if (snap.state.phase === "stopped" && saved) {
           exitResearchMode(ctx, id);
           return reply(reportText + "\n\n" + savedNote + "\nResearch mode is OFF.");
+        }
+        if (snap.state.phase === "stopped") {
+          return reply(reportText + "\n\n" + savedNote + "\nResearch mode stays ON: the report is not saved. Fix the cause and run research report again.");
         }
         return reply(reportText + "\n\n" + savedNote);
       }
@@ -9645,11 +9686,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             }
           }
         } else if (existingIds.length > 0) {
-          // No --id and campaigns exist: never silently start a second one.
-          ctx.ui.notify(existingIds.length > 1
-            ? `Several campaigns exist (${existingIds.join(", ")}); resume one with /autoresearch research --id <id>; finished campaigns are archived automatically on the next draft`
-            : `Campaign ${existingIds[0]} exists; resume it with /autoresearch research --id ${existingIds[0]}, stop it first to start a new campaign (finished campaigns are archived automatically on draft)`, "info");
-          return;
+          // No --id and a campaign that is not finished exists: never silently
+          // start a second one. A finished (stopped) campaign does not block:
+          // the draft that starts the new campaign archives it.
+          const blocking = await blockingCampaignIds(uniqueLaunchBases);
+          if (blocking.length > 0) {
+            ctx.ui.notify(blocking.length > 1
+              ? `Several campaigns exist (${blocking.join(", ")}); resume one with /autoresearch research --id <id>, or finish it first`
+              : `Campaign ${blocking[0]} is active or unreadable; resume it with /autoresearch research --id ${blocking[0]}, or finish it first`, "info");
+            return;
+          }
         }
         if (await campaignBlocksOrdinaryLoop(researchWorkDir)) {
           ctx.ui.notify("Candidate campaign active — use candidate_branch; the research campaign is not started.", "info");
