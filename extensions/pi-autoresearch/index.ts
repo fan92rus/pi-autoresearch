@@ -8684,8 +8684,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         "Optimization session: approve brief",
         optimizeBrief.optimizeConsentSummary(read.brief, read.sha256),
       );
-      optimizeBrief.writeOptimizeApproval(dir, confirmed === true, read.sha256);
-      if (confirmed !== true) return optimizeRefusal("❌ the owner did not confirm the brief; nothing was approved");
+      if (confirmed !== true) {
+        optimizeBrief.writeOptimizeApproval(dir, false, read.sha256);
+        return optimizeRefusal("❌ the owner did not confirm the brief; nothing was approved");
+      }
+      const written = optimizeBrief.writeOptimizeApproval(dir, true, read.sha256);
+      if (!written.ok) return optimizeRefusal(`❌ ${written.message}; nothing was approved`);
       return {
         content: [{ type: "text", text: `✅ Brief approved (sha256 ${read.sha256}). Call init_experiment with the same name, metric_name, metric_unit, direction and cwd.` }],
         details: { action },

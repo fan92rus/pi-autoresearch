@@ -6,6 +6,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { randomBytes } from "node:crypto";
 import { consentDialogBody, CONSENT_SUMMARY_MAX_LINES } from "./brief-consent.ts";
 import { sha256Hex } from "./research-state.ts";
 
@@ -106,13 +107,41 @@ export function optimizeDirOf(baseDir: string): string {
 
 export type DraftResult = { ok: true; sha256: string } | { ok: false; errors: string[] };
 
+/**
+ * Atomic text write: a temporary file (wx), fsync, then rename over the target. A failure keeps the
+ * previous target content and removes the temporary file. `rename` is injectable for the failure test.
+ */
+export function writeTextAtomicSync(
+  target: string,
+  text: string,
+  rename: (from: string, to: string) => void = fs.renameSync,
+): void {
+  const tmp = `${target}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  const fd = fs.openSync(tmp, "wx");
+  try {
+    fs.writeFileSync(fd, text, "utf-8");
+    fs.fsyncSync(fd);
+  } catch (err) {
+    fs.closeSync(fd);
+    fs.rmSync(tmp, { force: true });
+    throw err;
+  }
+  fs.closeSync(fd);
+  try {
+    rename(tmp, target);
+  } catch (err) {
+    fs.rmSync(tmp, { force: true });
+    throw err;
+  }
+}
+
 /** Validates and writes brief.json in canonical form. Nothing is written when validation fails. */
 export function writeOptimizeBriefDraft(dir: string, input: unknown): DraftResult {
   const validation = validateOptimizeBrief(input);
   if (!validation.ok) return validation;
   const bytes = canonicalBriefBytes(validation.brief);
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, OPTIMIZE_BRIEF_FILE), bytes, "utf-8");
+  writeTextAtomicSync(path.join(dir, OPTIMIZE_BRIEF_FILE), bytes);
   return { ok: true, sha256: sha256Hex(bytes) };
 }
 
@@ -146,8 +175,38 @@ export interface OptimizeApproval {
   decided_at: string;
 }
 
-/** Records the owner's decision. A refusal is recorded too, so it is visible in the state dir. */
-export function writeOptimizeApproval(dir: string, confirmed: boolean, sha256: string): void {
+const APPROVAL_KEYS = new Set(["schema_version", "confirmed", "brief_sha256", "decided_at"]);
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+
+/** Strict rules shared in spirit with research approval: exact fields, typed values, lowercase hex hash. */
+export function approvalProblem(v: unknown): string | null {
+  if (v === null || typeof v !== "object" || Array.isArray(v)) return "approval is not an object";
+  const o = v as Record<string, unknown>;
+  for (const key of Object.keys(o)) {
+    if (!APPROVAL_KEYS.has(key)) return `unknown field "${key}"`;
+  }
+  if (o.schema_version !== 1) return "schema_version must be 1";
+  if (typeof o.brief_sha256 !== "string" || !SHA256_HEX_RE.test(o.brief_sha256)) {
+    return "brief_sha256 must be 64 lowercase hex characters";
+  }
+  if (typeof o.confirmed !== "boolean") return "confirmed must be a boolean";
+  if (typeof o.decided_at !== "string" || o.decided_at === "") return "decided_at must be a non-empty string";
+  return null;
+}
+
+export type ApprovalWrite = { ok: true } | { ok: false; message: string };
+
+/**
+ * Records the owner's decision. A refusal is recorded too (confirmed false, brief not re-checked).
+ * A confirmation is written only when brief.json on disk still has the hash the owner was shown.
+ */
+export function writeOptimizeApproval(dir: string, confirmed: boolean, sha256: string): ApprovalWrite {
+  if (confirmed) {
+    const current = readOptimizeBrief(dir);
+    if (!current.ok || current.sha256 !== sha256) {
+      return { ok: false, message: "brief.json changed while it was shown for confirmation; show the brief again with optimize_brief propose" };
+    }
+  }
   fs.mkdirSync(dir, { recursive: true });
   const approval: OptimizeApproval = {
     schema_version: 1,
@@ -155,7 +214,8 @@ export function writeOptimizeApproval(dir: string, confirmed: boolean, sha256: s
     brief_sha256: sha256,
     decided_at: new Date().toISOString(),
   };
-  fs.writeFileSync(path.join(dir, OPTIMIZE_APPROVAL_FILE), JSON.stringify(approval, null, 2) + "\n", "utf-8");
+  writeTextAtomicSync(path.join(dir, OPTIMIZE_APPROVAL_FILE), JSON.stringify(approval, null, 2) + "\n");
+  return { ok: true };
 }
 
 export type ApprovalResult =
@@ -169,15 +229,15 @@ export function readOptimizeApproval(dir: string): ApprovalResult {
   } catch {
     return { ok: false, reason: "not_approved", message: "brief is not approved yet" };
   }
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(raw) as Partial<OptimizeApproval>;
-    if (typeof parsed.confirmed !== "boolean" || typeof parsed.brief_sha256 !== "string") {
-      return { ok: false, reason: "approval_invalid", message: "approval.json has no confirmed flag or hash" };
-    }
-    return { ok: true, approval: parsed as OptimizeApproval };
+    parsed = JSON.parse(raw);
   } catch {
     return { ok: false, reason: "approval_invalid", message: "approval.json is not valid JSON" };
   }
+  const problem = approvalProblem(parsed);
+  if (problem) return { ok: false, reason: "approval_invalid", message: `approval.json failed validation: ${problem}` };
+  return { ok: true, approval: parsed as OptimizeApproval };
 }
 
 /** Phase 2 gate: an approved brief whose bytes still match the approval. */
