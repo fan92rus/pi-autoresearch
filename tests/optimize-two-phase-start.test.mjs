@@ -240,7 +240,7 @@ test("invisible-format cwd (U+2060, U+180E, U+00AD, U+200E) is refused as empty"
   h.ctx.ui.confirm = async () => true;
   await run(h, "optimize_brief", { action: "draft", brief: briefArgs() });
   await run(h, "optimize_brief", { action: "propose" });
-  for (const cwd of ["\u2060", "\u180E", "\u00AD", "\u200E"]) {
+  for (const cwd of ["\u2060", "\u180E", "\u00AD", "\u200E", "\u3164", "\u115F", "\u1160", "\uFFA0", "\u2800", "\u034F"]) {
     const text = await run(h, "init_experiment", { name: "liquid speed", metric_name: "total_us", metric_unit: "us", direction: "lower", cwd });
     assert.match(text, /cwd must be a non-empty path/, `${JSON.stringify(cwd)} must be refused: ${text}`);
   }

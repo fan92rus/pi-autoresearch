@@ -15,6 +15,14 @@ export const OPTIMIZE_APPROVAL_FILE = "approval.json";
 /** Same budget as the research consent dialog (shared in brief-consent.ts). */
 export const OPTIMIZE_CONSENT_MAX_LINES = CONSENT_SUMMARY_MAX_LINES;
 
+/** Whitespace, format characters, combining marks and blank glyphs: a path made only of these looks empty in the dialog. */
+const INVISIBLE_PATH_CHARS = /[\s\p{Cf}\p{Mn}\u115F\u1160\u2800\u3164\uFFA0]/gu;
+
+/** True when a path would display as empty (the same rule for the brief and for init_experiment's cwd). */
+export function isBlankPath(p: string): boolean {
+  return p.replace(INVISIBLE_PATH_CHARS, "").length === 0;
+}
+
 const BRIEF_KEYS = new Set(["schema_version", "name", "metric_name", "metric_unit", "direction", "cwd"]);
 const DIRECTIONS = new Set(["lower", "higher"]);
 
@@ -62,7 +70,7 @@ export function validateOptimizeBrief(input: unknown): BriefValidation {
   if (obj.direction !== undefined && (typeof obj.direction !== "string" || !DIRECTIONS.has(obj.direction))) {
     errors.push('direction must be "lower" or "higher"');
   }
-  if (obj.cwd !== undefined && (typeof obj.cwd !== "string" || !/[^\s\p{Cf}]/u.test(obj.cwd))) {
+  if (obj.cwd !== undefined && (typeof obj.cwd !== "string" || isBlankPath(obj.cwd))) {
     errors.push("cwd must be a non-empty string");
   }
   // Every string field is one physical line: a newline would break the dialog budget and the markdown list.

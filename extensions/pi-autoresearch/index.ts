@@ -8568,7 +8568,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     params: { name: string; metric_name: string; metric_unit?: string; direction?: string; cwd?: string },
   ) => {
     // An empty cwd would be read as the process directory by the gate but as absent by init: refuse it before any comparison.
-    if (params.cwd !== undefined && !/[^\s\p{Cf}]/u.test(params.cwd)) {
+    if (params.cwd !== undefined && optimizeBrief.isBlankPath(params.cwd)) {
       return optimizeRefusal("❌ init_experiment refused: cwd must be a non-empty path");
     }
     const workDir = resolveWorkDir(ctx.cwd);
