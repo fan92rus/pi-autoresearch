@@ -130,3 +130,19 @@ test("B6: the research dialog is assembled by consentDialogBody with its own foo
   assert.ok(body.split("\n").length <= bc.CONSENT_SUMMARY_MAX_LINES);
   assert.ok(body.startsWith(`Brief SHA-256: ${sha}\n`));
 });
+
+test("B7: a research goal with many U+0085 (NEL) builds a dialog within the line budget, without throwing", () => {
+  const brief = {
+    schema_version: 1,
+    goal: "x\u0085y\u0085z\u0085a\u0085b\u0085c\u0085d\u0085e\u0085f\u0085g",
+    plan_source: "p",
+    caveat_block: "c",
+    data_roles: { explore: ["e"], validate: [], confirm: [] },
+    questions: [{ id: "q1", text: "t", decision_rules: [{ id: "r1", verdict: "confirmed", when: "w" }] }],
+    process_metrics: ["m"],
+    stop_rules: [{ id: "s1", when: "w" }],
+  };
+  const body = bc.briefConsentSummary(brief, "a".repeat(64), "camp-1");
+  assert.ok(body.split(/\r\n|[\n\r\u2028\u2029\u0085]/).length <= bc.CONSENT_SUMMARY_MAX_LINES);
+  assert.ok(body.includes("Цель: x y z a b c d e f g"));
+});

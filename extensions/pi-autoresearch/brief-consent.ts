@@ -12,7 +12,8 @@ const CLIP_LIST = 160;
 
 /** One line, no newlines, at most `max` characters. */
 function clip(text: string, max: number): string {
-  const flat = text.replace(/\s+/g, " ").trim();
+  // U+0085 (NEL) is a line break for the dialog budget but not for JS \s, so it is flattened here too.
+  const flat = text.replace(/[\s\u0085]+/g, " ").trim();
   return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
 }
 
