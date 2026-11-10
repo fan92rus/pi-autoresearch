@@ -192,13 +192,17 @@ test("readNoiseFloorConfig: floor и штамп; отсутствующий/кр
   const dir = makeWorkDir("config");
   assert.deepEqual(readNoiseFloorConfig(dir), { floor: null, epoch: null }, "конфига нет");
 
-  writeConfigFile(dir, { noiseFloor: 0.04, noiseFloorEpoch: 2 });
+  writeConfigFile(dir, { noiseFloor: 0.04, noiseFloorUnit: "metric", noiseFloorEpoch: 2 });
   assert.deepEqual(readNoiseFloorConfig(dir), { floor: 0.04, epoch: 2 });
 
-  writeConfigFile(dir, { noiseFloor: 0.04, noiseFloorEpoch: "2" });
+  // experiment-rigor 1.3: a legacy fraction without the unit marker is "not calibrated".
+  writeConfigFile(dir, { noiseFloor: 0.04, noiseFloorEpoch: 2 });
+  assert.deepEqual(readNoiseFloorConfig(dir), { floor: null, epoch: 2 }, "legacy fraction is not a floor");
+
+  writeConfigFile(dir, { noiseFloor: 0.04, noiseFloorUnit: "metric", noiseFloorEpoch: "2" });
   assert.equal(readNoiseFloorConfig(dir).epoch, null, "штамп не-числом трактуется как отсутствие");
 
-  writeConfigFile(dir, { noiseFloor: -1, noiseFloorEpoch: 2 });
+  writeConfigFile(dir, { noiseFloor: -1, noiseFloorUnit: "metric", noiseFloorEpoch: 2 });
   assert.equal(readNoiseFloorConfig(dir).floor, null, "неположительный floor не годится");
 
   fs.writeFileSync(path.join(dir, ".auto", "config.json"), "{broken", "utf-8");
@@ -208,7 +212,7 @@ test("readNoiseFloorConfig: floor и штамп; отсутствующий/кр
 test("noiseFloorStatusOfDir: леджер + конфиг согласованы; без леджера — эпоха 1", () => {
   const dir = makeWorkDir("ofdir");
   seedLedger(dir, [CONFIG, run(1, 100), change(2)]);
-  writeConfigFile(dir, { noiseFloor: 0.04, noiseFloorEpoch: 1 });
+  writeConfigFile(dir, { noiseFloor: 0.04, noiseFloorUnit: "metric", noiseFloorEpoch: 1 });
 
   const status = noiseFloorStatusOfDir(dir);
   assert.equal(status.epoch, 2);
@@ -236,10 +240,10 @@ test("measurementHealthSummary: переоценённый floor (штамп = �
   const dir = makeWorkDir("summary-fresh");
   seedLedger(dir, [CONFIG, run(1, 100), change(2), run(2, 90, { epoch: 2 })]);
 
-  writeConfigFile(dir, { noiseFloor: 0.04, noiseFloorEpoch: 1 });
+  writeConfigFile(dir, { noiseFloor: 0.04, noiseFloorUnit: "metric", noiseFloorEpoch: 1 });
   assert.equal(measurementHealthSummary(dir).floor_stale, true);
 
-  writeConfigFile(dir, { noiseFloor: 0.03, noiseFloorEpoch: 2 });
+  writeConfigFile(dir, { noiseFloor: 0.03, noiseFloorUnit: "metric", noiseFloorEpoch: 2 });
   assert.equal(measurementHealthSummary(dir).floor_stale, false, "переоценка сняла пометку сводки");
 });
 
@@ -322,7 +326,7 @@ test("keep при устаревшем floor: принят с явной пом�
   assert.match(changeRes.content[0].text, /Measurement change e2 recorded \(epoch 2/);
 
   // Floor откалиброван ДО изменения (эпоха 1) — теперь устарел.
-  writeConfigFile(dir, { noiseFloor: 0.04, noiseFloorEpoch: 1 });
+  writeConfigFile(dir, { noiseFloor: 0.04, noiseFloorUnit: "metric", noiseFloorEpoch: 1 });
 
   const keep = await tool("log_experiment").execute("id", {
     metric: 100,
@@ -353,7 +357,7 @@ test("после переоценки (штамп = текущая эпоха): 
     rescore_ref: writeRescore(dir, FULL_ARTIFACT),
     justification: "gold fixed",
   }, null, null, ctx);
-  writeConfigFile(dir, { noiseFloor: 0.04, noiseFloorEpoch: 1 });
+  writeConfigFile(dir, { noiseFloor: 0.04, noiseFloorUnit: "metric", noiseFloorEpoch: 1 });
 
   const first = await tool("log_experiment").execute("id", {
     metric: 100, status: "keep", description: "before re-evaluation", asi: { hypothesis: "h" },
@@ -361,7 +365,7 @@ test("после переоценки (штамп = текущая эпоха): 
   assert.match(first.content[0].text, /floor_stale/);
 
   // Переоценка floor на новой шкале — ручное обновление обоих ключей конфига.
-  writeConfigFile(dir, { noiseFloor: 0.03, noiseFloorEpoch: 2 });
+  writeConfigFile(dir, { noiseFloor: 0.03, noiseFloorUnit: "metric", noiseFloorEpoch: 2 });
 
   const second = await tool("log_experiment").execute("id", {
     metric: 80, status: "keep", description: "after re-evaluation", asi: { hypothesis: "h" },
@@ -384,7 +388,7 @@ test("pending-рескор + устаревший floor: обе причины �
     justification: "scorer fix",
     rescore_pending: true,
   }, null, null, ctx);
-  writeConfigFile(dir, { noiseFloor: 0.04, noiseFloorEpoch: 1 });
+  writeConfigFile(dir, { noiseFloor: 0.04, noiseFloorUnit: "metric", noiseFloorEpoch: 1 });
 
   const keep = await tool("log_experiment").execute("id", {
     metric: 100, status: "keep", description: "pending and stale floor", asi: { hypothesis: "h" },
@@ -472,7 +476,8 @@ test("автокалибровка baseline ставит noiseFloorEpoch тек�
   assert.match(keep1.content[0].text, /Logged #1: keep/);
 
   const cfg = readConfigJson(dir);
-  assert.equal(cfg.noiseFloor, 0.01, "floor = |101-100|/100");
+  assert.ok(Math.abs(cfg.noiseFloor - 1) < 1e-9, "floor = |101-100|/100 x baseline 100 = 1 metric unit");
+  assert.equal(cfg.noiseFloorUnit, "metric", "floor carries the metric unit marker");
   assert.equal(cfg.noiseFloorEpoch, 2, "штамп — эпоха на момент калибровки");
   assert.equal(noiseFloorStatusOfDir(dir).stale, false, "свежая калибровка — не устарел");
 

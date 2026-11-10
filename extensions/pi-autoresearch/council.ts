@@ -803,7 +803,9 @@ export function validateSlate(slateText: string, noiseFloor: number | null, minE
 /** Read the calibrated noise floor from .auto/config.json (written by the loop after baseline). */
 export function readNoiseFloor(cwd: string): number | null {
   try {
-    const raw = JSON.parse(fs.readFileSync(path.join(cwd, ".auto", "config.json"), "utf-8")) as { noiseFloor?: unknown };
+    const raw = JSON.parse(fs.readFileSync(path.join(cwd, ".auto", "config.json"), "utf-8")) as { noiseFloor?: unknown; noiseFloorUnit?: unknown };
+    // Only a floor stored in metric units counts; a legacy fraction (no marker) is not calibrated.
+    if (raw.noiseFloorUnit !== "metric") return null;
     return typeof raw.noiseFloor === "number" && Number.isFinite(raw.noiseFloor) && raw.noiseFloor > 0 ? raw.noiseFloor : null;
   } catch {
     return null;

@@ -819,9 +819,10 @@ function renderNoiseSection(
 ): string[] {
   const lines = ["## 4. Шум и уверенность"];
   if (floor.floor === null) {
-    lines.push("Noise floor: не калиброван (.auto/config.json: ключ noiseFloor отсутствует или некорректен)");
+    lines.push("Noise floor: не калиброван (.auto/config.json: noiseFloor отсутствует, некорректен или без noiseFloorUnit \"metric\" — старый формат доли не используется)");
   } else {
-    const pct = `${Number((floor.floor * 100).toFixed(2))}%`;
+    // experiment-rigor 1.2: the floor is an absolute value in metric units, not a fraction.
+    const pct = `${Number(floor.floor.toPrecision(4))} ${unit}`.trim();
     lines.push(
       floor.stale
         ? `Noise floor: ±${pct} (калиброван на эпохе ${floor.floor_epoch}) — УСТАРЕЛ (floor_stale): ` +
@@ -987,7 +988,7 @@ function renderSummarySection(input: {
   const noisePart =
     input.floor.floor === null
       ? "floor не калиброван"
-      : `floor ±${Number((input.floor.floor * 100).toFixed(2))}%${input.floor.stale ? " (floor_stale)" : " (свежий)"}`;
+      : `floor ±${Number(input.floor.floor.toPrecision(4))}${input.floor.stale ? " (floor_stale)" : " (свежий)"}`;
   const confPart =
     input.suppression !== null
       ? "уверенность подавлена"

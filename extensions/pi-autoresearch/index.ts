@@ -966,8 +966,10 @@ interface AutoresearchConfig {
   workingDir?: string;
   /** Per-project cap for a single experiment's timeout_seconds, in minutes. Unset = no cap. */
   experiment_max_minutes?: number;
-  /** Calibrated noise floor as a fraction (0.04 = ±4%); written by the loop's calibration (task: floor). */
+  /** Calibrated noise floor in metric units (fraction × baseline); read only with noiseFloorUnit "metric". */
   noiseFloor?: number;
+  /** Unit marker for noiseFloor (experiment-rigor task 1.2); absent = legacy fraction = not calibrated. */
+  noiseFloorUnit?: string;
   /** Scale epoch the floor was calibrated on (task 2.5, single floor source in measurement.ts). */
   noiseFloorEpoch?: number;
 }
@@ -1585,7 +1587,14 @@ async function recordTreeNode(
             // epoch (single epoch source: noiseFloorStatusOfDir → jsonl.ts
             // reconstruct) next to the value, so a later measurement_change
             // marks the floor stale and a re-calibration lifts the mark.
-            writeConfig(workDir, { ...cfg, noiseFloor: nf, noiseFloorEpoch: noiseFloorStatusOfDir(workDir).epoch });
+            // Task 1.2: store the floor in metric units (fraction × baseline) with the unit marker,
+            // so the council and the gate read an absolute value, never the fraction.
+            writeConfig(workDir, {
+              ...cfg,
+              noiseFloor: nf * info.experiment.metric,
+              noiseFloorUnit: "metric",
+              noiseFloorEpoch: noiseFloorStatusOfDir(workDir).epoch,
+            });
           } else {
             console.warn("[autoresearch] noise floor not persisted: config.json is unparseable and must not be rewritten");
           }
@@ -7166,6 +7175,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (view.epoch > 1) text += `Epoch ${view.epoch} (current): best and deltas within this epoch only\n`;
       const referenceLine = epochReferenceLine(view);
       if (referenceLine) text += `${referenceLine}\n`;
+
+      // experiment-rigor 2.1: visible noise status (not calibrated / stale / fresh).
+      const floorStatus = noiseFloorStatusOfDir(workDir);
+      if (floorStatus.floor === null) {
+        text += "Noise floor: not calibrated (config.json noiseFloor with noiseFloorUnit \"metric\" is missing or legacy)\n";
+      } else if (floorStatus.stale) {
+        text += `Noise floor: ${floorStatus.floor} — stale (calibrated on epoch ${floorStatus.floor_epoch}, active epoch ${floorStatus.epoch})\n`;
+      } else {
+        text += `Noise floor: ${floorStatus.floor} — fresh\n`;
+      }
 
       text += renderTree(view.scoped, 60, 3, 7);
 

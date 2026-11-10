@@ -949,7 +949,7 @@ export function confidenceSuppressionReason(
  * key with the same predicate; new consumers must go through this module.
  */
 export interface NoiseFloorConfig {
-  /** Calibrated floor as a fraction (0.04 = ±4%); null = not calibrated or invalid. */
+  /** Calibrated floor in metric units (noiseFloorUnit "metric"); null = not calibrated, legacy or invalid. */
   floor: number | null;
   /** Scale epoch the floor was calibrated on (`noiseFloorEpoch`); null = unstamped config. */
   epoch: number | null;
@@ -996,7 +996,9 @@ export function readNoiseFloorConfig(workDir: string): NoiseFloorConfig {
   try {
     const raw = JSON.parse(fs.readFileSync(sessionFilePath(workDir, "config"), "utf-8")) as Record<string, unknown>;
     return {
-      floor: validFloorOrNull(raw["noiseFloor"]),
+      // Only an absolute floor in metric units counts (task 1.3): a legacy fraction
+      // without the unit marker is «not calibrated», never a metric-unit value.
+      floor: raw["noiseFloorUnit"] === "metric" ? validFloorOrNull(raw["noiseFloor"]) : null,
       epoch: validFloorEpochOrNull(raw["noiseFloorEpoch"]),
     };
   } catch {

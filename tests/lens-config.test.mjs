@@ -681,7 +681,8 @@ test("baseline keep persists the calibrated noiseFloor into a readable config.js
   assert.ok(initResultText(keep).includes("#1"), `baseline keep must land, got: ${initResultText(keep)}`);
 
   const cfg = JSON.parse(fs.readFileSync(configPath, "utf8"));
-  assert.equal(cfg.noiseFloor, 0.01, "calibrated |99-100|/100 must persist for readable configs");
+  assert.equal(cfg.noiseFloor, 1, "calibrated |99-100|/100 = 0.01 fraction x baseline 100 = 1 metric unit must persist");
+  assert.equal(cfg.noiseFloorUnit, "metric", "the floor must carry the metric unit marker");
   assert.equal(cfg.maxIterations, 7, "existing keys must survive the noiseFloor write");
   assert.equal(cfg.custom_key, "keep-me", "unknown user keys must survive the noiseFloor write");
 });
