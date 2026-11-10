@@ -8,6 +8,10 @@ import * as path from "node:path";
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const SHA_RE = /^[0-9a-f]{64}$/;
 const DIALOG_SHA_RE = /^Brief SHA-256: ([0-9a-f]{64})/m;
+// Charter dialogs are recognized by their own anchor (research-charter spec).
+// No multiline flag: the anchor must be the FIRST line of the message, so a
+// Charter line inside a brief dialog can never reclassify it.
+export const CHARTER_DIALOG_RE = /^Charter SHA-256: ([0-9a-f]{64})/;
 const DEFAULT_TIMEOUT = 3600;
 const DEFAULT_STAGE1_TIMEOUT = 30;
 const SHUTDOWN_GRACE_MS = 10_000;
@@ -24,6 +28,8 @@ export function resolvePiExecutable(piPath, platform = process.platform, env = p
   }
   return piPath;
 }
+
+export { DIALOG_SHA_RE };
 
 function piLaunch(piPath, platform = process.platform) {
   if (/\.m?js$/i.test(piPath)) return { command: process.execPath, args: [piPath, "--mode", "rpc"] };
@@ -51,11 +57,19 @@ function parseArgs(argv) {
     args[key] = value;
     i += 1;
   }
-  const KNOWN = new Set(["help", "mode", "brief", "approve-sha", "campaign-id", "state-root", "pi", "cwd", "timeout-sec", "stage1-timeout-sec", "hold-dialog-ms", "auto-adopt-draft", "log"]);
+  const KNOWN = new Set(["help", "mode", "brief", "approve-sha", "campaign-id", "state-root", "pi", "cwd", "timeout-sec", "stage1-timeout-sec", "hold-dialog-ms", "auto-adopt-draft", "log", "charter", "approve-charter-sha"]);
   for (const key of Object.keys(args)) {
     if (!KNOWN.has(key)) throw new Error(`Unknown option: --${key} (typos silently become part of the campaign description otherwise)`);
   }
   if (args.help) return args;
+  // research-charter: the two charter options are mutually required and the
+  // expected hash must be well-formed; both checks run here, BEFORE pi spawns,
+  // so a bad launch never creates campaign or chain state.
+  const hasCharter = args.charter !== undefined;
+  const hasCharterSha = args["approve-charter-sha"] !== undefined;
+  if (hasCharter !== hasCharterSha) throw new Error("--charter and --approve-charter-sha are mutually required; pass both or neither");
+  if (hasCharter && (typeof args.charter !== "string" || args.charter.trim() === "")) throw new Error("--charter must be a non-empty path");
+  if (hasCharter && !SHA_RE.test(args["approve-charter-sha"])) throw new Error("--approve-charter-sha must be 64 lowercase hexadecimal characters");
   if (args.mode === "optimize") {
     // Optimize is an explicit scope split for this MVP; see the headless-launch change.
     throw new Error("optimize mode is not implemented in this MVP build (documented scope split; see openspec/changes/headless-launch)");
@@ -77,7 +91,7 @@ function parseArgs(argv) {
 
 function sha256(bytes) { return createHash("sha256").update(bytes).digest("hex"); }
 function jsonLine(value) { return `${JSON.stringify(value)}\n`; }
-function usage() { return "Usage: node scripts/research-rpc.mjs --mode research --brief <canonical.json> --approve-sha <sha256> [--campaign-id <id>] [--state-root <dir>] [--pi <path>] [--cwd <dir>] [--timeout-sec 3600] [--stage1-timeout-sec 30] [--hold-dialog-ms 0] [--auto-adopt-draft] [--log <path>]"; }
+function usage() { return "Usage: node scripts/research-rpc.mjs --mode research --brief <canonical.json> --approve-sha <sha256> [--campaign-id <id>] [--state-root <dir>] [--charter <path> --approve-charter-sha <sha256>] [--pi <path>] [--cwd <dir>] [--timeout-sec 3600] [--stage1-timeout-sec 30] [--hold-dialog-ms 0] [--auto-adopt-draft] [--log <path>]"; }
 
 async function main() {
   let args;
@@ -102,6 +116,19 @@ async function main() {
   const campaignId = args["campaign-id"] ?? `bench-${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z")}`;
   if (!ID_RE.test(campaignId)) { console.error("Generated campaign id is invalid"); return 2; }
   let approveSha = args["approve-sha"];
+  // research-charter mode: when a charter is supplied, the wrapper owns the
+  // chain dialog (confirmed from --approve-charter-sha) and the chain lifecycle
+  // (intermediate reports do not end the run; awaiting_child pauses exit 0).
+  const charterSha = args["approve-charter-sha"];
+  const charterMode = charterSha !== undefined;
+  const charterPath = charterMode ? path.resolve(cwd, args.charter) : null;
+  let charterConfirmed = false;
+  // One continuation per awaiting_child period: the flag is raised when the
+  // continuation is sent and cleared only when a NEW brief action is observed
+  // (a new research_brief draft), so a second marker settle without any agent
+  // action pauses the run instead of looping (fix review B1).
+  let continuationSentForAwaiting = false;
+  let briefActionSeenSinceContinuation = false;
   const autoAdopt = args["auto-adopt-draft"] === true;
   // Auto-adopt state: none -> pending (first refusal, draft captured) -> applied (retry sent) or exhausted by a second refusal.
   let adoptState = "none";
@@ -224,7 +251,11 @@ async function main() {
   child.on("exit", (code, signal) => {
     if (!finished) {
       logEvent("wrapper", { event: "pi_exited", code, signal });
-      if (successfulReport && stage1Settled) exitCode = 0;
+      // An unexpected pi exit is never a graceful charter pause (fix review B2).
+      // Charter mode without a confirmed charter never reached the chain (m3):
+      // only a confirmed charter plus a saved successful report may exit 0.
+      if (charterMode && !charterConfirmed) exitCode = 3;
+      else if (successfulReport && stage1Settled) exitCode = 0;
       else exitCode = 3;
       finished = true;
       if (stage1Timer) clearTimeout(stage1Timer);
@@ -260,6 +291,46 @@ async function main() {
     }
     if (record.type === "agent_settled") {
       if (!stage1Started) return;
+      if (stage1Settled) {
+        // research-charter (after the stage-1 settle): a marker-carrying settle
+        // is the intermediate-report settle — the chain continues, deliver the
+        // continuation for the next chain brief ONCE per awaiting_child period;
+        // a settle without the marker (or a repeat marker without any agent
+        // action) is the idle pause — exit 0, state stays on disk.
+        if (charterMode && charterConfirmed && record.chain_status === "awaiting_child" && (!continuationSentForAwaiting || briefActionSeenSinceContinuation)) {
+          continuationSentForAwaiting = true;
+          briefActionSeenSinceContinuation = false;
+          logEvent("wrapper", { event: "chain_continuation" });
+          requestPrompt([
+            `Chain campaign ${campaignId} finished its intermediate report.`,
+            "Write the brief for the next campaign with research_brief draft: every question must cite findings from the previous campaign (finding_refs), keep the caveat block, verdict set and evidence_gate identical, then research_brief propose.",
+            "The brief will be auto-approved by the charter checks (no dialog). After approval run research start, work the questions, close them, then research stop and research report.",
+          ].join("\n"), 3);
+          return;
+        }
+        if (charterMode && charterConfirmed && record.chain_status === "awaiting_child") {
+          // A repeat marker with no intervening agent action: the continuation
+          // was already delivered for this period — pause gracefully (fix review B1).
+          logEvent("wrapper", { event: "chain_awaiting_child" });
+          console.log("Chain paused in awaiting_child; wrapper exits 0 (state preserved).");
+          await stopChild(0, "chain_awaiting_child");
+          return;
+        }
+        if (charterMode && charterConfirmed) {
+          // A marker-less idle settle in a confirmed chain is NOT the documented
+          // awaiting_child pause (fix review B3): fall through to the
+          // pre-existing non-charter behavior, which ends by timeout with 3.
+        } else if (charterMode && !charterConfirmed) {
+          // Charter mode without a confirmed charter never reached the chain:
+          // any settle here must not report success (fix review m3).
+          await stopChild(3, "charter_not_confirmed");
+          return;
+        } else if (successfulReport) {
+          await stopChild(0, "successful_report");
+          return;
+        }
+        // Non-charter fallthrough keeps the pre-existing behavior below.
+      }
       if (!stage1Settled) {
         stage1Settled = true;
         if (adoptState === "pending") {
@@ -271,6 +342,19 @@ async function main() {
           adoptState = "applied";
           logEvent("wrapper", { type: "auto_adopt", from_sha: from, to_sha: approveSha });
           requestPrompt(adoptRetryMessage(), 2);
+          return;
+        }
+        if (charterMode && charterConfirmed && record.chain_status === "awaiting_child" && !continuationSentForAwaiting) {
+          // research-charter: the stage-1 turn already accepted the charter and
+          // finished with an intermediate report — the root-brief stage is done,
+          // deliver the ONE continuation for the next chain brief.
+          continuationSentForAwaiting = true;
+          logEvent("wrapper", { event: "chain_continuation" });
+          requestPrompt([
+            `Chain campaign ${campaignId} finished its intermediate report.`,
+            "Write the brief for the next campaign with research_brief draft: every question must cite findings from the previous campaign (finding_refs), keep the caveat block, verdict set and evidence_gate identical, then research_brief propose.",
+            "The brief will be auto-approved by the charter checks (no dialog). After approval run research start, work the questions, close them, then research stop and research report.",
+          ].join("\n"), 2);
           return;
         }
         if (!stage2Sent) {
@@ -286,6 +370,10 @@ async function main() {
           ].join("\n");
           requestPrompt(message, 2);
         }
+      } else if (charterMode && !charterConfirmed && successfulReport) {
+        // Charter mode without a confirmed charter never reached the chain:
+        // a successful report here must not report success (fix review m3).
+        await stopChild(3, "charter_not_confirmed");
       } else if (successfulReport) {
         await stopChild(0, "successful_report");
       } else if (adoptState === "pending") {
@@ -304,6 +392,13 @@ async function main() {
       if (callId !== undefined) reportStarted.set(String(callId), true);
       return;
     }
+    if (record.type === "tool_execution_start" && record.toolName === "research_brief") {
+      // A new draft action re-arms the continuation guard: the agent acted on
+      // the previous continuation, so the next awaiting_child period may need
+      // a fresh one (fix review B1).
+      briefActionSeenSinceContinuation = true;
+      return;
+    }
     if (record.type === "tool_execution_end") {
       const callId = record.toolCallId ?? record.callId ?? record.id;
       const result = record.result;
@@ -319,6 +414,29 @@ async function main() {
         const dialogId = record.id;
         pendingDialogs.add(dialogId);
         const message = String(record.message ?? "");
+        // research-charter: the charter dialog is checked BEFORE the brief one;
+        // the prefixes are disjoint, so exactly one regex can match.
+        const charterMatch = CHARTER_DIALOG_RE.exec(message);
+        if (charterMatch) {
+          if (!charterMode) {
+            send({ type: "extension_ui_response", id: dialogId, confirmed: false });
+            pendingDialogs.delete(dialogId);
+            logEvent("wrapper", { event: "dialog_refused", reason: "charter_dialog_without_charter_mode", id: dialogId });
+            return;
+          }
+          if (holdDialogMs > 0) await new Promise((resolve) => setTimeout(resolve, holdDialogMs));
+          if (finished) return;
+          const confirmed = charterMatch[1] === charterSha;
+          charterConfirmed = confirmed;
+          send({ type: "extension_ui_response", id: dialogId, confirmed });
+          pendingDialogs.delete(dialogId);
+          logEvent("wrapper", { event: "charter_confirmation", id: dialogId, confirmed, dialog_sha: charterMatch[1] });
+          if (!confirmed) {
+            // Charter refused: the chain never starts, no campaign state.
+            await stopChild(3, "charter_hash_mismatch", true);
+          }
+          return;
+        }
         const shaMatch = DIALOG_SHA_RE.exec(message);
         if (!shaMatch) {
           send({ type: "extension_ui_response", id: dialogId, confirmed: false });
@@ -385,7 +503,7 @@ async function main() {
     }
   }, stage1TimeoutMs);
 
-  requestPrompt(`/autoresearch research --id ${campaignId}${args["state-root"] ? ` --state-root ${args["state-root"]}` : ""}`, 1);
+  requestPrompt(`/autoresearch research --id ${campaignId}${args["state-root"] ? ` --state-root ${args["state-root"]}` : ""}${charterMode ? ` --charter ${charterPath}` : ""}`, 1);
   const resultCode = await new Promise((resolve) => child.on("close", () => resolve(exitCode)));
   if (killTimer) clearTimeout(killTimer);
   await closeLog();

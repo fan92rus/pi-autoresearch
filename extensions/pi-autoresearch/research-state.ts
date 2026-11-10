@@ -85,6 +85,8 @@ const BRIEF_OPTIONAL_KEYS = ["verdicts", "evidence_gate"];
 const GATE_KEYS = ["blocked_globs", "gate_file", "gate_contains"];
 const DATA_ROLE_KEYS = ["explore", "validate", "confirm"];
 const QUESTION_KEYS = ["id", "text", "decision_rules", "needs_data"];
+/** Chain-only optional question field (research-charter): unknown to older briefs. */
+const QUESTION_OPTIONAL_KEYS = ["finding_refs"];
 const RULE_KEYS = ["id", "verdict", "when"];
 const STOP_KEYS = ["id", "when"];
 const STATE_KEYS = ["schema_version", "campaign_id", "created_at", "phase"];
@@ -718,7 +720,7 @@ function validateQuestion(
     errors.push(`${where} must be an object`);
     return;
   }
-  errors.push(...fieldSetProblems(q, QUESTION_KEYS, where));
+  errors.push(...fieldSetProblems(q, [...QUESTION_KEYS, ...(q.finding_refs !== undefined ? QUESTION_OPTIONAL_KEYS : [])], where));
   requireId(q.id, `${where}.id`, ids, errors);
   requireText(q.text, `${where}.text`, errors);
   if (q.needs_data !== null && (typeof q.needs_data !== "string" || q.needs_data.trim() === "")) {
