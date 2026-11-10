@@ -9,7 +9,15 @@ Autonomous experiment loop: try ideas, keep what works, discard what doesn't, ne
 
 ## Tools
 
-- **`init_experiment`** — configure session (name, metric, unit, direction). Call again to re-initialize with a new baseline when the optimization target changes.
+- **`optimize_brief`** — phase 1 of the session start. `draft` saves the brief (`name`, `metric_name`, `metric_unit`, `direction`, `cwd`; unknown fields are refused). `propose` shows it to the owner, who approves it. The benchmark command and timeout are NOT in the brief; they stay in `run_experiment`.
+- **`init_experiment`** — phase 2 of the session start. Its arguments must equal the approved brief. Call it again with the same rule when the metric, direction or target changes (draft → propose → init).
+- **`propose_hypothesis`** — registers an idea before its run. Returns the `hypothesis_id` that `run_experiment` and `log_experiment` take. Pass an optional `finding_id` when the idea is based on a recorded finding.
+- **`tree_status`** — shows the hypothesis tree, the best keep and the linked findings.
+- **`record_finding`** / **`update_finding`** — record a result finding with a checkable `evidence_ref` (required), and move it through open / verified / revised / deferred.
+- **`inspect_results`** — reads a run's persisted output in bounded pages (METRIC lines, errors, timing, delta against the best keep). Read it before recording a finding.
+- **`search_precedents`** / **`assess_precedents`** — search past campaign records for similar problems (candidates, not evidence) and record your assessment of a candidate (`reuse`, `adapt-and-test`, `avoid`, `insufficient-evidence`).
+- **`log_measurement_change`** / **`verify_measurement_change`** — the only way to change the scorer, gold or metric (mandatory accounting; the change stays provisional until an independent check confirms it). Never edit them silently.
+- **`finalize_research`** — signals that optimization is complete; you keep control. Writes `.auto/report.md`.
 - **`run_experiment`** — runs command, times it, captures output. If the project sets `experiment_max_minutes` in `.auto/config.json`, `timeout_seconds` must fit that cap — bigger values are rejected with a reminder to adapt the experiment (smaller fixture, fewer iterations, a BENCH_MODE=quick subset), never to raise the timeout.
 - **`log_experiment`** — records result. `keep` auto-commits. `discard`/`crash`/`checks_failed` auto-reverts code changes (autoresearch files preserved). Always include secondary `metrics` dict. Optional `activity_type` (`measurement` | `intermediate` | `verification` | `attribution`) labels what the run did; it is stored in the ledger only and never changes status, keep/discard, git, best or the epoch. Omit it when no label applies. Dashboard: ctrl+shift+t.
 - **`log_observation`** — records a preparation, diagnostic or infrastructure event about a run (warm-up pass, measurer check, OOM during teacher generation) as a separate observation. It is not a run: it never touches git, best, streak or `log.jsonl`. Outcome is `success` | `technical_failure` | `unknown`.
@@ -29,6 +37,9 @@ All session files live in a single `.auto/` subfolder at the working directory r
 | `.auto/log.jsonl` | Append-only result log (written by the tools) |
 | `.auto/observations.jsonl` | Observations about preparation and diagnostic events (written by `log_observation`) |
 | `.auto/analysis.jsonl` | Analysis records: prereg, comparison, attribution, supplement (written by `record_analysis`) |
+| `.auto/optimize/brief.json`, `.auto/optimize/approval.json` | Optimize start brief and the owner's approval (written by `optimize_brief`; never edit by hand) |
+| `.auto/findings.jsonl` | Result findings (written by `record_finding` / `update_finding`) |
+| `.auto/candidate/`, `.auto/research/`, `.auto/research-archive/` | Candidate-branch and research campaign state (written by their tools; finished research campaigns are archived, never deleted) |
 | `.auto/run-links.jsonl` | Confirmed links between ledger rows and run directories (written by `log_experiment`; do not edit by hand) |
 | `.auto/reviews/` | Direction-review documents (written by `direction_review`) |
 | `.auto/ideas/` | Ideas backlog — one `.md` file per idea (optional) |
@@ -44,7 +55,7 @@ All session files live in a single `.auto/` subfolder at the working directory r
 2. `git checkout -b autoresearch/<goal>-<date>`
 3. Read the source files. Understand the workload deeply before writing anything.
 4. `mkdir -p .auto`, then write `.auto/prompt.md` and `.auto/measure.sh` (see below). Commit both.
-5. `init_experiment` → run baseline → `log_experiment` → start looping immediately.
+5. `optimize_brief draft` → `optimize_brief propose` (the owner approves) → `init_experiment` with the same arguments → run baseline → `log_experiment` → start looping immediately. A session that already has a config header in `.auto/log.jsonl` and resumes with the same name, metric, unit and direction needs no new brief. `run_experiment` and `log_experiment` are refused until the session is started.
 
 ### `.auto/prompt.md`
 
@@ -149,6 +160,8 @@ pnpm typecheck 2>&1 | grep -i error || true
 
 - **Primary metric is king.** Improved → `keep`. Worse/equal → `discard`. Secondary metrics rarely affect this.
 - **Benchmark only via `run_experiment`.** A bash-run benchmark does not exist: it never enters the ledger, corrupts the noise floor, and its edits are lost on the next revert. Log EVERY run via `log_experiment` immediately — an unlogged run is wasted compute. Log the parsed METRIC value, not a hand-copied number (deviations are flagged as manual provenance).
+- **Hypothesis first.** Register each idea with `propose_hypothesis` before `run_experiment` and pass its `hypothesis_id`; the baseline run is the only exception. A behavior finding is linked to its hypothesis with the optional `finding_id`. Record a finding with `record_finding` after reading `inspect_results`.
+- **Subagents in flight.** While an async subagent runs, the drift nudge is deferred, so the loop does not push "Resume the cycle" into the turn. Hold the turn with `bg_wait` instead of ending it with a "waiting" reply. Your message still interrupts the wait. Details: README, "Waiting for async subagents".
 - **Annotate every run with `asi`.** Record what you learned — not what you did. What would help the next iteration or a fresh agent resuming this session?
 - **Not every event is a run.** Preparation, diagnostic or infrastructure events (warm-up pass, measurer check, environment failure before a candidate starts) go to `log_observation`. Do not record them as fake `crash` or `explore` rows in `log_experiment`. Runs are candidate measurements.
 - **Watch the confidence score.** After 3+ runs, `log_experiment` reports a confidence score (best improvement as a multiple of the session noise floor). ≥2.0× means the improvement is likely real. <1.0× means it's within noise — consider re-running to confirm before keeping. The score is advisory — it never auto-discards.

@@ -2,7 +2,7 @@
  * Subagent activity probe (openspec subagent-wait-guard, task 2.1).
  *
  * Layer-2 guard for the autoresearch drift policy: "is an async subagent
- * running?" Port of pi-goal-x `goal-subagent-probe.ts` (commit 0449563) with
+ * running?" Port of pi-goal-x `goal-subagent-probe.ts` (external repo, commit 0449563; not vendored here) with
  * one owner-approved refinement: a successful reply WITHOUT a usable fleet
  * count is `unknown`, not "0 active" — the caller delivers as before.
  *

@@ -3509,7 +3509,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     let extra =
       "\n\n## Autoresearch Mode (ACTIVE)" +
       "\nOptimize the primary metric through the experiment loop. Loop rules:" +
-      "\n- One idea = one cycle: propose_hypothesis \u2192 edit code \u2192 smoke test \u2192 run_experiment \u2192 log_experiment. A run that skipped run_experiment or log_experiment DOES NOT EXIST: it is not in the ledger, cannot be kept, and its edits are lost on the next revert." +
+      "\n- One idea = one cycle: propose_hypothesis \u2192 edit code \u2192 run_experiment \u2192 log_experiment. A run that skipped run_experiment or log_experiment DOES NOT EXIST: it is not in the ledger, cannot be kept, and its edits are lost on the next revert." +
       "\n- NEVER run the benchmark via bash: only run_experiment times the run, parses METRIC lines and updates the noise floor. Bash-run benchmarks are invisible to the ledger and corrupt the confidence score." +
       "\n- Call log_experiment IMMEDIATELY after every run_experiment \u2014 keep/discard/crash/budget_exceeded, whatever the outcome. An unlogged run is wasted compute." +
       "\n- Do not commit or revert manually: keep auto-commits; discard/crash/checks_failed auto-revert (autoresearch files preserved)." +
@@ -3524,7 +3524,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\n- behavior (the model/code does the wrong thing) \u2192 an ordinary hypothesis: propose_hypothesis (describe what you noticed, what changes, what you will learn; optionally pass finding_id) citing the finding id, then the normal cycle." +
       "\n- capability (the system cannot do it yet: needs new data, resources or abilities) \u2192 NOT a hypothesis and NOT a run: write it to " + ideasPath + " marked owner-input. It is an owner gate: wait for the owner's go-ahead on resume." +
       "\n- tradeoff (gaining on one side costs another) \u2192 ask the owner which side to prefer (a goal decision); until answered, track the cost as a secondary metric in log_experiment metrics." +
-      "\n- measurement (the scorer, gold or metric itself is wrong) \u2192 log_measurement_change with mandatory accounting: diff, reproducible rescore artifact with both scores, justification = finding id. The change stays provisional until independently verified. Stage note: this tool arrives in stage S3; until it is among your tools, keep the finding open and do NOT edit the scorer or gold silently." +
+      "\n- measurement (the scorer, gold or metric itself is wrong) \u2192 log_measurement_change with mandatory accounting: diff, reproducible rescore artifact with both scores, justification = finding id. The change stays provisional until independently verified; do NOT edit the scorer or gold silently." +
       "\n\n## Precedent Search (search_precedents)" +
       "\n- WHEN: significant problem or STAGNATION, before the next direction. Not after every run. Skip only with a stated reason in the hypothesis." +
       "\n- QUERY: problem = current problem, 1-2 sentences; keywords = up to 5, any language; finding_ref = finding id if any. Weak result: rephrase, search again." +

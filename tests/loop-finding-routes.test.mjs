@@ -109,7 +109,7 @@ test("tradeoff route: owner question or secondary metric", () => {
   assert.ok(line.includes("log_experiment"), "secondary metric is passed through log_experiment");
 });
 
-test("measurement route: log_measurement_change with accounting and S3 stage note", () => {
+test("measurement route: log_measurement_change with accounting and no silent edits", () => {
   const line = routeLine(routes, "measurement");
   assert.ok(line.includes("log_measurement_change"), "measurement → log_measurement_change");
   assert.ok(line.includes("mandatory accounting"), "accounting is mandatory");
@@ -117,7 +117,7 @@ test("measurement route: log_measurement_change with accounting and S3 stage not
   assert.ok(line.includes("rescore artifact"), "accounting names the rescore artifact");
   assert.ok(line.includes("justification = finding id"), "justification is the finding id");
   assert.ok(line.includes("provisional until independently verified"), "change is provisional until verified");
-  assert.ok(line.includes("stage S3"), "stage note: the tool arrives in S3");
+  assert.ok(!line.includes("stage S3"), "no stale stage note: the tool is registered");
   assert.ok(line.includes("do NOT edit the scorer or gold silently"), "no silent measurement edits");
 });
 

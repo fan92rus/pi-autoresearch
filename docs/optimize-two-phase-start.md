@@ -1,6 +1,6 @@
 # Двухфазный старт обычной оптимизации
 
-Спека: `openspec/changes/optimize-two-phase-start`. Код: `extensions/pi-autoresearch/optimize-brief.ts`
+Спека: `openspec/changes/archive/2026-11-09-optimize-two-phase-start` (архив). Код: `extensions/pi-autoresearch/optimize-brief.ts`
 и wiring в `index.ts`. Согласование диалога общее с исследовательским режимом (`brief-consent.ts`).
 
 ## Порядок

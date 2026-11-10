@@ -45,13 +45,12 @@ Then start the loop inside pi:
 
 | Tool | Description |
 |------|-------------|
-| `init_experiment` | One-time session config — name, metric, unit, direction |
+| `optimize_brief` | Phase 1 of the session start. `draft` saves the brief (name, metric_name, metric_unit, direction, cwd; unknown fields refused); `propose` shows it for owner approval. The benchmark command and timeout stay in `run_experiment`. See [docs/optimize-two-phase-start.md](docs/optimize-two-phase-start.md). |
+| `init_experiment` | Phase 2 of the session start. Starts the session with arguments that equal the approved brief (a resumed session with a matching config header needs no new brief). |
 | `run_experiment` | Runs any command, times wall-clock duration, captures output |
 | `log_experiment` | Records result, auto-commits, updates widget and dashboard |
 | `tree_status` | Show experiment tree + UCB1 suggestions for exploration |
-| `explore_from` | *Disabled in this build (`BRANCHING_TOOLS_ENABLED = false` in `index.ts`).* Backtrack to any tree node and explore from there |
-| `restore_main` | *Disabled in this build (see `explore_from`).* Return to main branch after `explore_from` |
-| `compose` | *Disabled in this build (see `explore_from`).* Merge orthogonal improvements from two different branches |
+| `explore_from`, `restore_main`, `compose` | *Removed from this build; not registered as tools.* |
 | `search_precedents` | Searches this project's past ledger, tree, ideas and council archives for similar problems (memory only when the host provides it); returns candidates with per-source coverage. See [Research precedents](#research-precedents). |
 | `assess_precedents` | Records the agent's assessment (`supports` or `contradicts` with references, plus an action) of a candidate in a search report |
 | `finalize_research` | Signals that optimization is complete (the agent keeps control). Writes the campaign report to `.auto/report.md` after the finalize record; a report failure is reported and does not fail the finalize. |
@@ -64,6 +63,18 @@ Then start the loop inside pi:
 | `log_observation` | Records a preparation, diagnostic or infrastructure event about a run (`success`, `technical_failure`, `unknown`) in `.auto/observations.jsonl`. Not a run: no git, best, streak or ledger change. See [Research map](#research-map). |
 | `record_analysis` | Appends a `prereg`, `comparison`, `attribution` or `supplement` record to `.auto/analysis.jsonl`. Never changes runs, git or best. See [Research map](#research-map). |
 | `direction_review` | Writes one document to `.auto/reviews/direction-<UTC>.md` with facts, unknowns, signals, alternatives and what is not proven. Runs no experiment and chooses no direction. |
+
+### Waiting for async subagents
+
+When the agent launches an async subagent (pi-subagents), the loop does not push its "Resume the cycle now" nudge into the turn while the subagent is still alive: the nudge is deferred.
+
+- The guard re-checks the live subagent count every 30 seconds. The nudge is delivered as soon as no async subagent is alive, or after a 10-minute fuse even if one still is.
+- A deferral does not count toward the drift limit or the auto-resume counter; those counters move once, at delivery.
+- The prompt tells the agent to hold the turn with `bg_wait` rather than end it with a "waiting" reply. A user message always interrupts the wait.
+- Without pi-subagents the guard fails open: nudges are delivered as before.
+- An owner pause of the candidate campaign, turning autoresearch mode off, compaction, a session switch or shutdown cancels a pending deferral.
+
+The guard covers the ordinary loop, including campaigns that block it. Partial-cycle turns (a loop tool was used) are not deferred.
 
 ### `/autoresearch` command
 
@@ -285,9 +296,7 @@ n0  100µs  baseline
 ```
 
 **Key capabilities:**
-- **Backtracking** — when a branch is exhausted, the agent can `explore_from("n3")` to jump to a different part of the tree
 - **Repeat detection** — before running an experiment, SimHash checks if a similar hypothesis was already tried
-- **Composition** — merge orthogonal improvements from different branches with `compose("n1", "n3")`
 - **UCB1 ranking** — the agent sees which nodes are most promising to expand (balance of exploitation + exploration)
 
 The tree is **enabled by default** and stored in `.auto/tree.json`. Toggle the tree view in the dashboard with `/autoresearch tree`.
