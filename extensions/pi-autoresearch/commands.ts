@@ -11,6 +11,7 @@ export interface Subcommand {
 export const SUBCOMMANDS: readonly Subcommand[] = [
   { name: "off", description: "Leave autoresearch mode." },
   { name: "research", description: "Start a research campaign (briefing via research_brief; supports headless launch)." },
+  { name: "charter", description: "Interactive charter: the agent drafts the chain charter, the owner confirms, the chain starts" },
   { name: "finalize", description: "Stop the loop and turn kept experiments into reviewable branches." },
   { name: "report", description: "Write the campaign report to .auto/report.md now, without stopping the loop." },
   { name: "clear", description: "Delete experiment session data (log, findings, observations, analysis, report, ideas, runs) and turn autoresearch mode off; refuses while a research or candidate campaign is active." },

@@ -40,6 +40,7 @@ export interface AutocompleteEntry {
 export const AUTORESEARCH_SUBCOMMANDS: AutocompleteEntry[] = [
   { value: "off", label: "off", description: "Turn autoresearch mode off" },
   { value: "research", label: "research", description: "Start a research campaign (briefing via research_brief)" },
+  { value: "charter", label: "charter", description: "Interactive charter: the agent drafts the chain charter, the owner confirms, the chain starts" },
   { value: "finalize", label: "finalize", description: "Stop the loop and load the autoresearch-finalize skill" },
   { value: "clear", label: "clear", description: "Delete session log and reset state" },
   { value: "tree", label: "tree", description: "Toggle tree/list view in dashboard widget" },

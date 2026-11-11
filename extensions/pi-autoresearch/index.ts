@@ -184,6 +184,7 @@ import {
 } from "./compaction.ts";
 import { resolveAutoresearchShortcuts, SHORTCUT_ACTIONS } from "./shortcuts.ts";
 import * as charter from "./charter.ts";
+import * as charterLaunch from "./charter-launch.ts";
 import * as chainJournal from "./chain-journal.ts";
 import * as chainBriefs from "./chain-briefs.ts";
 import { getAutoresearchArgumentCompletions, isHelpRequest, renderAutoresearchHelp } from "./commands.ts";
@@ -401,6 +402,10 @@ interface AutoresearchRuntime {
    *  --charter <path>' after the owner confirms the Charter SHA-256 dialog. Cleared when the chain
    *  reaches a final status together with the mode-off paths (chain_stop in pause, final report). */
   researchChain: { chainId: string; workDir: string; charterPath: string; charterSha256: string; charter: import("./charter.ts").Charter } | null;
+  charterDialogOpen: boolean;
+  charterDraft: { charter: import("./charter.ts").Charter; shownSha256: string } | null;
+  charterFirstLaunch: { path: string; sha256: string; chainId: string; rootCampaignId: string } | null;
+  charterRootId: string | null;
   /** True between the continuation of an awaiting_child period and the next brief action:
    *  the report branch sends at most ONE continuation per period (spec: no repeated
    *  continuation without a new agent action). Re-armed by a chain brief action. */
@@ -1838,6 +1843,10 @@ function createSessionRuntime(): AutoresearchRuntime {
     subagentDeferral: null,
     lastLogFlag: null,
     researchChain: null,
+    charterDialogOpen: false,
+    charterDraft: null,
+    charterFirstLaunch: null,
+    charterRootId: null,
     chainContinuationSent: false,
     lastMeasurement: null,
     lastRunNumber: null,
@@ -9078,6 +9087,117 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   });
 
   registerGatedTool({
+    name: "research_charter",
+    label: "Research charter",
+    renderCall(args: any, _theme: any, _context: any) {
+      return new Text(`research_charter ${String(args?.action ?? "")}`, 0, 0);
+    },
+    description: "Create and confirm the owner-approved chain charter before research briefing. Draft accepts only a charter object; propose opens the owner confirmation dialog and starts the root campaign chain.",
+    promptSnippet: "Research charter: draft chain limits, then ask the owner to confirm them with propose",
+    promptGuidelines: [
+      "Use research_charter draft with only the charter object (max_campaigns, max_depth, stop_rules), then research_charter propose with no extra fields.",
+      "propose requires an interactive owner dialog; never pass approval, confirmation, or hash fields.",
+    ],
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["draft", "propose"], description: "Charter action." },
+        charter: { type: "object", description: "draft only: max_campaigns, max_depth, and/or stop_rules." },
+      },
+      required: ["action"],
+    } as any,
+    async execute(_toolCallId: string, params: any, _signal, _onUpdate, ctx: ExtensionContext) {
+      const action = params?.action;
+      const runtime = getRuntime(ctx);
+      const reply = (text: string) => ({ content: [{ type: "text" as const, text }], details: { action } });
+      const fail = (reason: string, message: string) => ({
+        content: [{ type: "text" as const, text: refusalText({ reason, message }) }], details: { action, reason },
+      });
+      const { action: _action, ...launchParams } = params ?? {};
+      const checked = charterLaunch.validateCharterLaunchCall(action, launchParams);
+      if (!checked.ok) return fail(checked.reason, checked.message);
+      if (action === "propose" && runtime.charterDraft === null && runtime.charterFirstLaunch !== null) {
+        const first = runtime.charterFirstLaunch;
+        return reply(`ℹ️ Charter already launched (first confirmation: ${first.path}, sha256 ${first.sha256}, chain ${first.chainId}); no second chain is created.`);
+      }
+      if (activeChain(ctx) !== null) return fail("chain_active", `research chain ${activeChain(ctx)!.chainId} active`);
+      if (runtime.charterDialogOpen !== true) {
+        return fail("charter_dialog_closed", "research_charter is only available inside the /autoresearch charter dialog; run the command first");
+      }
+      if (action === "draft") {
+        if (params.charter === undefined) return fail("invalid_argument", "draft requires the charter object");
+        const valid = charterLaunch.validateDraftCharter(params.charter);
+        if (!valid.ok) return fail(valid.reason, valid.message);
+        const shownSha256 = researchState.sha256Hex(charterLaunch.serializeCharter(valid.charter));
+        runtime.charterDraft = { charter: valid.charter, shownSha256 };
+        return reply(`✅ Charter draft saved (sha256 ${shownSha256}). The owner confirms it with research_charter propose.`);
+      }
+      if (action !== "propose") return fail("invalid_argument", `unknown action ${JSON.stringify(String(action))}; allowed: draft propose`);
+      const draft = runtime.charterDraft;
+      if (draft === null) return fail("charter_draft_missing", "no charter draft; create one with research_charter draft first");
+      const workDir = resolveWorkDir(ctx.cwd);
+      if (!ctx.hasUI || !ctx.ui || typeof ctx.ui.confirm !== "function") {
+        return fail("charter_dialog_closed", "charter confirmation is an owner action and requires an interactive dialog; the draft is saved");
+      }
+      const confirmed = await ctx.ui.confirm("Research charter: chain limits", charterLaunch.charterLaunchDialogText(draft.charter, draft.shownSha256));
+      if (confirmed !== true) return fail("charter_dialog_closed", "the owner did not confirm; the draft is saved and propose may be retried");
+      const timestamp = () => new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
+      let ts = timestamp();
+      let rootId = runtime.charterRootId;
+      if (rootId === null) {
+        rootId = `bench-${ts}`;
+        while (
+          fs.existsSync(path.join(researchState.researchRoot(workDir), rootId)) ||
+          fs.existsSync(path.join(workDir, ".auto", "research-chain", `${rootId}-chain`)) ||
+          fs.existsSync(path.resolve(workDir, "..", `charter-${rootId}-${ts}.json`))
+        ) rootId += "-" + Math.random().toString(36).slice(2, 6);
+      }
+      ts = timestamp();
+      if (fs.existsSync(path.join(researchState.researchRoot(workDir), rootId))) {
+        return fail("campaign_exists", `campaign ${rootId} already exists; choose another --id`);
+      }
+      const conflict = await charterLaunchConflict(ctx, workDir);
+      if (conflict !== null) return fail("chain_active", conflict);
+      const charterPath = path.resolve(workDir, "..", `charter-${rootId}-${ts}.json`);
+      // Spec «Фиксация-запуск» step 2: the file must live OUTSIDE the work
+      // directory (realpath, not just a lexical parent). A work dir at a
+      // filesystem root has resolve(workDir, "..") === workDir — refuse
+      // before any write.
+      try {
+        if (await charter.charterInsideWorkdir(charterPath, workDir)) {
+          return fail("charter_inside_workdir", `computed charter path ${charterPath} is inside the work directory; nothing was written`);
+        }
+      } catch (err) {
+        return fail("charter_inside_workdir", `charter path cannot be resolved (${err instanceof Error ? err.message : String(err)})`);
+      }
+      const launched = await charterLaunch.launchFromDraft({ charter: draft.charter, workDir, rootId, charterPath });
+      if (!launched.ok || !("firstLaunch" in launched)) return fail(launched.reason, launched.message);
+      const firstLaunch = launched.firstLaunch;
+      runtime.researchChain = { chainId: firstLaunch.chainId, workDir, charterPath: firstLaunch.path, charterSha256: firstLaunch.sha256, charter: draft.charter };
+      runtime.researchCampaignId = rootId;
+      runtime.charterFirstLaunch = firstLaunch;
+      runtime.charterDraft = null;
+      runtime.charterDialogOpen = false;
+      runtime.charterRootId = null;
+      recordAutoresearchActivation(workDir, true);
+      setAutoresearchMode(ctx, true);
+      runtime.autoResumeTurns = 0;
+      updateWidget(ctx);
+      ctx.ui.notify(`Research chain ${firstLaunch.chainId} started (charter sha256 ${firstLaunch.sha256.slice(0, 12)})`, "info");
+      const kickoff = [
+        "Formulate the brief (questions, decision rules, stop rules) from the campaign description, then:",
+        `1. research_brief draft with the brief object (the campaign id is ${rootId}, note it),`,
+        "2. research_brief propose (the owner approves the Brief SHA-256 dialog),",
+        "3. research start,",
+        "4. research open for each question, record evidence, research close with a verdict,",
+        "5. research stop, then research report.",
+      ].join("\n");
+      sendWhenReady(ctx, kickoff);
+      return reply(`✅ Research chain ${firstLaunch.chainId} started (charter sha256 ${firstLaunch.sha256}).`);
+    },
+  });
+
+  registerGatedTool({
     name: "research_brief",
     label: "Research brief (phase 1)",
     // The full brief is drawn as this tool call's row in the transcript: the row is shown before execute and before the owner dialog.
@@ -9880,6 +10000,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // Review B4: leaving research mode ends the chain in memory too, so later
     // campaigns in this session are not routed into a finished chain.
     runtime.researchChain = null;
+    runtime.charterDialogOpen = false;
+    runtime.charterDraft = null;
     runtime.autoResumeTurns = 0;
     cancelPendingResume(runtime);
     ctx.ui.notify(`Research campaign ${campaignId} stopped — research mode OFF. The final report stays available: research report.`, "info");
@@ -9890,6 +10012,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   /** The active chain of this session, or null. Never taken from the model. */
   const activeChain = (ctx: ExtensionContext): NonNullable<AutoresearchRuntime["researchChain"]> | null =>
     getRuntime(ctx).researchChain;
+
+  const charterLaunchConflict = async (ctx: ExtensionContext, workDir: string): Promise<string | null> => {
+    const chain = activeChain(ctx);
+    if (chain !== null) return `research chain ${chain.chainId} active`;
+    if (await researchBlocksOrdinaryLoop(workDir, ctx)) return "research campaign active";
+    return null;
+  };
 
   /** Spec predicate "the chain can continue": status active/awaiting_child and
    *  the charter still matches the file on disk (charter_changed refuses).
@@ -10054,6 +10183,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     setAutoresearchMode(ctx, false);
     runtime.researchCampaignId = null;
     runtime.researchChain = null;
+    runtime.charterDialogOpen = false;
+    runtime.charterDraft = null;
     runtime.chainContinuationSent = false;
     cancelPendingResume(runtime);
     ctx.ui.notify(`Research chain ${chainId} stopped — research mode OFF (the chain was in awaiting_child; the last report is already saved).`, "info");
@@ -10333,6 +10464,40 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const kickoff = `/skill:autoresearch-parallel ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`.replace(/\s+/g, " ").trim();
         ctx.ui.notify(`Parallel mode ON (${parallelMatch[1]}) — loaded autoresearch-parallel skill`, "info");
         sendWhenReady(ctx, kickoff);
+        return;
+      }
+
+      // ===== charter subcommand: owner-directed interactive chain launch =====
+      if (/^charter(\s|$)/.test(command)) {
+        let args_ = trimmedArgs.slice("charter".length).trim();
+        let requestedId: string | null = null;
+        const idMatch = /^--id\s+([A-Za-z0-9][A-Za-z0-9._-]{0,63})(\s|$)/.exec(args_);
+        if (idMatch) {
+          requestedId = idMatch[1];
+          args_ = args_.slice(idMatch[0].length).trim();
+        }
+        const description = args_;
+        const usage = "Usage: /autoresearch charter [--id <root>] <description> — describe the chain frames in words; the agent drafts the charter and the owner confirms it";
+        if (!description && requestedId === null) {
+          ctx.ui.notify(usage, "error");
+          return;
+        }
+        const workDir = resolveWorkDir(ctx.cwd);
+        const chain = (runtime as any).researchChain ?? null;
+        if (chain !== null) {
+          ctx.ui.notify(`research chain ${chain.chainId} active: /autoresearch charter refused`, "error");
+          return;
+        }
+        if (await researchBlocksOrdinaryLoop(workDir, ctx)) {
+          ctx.ui.notify("research campaign active", "error");
+          return;
+        }
+        (runtime as any).charterDialogOpen = true;
+        (runtime as any).charterRootId = requestedId;
+        const rootHint = requestedId ?? "generated as bench-<timestamp> at propose";
+        const kickoff = `The owner wants to start a research chain. Description: ${description}. Formulate the charter now:\n1. research_charter draft with the charter object ({max_campaigns, max_depth, stop_rules} — all optional, validateCharter rules apply);\n2. research_charter propose — the owner confirms the Charter SHA-256 dialog; on confirm the chain starts immediately (campaign ${rootHint}, journal ${requestedId ? `${requestedId}-chain` : "<rootId>-chain"}) and the root brief dialog follows.\nLimits are the owner's words; do not invent fields beyond the charter allowlist.`;
+        sendWhenReady(ctx, kickoff);
+        ctx.ui.notify("Charter dialog open — describe the chain frames; the agent drafts the charter", "info");
         return;
       }
 
