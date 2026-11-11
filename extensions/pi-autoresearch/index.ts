@@ -9139,6 +9139,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (status !== "awaiting_child") {
           return fail("invalid_argument", `parent_not_reported: the parent campaign's report must be recorded before the next chain brief (chain status ${status})`);
         }
+        if (!(await charterFileIntact(draftChain.workDir, draftChain.chainId, draftChain.charterPath, draftChain.charterSha256))) {
+          return fail("manual_check_required", `research chain ${draftChain.chainId}: the charter file changed since the owner confirmed it; chain actions are blocked`);
+        }
         const brief = params.brief;
         if (brief === undefined) return fail("invalid_argument", "draft requires the brief object");
         const campaignIds = await chainCampaignIds(ctx);
@@ -9630,6 +9633,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           // (prospective predicate false) sets limit_reached and turns the mode
           // OFF — a forbidden child must never be prompted for.
           if (!(await chainCanContinue(ctx, workDir))) {
+            // Review (ef7d8951): a charter change inside the predicate sets
+            // manual_check_required; it must not be overwritten by limit_reached.
+            if ((await chainJournal.statusOf(chain.workDir, chain.chainId)) === "manual_check_required") {
+              return reply(reportText + "\n\n" + savedNote + "\nThe charter file changed since the owner confirmed it: chain status manual_check_required. Research mode stays ON until manual check.");
+            }
             await chainJournal.setChainStatus(chain.workDir, chain.chainId, "limit_reached").catch(() => undefined);
             exitResearchMode(ctx, id);
             return reply(reportText + "\n\n" + savedNote + "\nResearch mode is OFF: the charter limit is reached (chain limit_reached). No further chain campaigns are created.");
@@ -9855,27 +9863,32 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   /** Spec predicate "the chain can continue": status active/awaiting_child and
    *  the charter still matches the file on disk (charter_changed refuses).
    *  Limits are optional (owner decision 2026-11-10): absent means unlimited. */
+  /** Re-hash the charter file against the hash the owner confirmed. A changed
+   *  or unreadable file sets manual_check_required (spec) and returns false.
+   *  Shared by the child-draft branch and the continuation predicate (review B2). */
+  const charterFileIntact = async (workDir: string, chainId: string, charterPath: string, charterSha256: string): Promise<boolean> => {
+    try {
+      const bytes = await fs.promises.readFile(charterPath);
+      if (createHash("sha256").update(bytes).digest("hex") === charterSha256) return true;
+    } catch {
+      // unreadable counts as changed
+    }
+    await chainJournal.setChainStatus(workDir, chainId, "manual_check_required").catch(() => undefined);
+    return false;
+  };
+
   const chainCanContinue = async (ctx: ExtensionContext, workDir: string): Promise<boolean> => {
     const chain = activeChain(ctx);
     if (chain === null) return false;
     const status = await chainJournal.statusOf(chain.workDir, chain.chainId);
     if (status !== "active" && status !== "awaiting_child") return false;
-    // Re-hash the charter file: a changed file means manual_check_required (spec).
-    // Review B2: the file itself is re-read, not just the journal.
     try {
-      const dir = chainJournal.chainDir(chain.workDir, chain.chainId);
-      if (dir === null) return false;
       const verified = await chainJournal.verifyChain(chain.workDir, chain.chainId);
       if (!verified.ok) return false;
-      const bytes = await fs.promises.readFile(chain.charterPath);
-      const nowSha = createHash("sha256").update(bytes).digest("hex");
-      if (nowSha !== chain.charterSha256) {
-        await chainJournal.setChainStatus(chain.workDir, chain.chainId, "manual_check_required").catch(() => undefined);
-        return false;
-      }
     } catch {
       return false;
     }
+    if (!(await charterFileIntact(chain.workDir, chain.chainId, chain.charterPath, chain.charterSha256))) return false;
     // Charter limits, when set (spec: the PREDICATE is prospective — the next
     // campaign must not exceed either limit; root depth is 0, count includes
     // the root). Without limits the chain is unlimited by owner decision.
