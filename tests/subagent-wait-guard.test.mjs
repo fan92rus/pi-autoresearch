@@ -6,7 +6,7 @@
  *
  * Run: node --experimental-strip-types --experimental-loader ./tests/redirect-loader.mjs --test tests/subagent-wait-guard.test.mjs
  */
-import { test, mock } from "node:test";
+import { test, mock, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -75,8 +75,28 @@ function driftNudges(h) {
 
 /** Wait out the pending-resume settle window so scheduled nudges actually send. */
 async function settleWindow() {
-  await new Promise((r) => setTimeout(r, SETTLED_WINDOW_MS + 250));
+  await advance(SETTLED_WINDOW_MS + 250);
 }
+
+/**
+ * Virtual clock (node:test mock.timers, enabled per test below). Ticks in 10 ms steps and
+ * flushes microtasks between steps, so timers created by async chains (the probe window,
+ * the re-check timer) fire in their real order. No wall-clock sleep in this file.
+ */
+const flushMicrotasks = () => new Promise((r) => setImmediate(r));
+async function advance(ms) {
+  for (let left = ms; left > 0; left -= 10) {
+    mock.timers.tick(Math.min(10, left));
+    await flushMicrotasks();
+  }
+}
+
+beforeEach(() => {
+  mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+});
+afterEach(() => {
+  mock.timers.reset();
+});
 
 test("live subagent defers the drift nudge; counters do not move", async () => {
   const h = await readySession("defer");
@@ -139,22 +159,22 @@ test("re-check timer alone (no completion event) delivers after subagents finish
   await settleNoWorkTurn(h);
   installRpcResponder(h.events, { respond: true, totalActive: 0 });
   // Wait past the 30 s re-check interval without any event.
-  await new Promise((r) => setTimeout(r, SUBAGENT_DEFER_RECHECK_MS + 1500));
+  await advance(SUBAGENT_DEFER_RECHECK_MS + 1500);
   await settleWindow();
   assert.equal(driftNudges(h).length, 1, "re-check timer delivered after zero active");
   await fireAgentStart(h);
 }, 60_000);
 
-test("fuse: a still-alive subagent does not block delivery past SUBAGENT_DEFER_FUSE_MS {skip: needs 10 min unless RUN_FUSE_TEST=1}", { skip: process.env.RUN_FUSE_TEST !== "1" }, async () => {
+test("fuse: a still-alive subagent does not block delivery past SUBAGENT_DEFER_FUSE_MS (virtual clock)", async () => {
   const h = await readySession("fuse");
   installRpcResponder(h.events, { respond: true, totalActive: 1 });
   await fireSessionStart(h);
   await settleNoWorkTurn(h);
   // Keep reporting one live run far past the fuse.
-  await new Promise((r) => setTimeout(r, SUBAGENT_DEFER_FUSE_MS + 2000));
+  await advance(SUBAGENT_DEFER_FUSE_MS + 2000);
   await settleWindow();
   assert.ok(driftNudges(h).length >= 1, "fuse delivered the nudge despite a live subagent");
-}, 700_000); // long: runs only with RUN_FUSE_TEST=1
+}, 60_000);
 
 test("no fleet in the reply → unknown → fail open (nudge delivered as before)", async () => {
   const h = await readySession("no-fleet");
@@ -475,6 +495,22 @@ test("shutdown clears the re-check timer: nothing fires after the re-check windo
   // Wait PAST the re-check interval: a surviving timer would fire its probe and
   // (after the responder flips to zero) deliver into the dead session.
   installRpcResponder(h.events, { respond: true, totalActive: 0 });
-  await new Promise((r) => setTimeout(r, SUBAGENT_DEFER_RECHECK_MS + 1500));
+  await advance(SUBAGENT_DEFER_RECHECK_MS + 1500);
   assert.equal(driftNudges(h).length, 0, "shutdown cancelled the re-check timer: no delivery past the window");
+});
+
+test("session_start resets the deferral (review round 4: reset point covered by a kill test)", async () => {
+  const h = await readySession("start-reset");
+  installRpcResponder(h.events, { respond: true, totalActive: 1 });
+  await fireSessionStart(h);
+  await settleNoWorkTurn(h);
+  await settleWindow();
+  assert.equal(driftNudges(h).length, 0, "deferred");
+  // A new session starts while the deferral is still pending.
+  await h.hook("session_start")({}, h.ctx);
+  installRpcResponder(h.events, { respond: true, totalActive: 0 });
+  h.events.emit("subagent:async-complete", {});
+  await settleWindow();
+  await advance(SUBAGENT_DEFER_RECHECK_MS + 1500);
+  assert.equal(driftNudges(h).length, 0, "session_start reset kills the deferral: no delivery after zero active");
 });

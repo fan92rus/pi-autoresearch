@@ -71,6 +71,8 @@ export interface TreeNode {
   ideaId: string | null;
   /** Optional explicit finding id this hypothesis is based on (hypothesis-evidence-context). */
   findingId?: string | null;
+  /** Original hypothesis node id when this node is a repeat (experiment-rigor 3.x). */
+  repeatOf?: string | null;
   /** Depth from root (0 = baseline). */
   depth: number;
   /** Unix timestamp (ms) when the node was created. */
@@ -234,6 +236,7 @@ export function createHypothesisNode(
   status: "untested" | "duplicate",
   asi: Record<string, unknown> | null,
   findingId: string | null = null,
+  repeatOf: string | null = null,
 ): TreeNode {
   const label = extractLabel(hypothesis);
   const ideaId = asi && typeof asi.idea_id === "string" ? asi.idea_id : null;
@@ -252,6 +255,7 @@ export function createHypothesisNode(
     simhashFull: computeSimhash(hypothesis),
     ideaId,
     findingId,
+    repeatOf,
     depth: parentDepth + 1,
     createdAt: Date.now(),
     exhausted: false,

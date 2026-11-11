@@ -187,9 +187,10 @@ test("внутри эпохи: baseline, best и confidence считаются �
 
   assert.equal(findBaselineMetric(results, 0), 90, "baseline — первый прогон эпохи 2, а не 100 из эпохи 1");
   assert.equal(findBestMetric(results, 0, "lower"), 88, "лучший keep текущей эпохи, не 58 из эпохи 1");
-  // Эпоха 2: 90, 92, 88 → медиана 90, |отклонения| 0, 2, 2 → MAD 2;
-  // лучший 88 от baseline 90 → |дельта| 2 → confidence 2 / 2 = 1.0.
-  assert.equal(computeConfidence(results, 0, "lower"), 1);
+  // experiment-rigor 3.2: confidence считается по повторам ОДНОЙ гипотезы. В этой
+  // фикстуре повторов нет (узлы не объявлены), значит confidence неизвестен (null).
+  // Прежняя MAD-формула (1.0) смешивала разные идеи и больше не используется.
+  assert.equal(computeConfidence(results, 0, "lower"), null);
 });
 
 test("поперёк эпох: прошлая эпоха — только справка с собственным значением и номером", () => {
@@ -253,7 +254,8 @@ test("дашборд: прогон с битым epoch присоединяет�
   // Лучший и baseline — только эпоха 2; 80 не становится лучшим текущей эпохи.
   assert.equal(findBestMetric(rec.results, 0, "lower"), 88);
   assert.equal(findBaselineMetric(rec.results, 0), 90);
-  assert.equal(computeConfidence(rec.results, 0, "lower"), 1, "MAD и baseline без прогона 5");
+  // experiment-rigor 3.2: без повторов одной гипотезы confidence неизвестен (null), MAD не используется.
+  assert.equal(computeConfidence(rec.results, 0, "lower"), null, "повторов нет -> confidence неизвестен");
   assert.deepEqual(priorEpochBest(rec.results, 0, 2, "lower"), { epoch: 1, metric: 80, runNumber: 5 });
 
   const lines = dashboard(text);
@@ -375,8 +377,9 @@ test("без эпох: дашборд как прежде — без Cross-epoch
   assert.match(lines.find((l) => l.includes("Baseline:")), /★ ms: 100ms #1/);
   assert.equal(lines.find((l) => l.includes("Cross-epoch:")), undefined);
   assert.equal(lines.find((l) => l.includes("── epoch")), undefined);
-  // 100, 60, 58, 62: медиана 61, отклонения 39, 1, 3, 1 → MAD 2; лучший 58 от baseline 100 → 42 / 2 = 21.0.
-  assert.match(lines.find((l) => l.includes("Runs:")), /\(conf: 21\.0×\)/);
+  // experiment-rigor 3.2: повторов одной гипотезы нет, confidence неизвестен — строка conf не выводится.
+  // (Прежнее значение 21.0× считалось по MAD всех прогонов и больше не используется как шум.)
+  assert.doesNotMatch(lines.find((l) => l.includes("Runs:")), /\(conf: /);
 });
 
 // ---------------------------------------------------------------------------

@@ -225,6 +225,7 @@ import {
 import { computeSimhash, hammingDistance, classifyDistance } from "./parallel/simhash.ts";
 import { rankNodes, type RankedNode } from "./parallel/ucb1.ts";
 import { renderTree, renderNodeDetail, findBestNodeId } from "./parallel/treeview.ts";
+import { repeatConfidence, keepStatus } from "./confidence.ts";
 
 // ---------------------------------------------------------------------------
 // Experiment output limits (sent to LLM — keep small to save context)
@@ -503,7 +504,7 @@ export const LogParams = Type.Object({
     Type.String({
       description:
         "Node ID from propose_hypothesis. Links this log entry to the pre-registered hypothesis. " +
-        "If omitted, falls back to last run_experiment's hypothesis_id (baseline path).",
+        "If omitted, the running hypothesis node (from run_experiment) is finalized and linked.",
     })
   ),
   metrics: Type.Optional(
@@ -741,25 +742,15 @@ function isBetter(
   return direction === "lower" ? current < best : current > best;
 }
 
-/** Compute the median of a numeric array (returns 0 for empty arrays) */
-function sortedMedian(values: number[]): number {
-  if (values.length === 0) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 0
-    ? (sorted[mid - 1] + sorted[mid]) / 2
-    : sorted[mid];
-}
-
 /**
  * Compute confidence score for the best improvement vs. session noise floor.
  *
- * Uses Median Absolute Deviation (MAD) of all metric values in the current
- * segment as a robust noise estimator. Returns `|best_delta| / MAD`, where
+ * Noise is the sample standard deviation of repeats of the best keep's own
+ * hypothesis (experiment-rigor 3.2). Returns `|best_delta| / sd`, where
  * best_delta is the improvement of the best kept metric over baseline.
  *
- * Returns null when there are fewer than 3 data points (insufficient data)
- * or when MAD is 0 (all values identical — no measurable noise).
+ * Returns null when there is no keep better than baseline, the hypothesis has
+ * fewer than two runs, or the spread is 0. The segment MAD is a diagnostic only.
  */
 export function computeConfidence(
   results: ExperimentResult[],
@@ -767,34 +758,14 @@ export function computeConfidence(
   direction: "lower" | "higher",
   epoch: number = segmentEpoch(results, segment),
 ): number | null {
-  // Within one epoch only (task 2.3): MAD and baseline of another scale would
-  // make the noise-floor multiple meaningless.
+  // Within one epoch only (task 2.3): the noise and baseline of another scale
+  // would make the noise-floor multiple meaningless. Noise = repeats of the best
+  // keep's own hypothesis (experiment-rigor 3.2, shared rule in confidence.ts).
   const cur = epochResults(results, segment, epoch).filter((r) => r.metric > 0);
-  if (cur.length < 3) return null;
-
-  const values = cur.map((r) => r.metric);
-  const median = sortedMedian(values);
-  const deviations = values.map((v) => Math.abs(v - median));
-  const mad = sortedMedian(deviations);
-
-  if (mad === 0) return null;
-
   const baseline = findBaselineMetric(results, segment, epoch);
   if (baseline === null) return null;
-
-  // Find best kept metric in current segment
-  let bestKept: number | null = null;
-  for (const r of cur) {
-    if (r.status === "keep" && r.metric > 0) {
-      if (bestKept === null || isBetter(r.metric, bestKept, direction)) {
-        bestKept = r.metric;
-      }
-    }
-  }
-  if (bestKept === null || bestKept === baseline) return null;
-
-  const delta = Math.abs(bestKept - baseline);
-  return delta / mad;
+  const rc = repeatConfidence(cur, baseline, direction);
+  return rc === null ? null : rc.value;
 }
 
 /** Get results in the current segment only */
@@ -3553,6 +3524,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\n8. NEXT hypothesis from what you learned; stuck 3+ non-improving runs \u2192 tree_status()." +
       "\n\n## Hypothesis Tree" +
       "\npropose_hypothesis() BEFORE each run_experiment. tree_status() \u2014 hypothesis list with statuses and the current best." +
+      "\nRepeat: propose_hypothesis(repeat_of=\"nX\", force=true). A keep stays preliminary until repeated." +
       "\n\n## Finalization" +
       "\nfinalize_research({reason, evidence, confidence}) only with PROOF (mathematical floor, noise floor reached, search space exhausted). A subjective \u201cthis seems hard\u201d is NOT proof \u2014 try orthogonal approaches first. It is a RECOMMENDATION; the observer arbitrates and suppresses premature signals." +
       "\n\n## Stagnation Council" +
@@ -3857,6 +3829,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     finding_id: Type.Optional(Type.String({
       description: "Optional finding id (e.g. \"f3\") this hypothesis is based on. Stored as an explicit link; text mentions are not auto-linked.",
     })),
+    repeat_of: Type.Optional(Type.String({
+      description: "Repeat of an existing hypothesis node (e.g. \"n1\"). Use with force=true to re-measure the same idea; the new node records the original, so repeats are grouped for confidence.",
+    })),
   });
 
   registerGatedTool({
@@ -4040,6 +4015,21 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         warning = warning + findingWarning;
       }
 
+      // ── Repeat link (experiment-rigor): the new node points at the ORIGINAL node id,
+      // so every repeat of one idea shares one root key (repeat of a repeat resolves to its root).
+      const repeatOfRaw = typeof params.repeat_of === "string" ? params.repeat_of.trim() : "";
+      let repeatOfRoot: string | null = null;
+      if (repeatOfRaw) {
+        const repeatTarget = tree.nodes[repeatOfRaw];
+        if (!repeatTarget) {
+          return {
+            content: [{ type: "text", text: `❌ repeat_of="${repeatOfRaw}": no such node in the tree.` }],
+            details: {},
+          };
+        }
+        repeatOfRoot = repeatTarget.repeatOf ?? repeatTarget.id;
+      }
+
       // ── Create tree node ──
       const nodeId = nextNodeId(tree);
       const hypothesisNode = createHypothesisNode(
@@ -4050,6 +4040,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         nodeStatus,
         null,
         findingId,
+        repeatOfRoot,
       );
       appendChild(tree, parentId, hypothesisNode);
       saveTree(workDir, tree);
@@ -5351,7 +5342,32 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       // ASI: agent-supplied free-form diagnostics + honest provenance for
       // previously-tracked metrics the harness no longer produces.
+      // The node this run belongs to: the explicit hypothesis_id, or else the running node
+      // that log finalization will close (review B6). Group key and finalization both read
+      // this one value, so a repeat logged without hypothesis_id still joins its group.
+      let linkNodeId: string | null = typeof params.hypothesis_id === "string" && params.hypothesis_id.length > 0 ? params.hypothesis_id : null;
+      if (!linkNodeId && treeExists(workDir)) {
+        const tree = loadTree(workDir);
+        const running = tree ? findRunningNode(tree) : null;
+        if (running) linkNodeId = running.id;
+      }
       const asiRecord: ASI = { ...((params.asi ?? {}) as ASI) };
+      // The group keys are owned by the harness: an agent-supplied asi must not join a
+      // repeat group or name a node it did not run (review B5-m3).
+      delete asiRecord.hypothesis_node;
+      delete asiRecord.repeat_of;
+      // experiment-rigor 3.2: the hypothesis node this run belongs to, so repeats of the
+      // same node (asi.repeat_of) can be grouped for the noise estimate.
+      if (linkNodeId) {
+        asiRecord.hypothesis_node = linkNodeId;
+        // A run of a repeat node carries its original's id, so it joins that group.
+        try {
+          const linkedNode = treeExists(workDir) ? loadTree(workDir).nodes[linkNodeId] : undefined;
+          if (linkedNode?.repeatOf) asiRecord.repeat_of = linkedNode.repeatOf;
+        } catch {
+          // unreadable tree: the run keeps its own node key
+        }
+      }
       if (droppedMissing.length > 0) {
         asiRecord.secondary_metrics_not_measured = droppedMissing.join(", ");
       }
@@ -5423,9 +5439,22 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       state.confidence = computeConfidence(state.results, state.currentSegment, state.bestDirection, runEpoch);
       experiment.confidence = state.confidence;
 
+      // experiment-rigor 4.3: a keep is confirmed or preliminary; it is never refused.
+      let keepTag = "";
+      if (experiment.status === "keep") {
+        const keepBaseline = findBaselineMetric(state.results, state.currentSegment, runEpoch);
+        const keepRuns = epochResults(state.results, state.currentSegment, runEpoch).filter((r) => r.metric > 0);
+        const ks = keepBaseline === null
+          ? "preliminary"
+          : keepStatus(keepRuns, experiment, keepBaseline, state.bestDirection);
+        // Derived, not stored: the ledger row stays byte-identical (run-links invariant).
+        // Readers recompute the status with keepStatus (report.ts).
+        keepTag = ` (${ks})`;
+      }
+
       // Build response text
       const segmentCount = currentResults(state.results, state.currentSegment).length;
-      let text = `Logged #${runNumber}: ${experiment.status} — ${experiment.description}`;
+      let text = `Logged #${runNumber}: ${experiment.status}${keepTag} — ${experiment.description}`;
 
       if (state.bestMetric !== null) {
         text += `\nBaseline ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}`;
@@ -5705,14 +5734,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         pi.exec(cmd, args, opts);
 
       // Resolve which node to finalize: explicit hypothesis_id, or last running node.
-      let resolveNodeId: string | null = params.hypothesis_id ?? null;
-      if (!resolveNodeId && treeExists(workDir)) {
-        const tree = loadTree(workDir);
-        if (tree) {
-          const running = findRunningNode(tree);
-          if (running) resolveNodeId = running.id;
-        }
-      }
+      const resolveNodeId: string | null = linkNodeId;
 
       if (resolveNodeId) {
         // ── New flow: finalize existing hypothesis node ──

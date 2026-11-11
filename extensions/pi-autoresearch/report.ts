@@ -56,9 +56,9 @@
  * or unreadable source marks its section empty or is named in «Ограничения»;
  * buildReport never throws (a fallback report keeps all seven sections).
  *
- * confidenceOf mirrors index.ts computeConfidence semantics (MAD multiple of
- * the best keep's delta over the baseline, within the active epoch and the
- * current segment only) instead of importing index.ts: report.ts must stay a
+ * confidenceOf mirrors index.ts computeConfidence semantics (sample-sd multiple of
+ * the best keep's delta over the baseline, from repeats of one hypothesis, within
+ * the active epoch and the current segment only) instead of importing index.ts: report.ts must stay a
  * leaf module — task 3.2 wires index.ts → report.ts, an index import would
  * create a cycle.
  */
@@ -73,6 +73,7 @@ import {
   type ReconstructedJsonlState,
 } from "./jsonl.ts";
 import { FINDING_THEMES, loadFindings, type FindingView } from "./findings.ts";
+import { repeatConfidence, keepStatus, rootKeyOf } from "./confidence.ts";
 import {
   confidenceSuppressionReason,
   measurerControlOfDir,
@@ -191,13 +192,6 @@ function str(value: unknown): string {
 
 function finiteOrNull(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function sortedMedian(values: number[]): number {
-  if (values.length === 0) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -473,6 +467,8 @@ interface ConfidenceView {
   baseline: number | null;
   best: number | null;
   bestRun: number | null;
+  /** Status of the best keep (experiment-rigor 5.2); null when there is no best keep. */
+  keepStatus: "confirmed" | "preliminary" | null;
 }
 
 function confidenceOf(
@@ -480,31 +476,28 @@ function confidenceOf(
   epoch: number,
   direction: "lower" | "higher",
 ): ConfidenceView {
-  const none: ConfidenceView = { value: null, baseline: null, best: null, bestRun: null };
+  // experiment-rigor 3.2: noise = repeats of the best keep's own hypothesis (shared rule
+  // in confidence.ts). The segment spread is shown only as a diagnostic.
+  const none: ConfidenceView = { value: null, baseline: null, best: null, bestRun: null, keepStatus: null };
   const inEpoch = state.results.filter((r) => r.segment === state.currentSegment && r.epoch === epoch);
-  const positive = inEpoch.filter((r) => r.metric > 0);
-  if (positive.length < 3) return none;
-
-  const values = positive.map((r) => r.metric);
-  const median = sortedMedian(values);
-  const mad = sortedMedian(values.map((v) => Math.abs(v - median)));
-  if (mad === 0) return none;
-
   const baseline = inEpoch.length > 0 ? inEpoch[0].metric : null;
   if (baseline === null) return none;
-
+  const positive = inEpoch.filter((r) => r.metric > 0);
+  // The best keep is shown whether or not its confidence is known (baseline → best is information).
   let best: number | null = null;
   let bestRun: number | null = null;
+  let bestObj: (typeof positive)[number] | null = null;
   for (const r of positive) {
     if (r.status !== "keep") continue;
     if (best === null || isBetter(r.metric, best, direction)) {
       best = r.metric;
       bestRun = r.run;
+      bestObj = r;
     }
   }
-  if (best === null || best === baseline) return none;
-
-  return { value: Math.abs(best - baseline) / mad, baseline, best, bestRun };
+  const rc = repeatConfidence(positive, baseline, direction);
+  const ks = bestObj === null ? null : keepStatus(positive, bestObj, baseline, direction);
+  return { value: rc === null ? null : rc.value, baseline, best, bestRun, keepStatus: ks };
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -811,11 +804,32 @@ function renderMeasurementSection(
   return lines;
 }
 
+/** Median of a non-empty list (no mutation of the input). */
+function medianOf(values: number[]): number {
+  const s = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 === 0 ? (s[mid - 1] + s[mid]) / 2 : s[mid];
+}
+
+/**
+ * experiment-rigor B3: median absolute deviation of all positive runs of the active
+ * epoch in the current segment. Diagnostic only: confidence never uses it.
+ */
+function segmentMadDiagnostic(state: ReconstructedJsonlState, epoch: number): number | null {
+  const values = state.results
+    .filter((r) => r.segment === state.currentSegment && r.epoch === epoch && r.metric > 0)
+    .map((r) => r.metric);
+  if (values.length < 3) return null;
+  const med = medianOf(values);
+  return medianOf(values.map((v) => Math.abs(v - med)));
+}
+
 function renderNoiseSection(
   floor: NoiseFloorStatus,
   suppression: string | null,
   conf: ConfidenceView,
   unit: string,
+  madDiag: number | null,
 ): string[] {
   const lines = ["## 4. Шум и уверенность"];
   if (floor.floor === null) {
@@ -835,15 +849,23 @@ function renderNoiseSection(
     lines.push(`Уверенность: подавлена — ${suppression}`);
   } else if (conf.value !== null && conf.baseline !== null && conf.best !== null) {
     lines.push(
-      `Уверенность: ${conf.value.toFixed(1)}× — отрыв лучшего keep от baseline в единицах MAD ` +
+      `Уверенность: ${conf.value.toFixed(1)}× — отрыв лучшего keep от baseline в единицах шума его повторов ` +
         `(активная эпоха: baseline ${fmtMetric(conf.baseline, unit)} → лучший ${fmtMetric(conf.best, unit)})`,
     );
   } else {
+    const where = conf.baseline !== null && conf.best !== null
+      ? ` (активная эпоха: baseline ${fmtMetric(conf.baseline, unit)} → лучший ${fmtMetric(conf.best, unit)})`
+      : "";
     lines.push(
-      `Уверенность: ${NO_DATA} (нужно ≥3 прогона в активной эпохе, ненулевой MAD и хотя бы один keep, ` +
-        "отличающийся от baseline)",
+      `Уверенность: ${NO_DATA} (нужны ≥2 прогона одной гипотезы в активной эпохе (повтор через asi.repeat_of), ` +
+        `ненулевой разброс повторов и keep, отличающийся от baseline)${where}`,
     );
   }
+  lines.push(
+    madDiag === null
+      ? "Диагностика: разброс прогонов сегмента (MAD) — нужно ≥3 прогона; на уверенность не влияет."
+      : `Диагностика: разброс прогонов сегмента (MAD) = ${`${Number(madDiag.toPrecision(4))} ${unit}`.trim()}; на уверенность не влияет.`,
+  );
   return lines;
 }
 
@@ -963,10 +985,16 @@ function renderSummarySection(input: {
       .join(" · ");
     const bestPart =
       input.conf.best !== null && input.conf.baseline !== null
-        ? ` · baseline ${fmtMetric(input.conf.baseline, unit)} · лучший ${fmtMetric(input.conf.best, unit)}`
+        ? ` · baseline ${fmtMetric(input.conf.baseline, unit)} · лучший ${fmtMetric(input.conf.best, unit)}` +
+          (input.conf.keepStatus !== null ? ` (${input.conf.keepStatus === "confirmed" ? "подтверждён" : "предварительный"})` : "")
         : "";
+    // experiment-rigor 5.1: counters of the active epoch (attempts, keeps, unique hypotheses).
+    const epochRuns = state.results.filter((r) => r.epoch === input.activeEpoch && r.segment === state.currentSegment);
+    const keepsInEpoch = epochRuns.filter((r) => r.status === "keep").length;
+    const uniqueHypotheses = new Set(epochRuns.map((r) => rootKeyOf(r.asi) ?? `run:${r.run}`)).size;
     lines.push(
-      `- Прогоны: ${state.results.length}${statusPart ? ` (${statusPart})` : ""} · активная эпоха ${input.activeEpoch}${bestPart}`,
+      `- Прогоны: ${state.results.length}${statusPart ? ` (${statusPart})` : ""} · активная эпоха ${input.activeEpoch}${bestPart}` +
+        ` · в эпохе: попыток ${epochRuns.length}, keep ${keepsInEpoch}, гипотез ${uniqueHypotheses}`,
     );
   }
 
@@ -1102,7 +1130,10 @@ function buildReportUnsafe(workDir: string): string {
   sections.push(...renderRunsSection(state, activeEpoch, manifests, unreadableManifests, workDir), "");
   sections.push(...renderFindingsSection(findings, storeOk), "");
   sections.push(...renderMeasurementSection(scan, state, scale, verification, artifacts), "");
-  sections.push(...renderNoiseSection(floor, suppression, conf, state.metricUnit), "");
+  sections.push(
+    ...renderNoiseSection(floor, suppression, conf, state.metricUnit, segmentMadDiagnostic(state, activeEpoch)),
+    "",
+  );
   sections.push(...renderIdeasSection(deadEnds, ideas), "");
   sections.push(
     ...renderGatesSection(findings, storeOk, storeErrors, measurer, deadEndsUnreadable, unreadableManifests),

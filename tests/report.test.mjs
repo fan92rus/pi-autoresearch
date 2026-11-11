@@ -402,8 +402,8 @@ test("полный отчёт: секция 4 — шум и уверенност
 
   // floor 0.04, калиброван на эпохе 2, активная шкала — эпоха 2: свежий
   assert.ok(s4.includes("Noise floor: ±0.04 (калиброван на эпохе 2) — свежий"), "floor is shown as an absolute metric value, not a percent");
-  // epoch 2: значения 0.61/0.60/0.66 → MAD 0.01, delta 0.05 → 5.0×
-  assert.ok(s4.includes("Уверенность: 5.0× — отрыв лучшего keep от baseline в единицах MAD"));
+  // experiment-rigor 3.2: в фикстуре нет повторов одной гипотезы → confidence неизвестен.
+  assert.ok(s4.includes("Уверенность: нет данных"), "без повторов confidence неизвестен, MAD не используется");
   assert.ok(s4.includes("baseline 0.61 → лучший 0.66"));
 });
 
@@ -444,7 +444,7 @@ test("полный отчёт: секция 7 — сводка", () => {
   assert.ok(s7.includes('- Кампания: "fixture-campaign" · метрика accuracy · лучше: больше'));
   assert.ok(s7.includes("- Прогоны: 7 (keep 4 · discard 2 · crash 1) · активная эпоха 2 · baseline 0.61 · лучший 0.66"));
   assert.ok(s7.includes("- Measurement-трек: изменений 1 · активная шкала эпоха 2 · последнее изменение подтверждено независимой проверкой"));
-  assert.ok(s7.includes("- Шум: floor ±0.04 (свежий) · уверенность 5.0×"));
+  assert.ok(s7.includes("- Шум: floor ±0.04 (свежий) · уверенность: нет данных"));
   assert.ok(s7.includes("- Находки: всего 5 · открытых 4 · требуют независимой проверки 1 · owner-гейтов 2"));
   assert.ok(s7.includes("- Dead-ends: 1 · неразобранные идеи: 1"));
 });

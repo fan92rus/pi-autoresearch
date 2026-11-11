@@ -135,6 +135,11 @@ test("finding routes stay within the block budget", () => {
   );
 });
 
+test("autoresearch section tells the agent how to repeat an idea and that a keep stays preliminary (experiment-rigor 4.3)", () => {
+  assert.ok(section.includes("repeat_of=\"nX\", force=true"), "repeat route is in the section");
+  assert.ok(section.includes("A keep stays preliminary until repeated"), "preliminary keep rule is in the section");
+});
+
 test("autoresearch section stays within the prompt size budget", () => {
   assert.ok(
     section.length <= AUTORESEARCH_SECTION_MAX_CHARS,
