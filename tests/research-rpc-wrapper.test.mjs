@@ -566,3 +566,71 @@ test("without --charter a Charter dialog is refused like any non-brief confirm a
   assert.equal(logged.some((event) => event.direction === "to_pi" && event.record.type === "abort"), false, "the wrapper must not abort on its own outside charter mode");
   assert.equal(result.code, 3, "pi closed without a report, so the pre-existing exit code stands");
 });
+
+// ─── Final-review coverage gaps (tasks 4.4–4.6) ──────────────────────────────
+
+test("review-4.4: the root brief still needs its own dialog alongside the charter dialog", async () => {
+  const ctx = setup();
+  const body = [
+    ...FAKE_HEAD,
+    '  if (request.type === "extension_ui_response") {',
+    '    if (request.confirmed !== true) { input.close(); return; }',
+    '    globalThis.dialogs = (globalThis.dialogs ?? 0) + 1;',
+    '    if (globalThis.dialogs === 1) out({ id: "dialog-2", type: "extension_ui_request", method: "confirm", message: "Brief SHA-256: " + briefSha + String.fromCharCode(10) + "Approve brief?" });',
+    '    else reportAndSettleAwaiting();',
+    '    return;',
+    '  }',
+    ...FAKE_TAIL,
+  ];
+  const result = await runCharter(ctx, { fakeName: "root-brief-fake.mjs", fakeBody: body, timeout: "5", env: { CHARTER_FAKE_AFTER_PROMPT: "idle" } });
+  assert.equal(result.code, 0, result.stderr);
+  const logged = events(ctx);
+  const charter = logged.find((e) => e.record?.event === "charter_confirmation");
+  assert.equal(charter?.record.confirmed, true, "the charter dialog was confirmed");
+  const brief = logged.find((e) => e.record?.event === "brief_confirmation");
+  assert.equal(brief?.record.confirmed, true, "the ROOT brief dialog was confirmed as usual");
+  assert.equal(brief?.record.dialog_sha, ctx.digest, "the root brief hash is checked against --approve-sha");
+  const prompts = sentMessages(ctx);
+  assert.equal(prompts.length, 2, "stage-1 + one continuation");
+  assert.match(prompts[0], /^\/autoresearch research --id test-campaign/, "the root keeps the --campaign-id");
+});
+
+test("review-4.4: the wrapper never invents a child campaign id (system-assigned by the extension)", async () => {
+  const ctx = setup();
+  const result = await runCharter(ctx, { timeout: "4", env: { CHARTER_FAKE_AFTER_PROMPT: "idle" } });
+  assert.equal(result.code, 0, result.stderr);
+  for (const message of sentMessages(ctx)) {
+    assert.doesNotMatch(message, /--id [^\s]*-c\d+/, "no system child id in wrapper prompts");
+  }
+});
+
+test("review-4.5: a graceful awaiting_child pause keeps the session state on disk", async () => {
+  const ctx = setup();
+  const result = await runCharter(ctx, { timeout: "4", env: { CHARTER_FAKE_AFTER_PROMPT: "idle" } });
+  assert.equal(result.code, 0, result.stderr);
+  assert.ok(fs.existsSync(ctx.log), "the session log survives the pause");
+  const logged = events(ctx);
+  assert.ok(logged.some((e) => e.record?.event === "chain_awaiting_child"), "the pause is logged");
+  const prompts = sentMessages(ctx);
+  assert.match(prompts[prompts.length - 1], /next campaign/i, "the last delivery is the continuation, nothing after the pause");
+});
+
+test("review-4.6: the legacy exit codes are unchanged without --charter", async () => {
+  for (const { scenario, code } of [
+    { scenario: "success", code: 0 },
+    { scenario: "crash", code: 3 },
+    { scenario: "foreign-sha", code: 1 },
+  ]) {
+    const ctx = setup();
+    const result = await run(ctx, ["--timeout-sec", "8", "--stage1-timeout-sec", "6"], scenario);
+    assert.equal(result.code, code, `${scenario}: expected ${code}, got ${result.code}; ${result.stderr}`);
+    assert.equal(
+      events(ctx).some((e) => e.record?.event === "charter_confirmation" || e.record?.event === "chain_continuation" || e.record?.event === "chain_awaiting_child"),
+      false,
+      `${scenario}: no charter events without --charter`,
+    );
+  }
+  const ctx = setup();
+  fs.writeFileSync(ctx.brief, Buffer.from("{broken\n"));
+  assert.equal((await run(ctx)).code, 2, "invalid canonical brief still exits 2");
+});

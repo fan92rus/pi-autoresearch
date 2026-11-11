@@ -252,6 +252,13 @@ export function approveChainBrief(params: ChainBriefParams): ChainBriefResult {
   }
 
   // 8) Charter limits, when set (root has depth 0; campaign count includes the root).
+  // Review nit: a limit that is set but never evaluated is fail-open — refuse non-numbers explicitly.
+  if (p.charter.max_campaigns !== undefined && typeof p.campaignCount !== "number") {
+    return refuse("invalid_argument", `charter.max_campaigns is set but campaignCount is ${typeof p.campaignCount}; the caller must pass a number`);
+  }
+  if (p.charter.max_depth !== undefined && typeof p.newDepth !== "number") {
+    return refuse("invalid_argument", `charter.max_depth is set but newDepth is ${typeof p.newDepth}; the caller must pass a number`);
+  }
   if (p.charter.max_campaigns !== undefined && typeof p.campaignCount === "number" && p.campaignCount > p.charter.max_campaigns) {
     return refuse(
       "limit_reached",

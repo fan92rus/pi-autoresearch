@@ -9951,7 +9951,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       return null;
     }
     const shownSha256 = researchState.sha256Hex(shownText);
-    const preview = charter.validateCharter(JSON.parse(shownText));
+    let preview;
+    try {
+      preview = charter.validateCharter(JSON.parse(shownText));
+    } catch (err) {
+      ctx.ui.notify(`Charter refused: the file is not valid JSON (${err instanceof Error ? err.message : String(err)})`, "error");
+      return null;
+    }
     if (!preview.ok) {
       ctx.ui.notify(`Charter refused: ${preview.errors.join("; ")}`, "error");
       return null;

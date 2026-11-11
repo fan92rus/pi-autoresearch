@@ -129,6 +129,11 @@ function isIntegerAtLeast(v: unknown, min: number): boolean {
   return typeof v === "number" && Number.isInteger(v) && v >= min;
 }
 
+/** Spec (task 1.5): the charter MUST NOT contain rules that allow changing the
+ *  effective verdict set, the evidence_gate, or the caveat block. A stop rule
+ *  states a condition to stop the chain — it never needs these words. */
+const FORBIDDEN_RULE_RE = /(verdict|вердикт|evidence[_ ]?gate|caveat|блок(а)? ограничени)/i;
+
 /**
  * Realpath with a fallback to the resolved input path when the file does not
  * exist (ENOENT) — the containment check must work for missing files too.
@@ -178,6 +183,8 @@ export function validateCharter(raw: unknown): CharterValidation {
       rules.forEach((rule, i) => {
         if (typeof rule !== "string" || rule.trim() === "") {
           errors.push(`charter.stop_rules[${i}] must be a non-empty string`);
+        } else if (FORBIDDEN_RULE_RE.test(rule)) {
+          errors.push(`charter.stop_rules[${i}] must not allow changing the verdict set, evidence_gate, or the caveat block`);
         }
       });
     }

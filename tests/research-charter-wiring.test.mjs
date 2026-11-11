@@ -526,6 +526,107 @@ test("review-701ded3d B1: a charter changed after a confirmation refuses even a 
   assert.equal(chainStatus(dir, "c1-chain"), "manual_check_required", "chain is manual_check_required");
 });
 
+
+test("review-2.5: without a chain the ordinary brief flow still requires the owner dialog", async () => {
+  const dir = makeWorkDir("noch-dialog");
+  writeCampaignState(dir, "c1", "briefing");
+  const brief = briefFixture();
+  const h = await loadExtensionBare(dir, "noch-dialog", true);
+  await call(h, "research_brief", { action: "draft", brief });
+  assert.ok(!fs.existsSync(path.join(dir, ".auto", "research", "c1", "approval.json")), "draft alone approves nothing");
+
+  // No dialog channel: propose refuses — the owner approves, never the model.
+  delete h.ctx.ui.confirm;
+  const noUi = textOf(await call(h, "research_brief", { action: "propose" }));
+  assert.match(noUi, /owner action|interactive dialog|not_approved/i, noUi);
+  assert.ok(!fs.existsSync(path.join(dir, ".auto", "research", "c1", "approval.json")), "no approval without the dialog");
+
+  // The owner confirms in the dialog: the approval has NO charter provenance.
+  h.ctx.ui.confirm = async () => true;
+  const res = textOf(await call(h, "research_brief", { action: "propose" }));
+  assert.match(res, /approved|sha256/i, res);
+  const approval = JSON.parse(fs.readFileSync(path.join(dir, ".auto", "research", "c1", "approval.json"), "utf8"));
+  assert.equal(approval.source, undefined, "the ordinary approval has no charter provenance");
+});
+
+test("review-3.4: every final status refuses drafts and reports as final-status actions", async () => {
+  const dir = makeWorkDir("finals");
+  writeStoppedRootCampaign(dir, "c1");
+  const charterPath = writeCharter(dir, { max_campaigns: 1 });
+  const h = await loadExtensionBare(dir, "finals", true);
+  await launchWithCharter(h, charterPath, "c1");
+  // Two reachable final statuses: limit_reached (report) and stopped_by_owner (dialog).
+  await call(h, "research", { action: "report" });
+  assert.equal(chainStatus(dir, "c1-chain"), "limit_reached", "precondition");
+  const child = briefFixture();
+  child.questions[0].finding_refs = [{ campaign: "c1", question: "Q1" }];
+  const draft = textOf(await call(h, "research_brief", { action: "draft", brief: child }));
+  assert.match(draft, /mode is OFF|invalid_transition|limit_reached/i, draft);
+  // stopped_by_owner from an active campaign keeps the mode ON; the report then exits by the final status.
+  const dir2 = makeWorkDir("finals2");
+  writeStoppedRootCampaign(dir2, "c1");
+  const charter2 = writeCharter(dir2, {});
+  const h2 = await loadExtensionBare(dir2, "finals2", true);
+  await launchWithCharter(h2, charter2, "c1");
+  await call(h2, "research", { action: "chain_stop" });
+  assert.equal(chainStatus(dir2, "c1-chain"), "stopped_by_owner", "precondition");
+  const res = textOf(await call(h2, "research", { action: "report" }));
+  assert.match(res, /Research mode is OFF/i, res);
+  assert.match(res, /stopped_by_owner/i, res);
+});
+
+test("review-4.1: the idle mechanism does not send chain continuations without a new agent action", async () => {
+  const dir = makeWorkDir("idle-nocont");
+  writeStoppedRootCampaign(dir, "c1");
+  const charterPath = writeCharter(dir, {});
+  const h = await loadExtensionBare(dir, "idle-nocont", true);
+  await launchWithCharter(h, charterPath, "c1");
+  await call(h, "research", { action: "report" });
+  assert.equal(chainStatus(dir, "c1-chain"), "awaiting_child", "precondition: paused");
+  const before = h.pi.sentMessages.length;
+
+  // An idle turn (agent_end, no experiment tools) must not produce a SECOND
+  // chain continuation; at most the ordinary research drift nudge fires.
+  await h.hook("agent_end")({ messages: [] }, h.ctx);
+  await new Promise((r) => setTimeout(r, 1200)); // SETTLED_WINDOW_MS = 800
+
+  const chainContinuations = h.pi.sentMessages.slice(before).filter((m) => /chain can continue|research chain/i.test(m.text));
+  assert.equal(chainContinuations.length, 0, `no idle chain continuation; got: ${chainContinuations.map((m) => m.text.slice(0, 80)).join(" | ")}`);
+});
+
+test("review-4.3: the final report of the active campaign of a chain stopped during work turns the mode OFF", async () => {
+  const dir = makeWorkDir("stopped-work");
+  writeCampaignState(dir, "c1", "research");
+  const brief = briefFixture();
+  writeBriefAndLog(path.join(dir, ".auto", "research", "c1"), brief, [
+    { event: "open", question_id: "Q1" },
+  ]);
+  const charterPath = writeCharter(dir, {});
+  const h = await loadExtensionBare(dir, "stopped-work", true);
+  await launchWithCharter(h, charterPath, "c1");
+  // The owner stops the chain while the campaign is still in phase research.
+  await call(h, "research", { action: "chain_stop" });
+  assert.equal(chainStatus(dir, "c1-chain"), "stopped_by_owner", "precondition: stopped during work");
+
+  const res = textOf(await call(h, "research", { action: "report" }));
+
+  assert.match(res, /Research mode is OFF/i, res);
+  assert.match(res, /stopped_by_owner/i, res);
+});
+
+test("review-nit: a charter file that is not valid JSON is refused with a notify, nothing started", async () => {
+  const dir = makeWorkDir("charter-badjson");
+  writeStoppedRootCampaign(dir, "c1");
+  const badPath = path.join(dir, "..", `charter-bad-${Math.random().toString(36).slice(2, 8)}.json`);
+  fs.writeFileSync(badPath, "{broken json", "utf8");
+  const h = await loadExtensionBare(dir, "charter-badjson", true);
+
+  await launchWithCharter(h, badPath, "c1");
+
+  assert.equal(fs.existsSync(chainDirOf(dir, "c1-chain")), false, "no chain state created");
+  assert.ok(h.pi.notifications.some((n) => /not valid JSON/i.test(n.text)), "the refusal names the JSON problem");
+  fs.rmSync(badPath, { force: true });
+});
 test("review-M3: a damaged chain journal records manual_check_required durably (marker) and refuses later actions", async () => {
   const dir = makeWorkDir("journal-damaged");
   writeStoppedRootCampaign(dir, "c1");

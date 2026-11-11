@@ -157,6 +157,28 @@ test("1.2 a symlink outside the work directory pointing into it is detected via 
   });
 });
 
+test("1.2 a junction whose target resolves into the work directory is refused", { skip: process.platform !== "win32" }, async () => {
+  await withWorkDir(async (workDir) => {
+    const { path } = await writeCharter(workDir, "charter.json");
+    const junction = join(workDir, "..", `charter-junction-${Date.now()}-${process.pid}`);
+    let created = false;
+    try {
+      await symlink(workDir, junction, "junction");
+      created = true;
+    } catch (err) {
+      // Windows without developer/admin rights refuses junction creation: skip.
+      if (err && (err.code === "EPERM" || err.code === "EACCES")) return;
+      throw err;
+    }
+    try {
+      const result = await C.acceptCharter(join(junction, "charter.json"), workDir, {}, { expectedSha256: sha256Hex(await readFile(path, "utf8")) });
+      assertRefusal(result, "charter_inside_workdir");
+    } finally {
+      await rm(junction, { force: true });
+    }
+  });
+});
+
 test("1.2 Windows name case is folded when comparing containment", { skip: process.platform !== "win32" }, async () => {
   await withWorkDir(async (workDir) => {
     // Same directory addressed with a different drive-letter / path case.
@@ -347,6 +369,22 @@ test("1.5 stop_rules must be an array of strings", () => {
     const v = C.validateCharter({ stop_rules: bad });
     assert.equal(v.ok, false, `stop_rules ${JSON.stringify(bad)} must be rejected`);
   }
+});
+
+test("1.5 stop_rules must not allow changing verdicts, evidence_gate or the caveat block", () => {
+  for (const rule of [
+    "the owner may change the verdict set after the first campaign",
+    "evidence_gate may be relaxed once two campaigns finished",
+    "the caveat block of later campaigns may be rewritten",
+    "вердикты можно менять после первой кампании",
+    "блок ограничений разрешено расширять в дочерних кампаниях",
+  ]) {
+    const v = C.validateCharter({ stop_rules: [rule] });
+    assert.equal(v.ok, false, `rule ${JSON.stringify(rule)} must be rejected`);
+    assert.ok(v.errors.some((e) => /verdict|evidence_gate|caveat/i.test(e)), v.errors.join("; "));
+  }
+  // A legitimate stop rule names neither invariant and stays valid.
+  assert.equal(C.validateCharter({ stop_rules: ["two rejected findings in a row"] }).ok, true);
 });
 
 test("1.5 a charter with an unknown field is rejected (allowlist)", () => {

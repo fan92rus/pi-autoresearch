@@ -84,6 +84,20 @@ function baseParams(overrides = {}) {
   };
 }
 
+test("nit: a set limit with a non-number count/depth refuses instead of skipping the check", () => {
+  assertRefusal(
+    CB.approveChainBrief(baseParams({ charter: { max_campaigns: 3 } })),
+    "invalid_argument",
+  );
+  assertRefusal(
+    CB.approveChainBrief(baseParams({ charter: { max_depth: 2 }, newDepth: "1" })),
+    "invalid_argument",
+  );
+  // Without limits the missing numbers are fine (nothing to evaluate).
+  const ok = CB.approveChainBrief(baseParams({ charter: {} }));
+  assert.equal(ok.ok, true, JSON.stringify(ok));
+});
+
 // ─── 2.1 The passing brief ───────────────────────────────────────────────────
 
 test("2.1 a brief passing every check is approved with the parent snapshot", () => {
