@@ -9643,6 +9643,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             exitResearchMode(ctx, id);
             return reply(reportText + "\n\n" + savedNote + "\nResearch mode is OFF: the charter limit is reached (chain limit_reached). No further chain campaigns are created.");
           }
+          // Owner decision (review M1): the chain advances only on a report of a
+          // campaign in phase stopped. A report written in phase research leaves
+          // the chain active and sends no continuation (explicit gate, not a side effect).
+          if (snap.state.phase !== "stopped") {
+            return reply(reportText + "\n\n" + savedNote + "\nThe chain does not advance on a report written in phase research: stop the campaign first, then report. Chain status stays " + chainStatusNow + ", research mode stays ON.");
+          }
           // Intermediate report: the chain can continue — the mode stays ON, the
           // chain moves to awaiting_child, ONE continuation with the parent id.
           await chainJournal.setChainStatus(chain.workDir, chain.chainId, "awaiting_child");

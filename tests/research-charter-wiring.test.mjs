@@ -465,3 +465,23 @@ test("review-ef7d8951: a charter file changed after confirmation refuses the chi
   assert.equal(chainStatus(dir, "c1-chain"), "manual_check_required", "chain status is manual_check_required");
   assert.deepEqual(listDirs(path.join(dir, ".auto", "research")).filter((c) => /-c1$/.test(c)), [], "no child campaign created");
 });
+
+test("review-M1 owner decision: a chain report written in phase research does not advance the chain", async () => {
+  const dir = makeWorkDir("report-research");
+  writeCampaignState(dir, "c1", "research");
+  const brief = briefFixture();
+  writeBriefAndLog(path.join(dir, ".auto", "research", "c1"), brief, [
+    { event: "open", question_id: "Q1" },
+  ]);
+  const charterPath = writeCharter(dir, {});
+  const h = await loadExtensionBare(dir, "report-research", true);
+  await launchWithCharter(h, charterPath, "c1");
+  assert.equal(chainStatus(dir, "c1-chain"), "active", "precondition: chain active");
+
+  const before = h.pi.sentMessages.length;
+  const res = textOf(await call(h, "research", { action: "report" }));
+
+  assert.match(res, /does not advance|phase research/i, res);
+  assert.equal(chainStatus(dir, "c1-chain"), "active", "chain stays active, no awaiting_child");
+  assert.equal(h.pi.sentMessages.length, before, "no continuation message sent after the report");
+});
