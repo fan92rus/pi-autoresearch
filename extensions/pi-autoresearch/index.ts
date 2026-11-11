@@ -400,7 +400,7 @@ interface AutoresearchRuntime {
    *  campaigns behave exactly as before the charter change. Created by '/autoresearch research
    *  --charter <path>' after the owner confirms the Charter SHA-256 dialog. Cleared when the chain
    *  reaches a final status together with the mode-off paths (chain_stop in pause, final report). */
-  researchChain: { chainId: string; workDir: string; charterSha256: string; charter: import("./charter.ts").Charter } | null;
+  researchChain: { chainId: string; workDir: string; charterPath: string; charterSha256: string; charter: import("./charter.ts").Charter } | null;
   /** True between the continuation of an awaiting_child period and the next brief action:
    *  the report branch sends at most ONE continuation per period (spec: no repeated
    *  continuation without a new agent action). Re-armed by a chain brief action. */
@@ -9156,7 +9156,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (parentBrief === null) {
           return fail("campaign_missing", `the parent campaign ${parentId} brief cannot be read; the chain is blocked until manual check`);
         }
-        const childSha = researchState.sha256Hex(JSON.stringify(brief));
+        // Same bytes writeBriefDraft writes (pretty JSON + newline), so a resent
+        // brief hashes identically and the dedup check can match it (review B1).
+        const childSha = researchState.sha256Hex(JSON.stringify(brief, null, 2) + "\n");
         const approvedHashes = verified.entries
           .filter((e) => e.type === "brief_approved" && typeof (e as { brief_sha256?: string }).brief_sha256 === "string")
           .map((e) => (e as { brief_sha256: string }).brief_sha256);
@@ -9836,6 +9838,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     recordAutoresearchActivation(resolveWorkDir(ctx.cwd), false);
     setAutoresearchMode(ctx, false);
     runtime.researchCampaignId = null;
+    // Review B4: leaving research mode ends the chain in memory too, so later
+    // campaigns in this session are not routed into a finished chain.
+    runtime.researchChain = null;
     runtime.autoResumeTurns = 0;
     cancelPendingResume(runtime);
     ctx.ui.notify(`Research campaign ${campaignId} stopped — research mode OFF. The final report stays available: research report.`, "info");
@@ -9856,11 +9861,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const status = await chainJournal.statusOf(chain.workDir, chain.chainId);
     if (status !== "active" && status !== "awaiting_child") return false;
     // Re-hash the charter file: a changed file means manual_check_required (spec).
+    // Review B2: the file itself is re-read, not just the journal.
     try {
       const dir = chainJournal.chainDir(chain.workDir, chain.chainId);
       if (dir === null) return false;
       const verified = await chainJournal.verifyChain(chain.workDir, chain.chainId);
       if (!verified.ok) return false;
+      const bytes = await fs.promises.readFile(chain.charterPath);
+      const nowSha = createHash("sha256").update(bytes).digest("hex");
+      if (nowSha !== chain.charterSha256) {
+        await chainJournal.setChainStatus(chain.workDir, chain.chainId, "manual_check_required").catch(() => undefined);
+        return false;
+      }
     } catch {
       return false;
     }
@@ -10481,6 +10493,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // kickoff is sent, no chain state exists. The chain id derives from the
         // pinned (or first pinned-at-draft) campaign: <campaignId>-chain.
         if (requestedCharterPath !== null) {
+          // Review B3: a chain needs a pinned root campaign; without --id the
+          // root brief could never be drafted (parent_not_reported forever).
+          if (requestedId === null) {
+            ctx.ui.notify("Chain refused: --charter needs --id <root campaign> so the chain has a root to continue from", "error");
+            return;
+          }
           const accepted = await acceptLaunchCharter(ctx, researchWorkDir, requestedCharterPath);
           if (accepted === null) return;
           const chainSeedId = requestedId ?? runtime.researchCampaignId ?? `bench-chain`;
@@ -10490,7 +10508,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             ctx.ui.notify(`Chain refused (${createdChain.reason}): ${createdChain.message}`, "error");
             return;
           }
-          runtime.researchChain = { chainId, workDir: researchWorkDir, charterSha256: accepted.sha256, charter: accepted.charter };
+          runtime.researchChain = { chainId, workDir: researchWorkDir, charterPath: requestedCharterPath, charterSha256: accepted.sha256, charter: accepted.charter };
           ctx.ui.notify(`Research chain ${chainId} started (charter sha256 ${accepted.sha256.slice(0, 12)}); the chain follows the charter limits`, "info");
         }
         // No /skill: prefix: the metric-loop skill must not be expanded into a research campaign.

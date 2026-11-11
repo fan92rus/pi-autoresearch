@@ -437,3 +437,12 @@ test("orchestrator-fix: the charter predicate is prospective — max_depth 0 sto
   assert.match(res, /limit_reached/i, res);
   assert.equal(chainStatus(dir, "c1-chain"), "limit_reached");
 });
+
+test("review-B3: --charter without --id starts no chain", async () => {
+  const dir = makeWorkDir("no-id");
+  const charterPath = writeCharter(dir, {});
+  const h = await loadExtensionBare(dir, "no-id", true);
+  await launchWithCharter(h, charterPath, null);
+  assert.equal(fs.existsSync(path.join(dir, ".auto", "research-chain")), false, "no chain journal is created without a pinned root");
+  assert.ok(h.pi.notifications.some((n) => /--id/.test(n.text)), "the refusal names --id");
+});
