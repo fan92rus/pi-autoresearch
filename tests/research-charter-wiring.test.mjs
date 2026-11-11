@@ -505,3 +505,23 @@ test("review-M6: resubmitting an already confirmed child brief in active returns
   assert.doesNotMatch(res, /parent_not_reported/, res);
   assert.deepEqual(listDirs(path.join(dir, ".auto", "research")), before, "no second campaign created");
 });
+
+test("review-701ded3d B1: a charter changed after a confirmation refuses even a resubmitted brief with charter_changed", async () => {
+  const dir = makeWorkDir("resubmit-tampered");
+  writeStoppedRootCampaign(dir, "c1");
+  const charterPath = writeCharter(dir, {});
+  const h = await loadExtensionBare(dir, "resubmit-tampered", true);
+  await launchWithCharter(h, charterPath, "c1");
+  await call(h, "research", { action: "report" });
+  const childBrief = briefFixture();
+  childBrief.questions[0].finding_refs = [{ campaign: "c1", question: "Q1" }];
+  await call(h, "research_brief", { action: "draft", brief: childBrief });
+  assert.equal(chainStatus(dir, "c1-chain"), "active", "precondition: child confirmed");
+  fs.writeFileSync(charterPath, JSON.stringify({ max_campaigns: 9 }) + "\n", "utf8");
+
+  const res = textOf(await call(h, "research_brief", { action: "draft", brief: childBrief }));
+
+  assert.match(res, /charter_changed/, res);
+  assert.doesNotMatch(res, /already approved/, res);
+  assert.equal(chainStatus(dir, "c1-chain"), "manual_check_required", "chain is manual_check_required");
+});
