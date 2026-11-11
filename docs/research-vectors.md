@@ -282,3 +282,30 @@ Spec: `openspec/changes/research-exit-and-archive/`.
 
 Module and wiring suites: `tests/research-state.test.mjs` (52),
 `tests/research-branch-wiring.test.mjs` (22).
+
+## Research chain (research-charter)
+
+A charter lets the agent run a chain of research campaigns without an owner
+dialog per brief. Spec: `openspec/changes/research-charter/`.
+
+- **Launch**: `/autoresearch research --charter <path>` shows the charter in a
+  dialog whose first line is `Charter SHA-256: <hex>`; only the owner's `true`
+  starts the chain. The charter file must live outside the work directory.
+- **Charter fields** (JSON allowlist): `max_campaigns`, `max_depth` (root = 0),
+  `stop_rules`. All optional; no limits means an unlimited chain (owner decision
+  2026-11-10). Verdicts, `evidence_gate` and the caveat block cannot be changed
+  inside a chain.
+- **Child briefs** are approved without a dialog when every check passes:
+  caveat verbatim, effective verdict set, evidence_gate, and `finding_refs` that
+  each point at a question closed with evidence under a declared verdict in a
+  campaign of this chain. Approval is written with `source: charter`.
+- **Pause and stop**: an intermediate report keeps research mode ON and gives one
+  continuation. `research chain_stop` needs the operator's dialog (the model
+  cannot stop the chain). Reaching a charter limit sets `limit_reached` and turns
+  research mode OFF.
+- **Journal**: `.auto/research-chain/<id>/chain.json` (append-only, hash-linked)
+  with the head in `chain-head`. A broken or missing journal blocks chain actions
+  until manual check.
+
+Known limits: the agent writes its own findings and stop-rule self-reports
+(residual risk, see design.md). Shell writes to the state files are not blocked.
