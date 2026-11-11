@@ -9140,7 +9140,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           return fail("invalid_argument", `parent_not_reported: the parent campaign's report must be recorded before the next chain brief (chain status ${status})`);
         }
         if (!(await charterFileIntact(draftChain.workDir, draftChain.chainId, draftChain.charterPath, draftChain.charterSha256))) {
-          return fail("manual_check_required", `research chain ${draftChain.chainId}: the charter file changed since the owner confirmed it; chain actions are blocked`);
+          return fail("charter_changed", `research chain ${draftChain.chainId}: the charter file changed since the owner confirmed it; chain is manual_check_required`);
         }
         const brief = params.brief;
         if (brief === undefined) return fail("invalid_argument", "draft requires the brief object");
@@ -9636,7 +9636,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             // Review (ef7d8951): a charter change inside the predicate sets
             // manual_check_required; it must not be overwritten by limit_reached.
             if ((await chainJournal.statusOf(chain.workDir, chain.chainId)) === "manual_check_required") {
-              return reply(reportText + "\n\n" + savedNote + "\nThe charter file changed since the owner confirmed it: chain status manual_check_required. Research mode stays ON until manual check.");
+              exitResearchMode(ctx, id);
+              return reply(reportText + "\n\n" + savedNote + "\nThe charter file changed since the owner confirmed it: chain status manual_check_required. Research mode is OFF (spec: the predicate is false after the report).");
             }
             await chainJournal.setChainStatus(chain.workDir, chain.chainId, "limit_reached").catch(() => undefined);
             exitResearchMode(ctx, id);
@@ -9868,8 +9869,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
    *  Shared by the child-draft branch and the continuation predicate (review B2). */
   const charterFileIntact = async (workDir: string, chainId: string, charterPath: string, charterSha256: string): Promise<boolean> => {
     try {
-      const bytes = await fs.promises.readFile(charterPath);
-      if (createHash("sha256").update(bytes).digest("hex") === charterSha256) return true;
+      // Same bytes as acceptLaunchCharter: utf8 text hashed by sha256Hex (review ef7d8951 MINOR-1).
+      const text = await fs.promises.readFile(charterPath, "utf8");
+      if (researchState.sha256Hex(text) === charterSha256) return true;
     } catch {
       // unreadable counts as changed
     }

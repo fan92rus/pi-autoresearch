@@ -446,3 +446,22 @@ test("review-B3: --charter without --id starts no chain", async () => {
   assert.equal(fs.existsSync(path.join(dir, ".auto", "research-chain")), false, "no chain journal is created without a pinned root");
   assert.ok(h.pi.notifications.some((n) => /--id/.test(n.text)), "the refusal names --id");
 });
+
+test("review-ef7d8951: a charter file changed after confirmation refuses the child draft with charter_changed and sets manual_check_required", async () => {
+  const dir = makeWorkDir("charter-changed");
+  writeStoppedRootCampaign(dir, "c1");
+  const charterPath = writeCharter(dir, {});
+  const h = await loadExtensionBare(dir, "charter-changed", true);
+  await launchWithCharter(h, charterPath, "c1");
+  await call(h, "research", { action: "report" });
+  assert.equal(chainStatus(dir, "c1-chain"), "awaiting_child", "precondition: parent reported");
+  fs.writeFileSync(charterPath, JSON.stringify({ max_campaigns: 9 }) + "\n", "utf8");
+  const childBrief = briefFixture();
+  childBrief.questions[0].finding_refs = [{ campaign: "c1", question: "Q1" }];
+
+  const res = textOf(await call(h, "research_brief", { action: "draft", brief: childBrief }));
+
+  assert.match(res, /charter_changed/, res);
+  assert.equal(chainStatus(dir, "c1-chain"), "manual_check_required", "chain status is manual_check_required");
+  assert.deepEqual(listDirs(path.join(dir, ".auto", "research")).filter((c) => /-c1$/.test(c)), [], "no child campaign created");
+});
