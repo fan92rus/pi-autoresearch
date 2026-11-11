@@ -9485,7 +9485,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           if (!rules.includes(ruleId)) {
             return fail("invalid_argument", `stop rule ${JSON.stringify(ruleId)} is not in the charter (${rules.length ? rules.join("; ") : "no charter stop rules"})`);
           }
-          await chainJournal.setChainStatus(chain.workDir, chain.chainId, "awaiting_child" === status ? "stopped_by_rule" : "stopped_by_rule");
+          // Review M4/N2: a journal write that fails must not turn the mode OFF
+          // while the journal still says active/awaiting_child.
+          const ruleWrite = await chainJournal.setChainStatus(chain.workDir, chain.chainId, "stopped_by_rule");
+          if (!ruleWrite.ok) return fail(ruleWrite.reason as never, `chain stop not recorded: ${ruleWrite.message}`);
           if (status === "awaiting_child") {
             exitChainModeFromPause(ctx, chain.chainId);
             return reply(`🛑 Research chain ${chain.chainId} stopped by charter rule ${JSON.stringify(ruleId)} (charter stop rule, pause): research mode is OFF. The final report is already saved.`);
@@ -9503,7 +9506,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (confirmed !== true) {
           return fail("invalid_argument", "chain_stop requires explicit owner consent in the dialog; the chain keeps running");
         }
-        await chainJournal.setChainStatus(chain.workDir, chain.chainId, "stopped_by_owner");
+        const ownerWrite = await chainJournal.setChainStatus(chain.workDir, chain.chainId, "stopped_by_owner");
+        if (!ownerWrite.ok) return fail(ownerWrite.reason as never, `chain stop not recorded: ${ownerWrite.message}`);
         if (status === "awaiting_child") {
           exitChainModeFromPause(ctx, chain.chainId);
           return reply(`🛑 Research chain ${chain.chainId} stopped by the owner (pause): research mode is OFF. The final report is already saved.`);
