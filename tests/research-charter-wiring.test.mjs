@@ -525,3 +525,22 @@ test("review-701ded3d B1: a charter changed after a confirmation refuses even a 
   assert.doesNotMatch(res, /already approved/, res);
   assert.equal(chainStatus(dir, "c1-chain"), "manual_check_required", "chain is manual_check_required");
 });
+
+test("review-M3: a damaged chain journal records manual_check_required durably (marker) and refuses later actions", async () => {
+  const dir = makeWorkDir("journal-damaged");
+  writeStoppedRootCampaign(dir, "c1");
+  const charterPath = writeCharter(dir, {});
+  const h = await loadExtensionBare(dir, "journal-damaged", true);
+  await launchWithCharter(h, charterPath, "c1");
+  await call(h, "research", { action: "report" });
+  fs.appendFileSync(path.join(chainDirOf(dir, "c1-chain"), "chain.json"), "{broken\n", "utf8");
+  const childBrief = briefFixture();
+  childBrief.questions[0].finding_refs = [{ campaign: "c1", question: "Q1" }];
+
+  const res = textOf(await call(h, "research_brief", { action: "draft", brief: childBrief }));
+
+  assert.match(res, /manual_check_required/, res);
+  assert.ok(fs.existsSync(path.join(chainDirOf(dir, "c1-chain"), "manual-check")), "durable manual-check marker written");
+  const later = textOf(await call(h, "research", { action: "chain_stop" }));
+  assert.match(later, /manual_check_required|manual check/i, later);
+});

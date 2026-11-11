@@ -43,6 +43,11 @@ export function chainRoot(workDir: string): string {
 export const CHAIN_FILE = "chain.json";
 export const HEAD_FILE = "chain-head";
 export const LOCK_FILE = "lock";
+/** Durable marker written when a chain action finds the chain damaged or its
+ *  charter changed (spec 3.2/3.3). It lives beside chain.json, not inside it,
+ *  so it can be written without a verifiable journal. verifyChain refuses while
+ *  it exists, which keeps the status manual_check_required (fail closed). */
+export const MANUAL_FILE = "manual-check";
 
 /** Bounded retries while the chain lock is held (see research-journal.ts). */
 export const CHAIN_LOCK_RETRY_COUNT = 40;
@@ -358,9 +363,31 @@ export interface VerifiedChain {
  * — a missing/unreadable file, an invalid JSON line, a broken link, a head
  * mismatch — refuses with manual_check_required (fail closed).
  */
+/**
+ * Records manual_check_required durably beside the journal. Writes the marker
+ * without verifying the journal (it may be the damaged part). Idempotent.
+ */
+export async function markManualCheckRequired(workDir: string, chainId: string, reason: string): Promise<Result<{ head: string }>> {
+  const dir = chainDir(workDir, chainId);
+  if (dir === null) return refuse("invalid_argument", "chain id must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}");
+  try {
+    await mkdir(dir, { recursive: true });
+    await writeFileAtomic(join(dir, MANUAL_FILE), oneLine(reason) + "\n");
+  } catch (err) {
+    return refuse("manual_check_required", `manual-check marker not written: ${errorText(err)}`);
+  }
+  return { ok: true, head: "" };
+}
+
 export async function verifyChain(workDir: string, chainId: string): Promise<Result<VerifiedChain>> {
   const dir = chainDir(workDir, chainId);
   if (dir === null) return refuse("invalid_argument", "chain id must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}");
+  try {
+    const marker = await readFile(join(dir, MANUAL_FILE), "utf8");
+    return refuse("manual_check_required", `chain is in manual_check_required (${oneLine(marker)}); chain actions are blocked until manual check`);
+  } catch {
+    // no marker: continue with the normal verification
+  }
   let text: string;
   try {
     text = await readFile(join(dir, CHAIN_FILE), "utf8");

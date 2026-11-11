@@ -9132,7 +9132,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const draftChain = activeChain(ctx);
       if (action === "draft" && draftChain !== null) {
         const verified = await chainJournal.verifyChain(draftChain.workDir, draftChain.chainId);
-        if (!verified.ok) return fail("manual_check_required", `research chain ${draftChain.chainId}: ${verified.message}`);
+        if (!verified.ok) {
+          // Review M3: a damaged journal cannot take a status write; the marker records it durably.
+          await chainJournal.markManualCheckRequired(draftChain.workDir, draftChain.chainId, verified.message).catch(() => undefined);
+          return fail("manual_check_required", `research chain ${draftChain.chainId}: ${verified.message}`);
+        }
         const status = await chainJournal.statusOf(draftChain.workDir, draftChain.chainId);
         const stop = chainJournal.actionRefusalForStatus(status);
         if (stop !== null) return fail("invalid_transition", `research chain ${draftChain.chainId} is ${status}: ${stop.message}`);
@@ -9482,7 +9486,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // Verify the journal first (fail closed on damage or charter change).
         const verified = await chainJournal.verifyChain(chain.workDir, chain.chainId);
         if (!verified.ok) {
-          await chainJournal.setChainStatus(chain.workDir, chain.chainId, "manual_check_required").catch(() => undefined);
+          await chainJournal.markManualCheckRequired(chain.workDir, chain.chainId, verified.message).catch(() => undefined);
           return fail("manual_check_required", `research chain ${chain.chainId}: ${verified.message}`);
         }
         const status = await chainJournal.statusOf(chain.workDir, chain.chainId);
@@ -9631,7 +9635,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (chain !== null && saved) {
           const verified = await chainJournal.verifyChain(chain.workDir, chain.chainId);
           if (!verified.ok) {
-            await chainJournal.setChainStatus(chain.workDir, chain.chainId, "manual_check_required").catch(() => undefined);
+            await chainJournal.markManualCheckRequired(chain.workDir, chain.chainId, verified.message).catch(() => undefined);
             return reply(reportText + "\n\n" + savedNote + "\nResearch chain journal is damaged: actions are blocked until manual check (research status). Research mode stays ON.");
           }
           const chainStatusNow = await chainJournal.statusOf(chain.workDir, chain.chainId);
