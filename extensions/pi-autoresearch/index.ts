@@ -9221,10 +9221,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const childBase = effectiveResearchBase(workDir, ctx);
         const created = await researchState.createCampaign(childBase, childId);
         if (!created.ok) return fail(created.reason, created.message);
+        // Review M5: the campaign dir was created just now and no journal entry
+        // refers to it yet. A failure after this point removes it, so a retry is
+        // not blocked by campaign_exists.
+        const dropOrphan = () => { try { fs.rmSync(created.dir, { recursive: true, force: true }); } catch { /* best effort */ } };
         const written = await researchState.writeBriefDraft(created.dir, check.childBrief);
-        if (!written.ok) return fail(written.reason, written.message);
+        if (!written.ok) { dropOrphan(); return fail(written.reason, written.message); }
         const approved = await chainBriefs.writeChainApproval(created.dir, written.sha256, draftChain.charterSha256);
-        if (!approved.ok) return fail(approved.reason as never, approved.message);
+        if (!approved.ok) { dropOrphan(); return fail(approved.reason as never, approved.message); }
         await chainJournal.appendEntry(chainDirPath, draftChain.workDir, draftChain.chainId, "brief_approved", {
           campaign_id: childId,
           parent_campaign_id: parentId,
