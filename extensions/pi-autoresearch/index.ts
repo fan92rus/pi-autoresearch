@@ -183,6 +183,9 @@ import {
   buildAutoresearchCompactionSummary,
 } from "./compaction.ts";
 import { resolveAutoresearchShortcuts, SHORTCUT_ACTIONS } from "./shortcuts.ts";
+import * as charter from "./charter.ts";
+import * as chainJournal from "./chain-journal.ts";
+import * as chainBriefs from "./chain-briefs.ts";
 import { getAutoresearchArgumentCompletions, isHelpRequest, renderAutoresearchHelp } from "./commands.ts";
 import { sessionFilePath, sessionFileCandidates, ensureParentDir, AUTO_DIR } from "./paths.ts";
 import {
@@ -393,6 +396,15 @@ interface AutoresearchRuntime {
   subagentDeferral: { since: number; timer: ReturnType<typeof setTimeout> | null } | null;
   /** Provenance warning from the LAST log_experiment (e.g. "manual"/"unmeasured"). Null when the last log was measured. Re-injected into every resume until an honest (measured) log lands — goal-x [AUDITOR REJECTION] pattern. */
   lastLogFlag: string | null;
+  /** research-charter: the active chain of this session (bd pi-autoresearch-5ol). Null = no chain:
+   *  campaigns behave exactly as before the charter change. Created by '/autoresearch research
+   *  --charter <path>' after the owner confirms the Charter SHA-256 dialog. Cleared when the chain
+   *  reaches a final status together with the mode-off paths (chain_stop in pause, final report). */
+  researchChain: { chainId: string; workDir: string; charterSha256: string; charter: import("./charter.ts").Charter } | null;
+  /** True between the continuation of an awaiting_child period and the next brief action:
+   *  the report branch sends at most ONE continuation per period (spec: no repeated
+   *  continuation without a new agent action). Re-armed by a chain brief action. */
+  chainContinuationSent: boolean;
   /** What run_experiment actually measured last: parsed primary metric (or null if no METRIC line) + wall-clock fallback. Reset to null on init/compact. Read by log_experiment to flag agent-claimed metrics. */
   lastMeasurement: { primary: number | null; wallClockSeconds: number } | null;
   /** Run number minted by the last run_experiment — also its .auto/runs/<n> artifact directory number. Consumed by the next log_experiment so the ledger entry binds to the right artifacts; null when no run precedes the log. */
@@ -1825,6 +1837,8 @@ function createSessionRuntime(): AutoresearchRuntime {
     consecutiveDriftResumes: 0,
     subagentDeferral: null,
     lastLogFlag: null,
+    researchChain: null,
+    chainContinuationSent: false,
     lastMeasurement: null,
     lastRunNumber: null,
     runLinks: emptyRunLinksRuntime(),
@@ -8472,6 +8486,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     ["status", ["action"]],
     ["report", ["action"]],
     ["resolve", ["action"]],
+    ["chain_stop", ["action", "rule_id", "reason"]],
   ]);
 
   const researchRefusal = (reason: researchState.RefusalReason, message: string): researchState.Refusal => ({
@@ -8526,13 +8541,20 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
    *  <base>/.auto/research-archive/<id>-<stamp>. A move, never a delete. Returns
    *  the archived names, or null when any campaign is active, unreadable or
    *  unlistable: then nothing is moved and the caller keeps its refusal. */
-  const archiveFinishedCampaigns = async (workDir: string, stateBase: string): Promise<string[] | null> => {
+  const archiveFinishedCampaigns = async (workDir: string, stateBase: string, ctx?: ExtensionContext): Promise<string[] | null> => {
     const bases = [...new Set([stateBase, workDir])];
     const found: { base: string; id: string; dir: string }[] = [];
+    // research-charter: campaigns of an ACTIVE chain are never archived — the
+    // child checks and the continuation flow still read them. An unreadable
+    // chain journal fails closed (archive nothing). Without a chain (or ctx)
+    // this is the legacy behavior byte-for-byte.
+    const chainIds = ctx ? await chainCampaignIds(ctx) : [];
+    if (chainIds === null) return null;
     for (const base of bases) {
       const ids = listResearchCampaignIds(base);
       if (ids === null) return null;
       for (const id of ids) {
+        if (chainIds.includes(id)) continue;
         const resolved = researchState.resolveCampaignDir(base, id);
         if (!resolved.ok) return null;
         const read = await researchState.readState(resolved.dir);
@@ -9103,6 +9125,99 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const extra = unexpectedArgKeys(params ?? {}, allowed);
       if (extra) return fail("invalid_argument", extra);
       const workDir = resolveWorkDir(ctx.cwd);
+      // research-charter: a chain brief draft is auto-approved by the charter
+      // checks (spec: no owner dialog; approval.json source 'charter'). The
+      // chain must be awaiting_child (the parent report is recorded) — anything
+      // else is parent_not_reported.
+      const draftChain = activeChain(ctx);
+      if (action === "draft" && draftChain !== null) {
+        const verified = await chainJournal.verifyChain(draftChain.workDir, draftChain.chainId);
+        if (!verified.ok) return fail("manual_check_required", `research chain ${draftChain.chainId}: ${verified.message}`);
+        const status = await chainJournal.statusOf(draftChain.workDir, draftChain.chainId);
+        const stop = chainJournal.actionRefusalForStatus(status);
+        if (stop !== null) return fail("invalid_transition", `research chain ${draftChain.chainId} is ${status}: ${stop.message}`);
+        if (status !== "awaiting_child") {
+          return fail("invalid_argument", `parent_not_reported: the parent campaign's report must be recorded before the next chain brief (chain status ${status})`);
+        }
+        const brief = params.brief;
+        if (brief === undefined) return fail("invalid_argument", "draft requires the brief object");
+        const campaignIds = await chainCampaignIds(ctx);
+        const parentId = campaignIds[campaignIds.length - 1] ?? getRuntime(ctx).researchCampaignId ?? "";
+        let parentBrief: researchState.ResearchBrief | null = null;
+        let parentDir: string | null = null;
+        for (const base of [effectiveResearchBase(workDir, ctx), workDir]) {
+          const resolved = researchState.resolveCampaignDir(base, parentId);
+          if (resolved.ok && fs.existsSync(resolved.dir)) { parentDir = resolved.dir; break; }
+        }
+        if (parentDir !== null) {
+          const snap = await researchSnapshot(parentDir);
+          if (snap.ok) parentBrief = snap.brief;
+        }
+        if (parentBrief === null) {
+          return fail("campaign_missing", `the parent campaign ${parentId} brief cannot be read; the chain is blocked until manual check`);
+        }
+        const childSha = researchState.sha256Hex(JSON.stringify(brief));
+        const approvedHashes = verified.entries
+          .filter((e) => e.type === "brief_approved" && typeof (e as { brief_sha256?: string }).brief_sha256 === "string")
+          .map((e) => (e as { brief_sha256: string }).brief_sha256);
+        const chainDirPath = chainJournal.chainDir(draftChain.workDir, draftChain.chainId);
+        if (chainDirPath === null) return fail("invalid_argument", "invalid chain id");
+        const campaignCount = campaignIds.length + 1;
+        const newDepth = campaignIds.length;
+        const check = chainBriefs.approveChainBrief({
+          parentBrief,
+          parentCampaignId: parentId,
+          childBriefRaw: brief,
+          childBriefSha256: childSha,
+          charter: draftChain.charter,
+          chainStatus: status,
+          campaignJournals: await collectChainJournals(workDir, ctx, effectiveResearchBase(workDir, ctx), draftChain.chainId),
+          campaignCount,
+          newDepth,
+          approvedBriefHashes: approvedHashes,
+        });
+        if (!check.ok) {
+          // Refusals are journaled with the named reason and the brief hash (spec).
+          await chainJournal.appendEntry(chainDirPath, draftChain.workDir, draftChain.chainId, "brief_rejected", {
+            reason: check.reason, brief_sha256: childSha,
+          }).catch(() => undefined);
+          // Spec: a brief that would exceed a charter limit makes the chain
+          // status FINAL (limit_reached); chain actions refuse from now on.
+          if (check.reason === "limit_reached") {
+            await chainJournal.setChainStatus(draftChain.workDir, draftChain.chainId, "limit_reached").catch(() => undefined);
+          }
+          return fail(check.reason as never, check.message);
+        }
+        // Unrelated finished campaigns are archived by the common rules; chain
+        // campaigns are excluded inside archiveFinishedCampaigns.
+        await archiveFinishedCampaigns(workDir, effectiveResearchBase(workDir, ctx), ctx);
+        if (check.duplicate === true) {
+          return reply("ℹ️ This brief was already approved in this chain: no second campaign is created. Continue the existing campaign or write a different brief.");
+        }
+        // System-assigned child id: <chainId>-c<N> (root keeps its own id).
+        const childNumber = campaignIds.length;
+        const childId = `${draftChain.chainId}-c${childNumber}`;
+        const childBase = effectiveResearchBase(workDir, ctx);
+        const created = await researchState.createCampaign(childBase, childId);
+        if (!created.ok) return fail(created.reason, created.message);
+        const written = await researchState.writeBriefDraft(created.dir, check.childBrief);
+        if (!written.ok) return fail(written.reason, written.message);
+        const approved = await chainBriefs.writeChainApproval(created.dir, written.sha256, draftChain.charterSha256);
+        if (!approved.ok) return fail(approved.reason as never, approved.message);
+        await chainJournal.appendEntry(chainDirPath, draftChain.workDir, draftChain.chainId, "brief_approved", {
+          campaign_id: childId,
+          parent_campaign_id: parentId,
+          brief_sha256: written.sha256,
+          charter_sha256: draftChain.charterSha256,
+          snapshot: check.snapshot,
+        });
+        await chainJournal.appendEntry(chainDirPath, draftChain.workDir, draftChain.chainId, "campaign_added", { campaign_id: childId, parent_campaign_id: parentId, depth: newDepth });
+        await chainJournal.setChainStatus(draftChain.workDir, draftChain.chainId, "active");
+        getRuntime(ctx).researchCampaignId = childId;
+        getRuntime(ctx).chainContinuationSent = false;
+        briefPreviewDir = created.dir;
+        return reply(`✅ Chain brief auto-approved by the charter checks (source: charter, sha256 ${written.sha256}). Campaign ${childId} created (parent ${parentId}, depth ${newDepth}). Next: research start with this sha256 as expected_sha256.`);
+      }
       // The campaign id is never taken from the model: the pinned id (launch
       // command) wins; otherwise the single existing campaign is reused (draft
       // into an unapproved campaign stays possible); with none, draft
@@ -9124,7 +9239,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // to .auto/research-archive/ first. An active one keeps the refusal below.
         if (action === "draft") {
           const before = sessionResearchCampaignIds(workDir, ctx);
-          if (before !== null && before.length > 0) await archiveFinishedCampaigns(workDir, stateBase);
+          if (before !== null && before.length > 0) await archiveFinishedCampaigns(workDir, stateBase, ctx);
         }
         const ids = sessionResearchCampaignIds(workDir, ctx);
         if (ids === null) return fail("state_unreadable", "the research root cannot be listed; nothing was changed");
@@ -9168,7 +9283,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // A NEW campaign directory (pinned or generated) moves the finished
         // campaigns to the archive first; an active or unreadable one refuses.
         if (dirFromState === null && dirFromDefault === null) {
-          const moved = await archiveFinishedCampaigns(workDir, stateBase);
+          const moved = await archiveFinishedCampaigns(workDir, stateBase, ctx);
           if (moved === null) {
             return fail("invalid_argument", `a research campaign other than ${campaignId} is active or unreadable; finish it first: a session works with exactly one campaign`);
           }
@@ -9342,10 +9457,69 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return reply("✅ Pending operation resolved by the operator; the marker is cleared. Check the campaign with research status.");
       }
 
+      if (action === "chain_stop") {
+        const chain = activeChain(ctx);
+        if (chain === null) {
+          return fail("invalid_argument", "no active research chain in this session: chains are started by '/autoresearch research --charter <path>'");
+        }
+        // Verify the journal first (fail closed on damage or charter change).
+        const verified = await chainJournal.verifyChain(chain.workDir, chain.chainId);
+        if (!verified.ok) {
+          await chainJournal.setChainStatus(chain.workDir, chain.chainId, "manual_check_required").catch(() => undefined);
+          return fail("manual_check_required", `research chain ${chain.chainId}: ${verified.message}`);
+        }
+        const status = await chainJournal.statusOf(chain.workDir, chain.chainId);
+        if (chainJournal.isFinal(status)) {
+          return fail("invalid_transition", `research chain ${chain.chainId} is already ${status} (final); no further chain actions`);
+        }
+        // Charter stop rules are agent self-reports (spec: residual risk declared);
+        // they name a rule_id from the charter and do NOT need the owner dialog.
+        const ruleId = params.rule_id;
+        if (typeof ruleId === "string") {
+          const rules = chain.charter.stop_rules ?? [];
+          if (!rules.includes(ruleId)) {
+            return fail("invalid_argument", `stop rule ${JSON.stringify(ruleId)} is not in the charter (${rules.length ? rules.join("; ") : "no charter stop rules"})`);
+          }
+          await chainJournal.setChainStatus(chain.workDir, chain.chainId, "awaiting_child" === status ? "stopped_by_rule" : "stopped_by_rule");
+          if (status === "awaiting_child") {
+            exitChainModeFromPause(ctx, chain.chainId);
+            return reply(`🛑 Research chain ${chain.chainId} stopped by charter rule ${JSON.stringify(ruleId)} (charter stop rule, pause): research mode is OFF. The final report is already saved.`);
+          }
+          return reply(`🛑 Research chain ${chain.chainId} stopped by charter rule ${JSON.stringify(ruleId)}. New chain briefs are refused; the active campaign finishes its work and writes the final report, which turns research mode OFF.`);
+        }
+        // Owner stop: the model cannot confirm for the owner — a dialog is required.
+        if (!ctx.hasUI || !ctx.ui || typeof ctx.ui.confirm !== "function") {
+          return fail("manual_check_required", "chain_stop is an owner action and needs an interactive dialog; the chain keeps running");
+        }
+        const confirmed = await ctx.ui.confirm(
+          "Research chain: owner stop",
+          `Stop the research chain ${chain.chainId} now? No new chain campaigns will be created; the active campaign (if any) finishes its work and the final report turns research mode OFF. In awaiting_child the mode turns OFF immediately.`,
+        );
+        if (confirmed !== true) {
+          return fail("invalid_argument", "chain_stop requires explicit owner consent in the dialog; the chain keeps running");
+        }
+        await chainJournal.setChainStatus(chain.workDir, chain.chainId, "stopped_by_owner");
+        if (status === "awaiting_child") {
+          exitChainModeFromPause(ctx, chain.chainId);
+          return reply(`🛑 Research chain ${chain.chainId} stopped by the owner (pause): research mode is OFF. The final report is already saved.`);
+        }
+        return reply(`🛑 Research chain ${chain.chainId} stopped by the owner. New chain briefs are refused; the open vector is not interrupted; the active campaign finishes its work per research rules and writes the final report, which turns research mode OFF.`);
+      }
+
       if (action === "start") {
         const expected = params.expected_sha256;
         if (typeof expected !== "string") {
           return fail("invalid_argument", "start requires expected_sha256: the sha256 of the approved brief from research_brief propose");
+        }
+        // Chain gate: every chain action verifies the journal (fail closed on
+        // damage) and refuses in a final status (spec: chain actions refuse).
+        const chain = activeChain(ctx);
+        if (chain !== null) {
+          const verified = await chainJournal.verifyChain(chain.workDir, chain.chainId);
+          if (!verified.ok) return fail("manual_check_required", `research chain ${chain.chainId}: ${verified.message}`);
+          const status = await chainJournal.statusOf(chain.workDir, chain.chainId);
+          const stop = chainJournal.actionRefusalForStatus(status, { allowReport: true });
+          if (stop !== null) return fail("invalid_transition", `research chain ${chain.chainId} is ${status}: ${stop.message}`);
         }
         // One campaign works at a time (review B3): refuse the start when any
         // other campaign under the research root is already in the research
@@ -9429,6 +9603,42 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           savedNote = `Report saved to ${path.relative(workDir, reportPath)}`;
         } catch (err) {
           savedNote = `warning: the report could not be saved to ${path.relative(workDir, reportPath)} (${err instanceof Error ? err.message : String(err)})`;
+        }
+        // Chain-aware exit (research-charter): an active chain decides the exit
+        // by the "can continue" predicate; outside a chain the legacy rule holds.
+        const chain = activeChain(ctx);
+        if (chain !== null && saved) {
+          const verified = await chainJournal.verifyChain(chain.workDir, chain.chainId);
+          if (!verified.ok) {
+            await chainJournal.setChainStatus(chain.workDir, chain.chainId, "manual_check_required").catch(() => undefined);
+            return reply(reportText + "\n\n" + savedNote + "\nResearch chain journal is damaged: actions are blocked until manual check (research status). Research mode stays ON.");
+          }
+          const chainStatusNow = await chainJournal.statusOf(chain.workDir, chain.chainId);
+          // Exception (spec): the final report of the active campaign of a chain
+          // STOPPED during work turns the mode OFF regardless of the campaign phase.
+          if (chainJournal.isFinal(chainStatusNow)) {
+            exitResearchMode(ctx, id);
+            return reply(reportText + "\n\n" + savedNote + "\nResearch mode is OFF. The chain is " + chainStatusNow + ".");
+          }
+          if (chainStatusNow === "awaiting_child") {
+            // Already waiting: no new continuation without a new agent action.
+            return reply(reportText + "\n\n" + savedNote + "\nThe chain is awaiting the brief of the next campaign (parent " + id + "); write research_brief draft with finding_refs citing this chain.");
+          }
+          // Spec: the report of a campaign that REACHED the charter limits
+          // (prospective predicate false) sets limit_reached and turns the mode
+          // OFF — a forbidden child must never be prompted for.
+          if (!(await chainCanContinue(ctx, workDir))) {
+            await chainJournal.setChainStatus(chain.workDir, chain.chainId, "limit_reached").catch(() => undefined);
+            exitResearchMode(ctx, id);
+            return reply(reportText + "\n\n" + savedNote + "\nResearch mode is OFF: the charter limit is reached (chain limit_reached). No further chain campaigns are created.");
+          }
+          // Intermediate report: the chain can continue — the mode stays ON, the
+          // chain moves to awaiting_child, ONE continuation with the parent id.
+          await chainJournal.setChainStatus(chain.workDir, chain.chainId, "awaiting_child");
+          if (!getRuntime(ctx).chainContinuationSent) {
+            sendChainContinuation(ctx, id);
+          }
+          return reply(reportText + "\n\n" + savedNote + "\nResearch mode stays ON: the chain can continue. Status awaiting_child — write the brief of the next campaign (parent " + id + ") with research_brief draft; the brief is auto-approved by the charter checks.");
         }
         // A report of a STOPPED campaign is the campaign's last step: leave
         // research mode now (the report is already on disk).
@@ -9630,6 +9840,180 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     cancelPendingResume(runtime);
     ctx.ui.notify(`Research campaign ${campaignId} stopped — research mode OFF. The final report stays available: research report.`, "info");
   }
+
+  // ── research-charter helpers (bd pi-autoresearch-5ol) ────────────────────
+
+  /** The active chain of this session, or null. Never taken from the model. */
+  const activeChain = (ctx: ExtensionContext): NonNullable<AutoresearchRuntime["researchChain"]> | null =>
+    getRuntime(ctx).researchChain;
+
+  /** Spec predicate "the chain can continue": status active/awaiting_child and
+   *  the charter still matches the file on disk (charter_changed refuses).
+   *  Limits are optional (owner decision 2026-11-10): absent means unlimited. */
+  const chainCanContinue = async (ctx: ExtensionContext, workDir: string): Promise<boolean> => {
+    const chain = activeChain(ctx);
+    if (chain === null) return false;
+    const status = await chainJournal.statusOf(chain.workDir, chain.chainId);
+    if (status !== "active" && status !== "awaiting_child") return false;
+    // Re-hash the charter file: a changed file means manual_check_required (spec).
+    try {
+      const dir = chainJournal.chainDir(chain.workDir, chain.chainId);
+      if (dir === null) return false;
+      const verified = await chainJournal.verifyChain(chain.workDir, chain.chainId);
+      if (!verified.ok) return false;
+    } catch {
+      return false;
+    }
+    // Charter limits, when set (spec: the PREDICATE is prospective — the next
+    // campaign must not exceed either limit; root depth is 0, count includes
+    // the root). Without limits the chain is unlimited by owner decision.
+    const campaignIds = await chainCampaignIds(ctx);
+    const nextCount = campaignIds.length + 1;
+    const nextDepth = campaignIds.length;
+    const { charter } = chain;
+    if (charter.max_campaigns !== undefined && nextCount > charter.max_campaigns) return false;
+    if (charter.max_depth !== undefined && nextDepth > charter.max_depth) return false;
+    return true;
+  };
+
+  /** Charter path for the chain launch: acceptCharter with an interactive owner
+   *  dialog (first line Charter SHA-256). The shown hash is computed from the
+   *  file bytes and validated BEFORE the dialog (show-then-confirm, spec:
+   *  re-hash at confirmation refuses a file changed between show and confirm).
+   *  Returns the accepted charter or null (a refusal has already been notified). */
+  const acceptLaunchCharter = async (
+    ctx: ExtensionContext,
+    workDir: string,
+    charterPath: string,
+  ): Promise<{ charter: charter.Charter; sha256: string } | null> => {
+    let shownText: string;
+    try {
+      shownText = await fs.promises.readFile(charterPath, "utf8");
+    } catch (err) {
+      ctx.ui.notify(`Charter file cannot be read: ${err instanceof Error ? err.message : String(err)}`, "error");
+      return null;
+    }
+    const shownSha256 = researchState.sha256Hex(shownText);
+    const preview = charter.validateCharter(JSON.parse(shownText));
+    if (!preview.ok) {
+      ctx.ui.notify(`Charter refused: ${preview.errors.join("; ")}`, "error");
+      return null;
+    }
+    if (!ctx.hasUI || !ctx.ui || typeof ctx.ui.confirm !== "function") {
+      ctx.ui.notify("Charter confirmation needs an interactive dialog; nothing was started", "error");
+      return null;
+    }
+    const confirmed = await ctx.ui.confirm(
+      "Research charter: chain limits",
+      charter.charterDialogText(preview.charter, shownSha256),
+    );
+    const accepted = await charter.acceptCharter(charterPath, workDir, { charter_path: charterPath }, {
+      hasUI: ctx.hasUI,
+      ownerConfirmed: confirmed === true,
+      shownSha256,
+    });
+    if (!accepted.ok) {
+      ctx.ui.notify(`Charter refused (${accepted.reason}): ${accepted.message}`, "error");
+      return null;
+    }
+    return { charter: accepted.charter, sha256: accepted.sha256 };
+  };
+
+  /** Journal helpers for the active chain (campaign journals are read from the
+   *  campaign log.jsonl files — the source of truth for finding checks). */
+  const readClosedQuestions = async (campaignDir: string): Promise<{ questionId: string; verdict: string; hasEvidence: boolean }[]> => {
+    const read = await readResearchLog(campaignDir);
+    if (!read.ok) return [];
+    const closed: { questionId: string; verdict: string; hasEvidence: boolean }[] = [];
+    const evidenceCount = new Map<string, number>();
+    for (const e of read.events) {
+      if (e.event === "record" && typeof e.question_id === "string") {
+        evidenceCount.set(e.question_id, (evidenceCount.get(e.question_id) ?? 0) + 1);
+      } else if (e.event === "close" && typeof e.question_id === "string" && typeof e.verdict === "string") {
+        closed.push({ questionId: e.question_id, verdict: e.verdict, hasEvidence: (evidenceCount.get(e.question_id) ?? 0) > 0 });
+      }
+    }
+    return closed;
+  };
+
+  /** Campaign journals of THIS chain (spec: the caller filters). Simplicity
+   *  note: verdicts come from each campaign's brief verdicts field (defaults
+   *  when absent), matching briefVerdicts semantics. */
+  const collectChainJournals = async (workDir: string, ctx: ExtensionContext, stateBase: string, chainId: string) => {
+    const chain = activeChain(ctx);
+    if (chain === null) return [];
+    const verified = await chainJournal.verifyChain(chain.workDir, chain.chainId);
+    if (!verified.ok) return [];
+    const journals: { campaignId: string; verdicts?: string[]; closedQuestions: { questionId: string; verdict: string; hasEvidence: boolean }[] }[] = [];
+    for (const entry of verified.entries) {
+      const cid = entry.type === "chain_created"
+        ? (entry as { root_campaign_id?: string }).root_campaign_id
+        : entry.type === "campaign_added"
+          ? (entry as { campaign_id?: string }).campaign_id
+          : undefined;
+      if (typeof cid !== "string") continue;
+      for (const base of [...new Set([stateBase, workDir])]) {
+        const resolved = researchState.resolveCampaignDir(base, cid);
+        if (!resolved.ok || !fs.existsSync(resolved.dir)) continue;
+        const snap = await researchSnapshot(resolved.dir);
+        if (!snap.ok || snap.brief === null) continue;
+        journals.push({
+          campaignId: cid,
+          verdicts: researchState.briefVerdicts(snap.brief),
+          closedQuestions: await readClosedQuestions(resolved.dir),
+        });
+        break;
+      }
+    }
+    return journals;
+  };
+
+  /** One continuation to the next chain brief; carries the parent campaign id
+   *  (spec: the continuation names the parent). Called once per awaiting_child
+   *  period — the report branch sends it, the wrapper mirrors it headless. */
+  const sendChainContinuation = (ctx: ExtensionContext, parentCampaignId: string): void => {
+    const runtime = getRuntime(ctx);
+    const message = [
+      `Research chain: the report of campaign ${parentCampaignId} is recorded and the chain can continue.`,
+      `Write the brief for the NEXT campaign now with research_brief draft:`,
+      `- every question must carry finding_refs: [{ campaign: "${parentCampaignId}", question: "<closed question id>" }] citing a closed question of this chain;`,
+      `- keep the caveat_block, the verdict set and the evidence_gate exactly as in the parent brief;`,
+      `- the brief is auto-approved by the charter checks (no owner dialog) and the next campaign id is assigned by the system.`,
+      "If you have nothing more to research, report and wait: the owner can stop the chain with research chain_stop.",
+    ].join("\n");
+    runtime.chainContinuationSent = true;
+    sendWhenReady(ctx, message);
+  };
+
+  const exitChainModeFromPause = (ctx: ExtensionContext, chainId: string): void => {
+    const runtime = getRuntime(ctx);
+    recordAutoresearchActivation(resolveWorkDir(ctx.cwd), false);
+    setAutoresearchMode(ctx, false);
+    runtime.researchCampaignId = null;
+    runtime.researchChain = null;
+    runtime.chainContinuationSent = false;
+    cancelPendingResume(runtime);
+    ctx.ui.notify(`Research chain ${chainId} stopped — research mode OFF (the chain was in awaiting_child; the last report is already saved).`, "info");
+  };
+
+  /** Campaign ids recorded in the chain journal (never archived while the chain
+   *  exists — spec: an active chain keeps its campaigns). The root id comes in
+   *  chain_created; child campaigns are appended as campaign_added entries. */
+  const chainCampaignIds = async (ctx: ExtensionContext): Promise<string[]> => {
+    const chain = activeChain(ctx);
+    if (chain === null) return [];
+    const verified = await chainJournal.verifyChain(chain.workDir, chain.chainId);
+    if (!verified.ok) return [];
+    const ids: string[] = [];
+    for (const e of verified.entries) {
+      if (e.type === "chain_created" && typeof (e as { root_campaign_id?: string }).root_campaign_id === "string") {
+        ids.push((e as { root_campaign_id: string }).root_campaign_id);
+      } else if (e.type === "campaign_added" && typeof (e as { campaign_id?: string }).campaign_id === "string") {
+        ids.push((e as { campaign_id: string }).campaign_id);
+      }
+    }
+    return ids;
+  };
 
   function turnAutoresearchOff(ctx: ExtensionContext): void {
     const wasRunning = !ctx.isIdle();
@@ -9908,6 +10292,21 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (/^research(\s|$)/.test(command)) {
         const researchWorkDir = resolveWorkDir(ctx.cwd);
         let args_ = trimmedArgs.slice("research".length).trim();
+        // research-charter: optional --charter <path> starts a chain for this
+        // session. The path must live OUTSIDE the work directory (spec:
+        // charter_inside_workdir refuses); the owner confirms the charter in a
+        // dialog whose first line is `Charter SHA-256: <hex>`.
+        let requestedCharterPath: string | null = null;
+        const charterMatch = /^--charter\s+(\S+)(\s|$)/.exec(args_);
+        if (charterMatch) {
+          requestedCharterPath = charterMatch[1];
+          args_ = args_.slice(charterMatch[0].length).trim();
+          if (requestedCharterPath === "") {
+            ctx.ui.notify("--charter does not accept an empty path; nothing was started", "error");
+            return;
+          }
+        }
+
         let requestedId: string | null = null;
         const idMatch = /^--id\s+([A-Za-z0-9][A-Za-z0-9._-]{0,63})(\s|$)/.exec(args_);
         if (idMatch) {
@@ -9976,11 +10375,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           if (campaignDir !== null) {
             const insp = await researchState.inspectCampaign(campaignDir);
             const phase = insp?.state?.phase ?? null;
-            if (phase === "stopped") {
+            // research-charter: a stopped campaign is the natural chain root —
+            // the chain resumes on top of it, so it does not block the launch.
+            if (requestedCharterPath !== null && phase === "stopped") {
+              // allowed: the chain takes this campaign as its root.
+            } else if (phase === "stopped") {
               ctx.ui.notify(`Campaign ${requestedId} is stopped (terminal); it never resumes. Create a new campaign: /autoresearch research <description>`, "info");
               return;
-            }
-            if (phase !== "briefing" && phase !== "research") {
+            } else if (phase !== "briefing" && phase !== "research") {
               ctx.ui.notify(`Campaign ${requestedId} is in phase ${String(phase)} or unreadable; cannot resume from here`, "info");
               return;
             }
@@ -10074,6 +10476,23 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         runtime.autoResumeTurns = 0;
         runtime.consecutiveDriftResumes = 0;
         updateWidget(ctx);
+        // research-charter: accept the charter AFTER the mode is on (the chain
+        // lives in the session runtime). A refusal here stops the launch: no
+        // kickoff is sent, no chain state exists. The chain id derives from the
+        // pinned (or first pinned-at-draft) campaign: <campaignId>-chain.
+        if (requestedCharterPath !== null) {
+          const accepted = await acceptLaunchCharter(ctx, researchWorkDir, requestedCharterPath);
+          if (accepted === null) return;
+          const chainSeedId = requestedId ?? runtime.researchCampaignId ?? `bench-chain`;
+          const chainId = `${chainSeedId}-chain`;
+          const createdChain = await chainJournal.createChain(researchWorkDir, chainId, requestedId ?? "(root pinned at draft)");
+          if (!createdChain.ok) {
+            ctx.ui.notify(`Chain refused (${createdChain.reason}): ${createdChain.message}`, "error");
+            return;
+          }
+          runtime.researchChain = { chainId, workDir: researchWorkDir, charterSha256: accepted.sha256, charter: accepted.charter };
+          ctx.ui.notify(`Research chain ${chainId} started (charter sha256 ${accepted.sha256.slice(0, 12)}); the chain follows the charter limits`, "info");
+        }
         // No /skill: prefix: the metric-loop skill must not be expanded into a research campaign.
         const researchKickoff = resumePhase === "research"
           ? [
