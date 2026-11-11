@@ -196,14 +196,16 @@ test("bare research with a state-root campaign visible only via the pin: no pin 
   assert.match(h.pi.sentMessages[0].text, /Research campaign: briefing phase/, "fresh briefing kickoff");
 });
 
-test("launch guard refuses when campaigns exist in either root (union check)", async () => {
+test("launch closes a closable state-root briefing campaign and proceeds (union check)", async () => {
   const dir = makeWorkDir("union");
-  writeCampaignState(path.join(dir, "runs", "c1"), "c1", "briefing");
+  const campaignDir = writeCampaignState(path.join(dir, "runs", "c1"), "c1", "briefing");
   const h = await loadExtension(dir, "union");
-  // No --id: with a state-root campaign on disk the launch must refuse and hint.
   await h.run("research --state-root runs/c1");
-  assert.equal(activationCount(h.pi), 0, "refused launch records no activation");
-  assert.ok(h.pi.notifications.some((n) => n.text.includes("resume")), "refusal hints at resume");
+  assert.equal(activationCount(h.pi), 1, "launch activation recorded");
+  assert.match(h.pi.sentMessages[0].text, /Research campaign: briefing phase/, "kickoff sent");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(campaignDir, "state.json"), "utf8")).phase, "stopped");
+  assert.match(fs.readFileSync(path.join(campaignDir, "log.jsonl"), "utf8"), /"event":"abandon"/);
+  assert.match(fs.readFileSync(path.join(campaignDir, "report.md"), "utf8"), /CLOSED AS STALE/);
 });
 
 test("session-aware guards: a state-root campaign in research phase blocks the ordinary loop in the same session", async () => {

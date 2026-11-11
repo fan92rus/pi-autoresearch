@@ -164,39 +164,40 @@ test("research while the mode is already active runs the research branch, not 'a
   assert.equal(researchKickoffs(h.pi).length, 1, "research kickoff is sent while the mode is on");
 });
 
-test("an existing briefing-phase campaign refuses bare research: no mode flip, no kickoff; --id resumes it", async () => {
+test("bare research closes a closable briefing campaign and proceeds; --id of the now-stopped campaign refuses", async () => {
   const dir = makeWorkDir("guard");
-  writeCampaignState(dir, "c1", "briefing");
+  const campaignDir = writeCampaignState(dir, "c1", "briefing");
   const h = await loadExtension(dir, "guard");
   await h.run("research");
 
-  assert.ok(notifyTexts(h.pi).some((t) => t.includes("resume it with /autoresearch research --id c1")), "refusal notify points at resume");
-  assert.equal(activationEntries(h.pi).length, 0, "mode must not be turned on by a refused research");
-  assert.equal(h.pi.sentMessages.length, 0, "no kickoff sent");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(campaignDir, "state.json"), "utf8")).phase, "stopped");
+  assert.match(fs.readFileSync(path.join(campaignDir, "log.jsonl"), "utf8"), /"event":"abandon"/);
+  assert.match(fs.readFileSync(path.join(campaignDir, "report.md"), "utf8"), /CLOSED AS STALE/);
+  assert.equal(activationEntries(h.pi).length, 1, "launch activation recorded");
+  assert.equal(researchKickoffs(h.pi).length, 1, "launch kickoff sent");
+  assert.match(researchKickoffs(h.pi)[0].text, /Research campaign: briefing phase/);
 
-  // --id c1 resumes the briefing-phase campaign: mode on + resume kickoff.
   await h.run("research --id c1");
-  assert.equal(activationEntries(h.pi).length, 1, "resume turns the mode on once");
-  assert.equal(researchKickoffs(h.pi).length, 1, "resume kickoff sent");
-  assert.match(researchKickoffs(h.pi)[0].text, /already has a brief draft/);
+  assert.ok(notifyTexts(h.pi).some((t) => /stopped \(terminal\)/.test(t)), "stopped campaign refusal notified");
+  assert.equal(activationEntries(h.pi).length, 1, "stopped --id refusal records no second activation");
 });
 
-test("an existing research campaign refuses research even when the mode is already on", async () => {
+test("bare research with an existing closable briefing campaign closes it and proceeds even when the mode is already on", async () => {
   const dir = makeWorkDir("guard-on");
   const h = await loadExtension(dir, "guard-on");
-  // Turn the mode on on a clean directory first; the campaign appears afterwards.
   await h.run("on");
-  writeCampaignState(dir, "c1", "briefing");
+  const campaignDir = writeCampaignState(dir, "c1", "briefing");
   h.pi.notifications.length = 0;
   h.pi.sentMessages.length = 0;
   const activationsBefore = activationEntries(h.pi).length;
 
   await h.run("research");
 
-  assert.ok(notifyTexts(h.pi).some((t) => t.includes("resume it with /autoresearch research --id c1")), "refusal notify points at resume");
-  assert.equal(researchKickoffs(h.pi).length, 0, "no research kickoff on refusal");
-  assert.equal(h.pi.sentMessages.length, 0, "no message of any kind on refusal");
-  assert.equal(activationEntries(h.pi).length, activationsBefore, "refused research must not re-record activation");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(campaignDir, "state.json"), "utf8")).phase, "stopped");
+  assert.match(fs.readFileSync(path.join(campaignDir, "log.jsonl"), "utf8"), /"event":"abandon"/);
+  assert.match(fs.readFileSync(path.join(campaignDir, "report.md"), "utf8"), /CLOSED AS STALE/);
+  assert.equal(researchKickoffs(h.pi).length, 1, "research kickoff sent");
+  assert.equal(activationEntries(h.pi).length, activationsBefore + 1, "successful research launch records activation");
 });
 
 test("free-text 'optimize research habits' stays on the legacy metric-loop path", async () => {

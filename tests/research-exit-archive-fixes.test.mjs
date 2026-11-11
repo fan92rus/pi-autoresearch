@@ -154,16 +154,20 @@ test("2.3 bare /autoresearch research with only a finished campaign starts; the 
   assert.ok(archivedNames(dir).some((n) => n.startsWith("c0-")), `finished c0 must be archived: ${archivedNames(dir)}`);
 }, { timeout: 60000 });
 
-test("2.3 bare /autoresearch research still refuses while a briefing campaign exists", async () => {
+test("2.3 bare /autoresearch research closes a stale briefing campaign before launch", async () => {
   const dir = makeWorkDir("bare-briefing");
   const other = await load(dir, "other", "research --id c0");
   await call(other, "research_brief", { action: "draft", brief: briefFixture() });
   const h = await load(dir, "bare-b", "research");
-  assert.ok(h.pi.notifications.some((n) => /c0/.test(n.text) && /exists|resume/.test(n.text)),
-    `must refuse and name c0: ${JSON.stringify(h.pi.notifications.map((n) => n.text))}`);
+  assert.equal(h.pi.notifications.some((n) => /Cannot launch research/.test(n.text)), false,
+    `stale briefing should close: ${JSON.stringify(h.pi.notifications.map((n) => n.text))}`);
+  const state = JSON.parse(fs.readFileSync(path.join(dir, ".auto", "research", "c0", "state.json"), "utf8"));
+  assert.equal(state.phase, "stopped");
+  assert.match(fs.readFileSync(path.join(dir, ".auto", "research", "c0", "log.jsonl"), "utf8"), /\"event\":\"abandon\"/);
+  assert.ok(fs.existsSync(path.join(dir, ".auto", "research", "c0", "report.md")));
   const draft = textOf(await call(h, "research_brief", { action: "draft", brief: briefFixture() }));
-  assert.match(draft, /Autoresearch mode is OFF/, `mode must stay off after the refusal: ${draft}`);
-  assert.deepEqual(archivedNames(dir), [], "nothing archived");
+  assert.match(draft, /Brief draft saved/, draft);
+  assert.ok(archivedNames(dir).some((n) => n.startsWith("c0-")), `c0 archived: ${archivedNames(dir)}`);
 }, { timeout: 60000 });
 
 // ─── invalid brief moves nothing ────────────────────────────────────────────

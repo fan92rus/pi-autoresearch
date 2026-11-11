@@ -292,6 +292,13 @@ interface ExperimentState {
 export const AUTORESUME_TURN_LIMIT = 200;
 export const CONSECUTIVE_FAILURE_OVERRIDE_LIMIT = 20;
 
+/** Test hook for the internal stale-close operation. Set by the extension instance. */
+export let closeStaleCampaign: ((dir: string) => Promise<researchState.Result<{ state: researchState.CampaignState }>>) | null = null;
+/** Test hook for send-time pending-resume policy. */
+export let sendPendingResumeIfReadyForTest: ((ctx: ExtensionContext, runtime: AutoresearchRuntime) => Promise<void>) | null = null;
+/** Test hook for the async auto-resume limit notification. */
+export let notifyAutoResumeLimitReachedAsyncForTest: ((ctx: ExtensionContext, reason?: string | null) => Promise<void>) | null = null;
+
 type AutoResumeGuardState = Pick<ExperimentState, "results" | "currentSegment">;
 type AutoResumeGuardRuntime = {
   autoResumeTurns: number;
@@ -2412,7 +2419,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     runtime.autoResumeTurns++;
   };
 
-  const sendPendingResumeIfReady = (ctx: ExtensionContext, runtime: AutoresearchRuntime): void => {
+  const sendPendingResumeIfReady = async (ctx: ExtensionContext, runtime: AutoresearchRuntime): Promise<void> => {
     const message = runtime.pendingResumeMessage;
 
     if (!message) return;
@@ -2448,13 +2455,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     markAutoResumeSent(runtime);
     // A legacy-cycle message stored before a campaign started is replaced by the
     // campaign wording at send time (design §5: no ordinary run/log prescription).
-    const sendText = researchNow.blocks
+    const isLegacyCycle = /run_experiment|log_experiment/.test(message);
+    const sendText = researchNow.blocks && isLegacyCycle
       ? RESEARCH_RESUME_TEXT
-      : campaignActiveSync(workDirNow) && !/candidate_branch/.test(message)
-        ? composeCampaignResumeMessage(ctx)
+      : !researchNow.blocks && campaignActiveSync(workDirNow) && !/candidate_branch/.test(message) && isLegacyCycle
+        ? await composeCampaignResumeMessage(ctx)
         : message;
     pi.sendUserMessage(sendText);
   };
+  sendPendingResumeIfReadyForTest = sendPendingResumeIfReady;
 
   const schedulePendingResume = (ctx: ExtensionContext, runtime: AutoresearchRuntime, message: string): void => {
     pausePendingResume(runtime);
@@ -2486,6 +2495,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const notifyAutoResumeLimitReached = (ctx: ExtensionContext, reason?: string | null): void => {
     ctx.ui.notify(reason ?? `Autoresearch auto-resume limit reached`, "info");
   };
+
+  const notifyAutoResumeLimitReachedAsync = async (ctx: ExtensionContext, reason?: string | null): Promise<void> => {
+    const snapshot = await researchCompletionSnapshot(ctx);
+    const detail = snapshot.readable && snapshot.allClosed && !snapshot.stopTriggered && snapshot.phase === "research"
+      ? `campaign ${snapshot.campaignId} has all questions closed but is not finalized (needs stop + report)`
+      : null;
+    notifyAutoResumeLimitReached(ctx, detail ? `${reason ?? "Autoresearch auto-resume limit reached"}; ${detail}` : reason);
+  };
+  notifyAutoResumeLimitReachedAsyncForTest = notifyAutoResumeLimitReachedAsync;
 
   // ── Research-vectors campaign (openspec/changes/research-vectors, design §8) ──
   const RESEARCH_BLOCK_TEXT = "Research campaign active; use research status or the operator resolve; the ordinary loop is blocked";
@@ -2591,12 +2609,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const RESEARCH_RESUME_TEXT =
     "Continue the research campaign: research status/open/record/close; STOP on manual_check_required.";
 
-  const composeResearchDriftMessage = (): string =>
-    [
+  const researchCompletionText = "Continue the research campaign: all brief questions are closed — pick a stop rule and run research stop <rule_id>, then research report; STOP on manual_check_required.";
+
+  const composeResearchDriftMessage = async (ctx: ExtensionContext): Promise<string> => {
+    const snapshot = await researchCompletionSnapshot(ctx);
+    const next = snapshot.readable && snapshot.allClosed && !snapshot.stopTriggered && snapshot.phase === "research"
+      ? researchCompletionText
+      : RESEARCH_RESUME_TEXT;
+    return [
       "⚠ Last turn did no research-campaign work.",
-      RESEARCH_RESUME_TEXT,
+      next,
       "Questions and decision rules come only from the approved brief.",
     ].join(" ");
+  };
 
   const composeResearchCompactionMessage = (): string =>
     [
@@ -2622,14 +2647,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   /** Campaign-mode default resume used by ensurePendingResume when no explicit
    *  composer is given: never mentions the blocked legacy tools. Session-aware
    *  sync variant: also consults the pinned --state-root base. */
-  const composeCampaignResumeMessage = (ctx: ExtensionContext): string => {
+  const composeCampaignResumeMessage = async (ctx: ExtensionContext): Promise<string> => {
     const workDir = resolveWorkDir(ctx.cwd);
     const stateRoot = getRuntime(ctx).researchStateRoot;
     const research =
       researchScanSync(workDir).blocks ||
       (stateRoot !== null && stateRoot !== workDir && researchScanSync(stateRoot).blocks);
-    return research ? RESEARCH_RESUME_TEXT
-      : [
+    if (research) {
+      const snapshot = await researchCompletionSnapshot(ctx);
+      return snapshot.readable && snapshot.allClosed && !snapshot.stopTriggered && snapshot.phase === "research"
+        ? researchCompletionText
+        : RESEARCH_RESUME_TEXT;
+    }
+    return [
           "Continue the candidate campaign now: candidate_branch status, then run/checkpoint on the active candidate.",
           "The ordinary experiment tools are blocked while the campaign is active.",
           "If status reports manual_check_required: STOP — report the pending operation and wait for the operator (resolve).",
@@ -2637,11 +2667,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   };
 
   /** Corrective resume for a settled turn that did no loop work (bounded — see MAX_CONSECUTIVE_DRIFT_RESUMES). */
-  const composeDriftResumeMessage = async (cwd: string, ctx?: ExtensionContext): Promise<string> => {
+  const composeDriftResumeMessage = async (cwd: string, ctx: ExtensionContext): Promise<string> => {
     // Research campaign active (design §8): resume the research campaign only.
     // Session-aware: the pinned --state-root campaign counts in THIS session
     // (review B2), so a state-root campaign gets research wording too.
-    if ((await researchBlocksOrdinaryLoop(resolveWorkDir(cwd), ctx))) return composeResearchDriftMessage();
+    if ((await researchBlocksOrdinaryLoop(resolveWorkDir(cwd), ctx))) return composeResearchDriftMessage(ctx);
     // Candidate-branch campaign active (design §5): do NOT prescribe the legacy
     // cycle; the campaign has its own loop and its own stop rules. resolveWorkDir
     // (not the raw cwd): the campaign may live under a configured workingDir.
@@ -2697,7 +2727,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (await campaignNeedsManualCheck(resolveWorkDir(ctx.cwd), ctx)) return;
     const stopReason = autoResumeStopReasonFor(runtime);
     if (stopReason !== null) {
-      notifyAutoResumeLimitReached(ctx, stopReason);
+      await notifyAutoResumeLimitReachedAsync(ctx, stopReason);
       return;
     }
     runtime.consecutiveDriftResumes++;
@@ -3256,7 +3286,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
     const stopReason = autoResumeStopReasonFor(runtime);
     if (stopReason !== null) {
-      notifyAutoResumeLimitReached(ctx, stopReason);
+      await notifyAutoResumeLimitReachedAsync(ctx, stopReason);
       return;
     }
     // Candidate-branch campaign active (design §5): the default resume must not
@@ -3308,7 +3338,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (runtime.autoresearchMode && runtime.experimentsThisSession === 0 && !hasPendingResume(runtime)) {
       const stopReason = autoResumeStopReasonFor(runtime);
       if (stopReason !== null) {
-        notifyAutoResumeLimitReached(ctx, stopReason);
+        await notifyAutoResumeLimitReachedAsync(ctx, stopReason);
         return;
       }
       if (runtime.lastTurnUsedExperimentTools) {
@@ -8579,6 +8609,80 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
   };
 
+  const staleReportText = (dir: string, snap: ResearchSnapshot, draftBytes: Buffer | null): string => {
+    const singleLine = (text: string): string => text.replace(/\s+/g, " ").trim();
+    const indentedBlock = (text: string): string => text.split(/\r?\n/).map((line) => `    ${line}`).join("\n");
+    const lines = [
+      `# Research campaign report: ${path.basename(dir)}`,
+      "Status: CLOSED AS STALE (NOT COMPLETED)",
+      `Phase at closure: ${snap.state.phase}`,
+      `Closed at: ${new Date().toISOString()}`,
+    ];
+    if (snap.brief && snap.briefSha256) {
+      lines.push(
+        `Brief sha256: ${snap.briefSha256}`,
+        `Goal: ${singleLine(snap.brief.goal)}`,
+        `Plan source: ${singleLine(snap.brief.plan_source)}`,
+        "",
+        indentedBlock(snap.brief.caveat_block),
+        "",
+        "## Questions",
+      );
+      for (const q of snap.brief.questions) {
+        const v = snap.replay.vectors.get(q.id);
+        if (!v || v.status !== "closed") {
+          lines.push(`${singleLine(q.id)}: ${singleLine(q.text)} — OPEN: not closed, no verdict`);
+        } else {
+          const rule = q.decision_rules.find((r) => r.id === v.rule_id);
+          lines.push(`${singleLine(q.id)}: ${singleLine(q.text)} — verdict ${singleLine(v.verdict)}; rule ${singleLine(v.rule_id)}${rule ? ` (${singleLine(rule.when)})` : ""}${v.reason ? ` (${singleLine(v.reason)})` : ""}`);
+        }
+      }
+      lines.push("", "## Stop rules");
+      for (const rule of snap.brief.stop_rules) {
+        const triggered = snap.replay.stop?.rule_id === rule.id ? ` — TRIGGERED (${snap.replay.stop.reason})` : "";
+        lines.push(`${singleLine(rule.id)}: ${singleLine(rule.when)}${triggered ? ` — TRIGGERED (${singleLine(snap.replay.stop?.reason ?? "")})` : ""}`);
+      }
+      if (!snap.replay.stop) lines.push("No stop rule triggered: the campaign was closed before completion.");
+    } else {
+      const draftGoal = draftBytes === null ? null : (JSON.parse(draftBytes.toString("utf8")) as { goal?: unknown }).goal;
+      lines.push("Brief: not approved (draft); campaign closed before approval.");
+      if (typeof draftGoal === "string") lines.push(`Goal: ${singleLine(draftGoal)}`);
+      lines.push("", ...(draftBytes !== null ? ["## Draft brief", indentedBlock(draftBytes.toString("utf8"))] : ["Draft brief: none was written before the campaign was closed."]));
+    }
+    return lines.join("\n");
+  };
+
+  /** Closes briefing/research campaigns without implying successful completion. */
+  const closeStaleCampaignInternal = async (dir: string): Promise<researchState.Result<{ state: researchState.CampaignState }>> => {
+    const snap = await researchSnapshot(dir);
+    if (!snap.ok) return snap;
+    let draftBytes: Buffer | null = null;
+    if (snap.brief === null && snap.state.phase === "briefing") {
+      try {
+        draftBytes = await fs.promises.readFile(path.join(dir, researchState.BRIEF_FILE));
+        try {
+          JSON.parse(draftBytes.toString("utf8"));
+        } catch (err) {
+          return researchRefusal("brief_unreadable", `draft brief cannot be read (${String(err)}); nothing was changed`);
+        }
+      } catch (err) {
+        if ((err as { code?: string }).code !== "ENOENT") {
+          return researchRefusal("brief_unreadable", `draft brief cannot be read (${String(err)}); nothing was changed`);
+        }
+        draftBytes = null;
+      }
+    }
+    return researchState.updateState(dir, "abandon stale campaign", (cur) =>
+      cur.phase === "briefing" || cur.phase === "research"
+        ? { ok: true, next: { ...cur, phase: "stopped" } }
+        : researchRefusal("invalid_transition", `campaign is in phase ${cur.phase}; only a briefing/research campaign can be closed as stale`),
+    async () => {
+      await appendResearchEvent(dir, { event: "abandon", reason: "stale" });
+      await fs.promises.writeFile(path.join(dir, "report.md"), staleReportText(dir, snap, draftBytes) + "\n", "utf8");
+    });
+  };
+  closeStaleCampaign = closeStaleCampaignInternal;
+
   /** Base the campaign state lives under: the pinned --state-root (resolved
    *  absolute) or the work directory itself. Byte-identical to the previous
    *  behavior when no pin is set. */
@@ -8687,6 +8791,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     vectors: Map<string, ResearchVector>;
     open: string | null;
     stop: { rule_id: string; reason: string } | null;
+    abandoned: boolean;
   }
 
   /** Reads log.jsonl. A missing log is empty; any malformed line fails closed. */
@@ -8718,11 +8823,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   /** Replays the log into vector statuses. Any inconsistent entry fails closed. */
   const replayResearchLog = (events: any[]): researchState.Result<{ replay: ResearchReplay }> => {
-    const replay: ResearchReplay = { vectors: new Map(), open: null, stop: null };
+    const replay: ResearchReplay = { vectors: new Map(), open: null, stop: null, abandoned: false };
     const bad = (i: number, why: string) =>
       researchRefusal("state_unreadable", `log.jsonl entry ${i + 1} ${why}; nothing was changed`);
     for (let i = 0; i < events.length; i++) {
       const e = events[i];
+      if (replay.abandoned) return bad(i, "appears after abandon");
       if (e.event === "open") {
         if (typeof e.question_id !== "string" || replay.open !== null || replay.vectors.has(e.question_id)) {
           return bad(i, "is an invalid open");
@@ -8760,6 +8866,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       } else if (e.event === "stop") {
         if (replay.stop !== null || typeof e.rule_id !== "string") return bad(i, "is an invalid stop");
         replay.stop = { rule_id: e.rule_id, reason: typeof e.reason === "string" ? e.reason : "" };
+      } else if (e.event === "abandon") {
+        if (e.reason !== "stale" || replay.stop !== null || i !== events.length - 1) return bad(i, "is an invalid abandon");
+        replay.abandoned = true;
       } else {
         return bad(i, "has an unknown event");
       }
@@ -8805,6 +8914,21 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const replayed = replayResearchLog(log.events);
     if (!replayed.ok) return replayed;
     return { ok: true, state: loaded.state, brief, briefSha256, replay: replayed.replay };
+  };
+
+  const researchCompletionSnapshot = async (ctx: ExtensionContext): Promise<{
+    readable: boolean; allClosed: boolean; stopTriggered: boolean; phase: string | null; campaignId: string | null;
+  }> => {
+    const workDir = resolveWorkDir(ctx.cwd);
+    const target = resolveResearchTarget(workDir, ctx);
+    if (!target.ok) return { readable: false, allClosed: false, stopTriggered: false, phase: null, campaignId: null };
+    const snap = await researchSnapshot(target.dir);
+    if (!snap.ok) return { readable: false, allClosed: false, stopTriggered: false, phase: null, campaignId: target.id };
+    const vectors = snap.replay.vectors;
+    const allClosed = snap.brief !== null && vectors.size > 0 &&
+      [...vectors.values()].every((vector) => vector.status === "closed") &&
+      snap.brief.questions.every((question) => vectors.has(question.id));
+    return { readable: true, allClosed, stopTriggered: snap.replay.stop !== null, phase: snap.state.phase, campaignId: target.id };
   };
 
   /**
@@ -9816,7 +9940,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             findingNote = " (warning: the finding could not be recorded)";
           }
         }
-        return reply(`✅ Vector ${qid} closed: ${verdict} by rule ${rid}.` + findingNote);
+        const afterClose = await researchSnapshot(dir);
+        const allClosed = afterClose.ok && afterClose.brief !== null && afterClose.replay.vectors.size > 0 &&
+          afterClose.brief.questions.every((q) => afterClose.replay.vectors.get(q.id)?.status === "closed");
+        const closingNudge = allClosed && afterClose.ok && afterClose.replay.stop === null
+          ? " All questions are closed: pick a stop rule (research stop <rule_id>) then research report."
+          : "";
+        return reply(`✅ Vector ${qid} closed: ${verdict} by rule ${rid}.` + findingNote + closingNudge);
       }
 
       if (action === "stop") {
@@ -10414,7 +10544,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           ...[requestedStateRoot, pinnedStateRoot].filter((b) => b !== null) as string[],
         ];
         const uniqueLaunchBases = [...new Set(launchBases)];
-        const existingIds = [...new Set(uniqueLaunchBases.flatMap((b) => listResearchCampaignIds(b) ?? []))].sort();
+        const campaignIdsByBase = new Map<string, string[] | null>();
+        for (const base of uniqueLaunchBases) {
+          campaignIdsByBase.set(base, listResearchCampaignIds(base));
+        }
+        const existingIds = [...new Set(uniqueLaunchBases.flatMap((b) => campaignIdsByBase.get(b) ?? []))].sort();
 
         // Explicit --id: pin it for the session. When the campaign already
         // exists it must be resumable (briefing/research); when it does not,
@@ -10450,15 +10584,51 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               return;
             }
           }
-        } else if (existingIds.length > 0) {
-          // No --id and a campaign that is not finished exists: never silently
-          // start a second one. A finished (stopped) campaign does not block:
-          // the draft that starts the new campaign archives it.
-          const blocking = await blockingCampaignIds(uniqueLaunchBases);
-          if (blocking.length > 0) {
-            ctx.ui.notify(blocking.length > 1
-              ? `Several campaigns exist (${blocking.join(", ")}); resume one with /autoresearch research --id <id>, or finish it first`
-              : `Campaign ${blocking[0]} is active or unreadable; resume it with /autoresearch research --id ${blocking[0]}, or finish it first`, "info");
+        } else if (existingIds.length > 0 || uniqueLaunchBases.some((base) => campaignIdsByBase.get(base) === null)) {
+          // Bare launches close stale, unpinned campaigns before proceeding;
+          // protected or unreadable campaigns fail closed with their reason.
+          const chainIds = await chainCampaignIds(ctx);
+          const seenDirs = new Set<string>();
+          const idBaseCounts = new Map<string, number>();
+          for (const base of uniqueLaunchBases) {
+            for (const id of campaignIdsByBase.get(base) ?? []) idBaseCounts.set(id, (idBaseCounts.get(id) ?? 0) + 1);
+          }
+          const refusalName = (id: string, base: string): string =>
+            idBaseCounts.get(id)! > 1 ? `${id} (at ${path.relative(researchWorkDir, path.join(base, ".auto", "research", id)) || "."})` : id;
+          const refusals: string[] = [];
+          for (const base of uniqueLaunchBases) {
+            const campaignIds = campaignIdsByBase.get(base);
+            if (campaignIds === null || campaignIds === undefined) {
+              refusals.push(`(unreadable root ${base})`);
+              continue;
+            }
+            for (const id of campaignIds) {
+              const resolved = researchState.resolveCampaignDir(base, id);
+              if (!resolved.ok) { refusals.push(`${refusalName(id, base)} (unreadable state)`); continue; }
+              const dir = path.resolve(resolved.dir);
+              if (seenDirs.has(dir)) continue;
+              seenDirs.add(dir);
+              const name = refusalName(id, base);
+              const state = await researchState.readState(dir);
+              if (!state.ok) { refusals.push(`${name} (unreadable state)`); continue; }
+              if (state.state.phase === "stopped") continue;
+              if (state.state.phase !== "briefing" && state.state.phase !== "research") {
+                refusals.push(`${name} (unreadable state)`); continue;
+              }
+              if (id === runtime.researchCampaignId) {
+                // Spec (headless-launch): a pinned blocking campaign keeps the
+                // EXISTING blocking wording ("resume it …, or finish it first").
+                ctx.ui.notify(`Campaign ${id} is active or unreadable; resume it with /autoresearch research --id ${id}, or finish it first`, "info");
+                return;
+              }
+              if (fs.existsSync(path.join(dir, "pending-op.json"))) { refusals.push(`${name} (pending op)`); continue; }
+              if (chainIds.includes(id)) { refusals.push(`${name} (active chain)`); continue; }
+              const closed = closeStaleCampaign ? await closeStaleCampaign(dir) : null;
+              if (!closed?.ok) refusals.push(`${name} (${closed?.message ?? "could not close as stale"})`);
+            }
+          }
+          if (refusals.length > 0) {
+            ctx.ui.notify(`Cannot launch research; campaigns need attention: ${refusals.join("; ")}`, "info");
             return;
           }
         }

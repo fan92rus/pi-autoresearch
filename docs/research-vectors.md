@@ -278,6 +278,43 @@ A finished campaign (`phase: stopped`) is kept, never deleted.
 
 Spec: `openspec/changes/research-exit-and-archive/`.
 
+## Stale campaigns: closure at launch
+
+A bare `/autoresearch research <description>` (without `--id`) closes existing
+blocking campaigns before launching. This is not timer-driven; `--id` resumes
+never trigger it, and a campaign pinned to the current session is never closed
+by the guard.
+
+A campaign is closable only when its phase is `briefing` or `research`, it is
+not pinned to this session, has no `pending-op.json`, has readable and valid
+`state.json`, and is not part of an active charter chain. Otherwise the launch
+fails closed and gives a reason for each blocking campaign. This includes a
+pending operation, unreadable or invalid state, active-chain membership, and
+an approved brief whose hash no longer matches `brief.json` (`brief_changed`).
+A pinned campaign follows the existing “resume it …, or finish it first” refusal.
+Closable campaigns already handled in the same pass remain stopped if another
+campaign refuses the launch; an active-chain campaign's journal is untouched.
+
+Closure appends `{event:"abandon", reason:"stale"}` as the final journal event,
+then changes the phase to `stopped` through the atomic update protocol. The
+saved `report.md` reflects actual state: open questions remain open, with no
+verdicts, and it explicitly says the campaign was not completed (closed as
+stale). For a briefing campaign without an approved brief, the report embeds
+the draft brief verbatim and omits question-status and stop sections. No
+verdicts or success wording are fabricated. Any journal event after `abandon`
+makes replay unreadable (fail-closed).
+
+Stopped campaigns are moved, never deleted, by the next `research_brief draft`
+archive flow into `.auto/research-archive/`.
+
+Reminders follow campaign state: closing the last open question points to
+`research stop <rule_id>` and `research report`; auto-resume and drift reminders
+suggest continuing research only while questions remain open, and suggest
+`research stop <rule_id>` plus `research report` when all are closed (never
+“open”). No reminder is delivered for pending-op, unreadable, or stopped
+campaigns. The auto-resume-limit notification names a questions-complete but
+unfinalized campaign.
+
 ## Run: `node --experimental-strip-types --experimental-loader ./tests/redirect-loader.mjs --test tests/research-state.test.mjs tests/research-branch-wiring.test.mjs`
 
 Module and wiring suites: `tests/research-state.test.mjs` (52),
