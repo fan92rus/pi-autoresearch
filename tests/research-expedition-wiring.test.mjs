@@ -1,0 +1,19 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { pathToFileURL } from "node:url";
+import { createFakePi, makeCtx } from "./fake-pi.ts";
+import { AUTORESEARCH_SUBCOMMANDS } from "../extensions/pi-autoresearch/parallel/config-ui.ts";
+
+const brief = { schema_version:1, goal:"Study cache latency", plan_source:"plan.md", caveat_block:"Observational only", data_roles:{explore:[],validate:[],confirm:[]}, questions:[{id:"Q1",text:"Does latency improve?",decision_rules:[{id:"yes",verdict:"confirmed",when:"measured improvement"},{id:"no",verdict:"rejected",when:"no improvement"},{id:"unknown",verdict:"inconclusive",when:"unclear"},{id:"wait",verdict:"waiting_for_data",when:"data missing"}],needs_data:null}], process_metrics:[], stop_rules:[] };
+const doc = { charter:{stop_rules:[]}, goal:"Study cache latency", directions:[{name:"cache",why:"Measure cache effects"}], campaign0:brief };
+function workdir(){const p=fs.mkdtempSync(path.join(os.tmpdir(),"expedition-wire-")); return p;}
+async function harness(dir, confirm=true){const {pi,tool,command}=createFakePi({dir,sessionId:"exp-wire",realGit:false}); const ctx=makeCtx(dir,"exp-wire",pi); ctx.ui.confirm=async()=>confirm; const ext=await import(pathToFileURL(path.join(import.meta.dirname,"..","extensions","pi-autoresearch","index.ts")).href); ext.default(pi); return {pi,tool,command,ctx};}
+const text = r=>r?.content?.[0]?.text ?? "";
+
+test("expedition subcommand is registered",()=>{assert.ok(AUTORESEARCH_SUBCOMMANDS.some(x=>x.value==="expedition"));});
+test("expedition command rejects headless invocation",async()=>{const dir=workdir(),h=await harness(dir); h.ctx.hasUI=false; await h.command("autoresearch").handler("expedition goal",h.ctx); assert.ok(h.pi.notifications.some(n=>/headless|TUI/i.test(n.text)));});
+test("draft is saved and propose rejects workdir path",async()=>{const dir=workdir(),h=await harness(dir); await h.command("autoresearch").handler("expedition goal",h.ctx); const out=await h.tool("expedition_brief").execute("id",{action:"draft",doc},null,null,h.ctx); assert.match(text(out),/draft saved/i); const inside=path.join(dir,"inside.json"); fs.writeFileSync(inside,JSON.stringify(doc)); const refused=await h.tool("expedition_brief").execute("id",{action:"propose",doc_path:inside},null,null,h.ctx); assert.match(text(refused),/path_inside_workdir/);});
+test("propose from draft creates expedition chain and starts campaign 0",async()=>{const dir=workdir(),h=await harness(dir,true); await h.command("autoresearch").handler("expedition goal",h.ctx); await h.tool("expedition_brief").execute("id",{action:"draft",doc},null,null,h.ctx); const out=await h.tool("expedition_brief").execute("id",{action:"propose"},null,null,h.ctx); assert.match(text(out),/created/i); const id=text(out).match(/campaign (exp-[A-Za-z0-9-]+)/)?.[1]; assert.ok(id, text(out)); const chain=path.join(dir,".auto","research-chain",`${id}-chain`,`chain.json`); const entries=fs.readFileSync(chain,"utf8").trim().split("\n").map(JSON.parse); assert.ok(entries.some(e=>e.type==="expedition_created")); assert.ok(entries.some(e=>e.type==="direction_opened")); assert.ok(entries.some(e=>e.type==="campaign_added")); const before=fs.readFileSync(chain,"utf8"); await h.command("autoresearch").handler("expedition second",h.ctx); assert.equal(fs.readFileSync(chain,"utf8"),before,"re-entry guard leaves journal bytes untouched"); assert.ok(h.pi.notifications.some(n=>/resume or finish/i.test(n.text)));});

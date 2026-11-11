@@ -41,6 +41,7 @@ import { getBashSpawnOptions, killTree } from "./bash-shell.ts";
 import { computeState, markIdeaTried } from "./observer.ts";
 import { askConsent, briefChatMarkdown, briefConsentSummary } from "./brief-consent.ts";
 import * as optimizeBrief from "./optimize-brief.ts";
+import * as expedition from "./expedition.ts";
 import { registerCouncilTools } from "./council-tools.ts";
 import { registerAssessPrecedentsTool } from "./precedent-assess.ts";
 import { registerSearchPrecedentsTool } from "./precedent-report.ts";
@@ -299,6 +300,41 @@ export let sendPendingResumeIfReadyForTest: ((ctx: ExtensionContext, runtime: Au
 /** Test hook for the async auto-resume limit notification. */
 export let notifyAutoResumeLimitReachedAsyncForTest: ((ctx: ExtensionContext, reason?: string | null) => Promise<void>) | null = null;
 
+/** Synchronously reads expedition artifacts for the TUI. The map intentionally does not verify journal hashes. */
+export function buildExpeditionWidgetLines(
+  chainDir: string,
+  campaignDir: string | null,
+  info: { campaignId: string | null; campaignPhase: string | null; campaignsUsed: number; campaignsLimit: number | null; chainStatus: string },
+): string[] {
+  try {
+    const journal = fs.readFileSync(path.join(chainDir, "chain.json"), "utf8");
+    const entries = journal.split(/\r?\n/).filter((line) => line.length > 0).map((line) => JSON.parse(line));
+    const replay = expedition.replayExpeditionMap(entries);
+    if (!replay.ok) return ["(map unavailable: journal damaged)"];
+    const openQuestions: string[] = [];
+    if (campaignDir) {
+      try {
+        const brief = JSON.parse(fs.readFileSync(path.join(campaignDir, "brief.json"), "utf8"));
+        const log = fs.readFileSync(path.join(campaignDir, "log.jsonl"), "utf8");
+        const questionTexts = new Map((Array.isArray(brief.questions) ? brief.questions : []).map((q: any) => [q.id, q.text ?? q.id]));
+        const opened = new Set<string>();
+        for (const line of log.split(/\r?\n/).filter(Boolean)) {
+          const event = JSON.parse(line);
+          const id = event.question_id ?? event.questionId;
+          if (typeof id !== "string") continue;
+          const action = event.event ?? event.type;
+          if (action === "question_opened" || action === "open") opened.add(id);
+          if (action === "question_closed" || action === "close") opened.delete(id);
+        }
+        for (const id of opened) openQuestions.push(String(questionTexts.get(id) ?? id));
+      } catch { /* brief/log are optional for rendering; map remains useful */ }
+    }
+    return expedition.expeditionWidgetLines(replay.map, { ...info, openQuestions });
+  } catch {
+    return ["(map unavailable)"];
+  }
+}
+
 type AutoResumeGuardState = Pick<ExperimentState, "results" | "currentSegment">;
 type AutoResumeGuardRuntime = {
   autoResumeTurns: number;
@@ -407,7 +443,7 @@ interface AutoresearchRuntime {
    *  campaigns behave exactly as before the charter change. Created by '/autoresearch research
    *  --charter <path>' after the owner confirms the Charter SHA-256 dialog. Cleared when the chain
    *  reaches a final status together with the mode-off paths (chain_stop in pause, final report). */
-  researchChain: { chainId: string; workDir: string; charterPath: string; charterSha256: string; charter: import("./charter.ts").Charter } | null;
+  researchChain: { chainId: string; workDir: string; charterPath: string; charterSha256: string; charter: import("./charter.ts").Charter; expedition?: boolean; docSha256?: string } | null;
   /** True between the continuation of an awaiting_child period and the next brief action:
    *  the report branch sends at most ONE continuation per period (spec: no repeated
    *  continuation without a new agent action). Re-armed by a chain brief action. */
@@ -3125,6 +3161,38 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     if (!runtime.autoresearchMode) {
       ctx.ui.setWidget("autoresearch", undefined);
+      return;
+    }
+
+    if (runtime.researchChain && (runtime.researchChain as typeof runtime.researchChain & { expedition?: boolean }).expedition === true) {
+      const chain = runtime.researchChain;
+      const chainDir = path.join(chain.workDir, ".auto", "research-chain", chain.chainId);
+      const campaignRoot = runtime.researchStateRoot ?? researchState.researchRoot(chain.workDir);
+      const campaignDir = runtime.researchCampaignId ? path.join(campaignRoot, runtime.researchCampaignId) : null;
+      let chainStatus = "unknown";
+      let campaignsUsed = 0;
+      try {
+        const journal = fs.readFileSync(path.join(chainDir, "chain.json"), "utf8");
+        for (const line of journal.split(/\r?\n/).filter(Boolean)) {
+          const entry = JSON.parse(line);
+          if (entry.type === "status_change" && typeof entry.status === "string") chainStatus = entry.status;
+          if (entry.type === "campaign_added") campaignsUsed++;
+        }
+      } catch { /* use conservative status below */ }
+      if (chainStatus === "unknown") chainStatus = "active";
+      ctx.ui.setWidget("autoresearch", (tui, theme) => ({
+        render(width: number): string[] {
+          const safeWidth = Math.max(1, width || getTuiSize(tui).width);
+          return buildExpeditionWidgetLines(chainDir, campaignDir, {
+            campaignId: runtime.researchCampaignId,
+            campaignPhase: null,
+            campaignsUsed,
+            campaignsLimit: chain.charter.max_campaigns ?? null,
+            chainStatus,
+          }).map((line) => truncateToWidth(line, safeWidth, "…", true));
+        },
+        invalidate(): void { try { tui.requestRender(); } catch { /* headless */ } },
+      }));
       return;
     }
 
@@ -8517,6 +8585,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     ["report", ["action"]],
     ["resolve", ["action"]],
     ["chain_stop", ["action", "rule_id", "reason"]],
+    ["expedition", ["action", "subaction", "dir", "to", "from", "reason", "why", "refs", "review_ref", "review_sha256"]],
   ]);
 
   const researchRefusal = (reason: researchState.RefusalReason, message: string): researchState.Refusal => ({
@@ -9202,6 +9271,83 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   });
 
   registerGatedTool({
+    name: "expedition_brief",
+    label: "Expedition document",
+    renderCall(args: any) {
+      if (args?.action !== "propose") return new Text(`expedition_brief ${String(args?.action ?? "")}`, 0, 0);
+      const doc = args?.doc;
+      return new Text(typeof doc === "object" ? `Expedition proposal: ${String(doc.goal ?? "")}${Array.isArray(doc.directions) ? `\\n${doc.directions.map((d: any) => `- ${d.name}`).join("\\n")}` : ""}` : "Expedition proposal", 0, 0);
+    },
+    description: "Draft and obtain owner confirmation for an expedition document, then create campaign 0.",
+    promptSnippet: "Expedition: ask missing design questions as one packet, draft expedition_brief, then propose",
+    promptGuidelines: ["Ask the owner all missing questions in one message before drafting.", "Use expedition_brief draft, then propose. Never pass approval or hash fields."],
+    parameters: { type: "object", properties: { action: { type: "string", enum: ["draft", "propose"] }, doc: { type: "object" }, doc_path: { type: "string" } }, required: ["action"] } as any,
+    async execute(_id: string, params: any, _signal: any, _update: any, ctx: ExtensionContext) {
+      const action = params?.action;
+      const reply = (text: string, reason?: string) => ({content:[{type:"text" as const,text}],details:{action,...(reason?{reason}:{})}});
+      const allowed = action === "draft" ? ["action","doc"] : action === "propose" ? ["action","doc_path"] : null;
+      if (!allowed) return reply("invalid_argument: action must be draft or propose", "invalid_argument");
+      const extra = unexpectedArgKeys(params ?? {}, allowed);
+      if (extra) return reply(`invalid_argument: ${extra}`, "invalid_argument");
+      if (!ctx.hasUI && action === "propose") return reply("no_ui: expedition confirmation requires TUI", "no_ui");
+      const workDir = resolveWorkDir(ctx.cwd), runtime = getRuntime(ctx);
+      const stateRoot = runtime.researchStateRoot ?? path.join(workDir, ".auto");
+      if (action === "draft") {
+        const checked = expedition.validateExpeditionDoc(params.doc);
+        if (!checked.ok) return reply(`${checked.reason}: ${checked.message}`, checked.reason);
+        const saved = expedition.saveExpeditionDraft(stateRoot, checked.doc);
+        return saved.ok ? reply(`Expedition draft saved: ${saved.path}. Next: expedition_brief propose.`) : reply(`${saved.reason}: ${saved.message}`, saved.reason);
+      }
+      let docPath: string;
+      if (typeof params.doc_path === "string") docPath = path.resolve(workDir, params.doc_path);
+      else {
+        const latest = expedition.findLatestDraft(stateRoot);
+        if (!latest) return reply("expedition_draft_missing: no draft found", "expedition_draft_missing");
+        docPath = path.join(path.dirname(workDir), `expedition-${Date.now()}.json`);
+        try { fs.writeFileSync(docPath, fs.readFileSync(latest)); fs.unlinkSync(latest); } catch (e) { return reply(`io_failed: ${String(e)}`, "io_failed"); }
+      }
+      try {
+        const real = fs.realpathSync(docPath), realWork = fs.realpathSync(workDir), rel = path.relative(realWork, real);
+        if (rel === "" || (!path.isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${path.sep}`))) return reply("path_inside_workdir: document must be outside the work directory", "path_inside_workdir");
+      } catch (e) { return reply(`expedition_doc_unreadable: ${String(e)}`, "expedition_doc_unreadable"); }
+      const initial = expedition.readExpeditionDoc(docPath);
+      if (!initial.ok) return reply(`${initial.reason}: ${initial.message}`, initial.reason);
+      const dialog = expedition.expeditionDialogText(initial.doc, initial.sha256);
+      const confirmed = await ctx.ui.confirm("Confirm expedition document", dialog);
+      const current = expedition.readExpeditionDoc(docPath);
+      if (!current.ok || current.sha256 !== initial.sha256) return reply("expedition_changed: document changed during confirmation", "expedition_changed");
+      if (confirmed !== true) return reply("owner_declined: expedition was not created", "owner_declined");
+      const id = `exp-${Date.now()}`, chainId = `${id}-chain`;
+      const createdChain = await chainJournal.createChain(workDir, chainId, id);
+      if (!createdChain.ok) return reply(`${createdChain.reason}: ${createdChain.message}`, createdChain.reason);
+      const chainDir = chainJournal.chainDir(workDir, chainId)!;
+      const add = async (type: string, payload: Record<string, unknown>) => chainJournal.appendEntry(chainDir, workDir, chainId, type, payload);
+      let r = await add("expedition_created", {goal: current.doc.goal, doc_sha256: current.sha256});
+      if (!r.ok) return reply(`${r.reason}: ${r.message}`, r.reason);
+      for (const d of current.doc.directions) { r = await add("direction_opened", {dir:d.name,why:d.why}); if (!r.ok) return reply(`${r.reason}: ${r.message}`, r.reason); }
+      const campaign = await researchState.createCampaign(workDir, id);
+      if (!campaign.ok) return reply(`${campaign.reason}: ${campaign.message}`, campaign.reason);
+      const brief = await researchState.writeBriefDraft(campaign.dir, current.doc.campaign0);
+      if (!brief.ok) return reply(`${brief.reason}: ${brief.message}`, brief.reason);
+      const approval = await researchState.writeApproval(campaign.dir, brief.sha256);
+      if (!approval.ok) return reply(`${approval.reason}: ${approval.message}`, approval.reason);
+      r = await add("brief_approved", {campaign_id:id,brief_sha256:brief.sha256,source:"expedition"});
+      if (!r.ok) return reply(`${r.reason}: ${r.message}`, r.reason);
+      r = await add("campaign_added", {campaign_id:id});
+      if (!r.ok) return reply(`${r.reason}: ${r.message}`, r.reason);
+      const started = await researchState.updateState(campaign.dir, "start expedition campaign", s => s.phase === "briefing" ? {ok:true,next:{...s,phase:"research"}} : researchRefusal("invalid_transition", "campaign cannot start"));
+      if (!started.ok) return reply(`${started.reason}: ${started.message}`, started.reason);
+      const status = await chainJournal.setChainStatus(workDir, chainId, "active");
+      if (!status.ok) return reply(`${status.reason}: ${status.message}`, status.reason);
+      if (!runtime.autoresearchMode) { recordAutoresearchActivation(workDir,true); setAutoresearchMode(ctx,true); updateWidget(ctx); }
+      runtime.researchCampaignId = id;
+      runtime.researchChain = {chainId,workDir,charterPath:docPath,charterSha256:current.sha256,charter:current.doc.charter,expedition:true,docSha256:current.sha256};
+      sendWhenReady(ctx, `Expedition ${id} created. Campaign 0 is running. Continue with research status/open/record/close; the campaign brief is approved by the expedition confirmation.`);
+      return reply(`✅ Expedition ${chainId} created; campaign ${id} started (document sha256 ${current.sha256}).`);
+    },
+  });
+
+  registerGatedTool({
     name: "research_brief",
     label: "Research brief (phase 1)",
     // The full brief is drawn as this tool call's row in the transcript: the row is shown before execute and before the owner dialog.
@@ -9534,7 +9680,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       properties: {
         action: {
           type: "string",
-          enum: ["start", "open", "record", "close", "stop", "status", "report", "resolve"],
+          enum: ["start", "open", "record", "close", "stop", "status", "report", "resolve", "chain_stop", "expedition"],
           description: "Research action to perform.",
         },
         expected_sha256: { type: "string", description: "start only: sha256 of the approved brief (64 lowercase hex)." },
@@ -9606,6 +9752,35 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return reply("✅ Pending operation resolved by the operator; the marker is cleared. Check the campaign with research status.");
       }
 
+      if (action === "expedition") {
+        const chain = activeChain(ctx);
+        if (!chain?.expedition) return fail("not_an_expedition", "research expedition is available only on an expedition chain");
+        const verified = await chainJournal.verifyChain(chain.workDir, chain.chainId);
+        if (!verified.ok) {
+          await chainJournal.markManualCheckRequired(chain.workDir, chain.chainId, verified.message).catch(() => undefined);
+          return fail("manual_check_required", verified.message);
+        }
+        const replay = expedition.replayExpeditionMap(verified.entries);
+        if (!replay.ok) return fail(replay.reason, replay.message);
+        const subaction = params.subaction;
+        if (subaction === "status") {
+          return reply(expedition.mapSliceText(replay.map) || "Expedition map is empty.");
+        }
+        const types: Record<string, expedition.MapEventType> = {open:"direction_opened",activate:"direction_activated",resolve:"direction_resolved",reject:"direction_rejected",advisory:"direction_advisory",park:"direction_parked",reopen:"direction_reopened",pivot:"pivot"};
+        if (subaction === "expedition_stop" || !types[subaction]) return fail("invalid_argument", "invalid expedition subaction; expedition_stop is written by the system");
+        const type = types[subaction];
+        const payload: Record<string, unknown> = {dir:params.dir,from:params.from,to:params.to,why:params.why ?? params.reason,reason:params.reason ?? params.why,refs:params.refs,review_ref:params.review_ref,review_sha256:params.review_sha256,...(subaction === "activate" ? {campaign:getRuntime(ctx).researchCampaignId} : {})};
+        const journals = new Map<string, Array<{questionId:string;verdict:string;hasEvidence:boolean}>>();
+        for (const j of await collectChainJournals(workDir, ctx, effectiveResearchBase(workDir, ctx), chain.chainId)) journals.set(j.campaignId, j.closedQuestions);
+        const transition = expedition.validateMapTransition(replay.map, type, payload, journals);
+        if (!transition.ok) return fail(transition.reason, transition.message);
+        const chainDirPath = chainJournal.chainDir(chain.workDir, chain.chainId);
+        if (!chainDirPath) return fail("manual_check_required", "chain directory is unavailable");
+        const written = await chainJournal.appendEntry(chainDirPath, chain.workDir, chain.chainId, type, payload);
+        if (!written.ok) return fail(written.reason as never, written.message);
+        return reply(`Expedition map recorded: ${subaction} ${params.dir ?? params.from ?? ""}.`);
+      }
+
       if (action === "chain_stop") {
         const chain = activeChain(ctx);
         if (chain === null) {
@@ -9631,13 +9806,26 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           }
           // Review M4/N2: a journal write that fails must not turn the mode OFF
           // while the journal still says active/awaiting_child.
+          if (chain.expedition && ruleId === "territory_complete") {
+            const mapResult = expedition.replayExpeditionMap(verified.entries);
+            if (!mapResult.ok) return fail(mapResult.reason, mapResult.message);
+            const territory = expedition.territoryComplete(mapResult.map);
+            if (!territory.value) return fail("invalid_transition", `territory_complete is false; open directions: ${territory.openDirs.join(", ") || "none"}${territory.pivotTail ? "; pivot after the last closure" : ""}`);
+          }
+          if (chain.expedition) {
+            const chainDirPath = chainJournal.chainDir(chain.workDir, chain.chainId);
+            if (!chainDirPath) return fail("manual_check_required", "chain directory is unavailable");
+            const stop = await chainJournal.appendEntry(chainDirPath, chain.workDir, chain.chainId, "expedition_stop", {rule:ruleId,basis:"rule"});
+            if (!stop.ok) return fail(stop.reason as never, `chain stop not recorded: ${stop.message}`);
+          }
           const ruleWrite = await chainJournal.setChainStatus(chain.workDir, chain.chainId, "stopped_by_rule");
           if (!ruleWrite.ok) return fail(ruleWrite.reason as never, `chain stop not recorded: ${ruleWrite.message}`);
+          const reportNote = chain.expedition ? await writeExpeditionFinalReport(chain, "stopped_by_rule") : "";
           if (status === "awaiting_child") {
             exitChainModeFromPause(ctx, chain.chainId);
-            return reply(`🛑 Research chain ${chain.chainId} stopped by charter rule ${JSON.stringify(ruleId)} (charter stop rule, pause): research mode is OFF. The final report is already saved.`);
+            return reply(`🛑 Research chain ${chain.chainId} stopped by charter rule ${JSON.stringify(ruleId)} (charter stop rule, pause): research mode is OFF.${reportNote ? ` ${reportNote}.` : ""}`);
           }
-          return reply(`🛑 Research chain ${chain.chainId} stopped by charter rule ${JSON.stringify(ruleId)}. New chain briefs are refused; the active campaign finishes its work and writes the final report, which turns research mode OFF.`);
+          return reply(`🛑 Research chain ${chain.chainId} stopped by charter rule ${JSON.stringify(ruleId)}. ${reportNote ? `${reportNote}. ` : ""}New chain briefs are refused; the active campaign finishes its work and writes the final report, which turns research mode OFF.`);
         }
         // Owner stop: the model cannot confirm for the owner — a dialog is required.
         if (!ctx.hasUI || !ctx.ui || typeof ctx.ui.confirm !== "function") {
@@ -9650,13 +9838,20 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (confirmed !== true) {
           return fail("invalid_argument", "chain_stop requires explicit owner consent in the dialog; the chain keeps running");
         }
+        if (chain.expedition) {
+          const chainDirPath = chainJournal.chainDir(chain.workDir, chain.chainId);
+          if (!chainDirPath) return fail("manual_check_required", "chain directory is unavailable");
+          const stop = await chainJournal.appendEntry(chainDirPath, chain.workDir, chain.chainId, "expedition_stop", {rule:ruleId ?? "owner",basis:"owner"});
+          if (!stop.ok) return fail(stop.reason as never, `chain stop not recorded: ${stop.message}`);
+        }
         const ownerWrite = await chainJournal.setChainStatus(chain.workDir, chain.chainId, "stopped_by_owner");
         if (!ownerWrite.ok) return fail(ownerWrite.reason as never, `chain stop not recorded: ${ownerWrite.message}`);
+        const reportNote = chain.expedition ? await writeExpeditionFinalReport(chain, "stopped_by_owner") : "";
         if (status === "awaiting_child") {
           exitChainModeFromPause(ctx, chain.chainId);
-          return reply(`🛑 Research chain ${chain.chainId} stopped by the owner (pause): research mode is OFF. The final report is already saved.`);
+          return reply(`🛑 Research chain ${chain.chainId} stopped by the owner (pause): research mode is OFF.${reportNote ? ` ${reportNote}.` : ""}`);
         }
-        return reply(`🛑 Research chain ${chain.chainId} stopped by the owner. New chain briefs are refused; the open vector is not interrupted; the active campaign finishes its work per research rules and writes the final report, which turns research mode OFF.`);
+        return reply(`🛑 Research chain ${chain.chainId} stopped by the owner. ${reportNote ? `${reportNote}. ` : ""}New chain briefs are refused; the open vector is not interrupted; the active campaign finishes its work per research rules and writes the final report, which turns research mode OFF.`);
       }
 
       if (action === "start") {
@@ -9770,8 +9965,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           // Exception (spec): the final report of the active campaign of a chain
           // STOPPED during work turns the mode OFF regardless of the campaign phase.
           if (chainJournal.isFinal(chainStatusNow)) {
+            const expeditionNote = chain.expedition ? await writeExpeditionFinalReport(chain, chainStatusNow, verified.entries) : "";
             exitResearchMode(ctx, id);
-            return reply(reportText + "\n\n" + savedNote + "\nResearch mode is OFF. The chain is " + chainStatusNow + ".");
+            return reply(reportText + "\n\n" + savedNote + (expeditionNote ? `\n${expeditionNote}` : "") + "\nResearch mode is OFF. The chain is " + chainStatusNow + ".");
           }
           if (chainStatusNow === "awaiting_child") {
             // Already waiting: no new continuation without a new agent action.
@@ -9801,7 +9997,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           // chain moves to awaiting_child, ONE continuation with the parent id.
           await chainJournal.setChainStatus(chain.workDir, chain.chainId, "awaiting_child");
           if (!getRuntime(ctx).chainContinuationSent) {
-            sendChainContinuation(ctx, id);
+            await sendChainContinuation(ctx, id);
           }
           return reply(reportText + "\n\n" + savedNote + "\nResearch mode stays ON: the chain can continue. Status awaiting_child — write the brief of the next campaign (parent " + id + ") with research_brief draft; the brief is auto-approved by the charter checks.");
         }
@@ -10164,8 +10360,37 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   /** One continuation to the next chain brief; carries the parent campaign id
    *  (spec: the continuation names the parent). Called once per awaiting_child
    *  period — the report branch sends it, the wrapper mirrors it headless. */
-  const sendChainContinuation = (ctx: ExtensionContext, parentCampaignId: string): void => {
+  const writeExpeditionFinalReport = async (chain: NonNullable<ReturnType<typeof activeChain>>, finalStatus: string, _entries?: chainJournal.ChainEntry[]): Promise<string> => {
+    if (!chain.expedition) return "";
+    const verified = await chainJournal.verifyChain(chain.workDir, chain.chainId);
+    if (!verified.ok) return `warning: expedition report unavailable (${verified.message})`;
+    const replay = expedition.replayExpeditionMap(verified.entries);
+    if (!replay.ok) return `warning: expedition report unavailable (${replay.message})`;
+    const campaigns: Array<{id:string;reportPath:string}> = [];
+    for (const e of verified.entries) {
+      const cid = e.type === "chain_created" ? (e as any).root_campaign_id : e.type === "campaign_added" ? (e as any).campaign_id : undefined;
+      if (typeof cid !== "string" || campaigns.some(c => c.id === cid)) continue;
+      for (const base of [chain.workDir]) {
+        const resolved = researchState.resolveCampaignDir(base, cid);
+        if (resolved.ok) { campaigns.push({id:cid,reportPath:path.join(resolved.dir,"report.md")}); break; }
+      }
+    }
+    const dir = chainJournal.chainDir(chain.workDir, chain.chainId);
+    if (!dir) return "warning: expedition report unavailable (chain directory is unavailable)";
+    const reportPath = path.join(dir, "expedition-report.md");
+    const report = expedition.expeditionReportText(replay.map,{chainId:chain.chainId,finalStatus,campaigns,computedAt:new Date().toISOString()});
+    try { await researchState.writeFileAtomic(reportPath, report + "\\n"); return `Expedition report saved to ${reportPath}`; }
+    catch (e) { return `warning: expedition report could not be saved (${String(e)})`; }
+  };
+
+  const sendChainContinuation = async (ctx: ExtensionContext, parentCampaignId: string): Promise<void> => {
     const runtime = getRuntime(ctx);
+    let slice = "";
+    const chain = activeChain(ctx);
+    if (chain?.expedition) {
+      const verified = await chainJournal.verifyChain(chain.workDir, chain.chainId);
+      if (verified.ok) { const replay = expedition.replayExpeditionMap(verified.entries); if (replay.ok) slice = expedition.mapSliceText(replay.map); }
+    }
     const message = [
       `Research chain: the report of campaign ${parentCampaignId} is recorded and the chain can continue.`,
       `Write the brief for the NEXT campaign now with research_brief draft:`,
@@ -10173,6 +10398,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       `- keep the caveat_block, the verdict set and the evidence_gate exactly as in the parent brief;`,
       `- the brief is auto-approved by the charter checks (no owner dialog) and the next campaign id is assigned by the system.`,
       "If you have nothing more to research, report and wait: the owner can stop the chain with research chain_stop.",
+      ...(slice ? ["Expedition map snapshot:", slice] : []),
     ].join("\n");
     runtime.chainContinuationSent = true;
     sendWhenReady(ctx, message);
@@ -10463,6 +10689,33 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const kickoff = `/skill:autoresearch-parallel ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`.replace(/\s+/g, " ").trim();
         ctx.ui.notify(`Parallel mode ON (${parallelMatch[1]}) — loaded autoresearch-parallel skill`, "info");
         sendWhenReady(ctx, kickoff);
+        return;
+      }
+
+      // ===== expedition subcommand: design-first research chain =====
+      if (/^expedition(\s|$)/.test(command)) {
+        const workDir = resolveWorkDir(ctx.cwd);
+        const chain = runtime.researchChain;
+        if (chain?.expedition) {
+          const verified = await chainJournal.verifyChain(chain.workDir, chain.chainId);
+          if (!verified.ok) { ctx.ui.notify(`Expedition refused (manual_check_required): ${verified.message}`, "error"); return; }
+          const status = await chainJournal.statusOf(chain.workDir, chain.chainId);
+          if (status === "active" || status === "awaiting_child") {
+            const ids = await chainCampaignIds(ctx);
+            ctx.ui.notify(`Resume or finish the existing expedition; resume with /autoresearch research --id ${ids.at(-1) ?? runtime.researchCampaignId ?? "<campaign>"}`, "error"); return;
+          }
+        }
+        if (!ctx.hasUI) { ctx.ui.notify("Expedition needs TUI confirmation; headless use requires the --expedition-doc wrapper.", "error"); return; }
+        if (await researchBlocksOrdinaryLoop(workDir, ctx)) { ctx.ui.notify("Cannot launch expedition while a research campaign is active; resume or finish it first.", "error"); return; }
+        if (await campaignBlocksOrdinaryLoop(workDir)) { ctx.ui.notify("Candidate campaign active; finish it before starting an expedition.", "error"); return; }
+        recordAutoresearchActivation(workDir, true); setAutoresearchMode(ctx, true);
+        runtime.autoResumeTurns = 0; runtime.consecutiveDriftResumes = 0; updateWidget(ctx);
+        const goal = trimmedArgs.slice("expedition".length).trim();
+        const stateRoot = runtime.researchStateRoot ?? path.join(workDir, ".auto");
+        const draft = expedition.findLatestDraft(stateRoot);
+        sendWhenReady(ctx, draft
+          ? `Expedition design phase for ${goal || "the requested goal"}. An unconfirmed draft exists at ${draft}; begin with expedition_brief propose (or revise it).`
+          : `Expedition design phase. Goal: ${goal || "not specified"}. Ask all missing owner questions in one message (territory, completion criteria, constraints, starting directions). Then use expedition_brief draft and propose; do not create chain state before owner confirmation.`);
         return;
       }
 

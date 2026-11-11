@@ -128,8 +128,9 @@ Absent fields keep the behaviour above unchanged.
   `["test-consistent", "rejected", "inconclusive", "waiting_for_data"]`.
   Absent means `confirmed, rejected, inconclusive, waiting_for_data`.
   Names are tokens `^[a-z][a-z0-9_-]{0,31}$`, unique and non-empty. Every
-  decision rule's `verdict` must be declared, and every question needs a rule
-  for every declared verdict. `research close` accepts only declared verdicts.
+  decision rule's `verdict` must be declared, and every question needs a
+  rule for every declared verdict. `research close` accepts only declared
+  verdicts.
 - `evidence_gate` — `{blocked_globs, gate_file, gate_contains}`. A `record`
   whose evidence path matches a `blocked_globs` pattern is refused with
   `evidence_gate_blocked` until `gate_file` exists inside the work directory and
@@ -187,13 +188,12 @@ model cannot alter its own argv. Non-brief dialogs are always refused.
 ### Canonical brief recipe (important)
 
 The brief file must be in canonical form: its bytes must equal
-`JSON.stringify(JSON.parse(bytes), null, 2) + "
-"`. More importantly, the bytes
+`JSON.stringify(JSON.parse(bytes), null, 2) + "\n"`. More importantly, the bytes
 must match what the agent will TYPE into `research_brief draft`: an LLM
-re-serializing JSON typically sorts keys alphabetically and coerces strings to
-arrays where the schema allows lists, so a hand-written brief usually FAILS the
-hash check (verified live: the first bench run was refused with exit 1 - this is
-the documented fail-closed behaviour, not a bug). Reliable recipe:
+re-serializing JSON typically sorts keys alphabetically and coerces strings
+into arrays where the schema allows lists, so a hand-written brief usually FAILS
+the hash check (verified live: the first bench run was refused with exit 1 -
+this is the documented fail-closed behaviour, not a bug). Reliable recipe:
 
 1. Run the wrapper once; let the agent build the draft (`research_brief draft`).
    The refusal (if any) happens at `propose`, after the draft is written.
@@ -345,4 +345,160 @@ dialog per brief. Spec: `openspec/changes/research-charter/`.
   until manual check.
 
 Known limits: the agent writes its own findings and stop-rule self-reports
-(residual risk, see design.md). Shell writes to the state files are not blocked.
+(residual risk, see design.md).
+
+## Экспедиция
+
+Экспедиция — это цепочка исследовательских кампаний с картой направлений
+(векторов), сохранённой в журнале цепочки. Она позволяет агенту выбирать и
+обосновывать следующие этапы исследования, а владельцу — следить за картой в
+TUI и получить общий отчёт. Экспедиция использует механизм charter-цепочки;
+карта не означает, что территория исчерпывающе исследована.
+
+### Запуск и проектирование
+
+Владелец запускает проектирование командой `/autoresearch expedition <цель>`.
+В обычном диалоге агент выясняет недостающие данные о территории, критериях,
+ограничениях и стартовых направлениях одним пакетом вопросов, без серии
+промежуточных подтверждений. Пока документ не подтверждён, цепочка и её журнал
+не создаются. Если предыдущий черновик сохранился после потери сессии, агент
+может использовать его для предложения.
+
+Документ формируется через `expedition_brief draft` и включает:
+
+- `charter` — правила и лимиты цепочки;
+- `goal` — цель экспедиции;
+- `directions` — непустой список направлений с именами и обоснованиями;
+- `campaign0` — бриф стартовой кампании.
+
+Черновик хранится в `<state-root>/research-expedition-drafts/`. Предлагаемый на
+подтверждение документ должен находиться вне рабочей директории. Команда
+`expedition_brief propose` проверяет его состав и показывает цель, направления,
+вопросы кампании №0, стоп-правила и лимиты. В первой строке диалога указан
+`Expedition SHA-256: <hex>`; подтверждение принимает только `true`. Это одно
+подтверждение фиксирует документ целиком, включая хартию и стартовый бриф —
+отдельных подтверждений Charter и Brief №0 нет. Система повторно сверяет хеш
+файла в момент ответа. Отказ или изменение файла не создаёт цепочку.
+
+После подтверждения в журнал записываются `chain_created`,
+`expedition_created`, события открытия стартовых направлений и
+`campaign_added` для кампании №0, которая запускается. Подтверждённый SHA-256
+документа далее используется как хеш-якорь хартии.
+
+### Карта направлений и решения агента
+
+Карта вычисляется повторным проигрыванием проверенного append-only журнала.
+Последнее событие по направлению определяет его статус. События несут
+обоснование, а решения, меняющие карту, валидируются до записи: отказ не
+меняет журнал.
+
+| Статус | Значение |
+|---|---|
+| `open` | Направление открыто и ожидает выбора для исследования. |
+| `active` | По направлению идёт кампания. Одновременно активно не более одного. |
+| `resolved` | Направление закрыто находками с доказательствами и ссылками на вердикты. |
+| `rejected` | Направление отклонено находками с доказательствами и ссылками на вердикты. |
+| `advisory_exhausted` | Агент считает направление исчерпанным по обзору; это самоотчёт, НЕ доказательство. |
+| `parked` | Направление отложено с указанной причиной; оно остаётся незавершённым. |
+
+Допустимые переходы: `open` → `active` или `parked`; `active` → `resolved`,
+`rejected`, `advisory_exhausted` или `parked`; из `parked`, `advisory_exhausted`,
+`resolved` и `rejected` можно вернуться в `open` через `reopen`. `resolved` и
+`rejected` требуют ссылок на закрытые с доказательствами вопросы кампаний этой
+цепочки. `advisory_exhausted` требует существующий обзор с записанным SHA-256,
+но основание всё равно не является доказательством. `park` и `reopen` требуют
+причины. Второе направление нельзя активировать, пока первое активно.
+
+Обычный рабочий цикл агента выглядит так:
+
+1. Прочитать срез карты, результаты и открытые вопросы текущей кампании.
+2. Обосновать выбор следующего направления в рамках цели, хартии и лимитов.
+   Агент может активировать `open`-направление; при смене приоритета — атомарно
+   выполнить `pivot`, закрывая текущее активное и открывая/активируя целевое.
+3. Создать и запустить следующую кампанию предусмотренным механизмом цепочки.
+   После промежуточного отчёта агент получает продолжение с бриф-указанием и
+   текущим срезом карты; обычная цепочка продолжает работать без среза карты.
+4. На основании результатов выбрать закрытие с доказательствами, advisory по
+   обзору или парковку с причиной. Решение и основание остаются в журнале;
+   затем цикл выбора следующего этапа повторяется.
+
+Переходы `open` → `active`, `active` → `resolved|rejected|advisory_exhausted|parked`,
+а также `pivot` фиксируют явный выбор агента. `resolved`/`rejected` нельзя
+использовать как оценку «на глаз»: проверяются ссылки на доказательные
+вердикты. Владелец может остановить экспедицию в любой момент через диалог
+`chain_stop`; остановка не зависит от значения предиката.
+
+Пример фрагмента `chain.json` (события append-only; при создании перед ними
+идёт общее `chain_created`, после них — `campaign_added` для кампании №0):
+
+```jsonc
+{"type":"expedition_created","goal":"Понять поведение векторов","doc_sha256":"9f2a…"}
+{"type":"direction_opened","dir":"D2","why":"Проверить обработку отрицательных векторов"}
+{"type":"direction_activated","dir":"D2","campaign":"c1","why":"Начать с наиболее рискованной гипотезы"}
+{"type":"direction_resolved","dir":"D2","refs":[{"campaign":"c1","question":"Q2"}],"why":"Вопрос закрыт вердиктом с доказательством"}
+{"type":"pivot","from":"D2","to":"D5","reason":"Новая находка сместила приоритет","refs":[]}
+{"type":"expedition_stop","rule":"territory_complete","basis":"predicate"}
+```
+
+`pivot` атомарно переводит активное направление и целевое в новые состояния;
+если любой элемент перехода невалиден, запись целиком отклоняется. Действие
+карты на обычной charter-цепочке отказывает как `not_an_expedition`. Повреждённый
+журнал блокирует действия и требует ручной проверки.
+
+### Предикат остановки `territory_complete`
+
+Предикат истинен, если открыто хотя бы одно направление исторически, сейчас
+нет направлений `open` или `active`, и после последнего закрывающего события
+нет более позднего `pivot`. В противном случае он ложен. Поэтому припаркованные
+и `advisory_exhausted` направления сами по себе не мешают истинности, но должны
+быть явно перечислены как незавершённые. Агентское самоотмечание правила
+`territory_complete` при ложном предикате отклоняется с перечнем открытых
+направлений (или указанием на pivot после закрытия); при истинном цепочка
+останавливается по правилу. Тексты говорят «предикат выполнен»: это только
+механическое отсутствие открытых направлений, не утверждение полноты
+исследования. Владелец может остановить цепочку при любом
+значении предиката.
+
+### Виджет TUI
+
+При активной экспедиционной цепочке и доступном UI виджет `autoresearch`
+показывает цель и текущую кампанию/статус, по строке на направление, а также
+счётчики направлений и кампаний и следующий статус цепочки. Глифы статусов:
+`○` open, `🔄` active, `✅` resolved, `❌` rejected, `❓` advisory_exhausted,
+`💤` parked. Для активного направления показываются кампания и её открытые
+вопросы; для остальных — обоснование. Advisory помечается как самоотчёт, не
+доказательство. Виджет строится из файлов и replay журнала. Вне экспедиции
+обычный дашборд не меняется; без UI виджет не отображается.
+
+### Отчёт экспедиции
+
+При любом финальном статусе экспедиционной цепочки создаётся
+`expedition-report.md` в каталоге цепочки и включается ссылка на него в ответ
+финального отчёта. В нём есть разделы `Map (final)` (карта финальных статусов,
+основания и ссылки на доказательства), `Timeline` (хронология решений, включая
+открытия, активации и pivot) и `Unfinished`, вычисленное значение
+`territory_complete` и ссылки на отчёты кампаний. Незавершённые parked-направления указываются как «не
+исследовано», advisory — как «не доказательство»; если активная кампания
+остановилась без результата, расхождение также указывается. Отчёт экспедиции
+дополняет, но не заменяет и не архивирует отчёты кампаний.
+
+### Headless-запуск
+
+`scripts/research-rpc.mjs` принимает пару параметров:
+
+```text
+--expedition-doc <path> --approve-expedition-sha <64 lowercase hex>
+```
+
+Пара взаимоисключающая с `--brief`, `--approve-sha` и `--charter`. Документ
+должен быть существующим каноническим JSON: его байты равны
+`JSON.stringify(JSON.parse(bytes), null, 2) + "\\n"`. Хеш сверяется по трём
+значениям: показанный `Expedition SHA-256`, заданный оператором хеш и заново
+прочитанный хеш файла в момент диалога. Любое несовпадение отвечает отказом и
+не создаёт состояния. Подтверждение документа покрывает кампанию №0; отдельные
+флаги или диалог подтверждения брифа не нужны. Промежуточный отчёт не завершает
+запуск: обёртка доставляет продолжение, а завершение хода в `awaiting_child` —
+штатный код 0. Коды: `2` — ошибка аргументов/каноничности до запуска pi;
+`3` — несовпадение хеша или отказ подтверждения; `0` — штатное завершение,
+включая паузу `awaiting_child`. Другие существующие сценарии обёртки сохраняют
+свои коды выхода.

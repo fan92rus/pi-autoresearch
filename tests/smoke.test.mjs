@@ -88,14 +88,14 @@ const EXPECTED_HOOKS = [
   "before_agent_start", "tool_execution_end", "tool_call",
 ];
 
-await test("registers all 26 tools (parallel + branching disabled)", async () => {
+await test("registers all 27 tools (parallel + branching disabled)", async () => {
   const dir = makeTempDir("reg");
   const { pi } = await loadExtension(dir);
   const names = pi.tools.map((t) => t.name);
   for (const expected of EXPECTED_TOOLS) {
     assert.ok(names.includes(expected), `Missing tool: ${expected}`);
   }
-  assert.strictEqual(names.length, 26, `Expected 26 tools, got ${names.length}: ${names.join(", ")}`);
+  assert.strictEqual(names.length, 27, `Expected 27 tools, got ${names.length}: ${names.join(", ")}`);
 });
 
 await test("registers all 11 hooks", async () => {

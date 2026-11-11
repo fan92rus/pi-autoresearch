@@ -8,6 +8,7 @@ import * as path from "node:path";
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const SHA_RE = /^[0-9a-f]{64}$/;
 const DIALOG_SHA_RE = /^Brief SHA-256: ([0-9a-f]{64})/m;
+export const EXPEDITION_DIALOG_RE = /^Expedition SHA-256: ([0-9a-f]{64})/m;
 // Charter dialogs are recognized by their own anchor (research-charter spec).
 // No multiline flag: the anchor must be the FIRST line of the message, so a
 // Charter line inside a brief dialog can never reclassify it.
@@ -57,7 +58,7 @@ function parseArgs(argv) {
     args[key] = value;
     i += 1;
   }
-  const KNOWN = new Set(["help", "mode", "brief", "approve-sha", "campaign-id", "state-root", "pi", "cwd", "timeout-sec", "stage1-timeout-sec", "hold-dialog-ms", "auto-adopt-draft", "log", "charter", "approve-charter-sha"]);
+  const KNOWN = new Set(["help", "mode", "brief", "approve-sha", "campaign-id", "state-root", "pi", "cwd", "timeout-sec", "stage1-timeout-sec", "hold-dialog-ms", "auto-adopt-draft", "log", "charter", "approve-charter-sha", "expedition-doc", "approve-expedition-sha"]);
   for (const key of Object.keys(args)) {
     if (!KNOWN.has(key)) throw new Error(`Unknown option: --${key} (typos silently become part of the campaign description otherwise)`);
   }
@@ -74,10 +75,17 @@ function parseArgs(argv) {
     // Optimize is an explicit scope split for this MVP; see the headless-launch change.
     throw new Error("optimize mode is not implemented in this MVP build (documented scope split; see openspec/changes/headless-launch)");
   }
+  const hasExpedition = args["expedition-doc"] !== undefined;
+  const hasExpeditionSha = args["approve-expedition-sha"] !== undefined;
+  if (hasExpedition !== hasExpeditionSha) throw new Error("--expedition-doc and --approve-expedition-sha are mutually required; pass both or neither");
+  if (hasExpedition && (hasCharter || args.brief !== undefined || args["approve-sha"] !== undefined)) throw new Error("--expedition-doc excludes --charter, --brief, and --approve-sha");
+  if (hasExpedition && (args["expedition-doc"].trim() === "" || !SHA_RE.test(args["approve-expedition-sha"]))) throw new Error("Invalid expedition document path or hash");
   if (args.mode !== "research") throw new Error("--mode research is required");
-  if (!args.brief) throw new Error("--brief is required");
-  if (!args["approve-sha"]) throw new Error("--approve-sha is required");
-  if (!SHA_RE.test(args["approve-sha"])) throw new Error("--approve-sha must be 64 lowercase hexadecimal characters");
+  if (!hasExpedition) {
+    if (!args.brief) throw new Error("--brief is required");
+    if (!args["approve-sha"]) throw new Error("--approve-sha is required");
+    if (!SHA_RE.test(args["approve-sha"])) throw new Error("--approve-sha must be 64 lowercase hexadecimal characters");
+  }
   if (args["campaign-id"] !== undefined && !ID_RE.test(args["campaign-id"])) throw new Error("Invalid --campaign-id");
   if (args["state-root"] !== undefined && (typeof args["state-root"] !== "string" || args["state-root"].trim() === "")) throw new Error("Invalid --state-root");
   for (const key of ["timeout-sec", "stage1-timeout-sec", "hold-dialog-ms"]) {
@@ -91,7 +99,7 @@ function parseArgs(argv) {
 
 function sha256(bytes) { return createHash("sha256").update(bytes).digest("hex"); }
 function jsonLine(value) { return `${JSON.stringify(value)}\n`; }
-function usage() { return "Usage: node scripts/research-rpc.mjs --mode research --brief <canonical.json> --approve-sha <sha256> [--campaign-id <id>] [--state-root <dir>] [--charter <path> --approve-charter-sha <sha256>] [--pi <path>] [--cwd <dir>] [--timeout-sec 3600] [--stage1-timeout-sec 30] [--hold-dialog-ms 0] [--auto-adopt-draft] [--log <path>]"; }
+function usage() { return "Usage: node scripts/research-rpc.mjs --mode research (--brief <canonical.json> --approve-sha <sha256> | --expedition-doc <canonical.json> --approve-expedition-sha <sha256>) [--campaign-id <id>] [--state-root <dir>] [--charter <path> --approve-charter-sha <sha256>] [--pi <path>] [--cwd <dir>] [--timeout-sec 3600] [--stage1-timeout-sec 30] [--hold-dialog-ms 0] [--auto-adopt-draft] [--log <path>]"; }
 
 async function main() {
   let args;
@@ -100,17 +108,30 @@ async function main() {
   if (args.help) { console.log(usage()); return 0; }
 
   const cwd = path.resolve(args.cwd ?? process.cwd());
-  let briefPath = path.resolve(cwd, args.brief);
+  let briefPath = args.brief ? path.resolve(cwd, args.brief) : null;
   let briefBytes;
-  try {
-    briefBytes = fs.readFileSync(briefPath);
-    const text = briefBytes.toString("utf8");
-    const parsed = JSON.parse(text);
-    const canonical = `${JSON.stringify(parsed, null, 2)}\n`;
-    if (text !== canonical) throw new Error("Brief is not canonical JSON");
-  } catch (error) {
-    console.error(`Invalid --brief: ${error instanceof Error ? error.message : String(error)}`);
-    return 2;
+  let expeditionPath = null;
+  if (args["expedition-doc"] !== undefined) {
+    expeditionPath = path.resolve(cwd, args["expedition-doc"]);
+    try {
+      const bytes = fs.readFileSync(expeditionPath);
+      const text = bytes.toString("utf8");
+      if (text !== `${JSON.stringify(JSON.parse(text), null, 2)}\n`) throw new Error("Expedition document is not canonical JSON");
+    } catch (error) {
+      console.error(`Invalid --expedition-doc: ${error instanceof Error ? error.message : String(error)}`);
+      return 2;
+    }
+  } else {
+    try {
+      briefBytes = fs.readFileSync(briefPath);
+      const text = briefBytes.toString("utf8");
+      const parsed = JSON.parse(text);
+      const canonical = `${JSON.stringify(parsed, null, 2)}\n`;
+      if (text !== canonical) throw new Error("Brief is not canonical JSON");
+    } catch (error) {
+      console.error(`Invalid --brief: ${error instanceof Error ? error.message : String(error)}`);
+      return 2;
+    }
   }
 
   const campaignId = args["campaign-id"] ?? `bench-${new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z")}`;
@@ -121,6 +142,10 @@ async function main() {
   // (intermediate reports do not end the run; awaiting_child pauses exit 0).
   const charterSha = args["approve-charter-sha"];
   const charterMode = charterSha !== undefined;
+  const expeditionMode = args["approve-expedition-sha"] !== undefined;
+  const expeditionSha = args["approve-expedition-sha"];
+  let expeditionConfirmed = false;
+  const chainConfirmed = () => (charterMode && charterConfirmed) || (expeditionMode && expeditionConfirmed);
   const charterPath = charterMode ? path.resolve(cwd, args.charter) : null;
   let charterConfirmed = false;
   // One continuation per awaiting_child period: the flag is raised when the
@@ -254,7 +279,7 @@ async function main() {
       // An unexpected pi exit is never a graceful charter pause (fix review B2).
       // Charter mode without a confirmed charter never reached the chain (m3):
       // only a confirmed charter plus a saved successful report may exit 0.
-      if (charterMode && !charterConfirmed) exitCode = 3;
+      if ((charterMode && !charterConfirmed) || (expeditionMode && !expeditionConfirmed)) exitCode = 3;
       else if (successfulReport && stage1Settled) exitCode = 0;
       else exitCode = 3;
       finished = true;
@@ -297,7 +322,7 @@ async function main() {
         // continuation for the next chain brief ONCE per awaiting_child period;
         // a settle without the marker (or a repeat marker without any agent
         // action) is the idle pause — exit 0, state stays on disk.
-        if (charterMode && charterConfirmed && record.chain_status === "awaiting_child" && (!continuationSentForAwaiting || briefActionSeenSinceContinuation)) {
+        if (chainConfirmed() && record.chain_status === "awaiting_child" && (!continuationSentForAwaiting || briefActionSeenSinceContinuation)) {
           continuationSentForAwaiting = true;
           briefActionSeenSinceContinuation = false;
           logEvent("wrapper", { event: "chain_continuation" });
@@ -308,7 +333,7 @@ async function main() {
           ].join("\n"), 3);
           return;
         }
-        if (charterMode && charterConfirmed && record.chain_status === "awaiting_child") {
+        if (chainConfirmed() && record.chain_status === "awaiting_child") {
           // A repeat marker with no intervening agent action: the continuation
           // was already delivered for this period — pause gracefully (fix review B1).
           logEvent("wrapper", { event: "chain_awaiting_child" });
@@ -316,11 +341,11 @@ async function main() {
           await stopChild(0, "chain_awaiting_child");
           return;
         }
-        if (charterMode && charterConfirmed) {
+        if (chainConfirmed()) {
           // A marker-less idle settle in a confirmed chain is NOT the documented
           // awaiting_child pause (fix review B3): fall through to the
           // pre-existing non-charter behavior, which ends by timeout with 3.
-        } else if (charterMode && !charterConfirmed) {
+        } else if ((charterMode && !charterConfirmed) || (expeditionMode && !expeditionConfirmed)) {
           // Charter mode without a confirmed charter never reached the chain:
           // any settle here must not report success (fix review m3).
           await stopChild(3, "charter_not_confirmed");
@@ -344,7 +369,7 @@ async function main() {
           requestPrompt(adoptRetryMessage(), 2);
           return;
         }
-        if (charterMode && charterConfirmed && record.chain_status === "awaiting_child" && !continuationSentForAwaiting) {
+        if (chainConfirmed() && record.chain_status === "awaiting_child" && !continuationSentForAwaiting) {
           // research-charter: the stage-1 turn already accepted the charter and
           // finished with an intermediate report — the root-brief stage is done,
           // deliver the ONE continuation for the next chain brief.
@@ -370,7 +395,7 @@ async function main() {
           ].join("\n");
           requestPrompt(message, 2);
         }
-      } else if (charterMode && !charterConfirmed && successfulReport) {
+      } else if (((charterMode && !charterConfirmed) || (expeditionMode && !expeditionConfirmed)) && successfulReport) {
         // Charter mode without a confirmed charter never reached the chain:
         // a successful report here must not report success (fix review m3).
         await stopChild(3, "charter_not_confirmed");
@@ -416,6 +441,26 @@ async function main() {
         const message = String(record.message ?? "");
         // research-charter: the charter dialog is checked BEFORE the brief one;
         // the prefixes are disjoint, so exactly one regex can match.
+        const expeditionMatch = EXPEDITION_DIALOG_RE.exec(message);
+        if (expeditionMatch) {
+          if (!expeditionMode) {
+            send({ type: "extension_ui_response", id: dialogId, confirmed: false });
+            pendingDialogs.delete(dialogId);
+            logEvent("wrapper", { event: "dialog_refused", reason: "expedition_dialog_without_expedition_mode", id: dialogId });
+            return;
+          }
+          if (holdDialogMs > 0) await new Promise((resolve) => setTimeout(resolve, holdDialogMs));
+          if (finished) return;
+          let currentFileHash;
+          try { currentFileHash = sha256(fs.readFileSync(expeditionPath)); } catch { currentFileHash = null; }
+          const confirmed = expeditionMatch[1] === expeditionSha && expeditionMatch[1] === currentFileHash;
+          expeditionConfirmed = confirmed;
+          send({ type: "extension_ui_response", id: dialogId, confirmed });
+          pendingDialogs.delete(dialogId);
+          logEvent("wrapper", { event: "expedition_confirmation", id: dialogId, confirmed, dialog_sha: expeditionMatch[1], file_readable: currentFileHash !== null });
+          if (!confirmed) await stopChild(3, "expedition_hash_mismatch", true);
+          return;
+        }
         const charterMatch = CHARTER_DIALOG_RE.exec(message);
         if (charterMatch) {
           if (!charterMode) {
@@ -503,7 +548,7 @@ async function main() {
     }
   }, stage1TimeoutMs);
 
-  requestPrompt(`/autoresearch research --id ${campaignId}${args["state-root"] ? ` --state-root ${args["state-root"]}` : ""}${charterMode ? ` --charter ${charterPath}` : ""}`, 1);
+  requestPrompt(expeditionMode ? `/autoresearch expedition\nPrepared expedition document: ${expeditionPath}\nValidate it with the expedition_brief tool and call propose. The owner approval is handled by this headless wrapper dialog.` : `/autoresearch research --id ${campaignId}${args["state-root"] ? ` --state-root ${args["state-root"]}` : ""}${charterMode ? ` --charter ${charterPath}` : ""}`, 1);
   const resultCode = await new Promise((resolve) => child.on("close", () => resolve(exitCode)));
   if (killTimer) clearTimeout(killTimer);
   await closeLog();
