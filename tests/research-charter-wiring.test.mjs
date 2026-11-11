@@ -485,3 +485,23 @@ test("review-M1 owner decision: a chain report written in phase research does no
   assert.equal(chainStatus(dir, "c1-chain"), "active", "chain stays active, no awaiting_child");
   assert.equal(h.pi.sentMessages.length, before, "no continuation message sent after the report");
 });
+
+test("review-M6: resubmitting an already confirmed child brief in active returns the first confirmation, no second campaign", async () => {
+  const dir = makeWorkDir("resubmit-active");
+  writeStoppedRootCampaign(dir, "c1");
+  const charterPath = writeCharter(dir, {});
+  const h = await loadExtensionBare(dir, "resubmit-active", true);
+  await launchWithCharter(h, charterPath, "c1");
+  await call(h, "research", { action: "report" });
+  const childBrief = briefFixture();
+  childBrief.questions[0].finding_refs = [{ campaign: "c1", question: "Q1" }];
+  await call(h, "research_brief", { action: "draft", brief: childBrief });
+  assert.equal(chainStatus(dir, "c1-chain"), "active", "precondition: child confirmed, chain active");
+  const before = listDirs(path.join(dir, ".auto", "research"));
+
+  const res = textOf(await call(h, "research_brief", { action: "draft", brief: childBrief }));
+
+  assert.match(res, /already approved/i, res);
+  assert.doesNotMatch(res, /parent_not_reported/, res);
+  assert.deepEqual(listDirs(path.join(dir, ".auto", "research")), before, "no second campaign created");
+});

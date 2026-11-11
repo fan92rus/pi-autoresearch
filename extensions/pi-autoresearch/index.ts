@@ -9136,6 +9136,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const status = await chainJournal.statusOf(draftChain.workDir, draftChain.chainId);
         const stop = chainJournal.actionRefusalForStatus(status);
         if (stop !== null) return fail("invalid_transition", `research chain ${draftChain.chainId} is ${status}: ${stop.message}`);
+        // Spec (review M6): a resubmitted, already confirmed brief returns the
+        // first confirmation record, whatever the chain status is now.
+        const resentBrief = params.brief;
+        if (resentBrief !== undefined && typeof resentBrief === "object") {
+          const resentSha = researchState.sha256Hex(JSON.stringify(resentBrief, null, 2) + "\n");
+          const firstApproval = verified.entries.find(
+            (e) => e.type === "brief_approved" && (e as { brief_sha256?: string }).brief_sha256 === resentSha,
+          );
+          if (firstApproval !== undefined) {
+            return reply("ℹ️ This brief was already approved in this chain (first confirmation: campaign " + String((firstApproval as { campaign_id?: string }).campaign_id) + "): no second campaign is created.");
+          }
+        }
         if (status !== "awaiting_child") {
           return fail("invalid_argument", `parent_not_reported: the parent campaign's report must be recorded before the next chain brief (chain status ${status})`);
         }
