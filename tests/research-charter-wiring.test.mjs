@@ -627,6 +627,30 @@ test("review-nit: a charter file that is not valid JSON is refused with a notify
   assert.ok(h.pi.notifications.some((n) => /not valid JSON/i.test(n.text)), "the refusal names the JSON problem");
   fs.rmSync(badPath, { force: true });
 });
+test("review-3.7 full flow: campaign stop-rule -> report -> next brief is a new consent phase with no dialog", async () => {
+  const dir = makeWorkDir("new-phase");
+  writeStoppedRootCampaign(dir, "c1"); // stopped by its OWN campaign stop rule (stop event in the log)
+  const charterPath = writeCharter(dir, {});
+  const h = await loadExtensionBare(dir, "new-phase", true);
+  await launchWithCharter(h, charterPath, "c1");
+  const beforeDialogs = h.pi.notifications.length;
+
+  // 1) The report of the stopped campaign advances the chain (owner decision:
+  //    phase must be stopped; the campaign stop-rule produced that phase).
+  const rep = textOf(await call(h, "research", { action: "report" }));
+  assert.match(rep, /awaiting/i, rep);
+  assert.equal(chainStatus(dir, "c1-chain"), "awaiting_child");
+
+  // 2) The next brief is auto-approved WITHOUT any owner dialog (new consent
+  //    phase exception of the delta), while the ordinary flow needs one (2.5).
+  const childBrief = briefFixture();
+  childBrief.questions[0].finding_refs = [{ campaign: "c1", question: "Q1" }];
+  const res = textOf(await call(h, "research_brief", { action: "draft", brief: childBrief }));
+  assert.match(res, /auto-approved/i, res);
+  assert.equal(h.pi.notifications.slice(beforeDialogs).some((n) => /Brief SHA-256/i.test(n.text)), false, "no owner dialog in the chain child phase");
+  assert.equal(chainStatus(dir, "c1-chain"), "active", "the chain returned to active");
+});
+
 test("review-M3: a damaged chain journal records manual_check_required durably (marker) and refuses later actions", async () => {
   const dir = makeWorkDir("journal-damaged");
   writeStoppedRootCampaign(dir, "c1");
