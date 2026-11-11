@@ -103,7 +103,7 @@ function writeStoppedRootCampaign(dir, id = "c1") {
 }
 
 async function loadExtensionBare(dir, label, confirmReply = undefined) {
-  const { pi, tool, command } = createFakePi({ dir, sessionId: `charter-w-${label}`, realGit: false });
+  const { pi, tool, command, hook } = createFakePi({ dir, sessionId: `charter-w-${label}`, realGit: false });
   const ctx = makeCtx(dir, `charter-w-${label}`, pi);
   if (confirmReply !== undefined) ctx.ui.confirm = async () => confirmReply;
   const { default: autoresearchExtension } = await import(
@@ -111,7 +111,7 @@ async function loadExtensionBare(dir, label, confirmReply = undefined) {
   );
   autoresearchExtension(pi);
   await command("autoresearch").handler("on", ctx);
-  return { pi, tool, command, ctx, dir };
+  return { pi, tool, command, hook, ctx, dir };
 }
 
 function call(h, name, params) {
@@ -543,4 +543,33 @@ test("review-M3: a damaged chain journal records manual_check_required durably (
   assert.ok(fs.existsSync(path.join(chainDirOf(dir, "c1-chain"), "manual-check")), "durable manual-check marker written");
   const later = textOf(await call(h, "research", { action: "chain_stop" }));
   assert.match(later, /manual_check_required|manual check/i, later);
+});
+
+test("review-4.7: git in a chain campaign is blocked by the research-vectors rule", async () => {
+  const dir = makeWorkDir("git-chain");
+  writeStoppedRootCampaign(dir, "c1");
+  const charterPath = writeCharter(dir, {});
+  const h = await loadExtensionBare(dir, "git-chain", true);
+  await launchWithCharter(h, charterPath, "c1");
+  await call(h, "research", { action: "report" });
+  const hook = h.hook("tool_call");
+  for (const command of ["git status", "git commit -m x", "echo ok && git add -A"]) {
+    const result = await hook({ toolName: "bash", input: { command } }, h.ctx);
+    assert.equal(result?.block, true, `${command} must be blocked in a chain campaign`);
+  }
+});
+
+test("review-3.7: charter stop rule from awaiting_child stops the chain and turns the mode OFF at once", async () => {
+  const dir = makeWorkDir("stop-rule-pause");
+  writeStoppedRootCampaign(dir, "c1");
+  const charterPath = writeCharter(dir, { stop_rules: ["two rejected findings in a row"] });
+  const h = await loadExtensionBare(dir, "stop-rule-pause", true);
+  await launchWithCharter(h, charterPath, "c1");
+  await call(h, "research", { action: "report" });
+  assert.equal(chainStatus(dir, "c1-chain"), "awaiting_child", "precondition: paused in awaiting_child");
+
+  const res = textOf(await call(h, "research", { action: "chain_stop", rule_id: "two rejected findings in a row" }));
+
+  assert.equal(chainStatus(dir, "c1-chain"), "stopped_by_rule", res);
+  assert.equal(h.pi.notifications.some((n) => /mode OFF/i.test(n.text)), true, "mode OFF announced immediately from the pause");
 });
