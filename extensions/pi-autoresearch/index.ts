@@ -9831,7 +9831,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           async () => appendResearchEvent(dir, { event: "stop", rule_id: rid, stop_when: stopRule.when, reason }),
         );
         if (!done.ok) return fail(done.reason, done.message);
-        return reply(`🛑 Research stopped by ${rid}. No vector can be opened in this campaign; a new campaign needs a new brief. Next: research report; it writes the final report and leaves research mode.`);
+        return reply(`🛑 Research stopped by ${rid}. No vector can be opened in this campaign; a new campaign needs a new brief. ${activeChain(ctx) !== null ? "Next: research report; for a chain campaign the report leaves the chain awaiting_child and research mode stays ON." : "Next: research report; it writes the final report and leaves research mode."}`);
       }
 
       return fail("invalid_argument", `unknown action ${JSON.stringify(String(action))}`);

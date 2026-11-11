@@ -181,15 +181,7 @@ export function approveChainBrief(params: ChainBriefParams): ChainBriefResult {
   const p = params;
   if (!isRecord(p) || typeof p !== "object") return refuse("invalid_argument", "params must be an object");
 
-  // 1) The chain must be waiting for the child brief (parent report recorded).
-  if (p.chainStatus !== AWAITING_CHILD) {
-    return refuse(
-      "parent_not_reported",
-      `the parent's intermediate report is not recorded (chain status ${quote(p.chainStatus)}); write the parent report first`,
-    );
-  }
-
-  // 2) Standard brief schema (spec: «Бриф не проходит схему»).
+  // 1) Standard brief schema (spec: «Бриф не проходит схему»).
   const validation = validateBrief(p.childBriefRaw);
   if (!validation.ok) {
     return refuse(
@@ -199,7 +191,8 @@ export function approveChainBrief(params: ChainBriefParams): ChainBriefResult {
   }
   const childBrief = validation.brief;
 
-  // 3) Resubmission of an already-approved brief creates no second campaign.
+  // 2) Resubmission of an already-approved brief returns the first confirmation
+  // (review M6 / 701ded3d NOTE-1): it runs before the status gate.
   if (p.approvedBriefHashes.includes(p.childBriefSha256)) {
     return {
       ok: true,
@@ -207,6 +200,14 @@ export function approveChainBrief(params: ChainBriefParams): ChainBriefResult {
       childBrief,
       snapshot: emptySnapshot(p),
     };
+  }
+
+  // 3) The chain must be waiting for the child brief (parent report recorded).
+  if (p.chainStatus !== AWAITING_CHILD) {
+    return refuse(
+      "parent_not_reported",
+      `the parent's intermediate report is not recorded (chain status ${quote(p.chainStatus)}); write the parent report first`,
+    );
   }
 
   // 4) The caveat block must be verbatim equal to the parent's.

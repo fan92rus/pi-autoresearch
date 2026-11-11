@@ -395,3 +395,10 @@ test("round2-minor numeric campaign in finding_refs is a malformed entry", () =>
   const result = CB.approveChainBrief(params);
   assertRefusal(result, "finding_missing");
 });
+
+test("2.4 review-NOTE-1: resubmitting an approved brief in chain status active is duplicate, not parent_not_reported", () => {
+  const sha = "b".repeat(64);
+  const result = CB.approveChainBrief(baseParams({ childBriefSha256: sha, approvedBriefHashes: [sha], chainStatus: "active" }));
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.duplicate, true);
+});
