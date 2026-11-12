@@ -25,22 +25,41 @@ research campaign is active.
 
 **Phase 2 — autonomous research.**
 
-4. `research start` with `expected_sha256` from phase 1. A mismatch is
-   a `brief_changed` refusal. Only one campaign may be in the research
-   phase at a time.
-5. `research open` — open a vector for a question id from the brief
+4. `research_questions(action="start")` with `expected_sha256` from phase 1. A mismatch is
+   a `brief_changed` refusal. Only one campaign may be in the research phase at a time.
+5. `research_questions(action="open")` — open a vector for a question id from the brief
    (one open vector at a time; closed vectors never reopen).
-6. `research record` — store the conclusion with an `evidence_ref`
+6. `research_questions(action="record")` — store the conclusion with an `evidence_ref`
    (`path:lines` or `path#anchor`); the file's SHA-256 is recorded.
-7. `research close` — a verdict plus the `rule_id` of that question
-   with the matching verdict; `inconclusive` and `waiting_for_data`
-   need a reason. The journal keeps the question and rule text.
-8. `research stop` — a stop rule from the brief; after it, no new
-   vectors open.
-9. `research status` / `report` — question statuses, evidence hash
-   checks, the caveat block verbatim. No target metric exists by
-   design; available after stop as well.
+7. `research_questions(action="close")` — provide the `question_id`, verdict and `rule_id` of that question
+   with the matching verdict; `inconclusive` and `waiting_for_data` need a reason.
+   The journal keeps the question and rule text.
+8. `research_questions(action="stop")` — provide `rule_id` and `reason` for a stop rule from the brief; after it, no new vectors open.
+9. Use separate calls: `research_questions(action="status")` for question status and
+   `research_questions(action="report")` for evidence hash checks and the caveat block;
+   both remain available after stop.
 10. The operator receives the report.
+
+## Explicit campaign and expedition tools
+
+For new model calls, prefer the two separate tools:
+
+| Tool | Scope | Example |
+|---|---|---|
+| `research_questions` | Campaign lifecycle and questions (`start/open/record/close/stop/status/report/resolve/chain_stop`) | `research_questions(action="close", question_id="Q1", rule_id="supported", verdict="confirmed")` |
+| `expedition_map` | Expedition map transitions (`open/activate/resolve/reject/advisory/park/reopen/pivot/status`) | `expedition_map(subaction="resolve", dir="cache", refs=[{campaign:"exp-c1",question:"Q1"}])` |
+
+These are separate schemas over the existing executor. **Closing a question** uses
+`research_questions(action="close")` with `question_id`, `rule_id`, and `verdict`.
+**Resolving a direction** uses `expedition_map(subaction="resolve"|"reject")` with
+`refs` to already-closed campaign questions; it never takes `rule_id` or `verdict`.
+`research_questions(action="resolve")` is different again: it is operator-only pending-op
+cleanup requiring owner dialog confirmation and does not change the expedition map.
+
+The old combined `research` tool is hidden from the model because its mixed schema caused
+question/map argument confusion. Its executor remains an internal dispatcher used by both
+aliases, preserving validation and journal behavior. Migrate direct calls to `research` onto
+the appropriate alias. The `/autoresearch research ...` slash command is unchanged.
 
 ## Guarantees
 
@@ -84,7 +103,7 @@ research campaign is active.
 ## Manual recovery
 
 An interrupted operation leaves `pending-op.json` and blocks the
-campaign (`manual_check_required`). `research resolve` is
+campaign (`manual_check_required`). `research_questions(action="resolve")` is
 operator-only: a dialog (`ctx.ui.confirm === true`) clears the marker;
 `state.json` is never auto-repaired, and a failed or absent dialog
 leaves the marker in place. A stale lock is likewise never removed
@@ -129,7 +148,7 @@ Absent fields keep the behaviour above unchanged.
   Absent means `confirmed, rejected, inconclusive, waiting_for_data`.
   Names are tokens `^[a-z][a-z0-9_-]{0,31}$`, unique and non-empty. Every
   decision rule's `verdict` must be declared, and every question needs a
-  rule for every declared verdict. `research close` accepts only declared
+  rule for every declared verdict. `research_questions(action="close")` accepts only declared
   verdicts.
 - `evidence_gate` — `{blocked_globs, gate_file, gate_contains}`. A `record`
   whose evidence path matches a `blocked_globs` pattern is refused with
@@ -171,7 +190,7 @@ node scripts/research-rpc.mjs \
   [--pi <path>] [--timeout-sec 3600] [--stage1-timeout-sec 30] [--log <path>]
 ```
 
-Exit codes: `0` campaign reached an accepted `research report`; `1` brief-hash
+Exit codes: `0` campaign reached an accepted `research_questions(action="report")`; `1` brief-hash
 refusal (session aborted) or a wrapper protocol error; `2` argument errors
 (missing options, non-canonical brief) or stage-1 refusal; `3` timeout or an
 unexpected pi exit (the reason is in the log).
@@ -242,9 +261,9 @@ instead of `<workDir>/.auto/research/<id>/`. Constraints:
 
 ### Report and findings artifacts
 
-`research report` now also writes `<campaign dir>/report.md` (the tool text is
+`research_questions(action="report")` now also writes `<campaign dir>/report.md` (the tool text is
 returned as before, with a saved-to line; a write failure warns but does not
-fail the report; report does not require a prior `stop`). `research close` with
+fail the report; report does not require a prior `stop`). `research_questions(action="close")` with
 verdict `confirmed` or `rejected` additionally appends a compact finding to
 `.auto/findings.jsonl` in the work directory (theme `behavior`, status `open`,
 evidence_ref from the vector's first evidence), so research verdicts become
@@ -272,8 +291,8 @@ A finished campaign (`phase: stopped`) is kept, never deleted.
 - **Archive on a new draft.** `research_brief draft` that creates a new campaign directory first checks the brief. Then every finished campaign under the research root moves to `.auto/research-archive/<id>-<stamp>/` as a whole: report, log, briefs and state. This applies to the unpinned draft and to a pinned new id (`/autoresearch research --id <new>`).
 - **Refusal.** If another campaign is briefing, researching or unreadable, the draft refuses and nothing moves. A single briefing campaign found without a pinned id is reused, as before.
 - **Launch.** A bare `/autoresearch research <description>` is not refused by a finished campaign. It is refused only by a briefing, researching or unreadable one.
-- **Stop does not leave the mode.** `research stop` keeps research mode on, so `status` and `report` still work.
-- **Exit after the report.** `research report` of a stopped campaign writes `report.md` first. Only after a successful save does autoresearch mode go OFF: the OFF activation is recorded in the session, the pin is released and no automatic continuation follows. If the save fails, the mode stays on and the report says so.
+- **Stop does not leave the mode.** `research_questions(action="stop")` keeps research mode on, so `status` and `report` still work.
+- **Exit after the report.** `research_questions(action="report")` of a stopped campaign writes `report.md` first. Only after a successful save does autoresearch mode go OFF: the OFF activation is recorded in the session, the pin is released and no automatic continuation follows. If the save fails, the mode stays on and the report says so.
 - **Restoring an archived campaign** is manual: move its directory back under `.auto/research/`.
 
 Spec: `openspec/changes/research-exit-and-archive/`.
@@ -308,9 +327,9 @@ Stopped campaigns are moved, never deleted, by the next `research_brief draft`
 archive flow into `.auto/research-archive/`.
 
 Reminders follow campaign state: closing the last open question points to
-`research stop <rule_id>` and `research report`; auto-resume and drift reminders
+`research_questions(action="stop", rule_id=<id>)` and `research_questions(action="report")`; auto-resume and drift reminders
 suggest continuing research only while questions remain open, and suggest
-`research stop <rule_id>` plus `research report` when all are closed (never
+`research_questions(action="stop", rule_id=<id>)` plus `research_questions(action="report")` when all are closed (never
 “open”). No reminder is delivered for pending-op, unreadable, or stopped
 campaigns. The auto-resume-limit notification names a questions-complete but
 unfinalized campaign.
@@ -337,7 +356,7 @@ dialog per brief. Spec: `openspec/changes/research-charter/`.
   each point at a question closed with evidence under a declared verdict in a
   campaign of this chain. Approval is written with `source: charter`.
 - **Pause and stop**: an intermediate report keeps research mode ON and gives one
-  continuation. `research chain_stop` needs the operator's dialog (the model
+  continuation. `research_questions(action="chain_stop")` needs the operator's dialog (the model
   cannot stop the chain). Reaching a charter limit sets `limit_reached` and turns
   research mode OFF.
 - **Journal**: `.auto/research-chain/<id>/chain.json` (append-only, hash-linked)
@@ -385,9 +404,15 @@ TUI и получить общий отчёт. Экспедиция исполь
 `campaign_added` для кампании №0, которая запускается. Подтверждённый SHA-256
 документа далее используется как хеш-якорь хартии.
 
-Рабочий цикл экспедиции: подтверждение документа → `research expedition
-activate` выбранного направления → работа кампании (open/record/close) →
-закрытие направления (resolve/reject/advisory/park) → activate следующего →
+Рабочий цикл экспедиции: подтверждение документа → `expedition_map(subaction="activate", dir=<name>, why=<rationale>)`
+для выбранного направления → отдельные вызовы кампании `research_questions(action="open", question_id=...)`,
+`research_questions(action="record", evidence_ref=...)` и
+`research_questions(action="close", question_id=..., rule_id=..., verdict=...)` →
+закрытие направления отдельным вызовом `expedition_map(subaction="resolve", dir=<name>, refs=[{campaign, question}])`
+или `expedition_map(subaction="reject", dir=<name>, refs=[{campaign, question}])`; альтернативы —
+`expedition_map(subaction="advisory", dir=<name>, review_ref=<path>, review_sha256=<sha256>)`
+или `expedition_map(subaction="park", dir=<name>, reason=<why>)` →
+активация следующего направления через `expedition_map(subaction="activate", dir=<name>, why=<rationale>)` →
 бриф следующей кампании. Системные сообщения (после propose и в continuation
 после отчёта кампании) предписывают именно этот порядок, чтобы направления
 не оставались в статусе open при работающей кампании. Виджет подсвечивает

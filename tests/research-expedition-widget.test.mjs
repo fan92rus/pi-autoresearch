@@ -28,8 +28,8 @@ const journal = [
   const lines = expedition.expeditionWidgetLines(replay.map, { campaignId: "c1", campaignPhase: "research", openQuestions: [], closedQuestions: 0, totalQuestions: 0, campaignsUsed: 2, campaignsLimit: 5, chainStatus: "active" });
   assert.match(lines.join("\n"), /✅ latency/);
   assert.match(lines.join("\n"), /❓ advisory.*самоотчёт, не доказательство/);
-  assert.match(lines.join("\n"), /⚠ нет активного направления — research expedition activate dir=memory/);
-  assert.match(lines.at(-1), /territory .*campaigns 2\/5.*next: research expedition activate/);
+  assert.match(lines.join("\n"), /⚠ нет активного направления — expedition_map\(subaction=activate, dir=memory, why=<rationale>\)/);
+  assert.match(lines.at(-1), /territory .*campaigns 2\/5.*next: expedition_map\(subaction=activate, dir=memory, why=<rationale>\)/);
 });
 
 test("buildExpeditionWidgetLines reads a journal and renders three directions plus footer", () => {
@@ -79,7 +79,7 @@ test("non-expedition research chains retain the ordinary dashboard path", () => 
   assert.match(body, /❌ rejected dir/);
   assert.match(body, /🔄 active dir/);
   assert.match(lines.at(-1), /campaigns 1(?!\/) /, "no limit renders campaigns without slash");
-  assert.match(lines.at(-1), /next: закрыть направление → activate следующее → бриф/);
+  assert.match(lines.at(-1), /next: expedition_map\(subaction=resolve, dir, refs\) → expedition_map\(subaction=activate, dir, why\) → research_brief draft/);
 });
 
  test("advisory line always carries the unproven mark even with a long basis", () => {
@@ -179,7 +179,8 @@ const linesOf = (map, info) => expedition.expeditionWidgetLines(map, { openQuest
   const lines = linesOf(replay.map, { campaignId: "c1", campaignPhase: "research" });
   const warn = lines.find((l) => l.includes("⚠"));
   assert.ok(warn, "divergence line rendered");
-  assert.match(warn, /⚠ нет активного направления — research expedition activate dir=memory/);
+  assert.match(warn, /⚠ нет активного направления — expedition_map\(subaction=activate, dir=memory, why=<rationale>\)/);
+  assert.match(lines.at(-1), /next: expedition_map\(subaction=activate, dir=memory, why=<rationale>\)/);
 });
 
 test("divergence line: research phase with an active direction shows no warning", () => {
@@ -210,20 +211,19 @@ test("divergence line: research phase with no open direction suggests reopen, no
   const lines = linesOf(replay.map, { campaignId: "c1", campaignPhase: "research" });
   const warn = lines.find((l) => l.includes("⚠"));
   assert.ok(warn, "divergence line rendered");
-  assert.match(warn, /все направления закрыты/);
-  assert.match(warn, /reopen dir=d1/, "suggests reopen with the reopenable dir");
+  assert.match(warn, /expedition_map\(subaction=reopen, dir=d1, reason=<why>\)/, "suggests a valid reopen call with a reason");
   assert.ok(!warn.includes("activate"), "no dead-end activate hint");
 });
 
  test("next maps every chain status to an action", () => {
   const map = expedition.replayExpeditionMap([{ type: "expedition_created", goal: "G", doc_sha256: "x" }]).map;
   const cases = [
-    ["manual_check_required", "устраните блокер (research status)"],
-    ["stopped_by_owner", "expedition report"],
-    ["stopped_by_rule", "expedition report"],
-    ["completed", "expedition report"],
-    ["limit_reached", "expedition report"],
-    ["awaiting_child", "закрыть направление → activate следующее → бриф"],
+    ["manual_check_required", "research_questions(action=status) — проверьте блокер"],
+    ["stopped_by_owner", "research_questions(action=report)"],
+    ["stopped_by_rule", "research_questions(action=report)"],
+    ["completed", "research_questions(action=report)"],
+    ["limit_reached", "research_questions(action=report)"],
+    ["awaiting_child", "expedition_map(subaction=resolve, dir, refs) → expedition_map(subaction=activate, dir, why) → research_brief draft"],
     ["active", "active"],
   ];
   for (const [status, expected] of cases) {
@@ -240,7 +240,7 @@ test("next: active campaign in research phase with active direction prescribes c
   ];
   const map = expedition.replayExpeditionMap(entries).map;
   const lines = linesOf(map, { campaignId: "c1", chainStatus: "active", campaignPhase: "research" });
-  assert.match(lines.at(-1), /next: open\/record\/close → research stop → report/);
+  assert.match(lines.at(-1), /next: research_questions\(action=status\)/);
 });
 
 test("question progress renders closed/total in the footer only when total > 0", () => {
@@ -318,9 +318,9 @@ test("divergence line: research phase with no open direction suggests reopen ins
   const lines = linesOf(replay.map, { campaignId: "c1", campaignPhase: "research" });
   const warn = lines.find((l) => l.includes("⚠"));
   assert.ok(warn, "divergence line rendered");
-  assert.match(warn, /все направления закрыты/);
-  assert.match(warn, /reopen dir=d1/, "hints the first reopenable direction");
-  assert.match(warn, /research stop → report/, "offers campaign completion");
+  assert.match(warn, /expedition_map\(subaction=reopen, dir=d1, reason=<why>\)/, "hints the first reopenable direction");
+  assert.match(lines.at(-1), /next: expedition_map\(subaction=reopen, dir=d1, reason=<why>\)/);
+  assert.match(warn, /research_questions\(action=stop, rule_id=<rule>, reason=<why>\) → research_questions\(action=report\)/, "offers valid campaign completion calls");
   assert.ok(!warn.includes("activate"), "never suggests impossible activate");
 });
 
@@ -329,7 +329,8 @@ test("divergence line: no directions at all suggests opening one", () => {
   const lines = linesOf(map, { campaignId: "c1", campaignPhase: "research" });
   const warn = lines.find((l) => l.includes("⚠"));
   assert.ok(warn, "divergence line rendered");
-  assert.match(warn, /research expedition open/);
+  assert.match(warn, /expedition_map\(subaction=open, dir=<name>, why=<rationale>\)/);
+  assert.match(lines.at(-1), /next: expedition_map\(subaction=open, dir=<name>, why=<rationale>\)/);
 });
 
 test("goal truncation never splits a surrogate pair", () => {
@@ -365,7 +366,7 @@ test("campaign phase is read synchronously from state.json by buildExpeditionWid
   const lines = extensionModule.buildExpeditionWidgetLines(f.chain, f.campaign, { campaignId: "c1", campaignsUsed: 1, campaignsLimit: null, chainStatus: "active" });
   const warn = lines.find((l) => l.includes("⚠"));
   assert.ok(warn, "phase from state.json drives the divergence line");
-  assert.match(warn, /activate dir=d1/);
+  assert.match(warn, /expedition_map\(subaction=activate, dir=d1, why=<rationale>\)/);
   assert.match(lines[0], /\(research\)/);
 });
 

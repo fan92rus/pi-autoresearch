@@ -17,28 +17,27 @@ research_questions                      expedition_map
                                    ▼
                  existing validation, state machine and journal
 
-`research` remains registered as a backward-compatible legacy facade.
+The combined `research` tool is NOT registered. The internal research executor remains as a private shared dispatcher behind both aliases; its broad schema is never exposed to the model.
 ```
 
 `research_questions` retains the existing campaign action field. `expedition_map` receives `subaction` at the top level and maps it internally to `{action:"expedition", subaction,...}`. Its JSON schema MUST NOT declare `rule_id` or `verdict`; `research_questions` MUST NOT declare map-only `refs`, `review_ref`, `review_sha256`, `from`, or `to`.
 
 ## D2. Implementation boundaries
 
-- Capture the current research tool executor in a local `executeResearch` function/reference; existing `research` registration and behavior remain intact.
+- Keep the current executor as a private local `executeResearch` callback and do not call `registerGatedTool` for the combined `research` definition. The aliases are the only public research/map tool registrations.
 - Register aliases with `registerGatedTool`, preserving execution-time autoresearch mode gating.
 - Alias execute delegates to the existing executor with transformed params, same context/signal/update callback. No filesystem or transition code is copied.
 - Tool names, `description`, `promptSnippet`, and `promptGuidelines` explicitly state the semantic boundary: questions close via `research_questions(action="close")`; directions close via `expedition_map(subaction="resolve"|"reject", refs=...)`.
 - `renderCall` accepts both legacy and alias argument shapes; each path returns a valid Text component, including malformed/unknown inputs.
-- Backward compatibility: old `research` registration, accepted args, return shape, RPC/headless behavior and tool outputs remain unchanged. New instructions prefer aliases.
+- Dispatcher compatibility: internal action semantics, return/refusal codes, journal effects and mode gating remain unchanged. Direct callers of the removed public `research` tool must migrate to `research_questions` or `expedition_map`; no compatibility alias with the mixed schema is retained.
 
 ## D3. Messages to update
 
-Update all agent-authored prompts that describe expedition work:
-- expedition proposal confirmation reply and busy steer: activate/close/pivot through `expedition_map`; campaign question lifecycle through `research_questions`.
-- `restoreExpeditionFromDisk` resume message.
-- `sendChainContinuation` after a child campaign finishes.
-- `expedition-finish` slash-command steer text (if present in current implementation).
-- descriptions/guidelines in legacy `research` tool mark it as compatibility API and point to aliases.
+Update all model-facing campaign prompts/notices, including expedition kickoff/restart/continuation and ordinary campaign resume, compaction/completion, drift/pause, approval/start, stop/report, `/autoresearch research` kickoff, and blocked-mode notices.
+- Expedition map actions use `expedition_map`; campaign/question actions use `research_questions`.
+- Visible expedition widget next/divergence hints name the public aliases.
+- Each example uses one valid `research_questions.action`; stop examples include both required `rule_id` and `reason`.
+- The hidden combined executor is not model-facing, so it needs no user-facing descriptions.
 
 Do not rewrite owner-facing slash commands such as `/autoresearch research --id`; those are not tool calls.
 

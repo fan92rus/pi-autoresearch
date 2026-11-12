@@ -25,7 +25,7 @@ const LEGACY_MARKERS = [
 // Exact text of a legacy guideline line that the research prompt must drop.
 const LEGACY_GUIDELINE_LINE =
   "- log_experiment automatically runs git add -A && git commit on 'keep', and auto-reverts code changes on 'discard'/'crash'/'checks_failed' (autoresearch files are preserved). Do NOT commit or revert manually.";
-const BLOCK_TEXT = "Research campaign active; use research status or the operator resolve; the ordinary loop is blocked";
+const BLOCK_TEXT = "Research campaign active; use research_questions(action=status) or the operator resolve; the ordinary loop is blocked";
 
 function makeWorkDir(label) {
   const dir = path.join(os.tmpdir(), `pi-ar-research-${label}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
@@ -252,7 +252,7 @@ test("(d) research_brief propose: owner confirm === true writes approval.json wi
   const approval = readJson(path.join(dir, ".auto", "research", "c1", "approval.json"));
   assert.equal(approval.confirmed, true);
   assert.equal(approval.brief_sha256, expected);
-  assert.ok(text.includes(expected) && /research start/.test(text), `launch prompt must carry path and hash: ${text}`);
+  assert.ok(text.includes(expected) && /research_questions\(action=start/.test(text), `launch prompt must carry path and hash: ${text}`);
 });
 
 test("(d) research_brief propose: dialog is a summary of at most 10 lines starting with the SHA", async () => {

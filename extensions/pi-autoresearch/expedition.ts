@@ -97,13 +97,20 @@ export function mapSliceText(map:ExpeditionMap):string{return [...map.directions
  *  per visual line). */
 function oneLine(s:string):string{return s.replace(/\s*[\r\n]+\s*/g," ");}
 /** One-line action hint for the footer's `next:` segment (falls back to the raw status). */
-function nextAction(info:{campaignPhase:string|null;chainStatus:string},hasActive:boolean):string{
+function nextAction(info:{campaignPhase:string|null;chainStatus:string},dirs:DirectionState[]):string{
   const s=info.chainStatus;
-  if(s==="manual_check_required")return "устраните блокер (research status)";
-  if(s==="stopped_by_owner"||s==="stopped_by_rule"||s==="completed"||s==="limit_reached")return "expedition report";
-  if(s==="awaiting_child")return "закрыть направление → activate следующее → бриф";
-  if(s==="active"&&info.campaignPhase==="research"&&!hasActive)return "research expedition activate";
-  if(s==="active"&&info.campaignPhase==="research")return "open/record/close → research stop → report";
+  const hasActive=dirs.some(d=>d.status==="active");
+  if(s==="manual_check_required")return "research_questions(action=status) — проверьте блокер";
+  if(s==="stopped_by_owner"||s==="stopped_by_rule"||s==="completed"||s==="limit_reached")return "research_questions(action=report)";
+  if(s==="awaiting_child")return "expedition_map(subaction=resolve, dir, refs) → expedition_map(subaction=activate, dir, why) → research_brief draft";
+  if(s==="active"&&info.campaignPhase==="research"&&!hasActive){
+    const open=dirs.find(d=>d.status==="open");
+    if(open)return "expedition_map(subaction=activate, dir="+oneLine(open.dir)+", why=<rationale>)";
+    const reopenable=dirs.find(d=>["parked","advisory_exhausted","resolved","rejected"].includes(d.status));
+    if(reopenable)return "expedition_map(subaction=reopen, dir="+oneLine(reopenable.dir)+", reason=<why>)";
+    return "expedition_map(subaction=open, dir=<name>, why=<rationale>)";
+  }
+  if(s==="active"&&info.campaignPhase==="research")return "research_questions(action=status)";
   return s;
 }
 /** Code-point-safe truncation: slicing by UTF-16 index can split a surrogate
@@ -117,16 +124,16 @@ export function expeditionWidgetLines(map:ExpeditionMap,info:{campaignId:string|
   const head="🧭 "+goalView+" ("+dirs.length+" напр.) │ campaign "+oneLine(info.campaignId??info.chainStatus)+(info.campaignPhase?(" ("+oneLine(info.campaignPhase)+")"):"");
   const lines=[head];
   // Divergence: a campaign is running its research phase but the map has no
-  // active direction — the agent forgot `research expedition activate`.
+  // active direction — the agent needs the public `expedition_map` tool.
   if(info.campaignId&&info.campaignPhase==="research"&&!hasActive){
     const open=dirs.find(d=>d.status==="open");
-    if(open)lines.push("⚠ нет активного направления — research expedition activate dir="+open.dir);
+    if(open)lines.push("⚠ нет активного направления — expedition_map(subaction=activate, dir="+open.dir+", why=<rationale>)");
     else{
       // No open directions either: activating is impossible — suggest reopen
       // (state machine allows parked/advisory/resolved/rejected) or campaign
       // completion, never a dead-end activate hint.
       const reopenable=dirs.find(d=>["parked","advisory_exhausted","resolved","rejected"].includes(d.status));
-      lines.push("⚠ нет активного направления — все направления закрыты: research expedition reopen"+(reopenable?" dir="+reopenable.dir:" (research expedition open)")+" | или закрой кампанию (research stop → report)");
+      lines.push("⚠ нет активного направления — все направления закрыты: expedition_map(subaction=reopen, dir="+(reopenable ? reopenable.dir : "<name>")+", reason=<why>) | expedition_map(subaction=open, dir=<name>, why=<rationale>) | research_questions(action=stop, rule_id=<rule>, reason=<why>) → research_questions(action=report)");
     }
   }
   for(const d of dirs){
@@ -141,7 +148,7 @@ export function expeditionWidgetLines(map:ExpeditionMap,info:{campaignId:string|
   }
   const bar="█".repeat(Math.min(done,10))+"░".repeat(Math.min(map.directions.size,10)-Math.min(done,10));
   const q=(info.totalQuestions??0)>0?" │ Q "+(info.closedQuestions??0)+"/"+info.totalQuestions:"";
-  const foot="territory "+bar+" done/"+map.directions.size+" │ campaigns "+info.campaignsUsed+(info.campaignsLimit===null?"":"/"+info.campaignsLimit)+q+" │ next: "+oneLine(nextAction(info,hasActive));
+  const foot="territory "+bar+" done/"+map.directions.size+" │ campaigns "+info.campaignsUsed+(info.campaignsLimit===null?"":"/"+info.campaignsLimit)+q+" │ next: "+oneLine(nextAction(info,dirs));
   lines.push(foot);
   return lines;
 }

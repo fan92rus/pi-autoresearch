@@ -20,11 +20,11 @@ import { filterSubcommands } from "../extensions/pi-autoresearch/parallel/config
 const KICKOFF_MARKERS = [
   "research_brief draft",
   "research_brief propose",
-  "research start",
-  "research open",
-  "research close",
-  "research stop",
-  "research report",
+  "research_questions(action=start",
+  "research_questions(action=open",
+  "research_questions(action=close",
+  "research_questions(action=stop",
+  "research_questions(action=report",
 ];
 const FORBIDDEN_IN_KICKOFF = ["/skill:autoresearch-create", "run_experiment", "log_experiment", "/autoresearch on"];
 const RESEARCH_NOTIFY = "Research mode ON";

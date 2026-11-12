@@ -34,17 +34,25 @@
 - **WHEN** агент вызывает `expedition_map(subaction="resolve")`
 - **THEN** операция означает закрытие активного направления с refs и не означает операторское разрешение pending-op marker
 
-### Requirement: Фасады делегируют существующей логике
+### Requirement: Campaign facade delegates question operations
 
-Вызовы обоих новых фасадов SHALL делегироваться существующему research executor без копирования переходов или journal logic; сохраняются прежние execution-time mode gate, валидация, коды отказов и записи журнала.
+`research_questions` SHALL delegate question operations to the existing research executor; question transitions and journal logic are not duplicated.
 
 #### Scenario: Вопрос кампании закрывается отдельным фасадом
 - **WHEN** агент вызывает `research_questions` с action `close`, question_id, rule_id и verdict
 - **THEN** вызов делегируется существующей логике `research close`; вопрос закрывается по прежним правилам
 
+### Requirement: Map facade delegates direction operations
+
+`expedition_map` SHALL delegate map operations to the existing expedition executor; map transition rules and journal effects are unchanged.
+
 #### Scenario: Направление карты закрывается отдельным фасадом
 - **WHEN** агент вызывает `expedition_map` с subaction `resolve` или `reject`, dir и refs
 - **THEN** вызов делегируется существующей expedition map logic; операция требует тех же подтверждённых refs, что legacy-вызов
+
+### Requirement: Facades preserve the execution-time mode gate
+
+Both aliases SHALL preserve the execution-time mode gate of the existing gated research tools.
 
 #### Scenario: Выключенный режим
 - **WHEN** alias вызван при выключенном autoresearch mode
@@ -62,21 +70,33 @@
 - **WHEN** alias resolve вызван без UI или оператор отказывает
 - **THEN** действие отказывается, pending-op marker остаётся, map journal не меняется
 
-### Requirement: Совместимость legacy research
+### Requirement: Смешанный research tool не объявляется модели
 
-Существующий инструмент `research` SHALL оставаться зарегистрированным с прежней схемой и поведением для старых клиентов и сессий. Его описание SHALL называть его legacy-совместимым фасадом и рекомендовать новые инструменты для новых model calls.
+Расширение SHALL NOT регистрировать combined `research` tool как callable tool. Его executor SHALL оставаться внутренним общим dispatcher, используемым aliases; внутренние action semantics, return/refusal codes, journal effects и execution-time mode gate не меняются. Прямые публичные вызовы старого tool должны мигрировать на новые aliases.
 
-#### Scenario: Legacy-вызовы остаются рабочими
-- **WHEN** существующий клиент вызывает старый `research` tool с валидным аргументом
-- **THEN** прежняя схема, результат и поведение сохраняются
+#### Scenario: Модель видит только раздельные фасады
+- **WHEN** расширение регистрирует research/map tools
+- **THEN** `research` отсутствует в публичном наборе, а `research_questions` и `expedition_map` присутствуют
+
+#### Scenario: Новый фасад сохраняет прежние эффекты
+- **WHEN** валидная операция выполняется через любой alias
+- **THEN** вызывается прежняя внутренняя логика с теми же отказами/результатами и изменениями состояния
 
 #### Scenario: Неправильные alias-поля дают направляющую ошибку
 - **WHEN** вызов нового alias содержит поля другого фасада
 - **THEN** вызов отклоняется без изменения состояния и указывает alias/action, принимающий эти поля
 
-### Requirement: Экспедиционные сообщения используют новые aliases
+### Requirement: Model-facing instructions use public aliases
 
-Экспедиционные kickoff-, restart-resume- и continuation-инструкции, адресованные агенту, SHALL использовать `expedition_map` для карты и `research_questions` для кампании/вопросов; объясняется различие: `research_questions(action="close")` закрывает вопрос, `expedition_map(subaction="resolve"|"reject")` закрывает направление через refs. Инструкции SHALL NOT предписывать новые вызовы legacy `research(action="expedition")`.
+Все model-facing campaign instructions/notices SHALL использовать публичные aliases, не скрытый mixed `research`. Каждое действие SHALL задаваться отдельным допустимым `action`.
+
+#### Scenario: Campaign resume и completion инструкции
+- **WHEN** агенту приходит resume, compaction, completion, drift/pause, approval/start, stop/report или `/autoresearch research` kickoff сообщение
+- **THEN** campaign calls адресованы `research_questions`, stop включает `rule_id` и `reason`, а примеры не используют union-like action values
+
+### Requirement: Экспедиционные сообщения и widget hints используют aliases
+
+Экспедиционные kickoff/restart/continuation сообщения и TUI next/divergence-подсказки SHALL использовать `expedition_map` для карты и `research_questions` для кампании/вопросов; новые сообщения SHALL NOT предписывать removed combined `research(action="expedition")`.
 
 #### Scenario: Начало экспедиции
 - **WHEN** агент получает kickoff после подтверждения документа экспедиции
@@ -84,7 +104,11 @@
 
 #### Scenario: Возобновление и продолжение
 - **WHEN** экспедиция восстановлена после перезапуска или кампания завершена
-- **THEN** сообщение использует новые aliases для следующего действия и не просит применять legacy expedition subaction на `research`
+- **THEN** сообщение использует новые aliases для следующего действия и не просит применять combined research tool
+
+#### Scenario: Виджет подсказывает доступный alias
+- **WHEN** TUI показывает next/divergence-подсказку для активной экспедиции
+- **THEN** подсказка называет `expedition_map` для направления и `research_questions` для вопроса/кампании, а не скрытый combined tool
 
 #### Scenario: Агент смешал поля закрытия
 - **WHEN** агент передаёт `rule_id`/`verdict` в `expedition_map`

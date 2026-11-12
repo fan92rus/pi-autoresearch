@@ -2562,7 +2562,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   notifyAutoResumeLimitReachedAsyncForTest = notifyAutoResumeLimitReachedAsync;
 
   // ── Research-vectors campaign (openspec/changes/research-vectors, design §8) ──
-  const RESEARCH_BLOCK_TEXT = "Research campaign active; use research status or the operator resolve; the ordinary loop is blocked";
+  const RESEARCH_BLOCK_TEXT = "Research campaign active; use research_questions(action=status) or the operator resolve; the ordinary loop is blocked";
   /** Git invocations through the shell hook (design §8: no Git while the research campaign runs). */
   // Command-position match: the git word must be the command or a
   // wrapper-prefixed command; harmless prose like `echo git is useful`
@@ -2703,9 +2703,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   });
 
   const RESEARCH_RESUME_TEXT =
-    "Continue the research campaign: research status/open/record/close; STOP on manual_check_required.";
+    "Continue the research campaign: call research_questions(action=status), then issue separate research_questions calls with action=open, action=record, or action=close as indicated by the approved brief; STOP on manual_check_required.";
 
-  const researchCompletionText = "Continue the research campaign: all brief questions are closed — pick a stop rule and run research stop <rule_id>, then research report; STOP on manual_check_required.";
+  const researchCompletionText = "Continue the research campaign: all brief questions are closed — pick a stop rule and call research_questions(action=stop, rule_id=<rule_id>, reason=<why the stop condition is met>), then research_questions(action=report); STOP on manual_check_required.";
 
   const composeResearchDriftMessage = async (ctx: ExtensionContext): Promise<string> => {
     const snapshot = await researchCompletionSnapshot(ctx);
@@ -2721,7 +2721,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const composeResearchCompactionMessage = (): string =>
     [
-      "Resume the research campaign now: research status, then open/record/close per the brief.",
+      "Resume the research campaign now: call research_questions(action=status), then issue separate research_questions calls with action=open, action=record, or action=close per the brief.",
       "Do not re-read .auto/prompt.md for loop rules (they are not part of the research campaign).",
       "STOP on manual_check_required.",
     ].join(" ");
@@ -2823,7 +2823,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // while deferred behaves like the ordinary path: stop with a notice.
       ctx.ui.notify(
         researchScanSync(resolveWorkDir(ctx.cwd)).blocks
-          ? "Autoresearch paused — the last turns did no research-campaign work. Use research status to see the state, then resume the campaign."
+          ? "Autoresearch paused — the last turns did no research-campaign work. Use research_questions(action=status) to see the state, then resume the campaign."
           : campaignActiveSync(resolveWorkDir(ctx.cwd))
           ? "Autoresearch paused — the last turns did no candidate-campaign work. Use candidate_branch status to see the state, then resume the campaign."
           : "Autoresearch paused — the last turns did no experiment work (no run_experiment/log_experiment). Run /autoresearch <goal> to resume the loop.",
@@ -3411,7 +3411,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const message = [
       `Expedition ${fresh.chainId} restored after restart (goal: ${fresh.goal}).`,
       `Pinned campaign: ${campaignId ?? "none"}.`,
-      "Continue: research status first; if the campaign report is already recorded the chain continuation flow applies; close the finished direction (research expedition resolve/reject/advisory/park), activate the next one, then brief the next campaign. STOP on manual_check_required.",
+      "Continue: use research_questions(action=status) first; if the campaign report is already recorded, close the finished MAP DIRECTION with separate expedition_map calls: expedition_map(subaction=resolve, dir=<name>, refs=[{campaign,question}]) or expedition_map(subaction=reject, dir=<name>, refs=[{campaign,question}]), expedition_map(subaction=advisory, dir=<name>, review_ref=<path>, review_sha256=<sha256>), or expedition_map(subaction=park, dir=<name>, reason=<why>); activate the next direction with expedition_map(subaction=activate, dir=<name>, why=<rationale>) or pivot with expedition_map(subaction=pivot, from=<active>, to=<target>, reason=<why>), then brief the next campaign. For campaign questions, make separate research_questions calls: action=open plus question_id, action=record plus evidence_ref, action=close plus question_id/rule_id/verdict; stop requires action=stop plus rule_id/reason; use action=report for the final report. Question close is not direction resolve. STOP on manual_check_required.",
       ...(slice ? ["Expedition map snapshot:", slice] : []),
       ...(scan.chains.length > 1 ? [`Note: another expedition chain (${scan.chains[1].chainId}) is also active on disk; it was NOT restored (most recent wins).`] : []),
     ].join("\n");
@@ -3560,7 +3560,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // ordinary loop (design §5); it names the campaign tool instead.
       ctx.ui.notify(
         researchScanSync(resolveWorkDir(ctx.cwd)).blocks
-          ? "Autoresearch paused — the last turns did no research-campaign work. Use research status to see the state, then resume the campaign."
+          ? "Autoresearch paused — the last turns did no research-campaign work. Use research_questions(action=status) to see the state, then resume the campaign."
           : campaignActiveSync(resolveWorkDir(ctx.cwd))
           ? "Autoresearch paused — the last turns did no candidate-campaign work. Use candidate_branch status to see the state, then resume the campaign."
           : "Autoresearch paused — the last turns did no experiment work (no run_experiment/log_experiment). Run /autoresearch <goal> to resume the loop.",
@@ -3578,7 +3578,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     "run_experiment", "log_experiment", "propose_hypothesis", "init_experiment",
     "tree_status", "finalize_research",
     // Research-campaign tools are campaign work, not idle turns (design §8).
-    "research", "research_brief",
+    "research_questions", "research_brief",
     // Expedition design-phase work is campaign work: without it the drift
     // branch nags the legacy cycle while the agent drafts the expedition doc.
     "expedition_brief",
@@ -3611,7 +3611,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       return {
         block: true,
         reason:
-          "Blocked: git is not allowed while a research campaign is active; the research tools record evidence without Git.",
+          "Blocked: git is not allowed while a research campaign is active; research_questions records evidence without Git.",
       };
     }
     if (!getRuntime(ctx).autoresearchMode) return;
@@ -3681,12 +3681,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (await researchBlocksOrdinaryLoop(workDir, ctx)) {
       const researchExtra =
         "\n\n## Research Campaign (ACTIVE)" +
-        "\nWork through the research and research_brief tools only. Sequence: research_brief draft → propose (brief confirmed by the USER in a dialog) → research start (expected brief sha256) → open (one question from the brief) → record (evidence_ref) → close (verdict with a rule_id of that question) → stop (stop rule) → report." +
+        "\nWork through research_brief and research_questions only. Sequence: research_brief draft → propose (brief confirmed by the USER in a dialog) → research_questions(action=start, expected_sha256) → research_questions(action=open, question_id) → research_questions(action=record, evidence_ref) → research_questions(action=close, question_id, rule_id, verdict) → research_questions(action=stop, rule_id, reason) → research_questions(action=report)." +
         "\n- Questions and decision rules come ONLY from the approved brief. Never add or change a question or a rule during the campaign." +
         "\n- Close a vector only by a decision rule of that question, with recorded evidence. inconclusive and waiting_for_data need a reason; if the brief requires independent data that is missing, the verdict is waiting_for_data." +
         "\n- Only one vector is open at a time. A closed vector is never reopened." +
         "\n- Brief approval is the user's alone. Never pass or simulate confirmation." +
-        "\n- Git operations are FORBIDDEN in this mode: no git commands through the shell. The research tools never run Git." +
+        "\n- Git operations are FORBIDDEN in this mode: no git commands through the shell. research_questions never runs Git." +
         "\n- If status reports manual_check_required or brief_changed: STOP. Do not open or record anything; report the state and ask the operator. Only the operator's dialog resolves it (resolve)." +
         "\n- Copy the caveat_block of the brief verbatim into the report. Do not present unverified figures as computed facts.";
       const keptResearch = event.systemPrompt
@@ -8723,10 +8723,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   });
 
   /** Refuses any field the action does not accept, so approval fields never reach the tools. */
-  const unexpectedArgKeys = (params: Record<string, unknown>, allowed: readonly string[]): string | null => {
+  const unexpectedArgKeys = (params: Record<string, unknown>, allowed: readonly string[], hint?: string): string | null => {
     const extra = Object.keys(params).filter((k) => !allowed.includes(k));
     if (extra.length === 0) return null;
-    return `unexpected field(s) ${extra.map((k) => JSON.stringify(k)).join(", ")}; this action accepts only ${allowed.join(", ")}. Approval and operator confirmation are never accepted from the model`;
+    return `unexpected field(s) ${extra.map((k) => JSON.stringify(k)).join(", ")}; this action accepts only ${allowed.join(", ")}. Approval and operator confirmation are never accepted from the model${hint ? `. Hint: ${hint}` : ""}`;
   };
 
   const listResearchCampaignIds = (base: string): string[] | null => {
@@ -9475,8 +9475,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // so a marker failure degrades to a warning, not a rollback.
       const marker = expedition.writeExpeditionMarker(chainDir, {goal: current.doc.goal, docPath, docSha256: current.sha256, campaignId: id, charter: current.doc.charter});
       const markerNote = marker.ok ? "" : `\nwarning: expedition restart marker not written (${marker.reason}: ${marker.message}); the expedition will not survive a pi restart.`;
-      sendWhenReady(ctx, `Expedition ${id} created. Campaign 0 is running; the campaign brief is approved by the expedition confirmation. Before question work: pick a direction and activate it on the map with research expedition activate (action "expedition", subaction "activate", dir + why; the campaign is set automatically) — questions of campaign 0 belong to that direction. Then continue with research status/open/record/close. When the direction is closed (resolve/reject/advisory/park), activate the next direction and only then brief the next campaign.`, { steerIfBusy: true });
-      return reply(`✅ Expedition ${chainId} created; campaign ${id} started (document sha256 ${current.sha256}). Next: research expedition activate dir=<name> why=<rationale> before campaign work; after closing a direction activate the next one, then brief the next campaign.${markerNote}`);
+      sendWhenReady(ctx, `Expedition ${id} created. Campaign 0 is running; the campaign brief is approved by the expedition confirmation. Before question work: pick a direction and activate it with expedition_map(subaction="activate", dir=<name>, why=<rationale>) — questions of campaign 0 belong to that direction. Use separate research_questions calls with action="open", action="record", or action="close" for campaign questions. When the direction is closed, close its campaign questions first, then call expedition_map(subaction="resolve", dir=<name>, refs=[{campaign,question}]) or make a separate call to expedition_map(subaction="reject", dir=<name>, refs=[{campaign,question}]), expedition_map(subaction="advisory", dir=<name>, review_ref=<path>, review_sha256=<sha256>), or expedition_map(subaction="park", dir=<name>, reason=<why>); activate the next direction with expedition_map(subaction="activate", dir=<name>, why=<rationale>) before drafting the next campaign. Question close is not map direction resolve.`, { steerIfBusy: true });
+      return reply(`✅ Expedition ${chainId} created; campaign ${id} started (document sha256 ${current.sha256}). Next: expedition_map(subaction="activate", dir=<name>, why=<rationale>) before question work; use separate research_questions calls with action="open", action="record", or action="close" for questions. After closing a direction with expedition_map(subaction="resolve", dir=<name>, refs=...) or a separate call with expedition_map(subaction="reject", dir=<name>, refs=...), activate the next direction with expedition_map(subaction="activate", dir=<name>, why=<rationale>) before drafting the next campaign.${markerNote}`);
     },
   });
 
@@ -9499,7 +9499,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     promptGuidelines: [
       "Draft questions, one decision rule per verdict (confirmed, rejected, inconclusive, waiting_for_data) and stop rules with research_brief draft. caveat_block is required and is copied verbatim into the report.",
       "propose asks the OWNER to confirm the brief in a dialog. Never try to pass approval, confirmation or operator fields; they are refused.",
-      "After approval, start the research phase with research start using the expected_sha256 that propose returned.",
+      "After approval, start the research phase with research_questions(action=start, expected_sha256) using the hash that propose returned.",
     ],
     parameters: {
       type: "object",
@@ -9644,7 +9644,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         getRuntime(ctx).researchCampaignId = childId;
         getRuntime(ctx).chainContinuationSent = false;
         briefPreviewDir = created.dir;
-        return reply(`✅ Chain brief auto-approved by the charter checks (source: charter, sha256 ${written.sha256}). Campaign ${childId} created (parent ${parentId}, depth ${newDepth}). Next: research start with this sha256 as expected_sha256.`);
+        return reply(`✅ Chain brief auto-approved by the charter checks (source: charter, sha256 ${written.sha256}). Campaign ${childId} created (parent ${parentId}, depth ${newDepth}). Next: research_questions(action=start, expected_sha256=<this sha256>).`);
       }
       // The campaign id is never taken from the model: the pinned id (launch
       // command) wins; otherwise the single existing campaign is reused (draft
@@ -9787,27 +9787,106 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (outcome.status === "refused") return fail("not_approved", "the owner did not confirm the brief; nothing was approved");
       if (outcome.status === "write_failed") return fail(outcome.failure.reason ?? "approval_invalid", outcome.failure.message);
       return reply(
-        `✅ Brief approved for campaign ${campaignId} (sha256 ${sha.sha256}). Start the research phase: research start with expected_sha256 "${sha.sha256}". Brief file: ${path.join(dir, researchState.BRIEF_FILE)}.`,
+        `✅ Brief approved for campaign ${campaignId} (sha256 ${sha.sha256}). Start the research phase: research_questions(action=start, expected_sha256="${sha.sha256}"). Brief file: ${path.join(dir, researchState.BRIEF_FILE)}.`,
       );
     },
   });
 
-  registerGatedTool({
+  const researchTool: Parameters<typeof pi.registerTool>[0] = {
     name: "research",
-    label: "Research campaign (phase 2)",
+    label: "Internal research dispatcher (not exposed)",
+    exposure: "hidden",
     description:
-      "Research-vectors campaign, phase 2 (after an approved brief). Actions: start (expected_sha256 must match the approved brief), " +
-      "open (one question id from the brief; one vector at a time), record (evidence_ref path:lines or path#anchor; its SHA-256 is stored), " +
-      "close (verdict plus rule_id of that question; reason for inconclusive and waiting_for_data), stop (stop rule id plus the condition met), " +
-      "status, report (caveat block verbatim, question statuses, evidence hash check), resolve (OPERATOR-only: dialog consent clears a pending-op marker). " +
-      "Questions and rules are never added or changed here. While this campaign runs, the ordinary loop and candidate_branch are blocked; no Git.",
-    promptSnippet: "Research campaign: start, open/record/close questions from the approved brief, stop, report",
+      "Internal combined dispatcher used only by research_questions and expedition_map adapters. Not available as a model-callable tool. " +
+      "Question operations: start (expected_sha256 must match the approved brief), open (one question id from the brief), record (evidence_ref path:lines or path#anchor), " +
+      "close (verdict plus rule_id of that question), stop, status, report, resolve (OPERATOR-only pending-op dialog), chain_stop. " +
+      "Legacy expedition calls use action=expedition; new calls should use expedition_map. Question close closes a CAMPAIGN QUESTION; map resolve/reject closes a MAP DIRECTION using refs.",
+    promptSnippet: "Internal dispatcher for research_questions and expedition_map adapters",
     promptGuidelines: [
-      "research start needs expected_sha256: the sha256 that research_brief propose returned after the owner approved the brief.",
-      "open takes a question_id from the approved brief only; one vector at a time; a closed vector is never reopened.",
-      "close needs a decision rule of THAT question with the matching verdict and recorded evidence; use waiting_for_data when the brief requires data that is missing.",
-      "STOP on manual_check_required or brief_changed. resolve is OPERATOR-only: it asks the human via a dialog.",
+      "Internal dispatcher; use research_questions for campaign work and expedition_map for map transitions.",
+      "research_questions(action=close) closes a campaign QUESTION with question_id, rule_id, verdict and evidence; it does not close a map direction.",
+      "expedition_map with subaction=resolve or subaction=reject closes a MAP DIRECTION and needs refs naming already-closed questions; it does not take rule_id/verdict.",
+      "research_questions(action=resolve) is OPERATOR-only pending-operation resolution and requires owner confirmation; it is unrelated to map direction resolve.",
+      "STOP on manual_check_required or brief_changed.",
     ],
+    renderCall(args: any, _theme?: any) {
+      // This renderer is deliberately args-only: it runs before execute and must never touch the filesystem.
+      // Frame contract (review R1): renderCall MUST always return a Text component — a defined
+      // renderCall returning undefined breaks TUI rendering (MouseRegion renders its child
+      // unguarded in pi-tui 1.5.1). Every non-rendering branch returns the plain default header
+      // instead of undefined (spec fail-soft). The theme is optional: headless/test callers pass
+      // no theme, so the fallback uses plain markup-free text there.
+      const fallback = () => {
+        try {
+          const t = _theme;
+          return new Text(t ? t.fg("toolTitle", t.bold("research ")) : "research ", 0, 0);
+        } catch {
+          return new Text("research ", 0, 0);
+        }
+      };
+      try {
+        if (args?.action !== "expedition") return fallback();
+        const clean = (value: unknown): string => {
+          if (typeof value !== "string") return "";
+          const line = value.replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim();
+          return line.length > 120 ? `${Array.from(line).slice(0, 119).join("")}…` : line;
+        };
+        const quote = (value: unknown): string => {
+          const text = clean(value);
+          return text ? `«${text}»` : "";
+        };
+        const subaction = args?.subaction;
+        const dir = quote(args?.dir);
+        const reason = clean(args?.why ?? args?.reason);
+        const reasonLine = reason ? ` └ ${subaction === "activate" ? "why" : "reason"}: ${reason}` : "";
+        let text: string;
+        switch (subaction) {
+          case "activate":
+            if (!dir) return fallback();
+            text = `🔄 activate ${dir}${reasonLine}`;
+            break;
+          case "resolve":
+          case "reject": {
+            if (!dir) return fallback();
+            const refs = Array.isArray(args?.refs) ? args.refs : [];
+            const shown = refs.slice(0, 3).map((ref: any) => {
+              const campaign = clean(ref?.campaign);
+              const question = clean(ref?.question);
+              return campaign && question ? `${campaign}/${question}` : "";
+            }).filter(Boolean);
+            const more = Math.max(0, refs.length - shown.length);
+            const refText = shown.length ? ` ← ${shown.join(", ")}${more ? ` +${more} more` : ""}` : "";
+            text = `${subaction === "resolve" ? "✅" : "✗"} ${subaction} ${dir}${refText}`;
+            break;
+          }
+          case "advisory": {
+            if (!dir) return fallback();
+            const reviewRef = clean(args?.review_ref);
+            text = `❓ advisory ${dir}${reviewRef ? ` ← ${reviewRef}` : ""}${reasonLine}`;
+            break;
+          }
+          case "park":
+          case "reopen":
+            if (!dir) return fallback();
+            text = `${subaction === "park" ? "💤" : "🔓"} ${subaction} ${dir}${reasonLine}`;
+            break;
+          case "pivot": {
+            const from = quote(args?.from), to = quote(args?.to);
+            if (!from || !to) return fallback();
+            text = `🔀 pivot ${from} → ${to}${reasonLine}`;
+            break;
+          }
+          case "expedition_stop":
+            text = "🏁 expedition stop";
+            break;
+          default:
+            return fallback();
+        }
+        return new Text(text, 0, 0);
+      } catch {
+        return fallback();
+      }
+    },
     parameters: {
       type: "object",
       properties: {
@@ -9840,8 +9919,24 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (!allowed) {
         return fail("invalid_argument", `unknown action ${JSON.stringify(String(action))}; allowed: start open record close stop status report resolve`);
       }
+      // Redirect hint (user bug report 2026-11-12, lob-collector-data): the agent
+      // repeatedly sent question-close fields (rule_id/verdict) to the expedition
+      // map action. The plain field list did not say WHERE those fields belong, so
+      // name the right action for the known cross-scheme confusion.
+      const argHint = (extraKeys: string[]): string | null => {
+        const hasCloseOnly = extraKeys.includes("rule_id") || extraKeys.includes("verdict");
+        if (hasCloseOnly && action === "expedition") {
+          return "rule_id/verdict belong to closing a campaign QUESTION: use research_questions(action=close, question_id, rule_id, verdict, reason). To close a map DIRECTION make a separate expedition_map call with subaction=resolve or subaction=reject and refs to already-closed questions; advisory and park are distinct subactions.";
+        }
+        if (hasCloseOnly && (action === "open" || action === "record")) {
+          return "rule_id/verdict belong to research_questions(action=close, question_id, rule_id, verdict), not to this action";
+        }
+        return null;
+      };
+      const extraKeys = Object.keys(params ?? {}).filter((k) => !allowed.includes(k));
+      const hint = argHint(extraKeys);
       const extra = unexpectedArgKeys(params ?? {}, allowed);
-      if (extra) return fail("invalid_argument", extra);
+      if (extra) return fail("invalid_argument", hint ? `${extra}. Hint: ${hint}` : extra);
       const workDir = resolveWorkDir(ctx.cwd);
       // The campaign id is never taken from the model: the pinned id (launch
       // command) wins; resolve stays exempt (operator-only, must reach any
@@ -9882,12 +9977,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
         const res = await researchState.manualResolvePendingOp(dir, researchState.OPERATOR_CONFIRMATION);
         if (!res.ok) return fail(res.reason, res.message);
-        return reply("✅ Pending operation resolved by the operator; the marker is cleared. Check the campaign with research status.");
+        return reply("✅ Pending operation resolved by the operator; the marker is cleared. Check the campaign with research_questions(action=status).");
       }
 
       if (action === "expedition") {
         const chain = activeChain(ctx);
-        if (!chain?.expedition) return fail("not_an_expedition", "research expedition is available only on an expedition chain");
+        if (!chain?.expedition) return fail("not_an_expedition", "expedition_map is available only on an expedition chain");
         const verified = await chainJournal.verifyChain(chain.workDir, chain.chainId);
         if (!verified.ok) {
           await chainJournal.markManualCheckRequired(chain.workDir, chain.chainId, verified.message).catch(() => undefined);
@@ -10016,7 +10111,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         );
         if (!started.ok) return fail(started.reason, started.message);
         return reply(
-          `✅ Research phase started for campaign ${id} (brief sha256 ${checked.sha256}). Questions come only from the brief. Next: research open with a question_id from the brief.`,
+          `✅ Research phase started for campaign ${id} (brief sha256 ${checked.sha256}). Questions come only from the brief. Next: research_questions(action="open", question_id=<id from brief>).`,
         );
       }
 
@@ -10092,7 +10187,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           const verified = await chainJournal.verifyChain(chain.workDir, chain.chainId);
           if (!verified.ok) {
             await chainJournal.markManualCheckRequired(chain.workDir, chain.chainId, verified.message).catch(() => undefined);
-            return reply(reportText + "\n\n" + savedNote + "\nResearch chain journal is damaged: actions are blocked until manual check (research status). Research mode stays ON.");
+            return reply(reportText + "\n\n" + savedNote + "\nResearch chain journal is damaged: actions are blocked until manual check (research_questions(action=status)). Research mode stays ON.");
           }
           const chainStatusNow = await chainJournal.statusOf(chain.workDir, chain.chainId);
           // Exception (spec): the final report of the active campaign of a chain
@@ -10150,7 +10245,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           return reply(reportText + "\n\n" + savedNote + "\nResearch mode is OFF.");
         }
         if (snap.state.phase === "stopped") {
-          return reply(reportText + "\n\n" + savedNote + "\nResearch mode stays ON: the report is not saved. Fix the cause and run research report again.");
+          return reply(reportText + "\n\n" + savedNote + "\nResearch mode stays ON: the report is not saved. Fix the cause and run research_questions(action=report) again.");
         }
         return reply(reportText + "\n\n" + savedNote);
       }
@@ -10282,7 +10377,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const allClosed = afterClose.ok && afterClose.brief !== null && afterClose.replay.vectors.size > 0 &&
           afterClose.brief.questions.every((q) => afterClose.replay.vectors.get(q.id)?.status === "closed");
         const closingNudge = allClosed && afterClose.ok && afterClose.replay.stop === null
-          ? " All questions are closed: pick a stop rule (research stop <rule_id>) then research report."
+          ? " All questions are closed: pick a stop rule, then call research_questions(action=stop, rule_id=<rule_id>, reason=<why the stop condition is met>) and research_questions(action=report)."
           : "";
         return reply(`✅ Vector ${qid} closed: ${verdict} by rule ${rid}.` + findingNote + closingNudge);
       }
@@ -10307,10 +10402,112 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           async () => appendResearchEvent(dir, { event: "stop", rule_id: rid, stop_when: stopRule.when, reason }),
         );
         if (!done.ok) return fail(done.reason, done.message);
-        return reply(`🛑 Research stopped by ${rid}. No vector can be opened in this campaign; a new campaign needs a new brief. ${activeChain(ctx) !== null ? "Next: research report; for a chain campaign the report leaves the chain awaiting_child and research mode stays ON." : "Next: research report; it writes the final report and leaves research mode."}`);
+        return reply(`🛑 Research stopped by ${rid}. No vector can be opened in this campaign; a new campaign needs a new brief. ${activeChain(ctx) !== null ? "Next: research_questions(action=report); for a chain campaign the report leaves the chain awaiting_child and research mode stays ON." : "Next: research_questions(action=report); it writes the final report and leaves research mode."}`);
       }
 
       return fail("invalid_argument", `unknown action ${JSON.stringify(String(action))}`);
+    },
+  };
+  // Keep the combined executor as a hidden internal dispatcher: exposing this broad
+  // schema would reintroduce the question/map field confusion. Aliases below are the
+  // only model-callable research/map tools; existing wiring tests can still call it.
+  pi.registerTool(researchTool);
+
+  const researchExecutor = researchTool.execute as (...args: any[]) => Promise<any>;
+  const researchRenderer = researchTool.renderCall as ((...args: any[]) => any) | undefined;
+  const aliasRefusal = (toolName: string, message: string) => ({
+    content: [{ type: "text" as const, text: refusalText({ reason: "invalid_argument", message }) }],
+    details: { action: toolName, reason: "invalid_argument" },
+  });
+  const makeAliasRenderer = (toolName: string, mapAlias: boolean) => (args: any, theme: any, context: any) => {
+    try {
+      const normalized = mapAlias ? { ...(args ?? {}), action: "expedition" } : args;
+      return researchRenderer?.(normalized, theme, context) ?? new Text(theme ? theme.fg("toolTitle", theme.bold(`${toolName} `)) : `${toolName} `, 0, 0);
+    } catch {
+      return new Text(`${toolName} `, 0, 0);
+    }
+  };
+  const campaignAliasKeys = new Set(["action", "expected_sha256", "question_id", "evidence_ref", "rule_id", "verdict", "reason"]);
+  const campaignAliasActions = new Set(["start", "open", "record", "close", "stop", "status", "report", "resolve", "chain_stop"]);
+  const mapAliasKeys = new Set(["subaction", "dir", "from", "to", "reason", "why", "refs", "review_ref", "review_sha256"]);
+  const mapAliasActions = new Set(["open", "activate", "resolve", "reject", "advisory", "park", "reopen", "pivot", "status"]);
+
+  registerGatedTool({
+    name: "research_questions",
+    label: "Research campaign questions",
+    description: "Campaign lifecycle and approved-brief question tool. Actions: start, open, record, close, stop, status, report, resolve, chain_stop. `close` resolves a CAMPAIGN QUESTION using question_id + rule_id + verdict + evidence. `resolve` is OPERATOR-only pending-operation cleanup requiring owner dialog confirmation. For EXPEDITION MAP direction operations use expedition_map, not this tool.",
+    promptSnippet: "Campaign questions: open, record evidence, close questions under the approved brief; expedition map is a separate tool",
+    promptGuidelines: [
+      "Use research_questions(action=close) to close a campaign question: provide question_id, rule_id from that question, verdict, and recorded evidence.",
+      "This tool's resolve is only an operator-confirmed pending-op cleanup; it does not resolve map directions.",
+      "Do not pass map refs/review_ref/from/to here; use expedition_map for map operations.",
+    ],
+    renderCall: makeAliasRenderer("research_questions", false),
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["start", "open", "record", "close", "stop", "status", "report", "resolve", "chain_stop"], description: "Campaign/question action." },
+        expected_sha256: { type: "string", description: "start only: approved brief SHA-256." },
+        question_id: { type: "string", description: "open/close: question id from the approved brief." },
+        evidence_ref: { type: "string", description: "record only: path:lines or path#anchor." },
+        rule_id: { type: "string", description: "close: decision rule for that question; stop/chain_stop: charter stop rule." },
+        verdict: { type: "string", description: "close only: verdict declared by the approved brief." },
+        reason: { type: "string", description: "close/stop reason." },
+      },
+      required: ["action"],
+      additionalProperties: false,
+    } as any,
+    async execute(toolCallId: string, params: any, signal: any, onUpdate: any, ctx: ExtensionContext) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
+      const extra = Object.keys(params ?? {}).filter((key) => !campaignAliasKeys.has(key));
+      if (extra.length) {
+        const mapOnly = extra.some((key) => ["refs", "review_ref", "review_sha256", "from", "to"].includes(key));
+        return aliasRefusal("research_questions", `unexpected field(s) ${extra.map((key) => JSON.stringify(key)).join(", ")}; ${mapOnly ? "use expedition_map(subaction=..., refs=...) for map direction operations" : "only campaign/question fields are accepted"}`);
+      }
+      if (!campaignAliasActions.has(params?.action)) return aliasRefusal("research_questions", `unknown campaign/question action ${JSON.stringify(String(params?.action))}`);
+      return researchExecutor(toolCallId, params, signal, onUpdate, ctx);
+    },
+  });
+
+  registerGatedTool({
+    name: "expedition_map",
+    label: "Expedition direction map",
+    description: "Expedition MAP ONLY: open/activate/resolve/reject/advisory/park/reopen/pivot/status directions. `resolve`/`reject` close a MAP DIRECTION using refs to already-closed campaign questions; they do NOT close a question and never accept rule_id/verdict. For questions use research_questions(action=close, question_id, rule_id, verdict).",
+    promptSnippet: "Expedition map only: activate/resolve/reject directions using refs; campaign questions use research_questions",
+    promptGuidelines: [
+      "Use expedition_map(subaction=activate, dir=<name>, why=<rationale>) to activate the current direction.",
+      "Use expedition_map(subaction=resolve, dir=<name>, refs=[{campaign,question}]) or expedition_map(subaction=reject, dir=<name>, refs=[{campaign,question}]) to close a MAP DIRECTION after referenced questions are closed; reason is optional for both.",
+      "This tool never accepts rule_id or verdict. Use research_questions(action=close, question_id, rule_id, verdict) to close a campaign question.",
+      "Do not confuse research_questions(action=resolve), which is operator-only pending-op cleanup, with map resolve.",
+    ],
+    renderCall: makeAliasRenderer("expedition_map", true),
+    parameters: {
+      type: "object",
+      properties: {
+        subaction: { type: "string", enum: ["open", "activate", "resolve", "reject", "advisory", "park", "reopen", "pivot", "status"], description: "Map transition or status." },
+        dir: { type: "string", description: "Direction name for open/activate/resolve/reject/advisory/park/reopen." },
+        from: { type: "string", description: "pivot only: currently active direction." },
+        to: { type: "string", description: "pivot only: open target direction." },
+        reason: { type: "string", description: "Transition rationale; required for park/reopen/pivot." },
+        why: { type: "string", description: "open/activate rationale." },
+        refs: { type: "array", items: { type: "object", properties: { campaign: { type: "string" }, question: { type: "string" } }, required: ["campaign", "question"], additionalProperties: false }, description: "resolve/reject only: closed question refs proving direction outcome." },
+        review_ref: { type: "string", description: "advisory only: review file path." },
+        review_sha256: { type: "string", description: "advisory only: SHA-256 of the review file." },
+      },
+      required: ["subaction"],
+      additionalProperties: false,
+    } as any,
+    async execute(toolCallId: string, params: any, signal: any, onUpdate: any, ctx: ExtensionContext) {
+      const modeGate = assertModeActive(ctx);
+      if (modeGate) return modeGate;
+      const extra = Object.keys(params ?? {}).filter((key) => !mapAliasKeys.has(key));
+      if (extra.length) {
+        const questionOnly = extra.some((key) => ["rule_id", "verdict", "question_id", "expected_sha256", "evidence_ref"].includes(key));
+        return aliasRefusal("expedition_map", `unexpected field(s) ${extra.map((key) => JSON.stringify(key)).join(", ")}; ${questionOnly ? "use research_questions(action=close, question_id, rule_id, verdict) to close a campaign question" : "only expedition map fields are accepted"}`);
+      }
+      if (!mapAliasActions.has(params?.subaction)) return aliasRefusal("expedition_map", `unknown expedition-map subaction ${JSON.stringify(String(params?.subaction))}`);
+      return researchExecutor(toolCallId, { ...params, action: "expedition" }, signal, onUpdate, ctx);
     },
   });
 
@@ -10338,8 +10535,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
    *  does not abort or tear down UI: the stop runs inside a tool call. The OFF
    *  activation is persisted; the campaign pin is released so the next draft
    *  archives the finished campaign. The state-root pin stays, so the final
-   *  report still finds the campaign. Research tools are not mode-gated, so
-   *  research report keeps working. */
+   *  report still finds the campaign. The final report is available through
+   *  research_questions(action=report). */
   function exitResearchMode(ctx: ExtensionContext, campaignId: string): void {
     const runtime = getRuntime(ctx);
     recordAutoresearchActivation(resolveWorkDir(ctx.cwd), false);
@@ -10350,7 +10547,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     runtime.researchChain = null;
     runtime.autoResumeTurns = 0;
     cancelPendingResume(runtime);
-    ctx.ui.notify(`Research campaign ${campaignId} stopped — research mode OFF. The final report stays available: research report.`, "info");
+    ctx.ui.notify(`Research campaign ${campaignId} stopped — research mode OFF. The final report stays available: research_questions(action=report).`, "info");
   }
 
   // ── research-charter helpers (bd pi-autoresearch-5ol) ────────────────────
@@ -10551,8 +10748,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
     const message = [
       `Research chain: the report of campaign ${parentCampaignId} is recorded and the chain can continue.`,
-      `1. Close the direction of the finished campaign on the map: research expedition with subaction resolve or reject (refs citing closed questions of this chain) — or advisory with a review file, or park with a reason if the direction should stay unresearched.`,
-      `2. Activate the next direction (research expedition activate) or pivot from the closed one.`,
+      `1. Close campaign questions with research_questions(action="close", question_id, rule_id, verdict) first (evidence must already be recorded with action="record"). Then close the finished direction using separate calls: expedition_map(subaction="resolve", dir=<name>, refs=[{campaign,question}]) or expedition_map(subaction="reject", dir=<name>, refs=[{campaign,question}]) with refs citing closed questions of this chain; for other outcomes use expedition_map(subaction="advisory", dir=<name>, review_ref=<path>, review_sha256=<sha256>) or expedition_map(subaction="park", dir=<name>, reason=<why>). Question close is not direction resolve. Use expedition_map for all direction transitions.`,
+      `2. Activate the next direction with expedition_map(subaction="activate", dir=<name>, why=<rationale>) or pivot with expedition_map(subaction="pivot", from=<active>, to=<target>, reason=<why>). Use expedition_map for direction activation and pivot.`,
       `3. Write the brief for the NEXT campaign now with research_brief draft:`,
       `- every question must carry finding_refs: [{ campaign: "${parentCampaignId}", question: "<closed question id>" }] citing a closed question of this chain;`,
       `- keep the caveat_block, the verdict set and the evidence_gate exactly as in the parent brief;`,
@@ -10650,7 +10847,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       if (command === "finalize") {
         if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd), ctx)) {
-          ctx.ui.notify("Research campaign active — use research status; the legacy finalize flow is not started.", "info");
+          ctx.ui.notify("Research campaign active — use research_questions(action=status); the legacy finalize flow is not started.", "info");
           return;
         }
         if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) {
@@ -10690,7 +10887,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const note = trimmedArgs.replace(/^council\b\s*/i, "").trim();
         const workDir = resolveWorkDir(ctx.cwd);
         if (await researchBlocksOrdinaryLoop(workDir, ctx)) {
-          ctx.ui.notify("Research campaign active — the council is blocked in this mode; use research status.", "info");
+          ctx.ui.notify("Research campaign active — the council is blocked in this mode; use research_questions(action=status).", "info");
           return;
         }
         const cfg = readCouncilConfig(workDir);
@@ -10831,7 +11028,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const parallelMatch = command.match(/^parallel-(best-of-n|stack|search)\b/);
       if (parallelMatch) {
         if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd), ctx)) {
-          ctx.ui.notify("Research campaign active — the legacy parallel flow is not started; use research status.", "info");
+          ctx.ui.notify("Research campaign active — the legacy parallel flow is not started; use research_questions(action=status).", "info");
           return;
         }
         if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) {
@@ -11148,23 +11345,23 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // No /skill: prefix: the metric-loop skill must not be expanded into a research campaign.
         const researchKickoff = resumePhase === "research"
           ? [
-              `Research campaign ${requestedId} is already in the research phase. Continue it: research status first, then open/record/close the remaining questions, research stop when the stop rule fires, research report.`,
+              `Research campaign ${requestedId} is already in the research phase. Continue it: call research_questions(action=status), then use separate research_questions calls with action=open plus question_id, action=record plus evidence_ref, or action=close plus question_id/rule_id/verdict as needed for the remaining questions; when the stop rule fires call research_questions(action=stop, rule_id=<rule_id>, reason=<why the stop condition is met>) and research_questions(action=report).`,
             ].join("\n")
           : resumePhase === "briefing"
             ? [
-                `Research campaign ${requestedId} already has a brief draft. Continue: research_brief propose (the owner approves the Brief SHA-256 dialog), then research start, open each question, record evidence, close each question, research stop, research report.`,
+                `Research campaign ${requestedId} already has a brief draft. Continue: research_brief(action=propose) (the owner approves the Brief SHA-256 dialog), then research_questions(action=start, expected_sha256); for each brief question call research_questions(action=open, question_id), research_questions(action=record, evidence_ref), and research_questions(action=close, question_id, rule_id, verdict). When the stop rule fires call research_questions(action=stop, rule_id, reason), then research_questions(action=report).`,
               ].join("\n")
             : [
               "Research campaign: briefing phase." + (description ? ` Campaign description: ${description}.` : ""),
-              "The optimization loop does not apply here; the research_brief and research tools are the campaign tools.",
+              "The optimization loop does not apply here; research_brief and research_questions are the campaign tools.",
               requestedId !== null
                 ? "Wait for the next message: it gives the brief file path and its SHA-256. Then follow it in order:"
                 : "Formulate the brief (questions, decision rules, stop rules) from the campaign description, then:",
               "1. research_brief draft with the brief object" + (requestedId !== null ? "," : " (the campaign id is generated for you; note it from the reply),"),
               "2. research_brief propose (the owner approves the Brief SHA-256 dialog),",
-              "3. research start,",
-              "4. research open for each question, record evidence, research close with a verdict,",
-              "5. research stop, then research report.",
+              "3. research_questions(action=start, expected_sha256),",
+              "4. research_questions(action=open, question_id) for each question, then research_questions(action=record, evidence_ref) and research_questions(action=close, question_id, rule_id, verdict),",
+              "5. research_questions(action=stop, rule_id, reason), then research_questions(action=report).",
             ].join("\n");
         sendWhenReady(ctx, researchKickoff);
         return;
@@ -11186,7 +11383,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // A candidate campaign is active: the legacy create kickoff prescribes the
       // ordinary loop (run/log), which is blocked. Point to the campaign instead.
       if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd), ctx)) {
-        ctx.ui.notify("Research campaign active — continue it with research status; the legacy autoresearch kickoff is not sent.", "info");
+        ctx.ui.notify("Research campaign active — continue it with research_questions(action=status); the legacy autoresearch kickoff is not sent.", "info");
         return;
       }
       if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) {

@@ -73,7 +73,7 @@ const EXPECTED_TOOLS = ["optimize_brief",
   "council_convene", "record_finding", "update_finding", "search_precedents", "assess_precedents", "inspect_results",
   "log_measurement_change", "verify_measurement_change", "revert_measurement_change",
   "log_observation", "record_analysis", "direction_review",
-  "research_brief", "research",
+  "research_brief", "research", "research_questions", "expedition_map",
 ];
 
 // Legacy tools removed from this build; keep asserting that none are registered.
@@ -88,14 +88,17 @@ const EXPECTED_HOOKS = [
   "before_agent_start", "tool_execution_end", "tool_call",
 ];
 
-await test("registers all 27 tools (parallel + branching disabled)", async () => {
+await test("registers all 29 tools with the combined dispatcher hidden (parallel + branching disabled)", async () => {
   const dir = makeTempDir("reg");
   const { pi } = await loadExtension(dir);
   const names = pi.tools.map((t) => t.name);
   for (const expected of EXPECTED_TOOLS) {
     assert.ok(names.includes(expected), `Missing tool: ${expected}`);
   }
-  assert.strictEqual(names.length, 27, `Expected 27 tools, got ${names.length}: ${names.join(", ")}`);
+  assert.strictEqual(names.length, 29, `Expected 29 tools, got ${names.length}: ${names.join(", ")}`);
+  assert.strictEqual(pi.tools.find((t) => t.name === "research").exposure, "hidden", "combined dispatcher is registered internally but hidden from the model");
+  assert.notStrictEqual(pi.tools.find((t) => t.name === "research_questions").exposure, "hidden");
+  assert.notStrictEqual(pi.tools.find((t) => t.name === "expedition_map").exposure, "hidden");
 });
 
 await test("registers all 11 hooks", async () => {

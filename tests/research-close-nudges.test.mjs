@@ -56,20 +56,21 @@ test("close points to stop and report only after the final brief question", asyn
   assert.doesNotMatch(first, /pick a stop rule/i);
   const last = textOf(await h.close("Q2"));
   assert.match(last, /all questions are closed/i);
-  assert.match(last, /research stop <rule_id>/);
-  assert.match(last, /research report/);
+  assert.match(last, /research_questions\(action=stop, rule_id=<rule_id>, reason=/);
+  assert.match(last, /research_questions\(action=report\)/);
 }, { timeout: 60000 });
 
 test("drift reminder changes from open-work wording to stop/report after all questions close", async () => {
   const h = await fixture();
   const openText = await h.nudge();
-  assert.match(openText, /research status\/open\/record\/close/);
+  assert.match(openText, /research_questions\(action=status\)/);
+  assert.match(openText, /research_questions calls with action=open, action=record, or action=close/);
   await h.close("Q1");
   await h.close("Q2");
   const closedText = await h.nudge();
-  assert.match(closedText, /research stop <rule_id>/);
-  assert.match(closedText, /research report/);
-  assert.doesNotMatch(closedText, /open\/record\/close/);
+  assert.match(closedText, /research_questions\(action=stop, rule_id=<rule_id>, reason=/);
+  assert.match(closedText, /research_questions\(action=report\)/);
+  assert.doesNotMatch(closedText, /research status\/open\/record\/close/);
 }, { timeout: 60000 });
 
 test("auto-resume limit notification names a questions-complete campaign needing stop and report", async () => {
@@ -86,7 +87,7 @@ test("send-time override replaces legacy message only while research campaign bl
   const h = await fixture();
   const runtime = { pendingResumeMessage: "Please run_experiment and log_experiment.", pendingResumeTimer: null, autoresearchMode: true, autoResumeTurns: 0, state: { results: [], currentSegment: 0 } };
   await h.module.sendPendingResumeIfReadyForTest(h.ctx, runtime);
-  assert.equal(h.pi.sentMessages.at(-1)?.text, "Continue the research campaign: research status/open/record/close; STOP on manual_check_required.");
+  assert.equal(h.pi.sentMessages.at(-1)?.text, "Continue the research campaign: call research_questions(action=status), then issue separate research_questions calls with action=open, action=record, or action=close as indicated by the approved brief; STOP on manual_check_required.");
   const stateAware = "Continue the active research campaign with its recorded evidence.";
   runtime.pendingResumeMessage = stateAware;
   await h.module.sendPendingResumeIfReadyForTest(h.ctx, runtime);

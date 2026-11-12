@@ -129,8 +129,8 @@ test("continuation message prescribes close direction → activate next → brie
   await h.call("research",{action:"report"});
   assert.equal(h.pi.sentMessages.length,before+1,"exactly one continuation sent");
   const continuation=h.pi.sentMessages[h.pi.sentMessages.length-1].text;
-  assert.match(continuation,/subaction resolve or reject/,"step 1: close the finished direction");
-  assert.match(continuation,/research expedition activate|research expedition pivot/,"step 2: activate the next direction");
+  assert.match(continuation,/expedition_map\(subaction="resolve", dir=<name>, refs=\[\{campaign,question\}\]\).*expedition_map\(subaction="reject", dir=<name>, refs=\[\{campaign,question\}\]\)/,"step 1: close the finished direction with valid separate calls");
+  assert.match(continuation,/expedition_map\(subaction="activate", dir=<name>, why=<rationale>\).*expedition_map\(subaction="pivot", from=<active>, to=<target>, reason=<why>\)/,"step 2: activate or pivot with required arguments");
   assert.match(continuation,/research_brief draft/,"step 3: then write the brief");
   assert.match(continuation,/finding_refs/,"finding_refs requirement preserved");
   assert.match(continuation,/caveat_block/,"caveat requirement preserved");
