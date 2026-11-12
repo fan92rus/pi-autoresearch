@@ -2625,6 +2625,46 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (stateRoot && stateRoot !== workDir && researchScanSync(stateRoot).blocks) return true;
     return false;
   };
+
+  /**
+   * Launch-guard scan for the expedition entry point (bd pi-autoresearch-4e6):
+   * a manual owner launch is the legitimate next step after a campaign
+   * finishes, so a TERMINAL (stopped) campaign does not block. Blocking: any
+   * campaign in phase briefing or research, a pending operation, or an
+   * unreadable/invalid state (fail closed). Deliberately NOT
+   * researchScanSync/researchBlocksOrdinaryLoop — those must keep treating
+   * stopped as blocking for auto-continuations (design §8/§9).
+   */
+  const researchLaunchBlockingScan = (workDir: string): boolean => {
+    const root = researchState.researchRoot(workDir);
+    if (!fs.existsSync(root)) return false;
+    let names: string[];
+    try {
+      names = fs.readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+    } catch {
+      return true;
+    }
+    for (const name of names) {
+      const dir = path.join(root, name);
+      if (fs.existsSync(path.join(dir, researchState.PENDING_OP_FILE))) return true;
+      try {
+        const raw = JSON.parse(fs.readFileSync(path.join(dir, researchState.STATE_FILE), "utf8"));
+        const valid = raw && typeof raw === "object" && raw.schema_version === researchState.RESEARCH_STATE_SCHEMA_VERSION && raw.campaign_id === name && (researchState.CAMPAIGN_PHASES as readonly string[]).includes(raw.phase);
+        if (!valid) return true;
+        if (raw.phase !== "stopped") return true;
+      } catch {
+        return true;
+      }
+    }
+    return false;
+  };
+  /** Session-aware wrapper (same pin semantics as researchBlocksOrdinaryLoop). */
+  const researchBlocksExpeditionLaunch = async (workDir: string, ctx?: ExtensionContext): Promise<boolean> => {
+    if (researchLaunchBlockingScan(workDir)) return true;
+    const stateRoot = ctx ? getRuntime(ctx).researchStateRoot : null;
+    if (stateRoot && stateRoot !== workDir && researchLaunchBlockingScan(stateRoot)) return true;
+    return false;
+  };
   // Guard for starting a new research campaign: any campaign directory in any
   // phase (briefing included) refuses. Unlike researchBlocksOrdinaryLoop, which
   // leaves briefing campaigns unblocked for the ordinary loop and git.
@@ -10706,7 +10746,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           }
         }
         if (!ctx.hasUI) { ctx.ui.notify("Expedition needs TUI confirmation; headless use requires the --expedition-doc wrapper.", "error"); return; }
-        if (await researchBlocksOrdinaryLoop(workDir, ctx)) { ctx.ui.notify("Cannot launch expedition while a research campaign is active; resume or finish it first.", "error"); return; }
+        if (await researchBlocksExpeditionLaunch(workDir, ctx)) { ctx.ui.notify("Cannot launch expedition while a research campaign is active; resume or finish it first.", "error"); return; }
         if (await campaignBlocksOrdinaryLoop(workDir)) { ctx.ui.notify("Candidate campaign active; finish it before starting an expedition.", "error"); return; }
         recordAutoresearchActivation(workDir, true); setAutoresearchMode(ctx, true);
         runtime.autoResumeTurns = 0; runtime.consecutiveDriftResumes = 0; updateWidget(ctx);
