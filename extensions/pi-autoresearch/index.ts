@@ -313,10 +313,15 @@ export function buildExpeditionWidgetLines(
     if (!replay.ok) return ["(map unavailable: journal damaged)"];
     const openQuestions: string[] = [];
     if (campaignDir) {
+      // Independent try blocks: an unreadable brief.json must not discard the
+      // open-question set from a perfectly readable log.jsonl (the ids fallback).
+      let questionTexts: Map<string, string> | null = null;
       try {
         const brief = JSON.parse(fs.readFileSync(path.join(campaignDir, "brief.json"), "utf8"));
+        questionTexts = new Map((Array.isArray(brief.questions) ? brief.questions : []).map((q: any) => [q.id, q.text ?? q.id]));
+      } catch { /* brief is optional; question texts fall back to ids */ }
+      try {
         const log = fs.readFileSync(path.join(campaignDir, "log.jsonl"), "utf8");
-        const questionTexts = new Map((Array.isArray(brief.questions) ? brief.questions : []).map((q: any) => [q.id, q.text ?? q.id]));
         const opened = new Set<string>();
         for (const line of log.split(/\r?\n/).filter(Boolean)) {
           const event = JSON.parse(line);
@@ -326,8 +331,8 @@ export function buildExpeditionWidgetLines(
           if (action === "question_opened" || action === "open") opened.add(id);
           if (action === "question_closed" || action === "close") opened.delete(id);
         }
-        for (const id of opened) openQuestions.push(String(questionTexts.get(id) ?? id));
-      } catch { /* brief/log are optional for rendering; map remains useful */ }
+        for (const id of opened) openQuestions.push(String(questionTexts?.get(id) ?? id));
+      } catch { /* log is optional for rendering; map remains useful */ }
     }
     return expedition.expeditionWidgetLines(replay.map, { ...info, openQuestions });
   } catch {
@@ -2758,6 +2763,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         "If status reports manual_check_required: STOP — report the pending operation and wait for the operator (resolve).",
       ].join(" ");
     }
+    // No campaign is active. Prescribe the legacy cycle ONLY when the loop was
+    // actually initialized: without a ledger (.auto/log.jsonl) nagging a chat
+    // turn with run_experiment/log_experiment is noise (observed live in a
+    // chat-only project, bd drift-nudge fix). Name the start commands instead.
+    if (!fs.existsSync(autoresearchJsonlPath(resolveWorkDir(cwd)))) {
+      return [
+        "⚠ Last turn did no experiment work and no campaign is active.",
+        "The experiment loop is not initialized in this project (no .auto/log.jsonl).",
+        "To start a loop run /autoresearch <goal>; to run a research campaign use /autoresearch research <topic>.",
+      ].join(" ");
+    }
     return [
       "⚠ Last turn used no experiment tools (chat/reads don't advance the loop).",
       "Resume the cycle now: propose_hypothesis → run_experiment → log_experiment.",
@@ -3494,6 +3510,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     "tree_status", "finalize_research",
     // Research-campaign tools are campaign work, not idle turns (design §8).
     "research", "research_brief",
+    // Expedition design-phase work is campaign work: without it the drift
+    // branch nags the legacy cycle while the agent drafts the expedition doc.
+    "expedition_brief",
     // Council facilitation IS loop work: without these, drift-resume would nag
     // the agent mid-council (observed in the E2E run).
     "council_write_entry", "council_check_consensus",
@@ -10023,7 +10042,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               exitResearchMode(ctx, id);
               return reply(reportText + "\n\n" + savedNote + "\nThe charter file changed since the owner confirmed it: chain status manual_check_required. Research mode is OFF (spec: the predicate is false after the report).");
             }
-            await chainJournal.setChainStatus(chain.workDir, chain.chainId, "limit_reached").catch(() => undefined);
+            const limitWrite = await chainJournal.setChainStatus(chain.workDir, chain.chainId, "limit_reached");
+            if (!limitWrite.ok) {
+              // Review M4/N2 (same invariant as chain_stop): a journal write that
+              // fails must not turn the mode OFF while the journal still says
+              // active/awaiting_child. The report stays saved; the owner fixes
+              // the journal and reports again.
+              let freshStatus = "active";
+              try { freshStatus = await chainJournal.statusOf(chain.workDir, chain.chainId); } catch { /* best effort */ }
+              return reply(reportText + "\n\n" + savedNote + `\nwarning: limit_reached could not be recorded (${limitWrite.message}); the chain stays ${freshStatus}; research mode stays ON; fix the journal and report again.`);
+            }
             exitResearchMode(ctx, id);
             return reply(reportText + "\n\n" + savedNote + "\nResearch mode is OFF: the charter limit is reached (chain limit_reached). No further chain campaigns are created.");
           }
@@ -10406,9 +10434,25 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (!verified.ok) return `warning: expedition report unavailable (${verified.message})`;
     const replay = expedition.replayExpeditionMap(verified.entries);
     if (!replay.ok) return `warning: expedition report unavailable (${replay.message})`;
+    // Review B1: an ACTIVE direction whose campaign is gone or stopped is a
+    // divergence the report must surface (spec: Unfinished section). Computed
+    // here because only the caller can see the campaign state on disk.
+    // Review B1b: replay does not validate history, so campaign-absent active
+    // directions are possible — they are divergent by definition (no live
+    // campaign was ever attached); ALL active directions are checked.
+    let activeDirWithoutCampaign: string | undefined;
+    const activeDirs = [...replay.map.directions.values()].filter(d => d.status === "active");
+    for (const activeDir of activeDirs) {
+      if (activeDirWithoutCampaign !== undefined) break;
+      if (typeof activeDir.campaign !== "string" || activeDir.campaign === "") { activeDirWithoutCampaign = activeDir.dir; break; }
+      const resolved = researchState.resolveCampaignDir(chain.workDir, activeDir.campaign);
+      if (!resolved.ok) { activeDirWithoutCampaign = activeDir.dir; break; }
+      const campaignState = await researchState.readState(resolved.dir);
+      if (!campaignState.ok || campaignState.state.phase === "stopped") activeDirWithoutCampaign = activeDir.dir;
+    }
     const campaigns: Array<{id:string;reportPath:string}> = [];
     for (const e of verified.entries) {
-      const cid = e.type === "chain_created" ? (e as any).root_campaign_id : e.type === "campaign_added" ? (e as any).campaign_id : undefined;
+      const cid = e.type === "chain_created" ? (e as { root_campaign_id?: string }).root_campaign_id : e.type === "campaign_added" ? (e as { campaign_id?: string }).campaign_id : undefined;
       if (typeof cid !== "string" || campaigns.some(c => c.id === cid)) continue;
       for (const base of [chain.workDir]) {
         const resolved = researchState.resolveCampaignDir(base, cid);
@@ -10418,7 +10462,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const dir = chainJournal.chainDir(chain.workDir, chain.chainId);
     if (!dir) return "warning: expedition report unavailable (chain directory is unavailable)";
     const reportPath = path.join(dir, "expedition-report.md");
-    const report = expedition.expeditionReportText(replay.map,{chainId:chain.chainId,finalStatus,campaigns,computedAt:new Date().toISOString()});
+    const report = expedition.expeditionReportText(replay.map,{chainId:chain.chainId,finalStatus,campaigns,computedAt:new Date().toISOString(),...(activeDirWithoutCampaign ? {activeDirWithoutCampaign} : {})});
     try { await researchState.writeFileAtomic(reportPath, report + "\\n"); return `Expedition report saved to ${reportPath}`; }
     catch (e) { return `warning: expedition report could not be saved (${String(e)})`; }
   };

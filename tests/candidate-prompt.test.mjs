@@ -15,6 +15,7 @@ import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { createFakePi, makeCtx } from "./fake-pi.ts";
+import { markSessionStarted } from "./optimize-approve-helper.mjs";
 
 const LEGACY_LOOP_MARKERS = [
   "One idea = one cycle",
@@ -124,13 +125,35 @@ test("B1: agent_end under an active campaign never sends legacy-cycle resume tex
   assert.equal(legacy.length, 0, `no legacy-cycle steers under a campaign: ${JSON.stringify(legacy.map((m) => m.text))}`);
 }, { timeout: 30000 });
 
-test("B1: agent_end without a campaign keeps the legacy drift-resume text", async () => {
-  const { pi, hook, ctx } = await makeFullHarness("steer-legacy", { campaignActive: false });
+test("B1: agent_end without a campaign keeps the legacy drift-resume text (initialized loop)", async () => {
+  const { pi, hook, ctx, dir } = await makeFullHarness("steer-legacy", { campaignActive: false });
+  markSessionStarted(dir); // an initialized loop (ledger exists) keeps the legacy wording
   await hook("agent_start")({ messages: [] }, ctx);
   await hook("agent_end")({ messages: [] }, ctx);
   await new Promise((r) => setTimeout(r, 1100));
   const drift = pi.sentMessages.filter((m) => /propose_hypothesis → run_experiment → log_experiment/.test(m.text));
-  assert.equal(drift.length, 1, `legacy drift resume must survive without a campaign: ${JSON.stringify(pi.sentMessages.map((m) => m.text))}`);
+  assert.equal(drift.length, 1, `legacy drift resume must survive with an initialized loop: ${JSON.stringify(pi.sentMessages.map((m) => m.text))}`);
+}, { timeout: 30000 });
+
+test("B1: drift without a ledger and without a campaign names the uninitialized loop, not the legacy cycle", async () => {
+  const { pi, hook, ctx } = await makeFullHarness("steer-nolog", { campaignActive: false });
+  await hook("agent_start")({ messages: [] }, ctx);
+  await hook("agent_end")({ messages: [] }, ctx);
+  await new Promise((r) => setTimeout(r, 1100));
+  const legacy = pi.sentMessages.filter((m) => /propose_hypothesis → run_experiment → log_experiment/.test(m.text));
+  assert.equal(legacy.length, 0, `no legacy cycle prescription without a ledger: ${JSON.stringify(pi.sentMessages.map((m) => m.text))}`);
+  const uninit = pi.sentMessages.filter((m) => /not initialized/.test(m.text));
+  assert.equal(uninit.length, 1, `drift without a ledger must name the uninitialized loop: ${JSON.stringify(pi.sentMessages.map((m) => m.text))}`);
+}, { timeout: 30000 });
+
+test("B1: an expedition_brief tool turn counts as loop work, not drift", async () => {
+  const { pi, hook, ctx } = await makeFullHarness("steer-expbrief", { campaignActive: false });
+  await hook("agent_start")({ messages: [] }, ctx);
+  await hook("tool_execution_end")({ toolName: "expedition_brief" }, ctx);
+  await hook("agent_end")({ messages: [] }, ctx);
+  await new Promise((r) => setTimeout(r, 1100));
+  const drift = pi.sentMessages.filter((m) => /used no experiment tools|propose_hypothesis → run_experiment/.test(m.text));
+  assert.equal(drift.length, 0, `expedition_brief is loop work: no drift accusation: ${JSON.stringify(pi.sentMessages.map((m) => m.text))}`);
 }, { timeout: 30000 });
 
 test("B1: session_compact under an active campaign resumes the campaign, not the legacy loop", async () => {
@@ -181,7 +204,8 @@ test("B1: a partial-cycle turn (loop tool used, no experiment) under a campaign 
 }, { timeout: 30000 });
 
 test("B1: a partial-cycle turn without a campaign keeps the legacy default resume", async () => {
-  const { pi, hook, ctx } = await makeFullHarness("steer-partial-legacy", { campaignActive: false });
+  const { pi, hook, ctx, dir } = await makeFullHarness("steer-partial-legacy", { campaignActive: false });
+  markSessionStarted(dir); // partial-cycle wording is a legacy-loop concept (initialized loop)
   await hook("agent_start")({ messages: [] }, ctx);
   await hook("tool_execution_end")({ toolName: "propose_hypothesis" }, ctx);
   await hook("agent_end")({ messages: [] }, ctx);

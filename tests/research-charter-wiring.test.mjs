@@ -698,3 +698,32 @@ test("review-3.7: charter stop rule from awaiting_child stops the chain and turn
   assert.equal(chainStatus(dir, "c1-chain"), "stopped_by_rule", res);
   assert.equal(h.pi.notifications.some((n) => /mode OFF/i.test(n.text)), true, "mode OFF announced immediately from the pause");
 });
+
+test("review-B2: a failed limit_reached write keeps the mode ON (M4/N2 invariant)", async () => {
+  const dir = makeWorkDir("limit-write-fail");
+  writeStoppedRootCampaign(dir, "c1");
+  const charterPath = writeCharter(dir, { max_campaigns: 1 });
+  const h = await loadExtensionBare(dir, "limit-write-fail", true);
+  await launchWithCharter(h, charterPath, "c1");
+  // Plant a stale chain lock AFTER launch: verify/statusOf read without the
+  // lock (the report path passes its checks), but setChainStatus ->
+  // appendEntry -> acquireChainLock refuses lock_busy, so the status write
+  // fails while everything else is healthy — exactly the swallowed write.
+  const chainDirHere = chainDirOf(dir, "c1-chain");
+  fs.writeFileSync(path.join(chainDirHere, "lock"), '{"token":"stale","pid":0}');
+
+  const res = textOf(await call(h, "research", { action: "report" }));
+
+  assert.match(res, /limit_reached could not be recorded/i, res);
+  assert.match(res, /mode stays ON/i, res);
+  // Mode must still be ON: the gated research tools keep working (not the
+  // mode-OFF refusal).
+  const status = textOf(await call(h, "research", { action: "status" }));
+  assert.doesNotMatch(status, /Autoresearch mode is OFF/);
+  // Repair the journal (drop the stale lock): the SAME report action now
+  // succeeds and exits the mode — no permanent lock-out.
+  fs.rmSync(path.join(chainDirHere, "lock"));
+  const res2 = textOf(await call(h, "research", { action: "report" }));
+  assert.match(res2, /Research mode is OFF/i, res2);
+  assert.equal(chainStatus(dir, "c1-chain"), "limit_reached");
+});

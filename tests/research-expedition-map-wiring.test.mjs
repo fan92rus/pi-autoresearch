@@ -70,3 +70,40 @@ test("expedition status snapshot includes the direction basis",async()=>{
   const result=await h.call("research",{action:"expedition",subaction:"status"});
   assert.match(text(result),/cache.*Measure cache/);
 });
+
+test("review-B1: final report flags an active direction whose campaign is stopped",async()=>{
+  const h=await setup();
+  // Activate the direction on the campaign-0 of the chain, then stop that
+  // campaign: the map keeps an ACTIVE direction with a dead campaign.
+  const campaignId=text(await h.call("expedition_brief",{action:"propose"})).match(/campaign (exp-[A-Za-z0-9-]+)/)?.[1]
+    ?? text(await h.call("research",{action:"status"})).match(/(exp-[A-Za-z0-9-]+)/)?.[1];
+  assert.ok(campaignId,"campaign id not found");
+  await append(h,"direction_activated",{dir:"cache",why:"Start measuring",campaign:campaignId});
+  const campaignDir=path.join(h.dir,".auto","research",campaignId);
+  const statePath=path.join(campaignDir,"state.json");
+  fs.writeFileSync(statePath,JSON.stringify({...JSON.parse(fs.readFileSync(statePath,"utf8")),phase:"stopped"},null,2)+"\n");
+  await append(h,"direction_resolved",{dir:"other",why:"placeholder"});
+  // Owner stop writes the final report (writeExpeditionFinalReport path).
+  const stopped=await h.call("research",{action:"chain_stop"});
+  assert.match(text(stopped),/stopped by the owner/i,text(stopped));
+  const report=path.join(h.chainDir,"expedition-report.md");
+  assert.ok(fs.existsSync(report),"final report written");
+  const body=fs.readFileSync(report,"utf8");
+  assert.match(body,/active direction without a live campaign/,body);
+  assert.match(body,/cache/,body);
+});
+
+test("review-B1b: active direction with no campaign field is flagged as without a live campaign",async()=>{
+  const h=await setup();
+  // Activated entry WITHOUT a campaign field: replay yields an active
+  // direction whose campaign is absent — divergent by definition.
+  await append(h,"direction_activated",{dir:"cache",why:"Start measuring"});
+  // Owner stop writes the final report (writeExpeditionFinalReport path).
+  const stopped=await h.call("research",{action:"chain_stop"});
+  assert.match(text(stopped),/stopped by the owner/i,text(stopped));
+  const report=path.join(h.chainDir,"expedition-report.md");
+  assert.ok(fs.existsSync(report),"final report written");
+  const body=fs.readFileSync(report,"utf8");
+  assert.match(body,/active direction without a live campaign/,body);
+  assert.match(body,/cache/,body);
+});

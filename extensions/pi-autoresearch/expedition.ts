@@ -90,7 +90,29 @@ export function territoryComplete(map:ExpeditionMap):{value:boolean;openDirs:str
 function glyph(s:DirectionStatus):string{return ({resolved:"✅",active:"🔄",parked:"💤",open:"○",advisory_exhausted:"❓",rejected:"❌"})[s];}
 /** Text map slice for an agent continuation, preserving evidence caveats. */
 export function mapSliceText(map:ExpeditionMap):string{return [...map.directions.values()].map(d=>`${glyph(d.status)} ${d.dir} — ${d.status}: ${d.why}${d.status==="advisory_exhausted"?" (основание — самоотчёт, не доказательство)":""}${d.status==="active"?` [campaign ${d.campaign??"unknown"}]`:""}${d.refs?.length?` [refs ${d.refs.map(r=>`${r.campaign}/${r.question}`).join(", ")}]`:""}`).join("\n");}
-/** Plain-text TUI widget lines (the renderer owns width truncation). */
-export function expeditionWidgetLines(map:ExpeditionMap,info:{campaignId:string|null;campaignPhase:string|null;openQuestions:string[];campaignsUsed:number;campaignsLimit:number|null;chainStatus:string}):string[]{const done=[...map.directions.values()].filter(d=>["resolved","rejected"].includes(d.status)).length;return [`🧭 ${map.goal} │ campaign ${info.campaignId??info.chainStatus}${info.campaignPhase?` (${info.campaignPhase})`:""}`,...[...map.directions.values()].map(d=>`${glyph(d.status)} ${d.dir}${d.status==="active"?` campaign ${d.campaign??info.campaignId??"?"}${info.openQuestions.length?` — ${info.openQuestions.join(", ")}`:""}`:` — ${d.why}`}${d.status==="advisory_exhausted"?" (самоотчёт, не доказательство)":""}`),`territory ${done}/${map.directions.size} │ campaigns ${info.campaignsUsed}${info.campaignsLimit===null?"":`/${info.campaignsLimit}`} │ next: ${info.chainStatus}`];}
+/** Plain-text TUI widget lines (the renderer owns width truncation). Every row
+ *  is guaranteed single-line: dynamic strings are sanitized because
+ *  truncateToWidth cuts width but not embedded CR/LF, and a newline inside a
+ *  row would break the TUI widget layout contract (render returns one string
+ *  per visual line). */
+function oneLine(s:string):string{return s.replace(/\s*[\r\n]+\s*/g," ");}
+export function expeditionWidgetLines(map:ExpeditionMap,info:{campaignId:string|null;campaignPhase:string|null;openQuestions:string[];campaignsUsed:number;campaignsLimit:number|null;chainStatus:string}):string[]{
+  const done=[...map.directions.values()].filter(d=>["resolved","rejected"].includes(d.status)).length;
+  const goal=oneLine(map.goal),camp=oneLine(info.campaignId??info.chainStatus);
+  const phase=info.campaignPhase?oneLine(info.campaignPhase):null;
+  const head="🧭 "+goal+" │ campaign "+camp+(phase?(" ("+phase+")"):"");
+  const rows=[...map.directions.values()].map(d=>{
+    const why=oneLine(d.why);
+    const dcamp=oneLine(d.campaign??info.campaignId??"?");
+    const qs=info.openQuestions.map(oneLine).join(", ");
+    let row=glyph(d.status)+" "+d.dir;
+    if(d.status==="active")row+=" campaign "+dcamp+(qs.length?" — "+qs:"");
+    else row+=" — "+why;
+    if(d.status==="advisory_exhausted")row+=" (самоотчёт, не доказательство)";
+    return row;
+  });
+  const foot="territory "+done+"/"+map.directions.size+" │ campaigns "+info.campaignsUsed+(info.campaignsLimit===null?"":"/"+info.campaignsLimit)+" │ next: "+oneLine(info.chainStatus);
+  return [head,...rows,foot];
+}
 /** Produces a conservative markdown final report; never claims successful coverage. */
 export function expeditionReportText(map:ExpeditionMap,opts:{chainId:string;finalStatus:string;campaigns:Array<{id:string;reportPath:string}>;computedAt:string;activeDirWithoutCampaign?:string}):string{const pred=territoryComplete(map),unclosed=[...map.directions.values()].filter(d=>["parked","advisory_exhausted","active","open"].includes(d.status));const lines=[`# Expedition report — ${opts.chainId}`,`Status: ${opts.finalStatus}`,`Stop: ${map.stopEvent?`${map.stopEvent.rule} (${map.stopEvent.basis})`:"not recorded"}`,"Campaigns:",...opts.campaigns.map(c=>`- ${c.id}: ${c.reportPath}`),"",`Goal: ${map.goal}`,"","## Map (final)","| Dir | Status | Basis | Evidence |","|---|---|---|---|"];for(const d of map.directions.values())lines.push(`| ${d.dir} | ${d.status} | ${d.status==="advisory_exhausted"?"UNKNOWN basis: self-report — NOT proof":d.why} | ${(d.refs??[]).map(r=>`${r.campaign}/${r.question}`).join(", ")} |`);lines.push("","## Timeline",...map.timeline.map((e,i)=>`${i+1}. ${e.at} ${e.type}${e.dir?` ${e.dir}`:""}${e.to?` → ${e.to}`:""}${e.note?` — ${e.note}`:""}`),"","## Unfinished",...(unclosed.length?unclosed.map(d=>`- ${d.dir}: ${d.status==="parked"?"не исследовано":d.status==="advisory_exhausted"?"не доказательство":d.status}${d.status==="active"&&opts.activeDirWithoutCampaign===d.dir?" — active direction without a live campaign":""}`):["- none recorded"]),`territory_complete: ${pred.value} (computed ${opts.computedAt})${pred.openDirs.length?`; open: ${pred.openDirs.join(", ")}`:""}`);return lines.join("\n");}
