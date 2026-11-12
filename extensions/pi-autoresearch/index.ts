@@ -42,6 +42,8 @@ import { computeState, markIdeaTried } from "./observer.ts";
 import { askConsent, briefChatMarkdown, briefConsentSummary } from "./brief-consent.ts";
 import * as optimizeBrief from "./optimize-brief.ts";
 import * as expedition from "./expedition.ts";
+import { buildExpeditionView, type ExpeditionView } from "./expedition-view.ts";
+import { buildExpeditionHtml, type ExpeditionWebCampaign } from "./dashboard-web.ts";
 import { registerCouncilTools } from "./council-tools.ts";
 import { registerAssessPrecedentsTool } from "./precedent-assess.ts";
 import { registerSearchPrecedentsTool } from "./precedent-report.ts";
@@ -301,6 +303,13 @@ export let sendPendingResumeIfReadyForTest: ((ctx: ExtensionContext, runtime: Au
 export let notifyAutoResumeLimitReachedAsyncForTest: ((ctx: ExtensionContext, reason?: string | null) => Promise<void>) | null = null;
 /** Test hook for expedition restart restore (bd pi-autoresearch-es1.3). */
 export let restoreExpeditionForTest: ((ctx: ExtensionContext) => Promise<void>) | null = null;
+/** Test/CLI hook for the expedition web payload (expedition-tui group 4): the
+ *  shared builder behind GET /expedition and the initial page. Bound when the
+ *  extension initializes; typed as a const export so tests can call it. */
+export let resolveExpeditionPayload: ((workDir: string) => (ExpeditionView & { schema_version: number; campaigns: ExpeditionWebCampaign[] }) | null) | null = null;
+/** Test hook: stops the dashboard static server so tests that started it can
+ *  release the listen socket and let the process exit. */
+export let stopDashboardServerForTest: (() => void) | null = null;
 
 /** Synchronously reads expedition artifacts for the TUI. The map intentionally does not verify journal hashes.
  *  Campaign facts (phase, question progress) are re-read from files on every call: the caller reads
@@ -3418,6 +3427,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     sendWhenReady(ctx, message, { steerIfBusy: true });
   };
   restoreExpeditionForTest = (ctx: ExtensionContext) => restoreExpeditionFromDisk(ctx);
+
+  // Web payload hook (expedition-tui group 4): bind the shared builder once
+  // the extension initializes so tests and future callers resolve the same
+  // payload the /expedition route serves.
+  resolveExpeditionPayload = (workDir: string) => buildExpeditionPayload(workDir);
+  stopDashboardServerForTest = () => stopDashboardServer();
 
   pi.on("session_start", async (_e, ctx) => {
     reconstructState(ctx);
@@ -7191,6 +7206,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   let dashboardServerPort: number | null = null;
   let dashboardServerWorkDir: string | null = null;
   let dashboardServerHtmlPath: string | null = null;
+  /** True while the running dashboard serves the expedition page: the
+   *  /expedition route then answers with the honest damage payload instead
+   *  of 404 when the chain journal breaks while the page is open (spec). */
+  let dashboardServerExpedition = false;
   const dashboardSseClients = new Set<ServerResponse>();
 
   function openInBrowser(url: string): void {
@@ -7224,6 +7243,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     dashboardServerPort = null;
     dashboardServerWorkDir = null;
     dashboardServerHtmlPath = null;
+    dashboardServerExpedition = false;
   }
 
   function writeDashboardFile(workDir: string): string {
@@ -7255,7 +7275,95 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   function resolveServedFile(workDir: string, requestPath: string): string | null {
     if (requestPath === "/") return dashboardServerHtmlPath;
     if (requestPath === "/autoresearch.jsonl") return autoresearchJsonlPath(workDir);
+    // Expedition live JSON: not a file — the request handler builds it on
+    // the fly when it sees this marker (see the "json:/expedition" branch
+    // inside startStaticServer).
+    if (requestPath === "/expedition") return "json:/expedition";
     return null;
+  }
+
+  /** One campaign entry of the /expedition payload (fail-soft per campaign:
+   *  a broken directory degrades to phase null, empty questions, zero
+   *  evidence — never to a damaged whole payload). */
+  function expeditionCampaignPayload(campaignRoot: string, id: string): ExpeditionWebCampaign {
+    const dir = path.join(campaignRoot, id);
+    let phase: string | null = null;
+    try {
+      const state = JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8"));
+      if (typeof state?.phase === "string") phase = state.phase;
+    } catch { /* unreadable state → phase null */ }
+    let q: ExpeditionWebCampaign["q"] = [];
+    try {
+      const brief = JSON.parse(fs.readFileSync(path.join(dir, "brief.json"), "utf8"));
+      q = (Array.isArray(brief?.questions) ? brief.questions : []).map((question: { id?: unknown; text?: unknown }) => ({
+        id: typeof question?.id === "string" ? question.id : "",
+        text: typeof question?.text === "string" ? question.text : "",
+        verdict: null as string | null,
+      })).filter((question: ExpeditionWebCampaign["q"][number]) => question.id.length > 0);
+    } catch { /* broken brief → empty questions */ }
+    if (q.length > 0 || phase !== null) {
+      try {
+        const log = fs.readFileSync(path.join(dir, "log.jsonl"), "utf8");
+        const verdicts = new Map<string, string>();
+        for (const line of log.split(/\r?\n/)) {
+          if (!line.trim()) continue;
+          let ev: { event?: unknown; question_id?: unknown; verdict?: unknown } | null = null;
+          try { ev = JSON.parse(line); } catch { continue; }
+          const id = typeof ev?.question_id === "string" ? ev.question_id : null;
+          if (id === null) continue;
+          const action = typeof ev?.event === "string" ? ev.event : "";
+          if (action === "close") verdicts.set(id, typeof ev?.verdict === "string" ? ev.verdict : "");
+          else if (action === "open") verdicts.delete(id);
+        }
+        q = q.map((question: ExpeditionWebCampaign["q"][number]) => ({ ...question, verdict: verdicts.get(question.id) ?? null }));
+      } catch { /* unreadable log → verdicts stay null */ }
+    }
+    let evidenceCount = 0;
+    try { evidenceCount = fs.readdirSync(path.join(dir, "evidence")).filter((name) => fs.statSync(path.join(dir, "evidence", name)).isFile()).length; } catch { /* missing evidence dir → 0 */ }
+    return { id, phase, q, evidenceCount };
+  }
+
+  /** The /expedition JSON payload: ExpeditionView + the per-campaign array
+   *  (expedition-tui spec group 4 + the wiring contract). One shared builder
+   *  serves BOTH the initial page and the live route, so they can never drift.
+   *  Returns null when no active expedition chain exists on disk. */
+  function buildExpeditionPayload(workDir: string): (ExpeditionView & { schema_version: number; campaigns: ExpeditionWebCampaign[] }) | null {
+    const scan = expedition.scanActiveExpeditionChains(path.join(workDir, ".auto", "research-chain"));
+    if (scan === "root_missing" || scan.chains.length === 0) return null;
+    const chain = scan.chains[0];
+    const chainDir = path.join(workDir, ".auto", "research-chain", chain.chainId);
+    // The pinned campaign only affects the CAMPAIGN section; the map timeline
+    // and the campaign strip come from the journal, so a null pin is fine.
+    let campaignDir: string | null = null;
+    if (chain.campaignId) {
+      const dir = path.join(researchState.researchRoot(workDir), chain.campaignId);
+      if (fs.existsSync(dir)) campaignDir = dir;
+    }
+    const view = buildExpeditionView(chainDir, campaignDir);
+    // Presentation refinement (web only): the replay keeps `campaign` only on
+    // events that carry it, so closed directions lose the activation campaign.
+    // The close refs always name the proven campaign — use it for the card
+    // meta when the direction itself no longer has one.
+    const dirs = view.dirs.map((d) =>
+      d.campaign === null && d.refs.length > 0 && typeof d.refs[0]?.campaign === "string"
+        ? { ...d, campaign: d.refs[0].campaign }
+        : d
+    );
+    const campaignRoot = researchState.researchRoot(workDir);
+    let campaignIds: string[] = [];
+    try {
+      const journal = fs.readFileSync(path.join(chainDir, "chain.json"), "utf8");
+      for (const line of journal.split(/\r?\n/)) {
+        if (!line.trim()) continue;
+        try {
+          const entry = JSON.parse(line) as { type?: unknown; campaign_id?: unknown };
+          if (entry?.type === "campaign_added" && typeof entry.campaign_id === "string" && !campaignIds.includes(entry.campaign_id)) campaignIds.push(entry.campaign_id);
+        } catch { /* broken line: skipped, the scan already proved the chain usable */ }
+      }
+    } catch { /* unreadable journal here → the view's own fail payload already reports damage */ }
+    if (view.fail === "journal") campaignIds = [];
+    const campaigns = campaignIds.map((id) => expeditionCampaignPayload(campaignRoot, id));
+    return { schema_version: 1, ...view, dirs, campaigns };
   }
 
   function registerSseClient(res: ServerResponse): void {
@@ -7310,6 +7418,31 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           return;
         }
 
+        // Live expedition JSON: built on the fly from the current files
+        // (spec: "JSON текущего view, собранного на лету"). A damaged journal
+        // yields the fail payload, never a 500 — the page shows the damage
+        // banner. Outside an expedition session the route 404s like any
+        // unknown path (the server then serves the ordinary ledger page).
+        if (filePath === "json:/expedition") {
+          const payload = buildExpeditionPayload(resolvedWorkDir);
+          if (payload === null) {
+            if (dashboardServerExpedition) {
+              // The dashboard was opened for an expedition whose journal
+              // cannot be read anymore (damage while the page was open):
+              // serve the honest damage payload (spec scenario).
+              res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+              res.end(JSON.stringify({ schema_version: 1, fail: "journal", mapError: null, goal: "", dirs: [], timeline: [], timelineTotal: 0, campaignId: null, campaignState: "none", campaignPhase: null, questions: [], evidence: [], counters: { done: 0, total: 0, campaignsUsed: 0, campaignsMax: null, qClosed: 0, qTotal: 0, next: "" }, campaigns: [] }));
+              return;
+            }
+            res.writeHead(404);
+            res.end();
+            return;
+          }
+          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify(payload));
+          return;
+        }
+
         fs.readFile(filePath, (err, data) => {
           if (err) {
             res.writeHead(404);
@@ -7349,12 +7482,63 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     try {
       const dashboardHtmlPath = writeDashboardFile(workDir);
       const port = await startStaticServer(workDir, dashboardHtmlPath);
+      dashboardServerExpedition = false; // this server now serves the ledger page
       const url = `http://127.0.0.1:${port}`;
       openInBrowser(url);
       ctx.ui.notify(`Dashboard at ${url} (live updates)`, "info");
     } catch (error) {
       ctx.ui.notify(
         `Export failed: ${error instanceof Error ? error.message : String(error)}`,
+        "error"
+      );
+    }
+  }
+
+  /** Detects the active expedition for the web dashboard: the runtime pin
+   *  first, then the fail-closed disk scan (a restart loses the pin but the
+   *  chain stays on disk — same fallback as the widget restore). */
+  const activeExpeditionForWeb = (ctx: ExtensionContext): boolean => {
+    const runtime = getRuntime(ctx);
+    if (runtime.researchChain?.expedition === true) return true;
+    const workDir = resolveWorkDir(ctx.cwd);
+    const scan = expedition.scanActiveExpeditionChains(path.join(workDir, ".auto", "research-chain"));
+    return scan !== "root_missing" && scan.chains.length > 0;
+  };
+
+  /** Expedition branch of the web dashboard (expedition-tui spec group 4).
+   *  NEW headless gate — only this branch refuses without UI; the ordinary
+   *  ledger export keeps its existing behaviour untouched. Reuses the same
+   *  static server (same workDir → same URL; different workDir → replacement)
+   *  and the existing SSE «jsonl-updated» + the page's own 10s polling: no new
+   *  broadcast points. */
+  async function openExpeditionWebDashboard(ctx: ExtensionContext): Promise<void> {
+    if (!ctx.hasUI) {
+      ctx.ui.notify("Expedition web dashboard requires a TUI session", "info");
+      return;
+    }
+    try {
+      const workDir = resolveWorkDir(ctx.cwd);
+      const payload = buildExpeditionPayload(workDir);
+      // The active-chain check made the branch; a damaged journal still shows
+      // the honest damage banner on the page (spec scenario), so we proceed.
+      const viewForPage: ExpeditionView = payload ?? {
+        fail: "journal", mapError: null, goal: "", dirs: [], timeline: [], timelineTotal: 0,
+        campaignId: null, campaignState: "none", campaignPhase: null, questions: [], evidence: [],
+        counters: { done: 0, total: 0, campaignsUsed: 0, campaignsMax: null, qClosed: 0, qTotal: 0, next: "" },
+      };
+      const campaignsForPage: ExpeditionWebCampaign[] = payload?.campaigns ?? [];
+      const html = buildExpeditionHtml(viewForPage, campaignsForPage);
+      const exportDir = fs.mkdtempSync(path.join(tmpdir(), "pi-autoresearch-expedition-"));
+      const htmlPath = path.join(exportDir, "expedition.html");
+      fs.writeFileSync(htmlPath, html);
+      const port = await startStaticServer(workDir, htmlPath);
+      dashboardServerExpedition = true; // both fresh and reused server: the route serves expedition JSON
+      const url = `http://127.0.0.1:${port}`;
+      openInBrowser(url);
+      ctx.ui.notify(`Expedition dashboard at ${url} (live updates)`, "info");
+    } catch (error) {
+      ctx.ui.notify(
+        `Expedition dashboard failed: ${error instanceof Error ? error.message : String(error)}`,
         "error"
       );
     }
@@ -10925,6 +11109,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       if (command === "dashboard") {
+        // Expedition chain active → the expedition WEB dashboard (spec group 4:
+        // the browser kanban). Otherwise the ordinary fullscreen overlay path —
+        // byte-for-byte unchanged, including its own TUI gate and notifies.
+        if (activeExpeditionForWeb(ctx)) {
+          await openExpeditionWebDashboard(ctx);
+          return;
+        }
         await openFullscreenDashboard(ctx);
         return;
       }
