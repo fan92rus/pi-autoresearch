@@ -187,7 +187,7 @@ import { resolveAutoresearchShortcuts, SHORTCUT_ACTIONS } from "./shortcuts.ts";
 import * as charter from "./charter.ts";
 import * as chainJournal from "./chain-journal.ts";
 import * as chainBriefs from "./chain-briefs.ts";
-import { getAutoresearchArgumentCompletions, isHelpRequest, renderAutoresearchHelp } from "./commands.ts";
+import { isHelpRequest, renderAutoresearchHelp } from "./commands.ts";
 import { sessionFilePath, sessionFileCandidates, ensureParentDir, AUTO_DIR } from "./paths.ts";
 import {
   requestCandidatePolicyConsent,
@@ -3630,7 +3630,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       block: true,
       reason:
         "Blocked: benchmarks must run via run_experiment. A bash-run is invisible to the ledger — " +
-        "no METRIC capture, no provenance, cannot be kept. Use run_experiment({ command: \"bash measure.sh\" }).",
+        "no METRIC capture, no provenance, cannot be kept. Use run_experiment({ command: \"bash measure.sh\", timeout_seconds: 120 }).",
     };
   });
 
@@ -4041,8 +4041,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     },
 
     renderCall(args, theme) {
-      let text = theme.fg("toolTitle", theme.bold("init_experiment "));
-      text += theme.fg("accent", args.name ?? "");
+      let text = theme?.fg ? theme.fg("toolTitle", theme.bold("init_experiment ")) : "init_experiment ";
+      text += theme?.fg ? theme.fg("accent", String(args?.name ?? "")) : String(args?.name ?? "");
       return new Text(text, 0, 0);
     },
 
@@ -4317,8 +4317,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     },
 
     renderCall(args, theme) {
-      const desc = args.description || args.path || "";
-      return new Text(theme.fg("toolTitle", theme.bold("propose_hypothesis ")) + theme.fg("accent", desc.slice(0, 60)), 0, 0);
+      const desc = String(args?.description || args?.path || "");
+      const head = theme?.fg ? theme.fg("toolTitle", theme.bold("propose_hypothesis ")) : "propose_hypothesis ";
+      const body = theme?.fg ? theme.fg("accent", desc.slice(0, 60)) : desc.slice(0, 60);
+      return new Text(head + body, 0, 0);
     },
 
     renderResult(result, _options, _theme) {
@@ -4338,10 +4340,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     description: Type.String({
       description: "What the results show, stated concretely (not a generalisation without examples).",
     }),
-    evidence_ref: Type.Optional(Type.String({
+    evidence_ref: Type.String({
       description:
         "REQUIRED. A checkable example: 'path:start-end' (e.g. '.auto/runs/45/output.txt:120-134') or 'path#anchor' (literal substring of the file).",
-    })),
+    }),
     estimated_impact: Type.Optional(Type.String({
       description: "Optional scale estimate, e.g. '~14% of errors'.",
     })),
@@ -4559,13 +4561,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // -----------------------------------------------------------------------
 
   const VerifyMeasurementChangeParams = Type.Object({
-    change_ref: Type.Optional(Type.String({
+    change_ref: Type.String({
       description: 'The change being verified ("e2" or bare "2").',
-    })),
-    proof_ref: Type.Optional(Type.String({
+    }),
+    proof_ref: Type.String({
       description:
         'Path to the proof artifact inside .auto/measurement/ (JSON: {"anchor", "commands", "outputs", "old_scale_score", "new_scale_score"}): the re-run of the SAME commands/inputs with their outputs and the reproduced scores. Scores are machine-checked against the ledger — a mismatch is a refutation, not a confirmation.',
-    })),
+    }),
   });
 
   registerGatedTool({
@@ -4885,7 +4887,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return {
           content: [{
             type: "text",
-            text: `❌ ${benchmarkScriptRel} exists — you must run it instead of a custom command.\n\nFound: ${autoresearchShPath}\nYour command: ${params.command}\n\nUse: run_experiment({ command: "bash ${benchmarkScriptRel}" }) or run_experiment({ command: "./${benchmarkScriptRel}" })`,
+            text: `❌ ${benchmarkScriptRel} exists — you must run it instead of a custom command.\n\nFound: ${autoresearchShPath}\nYour command: ${params.command}\n\nUse: run_experiment({ command: "bash ${benchmarkScriptRel}", timeout_seconds: 180 }) or run_experiment({ command: "./${benchmarkScriptRel}", timeout_seconds: 180 })`,
           }],
           details: {
             command: params.command,
@@ -5329,10 +5331,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     },
 
     renderCall(args, theme) {
-      let text = theme.fg("toolTitle", theme.bold("run_experiment "));
-      text += theme.fg("muted", args.command);
-      if (args.timeout_seconds) {
-        text += theme.fg("dim", ` (timeout: ${args.timeout_seconds}s)`);
+      let text = theme?.fg ? theme.fg("toolTitle", theme.bold("run_experiment ")) : "run_experiment ";
+      text += theme?.fg ? theme.fg("muted", String(args?.command ?? "")) : String(args?.command ?? "");
+      if (args?.timeout_seconds) {
+        text += theme?.fg ? theme.fg("dim", ` (timeout: ${args.timeout_seconds}s)`) : ` (timeout: ${args.timeout_seconds}s)`;
       }
       return new Text(text, 0, 0);
     },
@@ -6094,15 +6096,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     },
 
     renderCall(args, theme) {
-      let text = theme.fg("toolTitle", theme.bold("log_experiment "));
+      const fg = theme?.fg ? (c: string, v: string) => theme.fg(c, v) : (_c: string, v: string) => v;
+      let text = fg("toolTitle", theme?.bold ? theme.bold("log_experiment ") : "log_experiment ");
+      const status = String(args?.status ?? "");
       const color =
-        args.status === "keep"
+        status === "keep"
           ? "success"
-          : args.status === "crash" || args.status === "checks_failed"
+          : status === "crash" || status === "checks_failed"
             ? "error"
             : "warning";
-      text += theme.fg(color, args.status);
-      text += " " + theme.fg("dim", args.description);
+      text += fg(color, status);
+      text += " " + fg("dim", String(args?.description ?? ""));
       return new Text(text, 0, 0);
     },
 
@@ -7493,9 +7497,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     },
 
     renderCall(args, theme) {
-      let text = theme.fg("toolTitle", theme.bold("tree_status"));
-      if (args.detail) {
-        text += theme.fg("dim", ` (${args.detail})`);
+      let text = theme?.fg ? theme.fg("toolTitle", theme.bold("tree_status")) : "tree_status";
+      if (args?.detail) {
+        text += theme?.fg ? theme.fg("dim", ` (${args.detail})`) : ` (${args.detail})`;
       }
       return new Text(text, 0, 0);
     },
@@ -9403,8 +9407,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     label: "Expedition document",
     renderCall(args: any) {
       if (args?.action !== "propose") return new Text(`expedition_brief ${String(args?.action ?? "")}`, 0, 0);
-      const doc = args?.doc;
-      return new Text(typeof doc === "object" ? `Expedition proposal: ${String(doc.goal ?? "")}${Array.isArray(doc.directions) ? `\\n${doc.directions.map((d: any) => `- ${d.name}`).join("\\n")}` : ""}` : "Expedition proposal", 0, 0);
+      const doc = typeof args?.doc === "object" && args?.doc !== null ? args.doc : null;
+      if (!doc) return new Text("Expedition proposal", 0, 0);
+      const goal = typeof doc.goal === "string" ? doc.goal : "";
+      const dirs = Array.isArray(doc.directions)
+        ? doc.directions.filter((d: any) => typeof d?.name === "string").map((d: any) => `- ${d.name}`).join("\\n")
+        : "";
+      return new Text(`Expedition proposal: ${goal}${dirs ? `\\n${dirs}` : ""}`, 0, 0);
     },
     description: "Draft and obtain owner confirmation for an expedition document, then create campaign 0.",
     promptSnippet: "Expedition: ask missing design questions as one packet, draft expedition_brief, then propose",
@@ -9917,7 +9926,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       const allowed = RESEARCH_ACTION_KEYS.get(action);
       if (!allowed) {
-        return fail("invalid_argument", `unknown action ${JSON.stringify(String(action))}; allowed: start open record close stop status report resolve`);
+        return fail("invalid_argument", `unknown action ${JSON.stringify(String(action))}; allowed: start open record close stop status report resolve chain_stop expedition`);
       }
       // Redirect hint (user bug report 2026-11-12, lob-collector-data): the agent
       // repeatedly sent question-close fields (rule_id/verdict) to the expedition
@@ -10450,9 +10459,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         expected_sha256: { type: "string", description: "start only: approved brief SHA-256." },
         question_id: { type: "string", description: "open/close: question id from the approved brief." },
         evidence_ref: { type: "string", description: "record only: path:lines or path#anchor." },
-        rule_id: { type: "string", description: "close: decision rule for that question; stop/chain_stop: charter stop rule." },
+        rule_id: { type: "string", description: "close: decision rule for that question; stop: stop rule of the approved brief; chain_stop: charter stop rule." },
         verdict: { type: "string", description: "close only: verdict declared by the approved brief." },
-        reason: { type: "string", description: "close/stop reason." },
+        reason: { type: "string", description: "stop: required; close: required for inconclusive/waiting_for_data verdicts." },
       },
       required: ["action"],
       additionalProperties: false,
@@ -10895,7 +10904,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           ctx.ui.notify("Council is disabled (council.enabled=false in .auto/config.json)", "error");
           return;
         }
-        const noteArg = note ? ", note: " + JSON.stringify(note) : "";
+        const noteArg = note ? "note: " + JSON.stringify(note) : "";
         const councilInCampaign = await campaignBlocksOrdinaryLoop(workDir);
         pi.sendUserMessage(
           "Convene a hypothesis council NOW: call council_convene({" + noteArg + "}). " +

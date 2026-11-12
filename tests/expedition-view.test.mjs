@@ -110,7 +110,7 @@ test('full happy view: brief order, verdict glyphs, evidence sorted, counters fr
   assert.equal(v.campaignPhase, 'research');
   assert.equal(v.campaignId, 'c1');
   assert.deepEqual(v.evidence, ['eval.json', 'script.py']);
-  assert.deepEqual(v.counters, { done: 0, total: 2, campaignsUsed: 1, campaignsMax: 7, qClosed: 4, qTotal: 4, next: 'expedition_map(subaction=activate)' });
+  assert.deepEqual(v.counters, { done: 0, total: 2, campaignsUsed: 1, campaignsMax: 7, qClosed: 4, qTotal: 4, next: 'expedition_map(subaction=activate, dir=<name>, why=<rationale>)' });
   const q = Object.fromEntries(v.questions.map((x) => [x.id, x]));
   assert.equal(q.T1.closed && q.T1.verdict === 'rejected' && q.T1.hasEvidence && q.T1.ruleId === 't1-r' && q.T1.reason === 'noise', true);
   assert.equal(q.T2.verdict, 'confirmed');
@@ -171,7 +171,7 @@ test('null campaignDir → campaign none with hint; unavailable never leaks ques
   assert.equal(v.campaignId, 'c1'); // journal-derived pin still shown
   const lines = view.toFullscreenLines(v, 200).join('\n');
   assert.match(lines, /нет активной кампании/);
-  assert.match(lines, /next: expedition_map\(subaction=activate\)/);
+  assert.match(lines, /next: expedition_map\(subaction=activate, dir=<name>, why=<rationale>\)/);
 });
 
 // ─── (h) Widget verdicts line ───────────────────────────────────────────────

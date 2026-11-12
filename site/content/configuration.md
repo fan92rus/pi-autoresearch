@@ -47,7 +47,7 @@ run_experiment({
 ```
 
 - **`command`** — The benchmark command. Required.
-- **`timeout_seconds`** — Benchmark timeout. Defaults to 600 seconds.
+- **`timeout_seconds`** — Hard kill timeout. Required: the experiment fails if the command exceeds it. Pick a tight bound (2–3× the expected runtime).
 - **`checks_timeout_seconds`** — Separate timeout for `.auto/checks.sh`. Defaults to 300 seconds.
 
 ## Safety and trust

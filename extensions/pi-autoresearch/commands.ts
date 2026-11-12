@@ -1,8 +1,9 @@
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 
-// The one list of /autoresearch subcommands. Completions, the usage line and
-// the help text are all derived from it, so a new subcommand cannot be left
-// out of one of them.
+// Help/usage list of /autoresearch subcommands. Live TAB completion uses the
+// separate AUTORESEARCH_SUBCOMMANDS list in parallel/config-ui.ts (it also
+// covers config-style entries); keep both in sync with the handler branches
+// in index.ts registerCommand("autoresearch", ...).
 export interface Subcommand {
   name: string;
   description: string;
@@ -11,11 +12,16 @@ export interface Subcommand {
 export const SUBCOMMANDS: readonly Subcommand[] = [
   { name: "off", description: "Leave autoresearch mode." },
   { name: "research", description: "Start a research campaign (briefing via research_brief; supports headless launch)." },
+  { name: "expedition", description: "Start a research expedition (map of directions; headless launch supported)." },
   { name: "finalize", description: "Stop the loop and turn kept experiments into reviewable branches." },
   { name: "report", description: "Write the campaign report to .auto/report.md now, without stopping the loop." },
   { name: "clear", description: "Delete experiment session data (log, findings, observations, analysis, report, ideas, runs) and turn autoresearch mode off; refuses while a research or candidate campaign is active." },
+  { name: "config", description: "Interactive campaign configuration (time limit, models, concurrency, budget)." },
+  { name: "limit", description: "Experiment time limit in minutes: /autoresearch limit 5 — set, /autoresearch limit off — clear, /autoresearch limit — interactive." },
   { name: "export", description: "Open a local live dashboard for the session log in your browser." },
   { name: "dashboard", description: "Open the fullscreen dashboard overlay in the terminal." },
+  { name: "tree", description: "Toggle tree/list view in the dashboard widget." },
+  { name: "council", description: "Convene a stagnation council (multi-model hypothesis review)." },
   { name: "help", description: "Show this help." },
 ];
 

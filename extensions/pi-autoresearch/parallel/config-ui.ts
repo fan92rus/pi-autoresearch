@@ -42,6 +42,7 @@ export const AUTORESEARCH_SUBCOMMANDS: AutocompleteEntry[] = [
   { value: "research", label: "research", description: "Start a research campaign (briefing via research_brief)" },
   { value: "expedition", label: "expedition", description: "Start a research expedition" },
   { value: "finalize", label: "finalize", description: "Stop the loop and load the autoresearch-finalize skill" },
+  { value: "report", label: "report", description: "Write the campaign report to .auto/report.md now" },
   { value: "clear", label: "clear", description: "Delete session log and reset state" },
   { value: "tree", label: "tree", description: "Toggle tree/list view in dashboard widget" },
   { value: "config", label: "config", description: "Interactive campaign configuration (time limit, models, concurrency, budget)" },

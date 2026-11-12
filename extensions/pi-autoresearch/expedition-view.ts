@@ -34,7 +34,7 @@ export interface ExpeditionView {
 
 export const TIMELINE_LIMIT = 200;
 /** Stub hint; the precise per-state action logic lives in the index.ts wiring. */
-const NEXT_HINT = "expedition_map(subaction=activate)";
+const NEXT_HINT = "expedition_map(subaction=activate, dir=<name>, why=<rationale>)";
 
 const str = (v: unknown): string => (typeof v === "string" ? v : "");
 const optStr = (v: unknown): string | null => (typeof v === "string" && v.length > 0 ? v : null);

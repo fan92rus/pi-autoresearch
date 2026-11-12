@@ -97,13 +97,23 @@ export function mapSliceText(map:ExpeditionMap):string{return [...map.directions
  *  per visual line). */
 function oneLine(s:string):string{return s.replace(/\s*[\r\n]+\s*/g," ");}
 /** One-line action hint for the footer's `next:` segment (falls back to the raw status). */
-function nextAction(info:{campaignPhase:string|null;chainStatus:string},dirs:DirectionState[]):string{
+function nextAction(info:{campaignId:string|null;campaignPhase:string|null;chainStatus:string},dirs:DirectionState[]):string{
   const s=info.chainStatus;
-  const hasActive=dirs.some(d=>d.status==="active");
   if(s==="manual_check_required")return "research_questions(action=status) — проверьте блокер";
   if(s==="stopped_by_owner"||s==="stopped_by_rule"||s==="completed"||s==="limit_reached")return "research_questions(action=report)";
-  if(s==="awaiting_child")return "expedition_map(subaction=resolve, dir, refs) → expedition_map(subaction=activate, dir, why) → research_brief draft";
-  if(s==="active"&&info.campaignPhase==="research"&&!hasActive){
+  if(s==="awaiting_child"){
+    // State-aware: with an active direction the first step is closing it;
+    // without one (or without a pinned campaign) there is nothing to resolve
+    // and nothing to activate — the only executable step is the brief.
+    const active=dirs.find(d=>d.status==="active");
+    if(active&&info.campaignId)return "expedition_map(subaction=resolve, dir="+oneLine(active.dir)+", refs=[{campaign,question}]) → research_brief draft";
+    const open=dirs.find(d=>d.status==="open");
+    if(open)return "research_brief draft → expedition_map(subaction=activate, dir="+oneLine(open.dir)+", why=<rationale>)";
+    const reopenable=dirs.find(d=>["parked","advisory_exhausted","resolved","rejected"].includes(d.status));
+    if(reopenable)return "research_brief draft → expedition_map(subaction=reopen, dir="+oneLine(reopenable.dir)+", reason=<why>)";
+    return "research_brief draft → expedition_map(subaction=open, dir=<name>, why=<rationale>)";
+  }
+  if(s==="active"&&info.campaignPhase==="research"&&!dirs.some(d=>d.status==="active")){
     const open=dirs.find(d=>d.status==="open");
     if(open)return "expedition_map(subaction=activate, dir="+oneLine(open.dir)+", why=<rationale>)";
     const reopenable=dirs.find(d=>["parked","advisory_exhausted","resolved","rejected"].includes(d.status));
@@ -121,7 +131,7 @@ export function expeditionWidgetLines(map:ExpeditionMap,info:{campaignId:string|
   const done=dirs.filter(d=>["resolved","rejected"].includes(d.status)).length;
   const hasActive=dirs.some(d=>d.status==="active");
   const goal=oneLine(map.goal);const goalView=truncateGoal(goal,60);
-  const head="🧭 "+goalView+" ("+dirs.length+" напр.) │ campaign "+oneLine(info.campaignId??info.chainStatus)+(info.campaignPhase?(" ("+oneLine(info.campaignPhase)+")"):"");
+  const head="🧭 "+goalView+" ("+dirs.length+" напр.) │ campaign "+(info.campaignId?oneLine(info.campaignId)+(info.campaignPhase?(" ("+oneLine(info.campaignPhase)+")"):""):"none — нет активной кампании");
   const lines=[head];
   // Divergence: a campaign is running its research phase but the map has no
   // active direction — the agent needs the public `expedition_map` tool.

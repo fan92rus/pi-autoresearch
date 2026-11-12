@@ -63,6 +63,12 @@ Then start the loop inside pi:
 | `log_observation` | Records a preparation, diagnostic or infrastructure event about a run (`success`, `technical_failure`, `unknown`) in `.auto/observations.jsonl`. Not a run: no git, best, streak or ledger change. See [Research map](#research-map). |
 | `record_analysis` | Appends a `prereg`, `comparison`, `attribution` or `supplement` record to `.auto/analysis.jsonl`. Never changes runs, git or best. See [Research map](#research-map). |
 | `direction_review` | Writes one document to `.auto/reviews/direction-<UTC>.md` with facts, unknowns, signals, alternatives and what is not proven. Runs no experiment and chooses no direction. |
+| `research_brief` | Phase 1 of a research campaign: `draft` saves the questions/verdicts/stop-rules brief, `propose` shows it for owner approval (Brief SHA-256 dialog). See [docs/research-vectors.md](docs/research-vectors.md). |
+| `research_questions` | Phase 2 campaign lifecycle over the approved brief: `start`, `open`, `record`, `close`, `stop`, `status`, `report`, `chain_stop`; `resolve` is operator-only pending-op cleanup. |
+| `expedition_brief` | Draft and obtain owner confirmation for an expedition document (goal, directions, campaign-0 brief in one SHA-256 dialog). |
+| `expedition_map` | Expedition map transitions: `open/activate/resolve/reject/advisory/park/reopen/pivot/status` directions. |
+| `candidate_branch` | Candidate-branch campaign: develop candidates in isolated worktrees and promote the leader only after re-measurement. See [docs/candidate-branches.md](docs/candidate-branches.md). |
+| `council_convene` | Convene a stagnation council (analysts, dispute, chair) that returns a validated experiment slate. |
 
 ### Waiting for async subagents
 
@@ -89,6 +95,11 @@ The guard covers the ordinary loop, including campaigns that block it. Partial-c
 | `/autoresearch tree` | Toggle between list view and experiment tree view in the dashboard widget. |
 | `/autoresearch export` | Open a live dashboard in your browser. Auto-updates as experiments run. |
 | `/autoresearch dashboard` | Open the fullscreen scrollable dashboard overlay in the terminal. Navigate with `↑`/`↓`/`j`/`k`, `PageUp`/`PageDown`/`u`/`d`, `g`/`G` for top/bottom, `Escape` or `q` to close. |
+| `/autoresearch research <text>` | Start a research campaign from a research plan (briefing via `research_brief`, owner approval, then `research_questions`); supports headless launch flags. See [docs/research-vectors.md](docs/research-vectors.md). |
+| `/autoresearch expedition <text>` | Start a research expedition: one goal, a map of directions, campaign 0 launched after the single document confirmation. `research` and `expedition` are reserved as the first word: a goal whose first word is `research` or `expedition` routes to the campaign/expedition launch, not the ordinary loop. |
+| `/autoresearch council <note>` | Delegate a stagnation council to `council_convene` (runs analysts, dispute and chair autonomously). |
+| `/autoresearch config` | Interactive campaign configuration (time limit, models, concurrency, budget, observer toggles). |
+| `/autoresearch limit [N\|off]` | Set or clear the experiment time limit in minutes without editing the config; bare `/autoresearch limit` is interactive. |
 
 Subcommands autocomplete: type `/autoresearch ` and pick one from the list, or start typing (`/autoresearch fi` → `finalize`).
 

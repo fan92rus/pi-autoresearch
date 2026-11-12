@@ -79,7 +79,7 @@ test("non-expedition research chains retain the ordinary dashboard path", () => 
   assert.match(body, /❌ rejected dir/);
   assert.match(body, /🔄 active dir/);
   assert.match(lines.at(-1), /campaigns 1(?!\/) /, "no limit renders campaigns without slash");
-  assert.match(lines.at(-1), /next: expedition_map\(subaction=resolve, dir, refs\) → expedition_map\(subaction=activate, dir, why\) → research_brief draft/);
+  assert.match(lines.at(-1), /next: expedition_map\(subaction=resolve, dir=active dir, refs=\[\{campaign,question\}\]\) → research_brief draft/);
 });
 
  test("advisory line always carries the unproven mark even with a long basis", () => {
@@ -223,7 +223,7 @@ test("divergence line: research phase with no open direction suggests reopen, no
     ["stopped_by_rule", "research_questions(action=report)"],
     ["completed", "research_questions(action=report)"],
     ["limit_reached", "research_questions(action=report)"],
-    ["awaiting_child", "expedition_map(subaction=resolve, dir, refs) → expedition_map(subaction=activate, dir, why) → research_brief draft"],
+    ["awaiting_child", "research_brief draft → expedition_map\(subaction=open, dir=<name>, why=<rationale>\)"],
     ["active", "active"],
   ];
   for (const [status, expected] of cases) {
