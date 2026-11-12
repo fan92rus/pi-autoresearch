@@ -299,6 +299,8 @@ export let closeStaleCampaign: ((dir: string) => Promise<researchState.Result<{ 
 export let sendPendingResumeIfReadyForTest: ((ctx: ExtensionContext, runtime: AutoresearchRuntime) => Promise<void>) | null = null;
 /** Test hook for the async auto-resume limit notification. */
 export let notifyAutoResumeLimitReachedAsyncForTest: ((ctx: ExtensionContext, reason?: string | null) => Promise<void>) | null = null;
+/** Test hook for expedition restart restore (bd pi-autoresearch-es1.3). */
+export let restoreExpeditionForTest: ((ctx: ExtensionContext) => Promise<void>) | null = null;
 
 /** Synchronously reads expedition artifacts for the TUI. The map intentionally does not verify journal hashes.
  *  Campaign facts (phase, question progress) are re-read from files on every call: the caller reads
@@ -3373,9 +3375,54 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }));
   };
 
+  // ── Expedition restart restore (bd pi-autoresearch-es1.3) ───────────────
+  // runtime.researchChain lives only in session memory; after a pi restart an
+  // active expedition silently degrades. The disk scan finds the most recent
+  // active/awaiting_child expedition chain with a valid marker and re-binds it
+  // (widget, mode ON, resume message with the map slice). Never interrupts a
+  // session that already holds a chain.
+  const restoreExpeditionFromDisk = async (ctx: ExtensionContext): Promise<void> => {
+    const runtime = getRuntime(ctx);
+    if (runtime.researchChain !== null) return;
+    const workDir = resolveWorkDir(ctx.cwd);
+    const scan = expedition.scanActiveExpeditionChains(path.join(workDir, ".auto", "research-chain"));
+    if (scan === "root_missing" || scan.chains.length === 0) return;
+    const fresh = scan.chains[0];
+    // The pinned campaign must still be live; a stopped campaign stays unpinned
+    // (the continuation flow decides the next step), but the chain itself is
+    // still restored so the map and widget stay visible.
+    let campaignId: string | null = null;
+    if (fresh.campaignId) {
+      const campaignDir = path.join(researchState.researchRoot(workDir), fresh.campaignId);
+      if (fs.existsSync(campaignDir)) {
+        const insp = await researchState.inspectCampaign(campaignDir);
+        if (insp.state?.phase === "briefing" || insp.state?.phase === "research") campaignId = fresh.campaignId;
+      }
+    }
+    runtime.researchCampaignId = campaignId;
+    runtime.researchChain = { chainId: fresh.chainId, workDir, charterPath: fresh.docPath, charterSha256: fresh.docSha256, charter: fresh.charter, expedition: true, docSha256: fresh.docSha256 };
+    if (!runtime.autoresearchMode) { recordAutoresearchActivation(workDir, true); setAutoresearchMode(ctx, true); }
+    runtime.autoResumeTurns = 0;
+    runtime.consecutiveDriftResumes = 0;
+    updateWidget(ctx);
+    let slice = "";
+    const verified = await chainJournal.verifyChain(workDir, fresh.chainId);
+    if (verified.ok) { const replay = expedition.replayExpeditionMap(verified.entries); if (replay.ok) slice = expedition.mapSliceText(replay.map); }
+    const message = [
+      `Expedition ${fresh.chainId} restored after restart (goal: ${fresh.goal}).`,
+      `Pinned campaign: ${campaignId ?? "none"}.`,
+      "Continue: research status first; if the campaign report is already recorded the chain continuation flow applies; close the finished direction (research expedition resolve/reject/advisory/park), activate the next one, then brief the next campaign. STOP on manual_check_required.",
+      ...(slice ? ["Expedition map snapshot:", slice] : []),
+      ...(scan.chains.length > 1 ? [`Note: another expedition chain (${scan.chains[1].chainId}) is also active on disk; it was NOT restored (most recent wins).`] : []),
+    ].join("\n");
+    sendWhenReady(ctx, message, { steerIfBusy: true });
+  };
+  restoreExpeditionForTest = (ctx: ExtensionContext) => restoreExpeditionFromDisk(ctx);
+
   pi.on("session_start", async (_e, ctx) => {
     reconstructState(ctx);
     syncBriefPreview(ctx);
+    await restoreExpeditionFromDisk(ctx);
     optimizeBriefDir = optimizeBrief.optimizeDirOf(ctx.cwd);
     ensureGatedToolsActive();
     // Late load coverage (subagent-wait-guard): ready may have fired before we
@@ -3387,6 +3434,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   pi.on("session_tree", async (_e, ctx) => {
     reconstructState(ctx);
     syncBriefPreview(ctx);
+    await restoreExpeditionFromDisk(ctx);
     cancelSubagentDeferral(getRuntime(ctx));
   });
   pi.on("session_before_switch", async () => {
@@ -9422,8 +9470,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (!runtime.autoresearchMode) { recordAutoresearchActivation(workDir,true); setAutoresearchMode(ctx,true); updateWidget(ctx); }
       runtime.researchCampaignId = id;
       runtime.researchChain = {chainId,workDir,charterPath:docPath,charterSha256:current.sha256,charter:current.doc.charter,expedition:true,docSha256:current.sha256};
+      // Restart marker (bd pi-autoresearch-es1.3): lets a fresh session restore
+      // the binding from disk. Chain creation is already durable at this point,
+      // so a marker failure degrades to a warning, not a rollback.
+      const marker = expedition.writeExpeditionMarker(chainDir, {goal: current.doc.goal, docPath, docSha256: current.sha256, campaignId: id, charter: current.doc.charter});
+      const markerNote = marker.ok ? "" : `\nwarning: expedition restart marker not written (${marker.reason}: ${marker.message}); the expedition will not survive a pi restart.`;
       sendWhenReady(ctx, `Expedition ${id} created. Campaign 0 is running; the campaign brief is approved by the expedition confirmation. Before question work: pick a direction and activate it on the map with research expedition activate (action "expedition", subaction "activate", dir + why; the campaign is set automatically) — questions of campaign 0 belong to that direction. Then continue with research status/open/record/close. When the direction is closed (resolve/reject/advisory/park), activate the next direction and only then brief the next campaign.`, { steerIfBusy: true });
-      return reply(`✅ Expedition ${chainId} created; campaign ${id} started (document sha256 ${current.sha256}). Next: research expedition activate dir=<name> why=<rationale> before campaign work; after closing a direction activate the next one, then brief the next campaign.`);
+      return reply(`✅ Expedition ${chainId} created; campaign ${id} started (document sha256 ${current.sha256}). Next: research expedition activate dir=<name> why=<rationale> before campaign work; after closing a direction activate the next one, then brief the next campaign.${markerNote}`);
     },
   });
 

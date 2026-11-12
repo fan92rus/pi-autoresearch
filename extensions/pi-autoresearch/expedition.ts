@@ -1,7 +1,7 @@
 /** Pure expedition document, map, transition, and presentation logic (research-expedition spec scenarios). */
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { sha256Hex, type ChainEntry, type Result } from "./chain-journal.ts";
+import { sha256Hex, CHAIN_FILE, MANUAL_FILE, type ChainEntry, type Result } from "./chain-journal.ts";
 import * as charter from "./charter.ts";
 import * as researchState from "./research-state.ts";
 
@@ -147,3 +147,67 @@ export function expeditionWidgetLines(map:ExpeditionMap,info:{campaignId:string|
 }
 /** Produces a conservative markdown final report; never claims successful coverage. */
 export function expeditionReportText(map:ExpeditionMap,opts:{chainId:string;finalStatus:string;campaigns:Array<{id:string;reportPath:string}>;computedAt:string;activeDirWithoutCampaign?:string}):string{const pred=territoryComplete(map),unclosed=[...map.directions.values()].filter(d=>["parked","advisory_exhausted","active","open"].includes(d.status));const lines=[`# Expedition report — ${opts.chainId}`,`Status: ${opts.finalStatus}`,`Stop: ${map.stopEvent?`${map.stopEvent.rule} (${map.stopEvent.basis})`:"not recorded"}`,"Campaigns:",...opts.campaigns.map(c=>`- ${c.id}: ${c.reportPath}`),"",`Goal: ${map.goal}`,"","## Map (final)","| Dir | Status | Basis | Evidence |","|---|---|---|---|"];for(const d of map.directions.values())lines.push(`| ${d.dir} | ${d.status} | ${d.status==="advisory_exhausted"?"UNKNOWN basis: self-report — NOT proof":d.why} | ${(d.refs??[]).map(r=>`${r.campaign}/${r.question}`).join(", ")} |`);lines.push("","## Timeline",...map.timeline.map((e,i)=>`${i+1}. ${e.at} ${e.type}${e.dir?` ${e.dir}`:""}${e.to?` → ${e.to}`:""}${e.note?` — ${e.note}`:""}`),"","## Unfinished",...(unclosed.length?unclosed.map(d=>`- ${d.dir}: ${d.status==="parked"?"не исследовано":d.status==="advisory_exhausted"?"не доказательство":d.status}${d.status==="active"&&opts.activeDirWithoutCampaign===d.dir?" — active direction without a live campaign":""}`):["- none recorded"]),`territory_complete: ${pred.value} (computed ${opts.computedAt})${pred.openDirs.length?`; open: ${pred.openDirs.join(", ")}`:""}`);return lines.join("\n");}
+
+// ─── Restart persistence (bd pi-autoresearch-es1.3) ─────────────────────────
+// runtime.researchChain is session memory: after a pi restart the binding is
+// gone and the expedition silently degrades (no widget, no map slice, the
+// re-entry guard does not see it). The chain journal on disk stays complete,
+// so a small marker file beside chain.json plus a disk scan restores it.
+
+export const EXPEDITION_MARKER_FILE = "expedition.json";
+export interface ExpeditionMarker { schema_version:1; expedition:true; goal:string; doc_path:string; doc_sha256:string; campaign_id:string; charter:charter.Charter }
+/** Writes the restart marker beside chain.json. In expedition chains
+ *  charterPath === docPath and charterSha256 === docSha256 (the confirmed
+ *  document digest anchors the charter), so one doc_sha256 field serves both. */
+export function writeExpeditionMarker(chainDir:string,data:{goal:string;docPath:string;docSha256:string;campaignId:string;charter:charter.Charter}):Result<{path:string}>{
+  const marker:ExpeditionMarker={schema_version:1,expedition:true,goal:data.goal,doc_path:data.docPath,doc_sha256:data.docSha256,campaign_id:data.campaignId,charter:data.charter};
+  try{writeFileSync(join(chainDir,EXPEDITION_MARKER_FILE),JSON.stringify(marker,null,2)+"\n","utf8");return {ok:true,path:join(chainDir,EXPEDITION_MARKER_FILE)};}
+  catch(e){return refuse("io_failed",`cannot write expedition restart marker: ${String(e)}`);}
+}
+/** Reads and type-checks the restart marker; an unreadable or invalid marker
+ *  refuses (the scan treats it as no-marker and skips the chain — fail closed). */
+export function readExpeditionMarker(chainDir:string):Result<{marker:ExpeditionMarker}>{
+  try{
+    const parsed:unknown=JSON.parse(readFileSync(join(chainDir,EXPEDITION_MARKER_FILE),"utf8"));
+    if(!record(parsed))return refuse("marker_invalid","expedition.json is not an object");
+    if(parsed.schema_version!==1)return refuse("marker_invalid","unsupported expedition.json schema_version");
+    if(parsed.expedition!==true)return refuse("marker_invalid","expedition.json is not an expedition marker");
+    if(!nonempty(parsed.goal)||!nonempty(parsed.doc_path)||!nonempty(parsed.doc_sha256)||!nonempty(parsed.campaign_id))return refuse("marker_invalid","expedition.json requires non-empty goal, doc_path, doc_sha256, campaign_id");
+    const c=charter.validateCharter(parsed.charter);if(!c.ok)return refuse("marker_invalid","expedition.json charter does not validate");
+    return {ok:true,marker:{schema_version:1,expedition:true,goal:parsed.goal as string,doc_path:parsed.doc_path as string,doc_sha256:parsed.doc_sha256 as string,campaign_id:parsed.campaign_id as string,charter:c.charter}};
+  }catch(e){return refuse("marker_unreadable",`cannot read expedition.json: ${String(e)}`);}
+}
+export interface RestorableExpeditionChain { chainId:string; dir:string; status:"active"|"awaiting_child"; goal:string; docSha256:string; docPath:string; charterSha256:string; charter:charter.Charter; campaignId:string; mtimeMs:number }
+/** Disk scan for restorable expeditions (called on session start). A chain is
+ *  restorable when its journal shows expedition_created, the latest status is
+ *  active/awaiting_child, and a valid marker with a matching doc_sha256 exists
+ *  (no marker = not restorable, fail closed). Broken journal lines are skipped
+ *  (fail-soft); an unreadable journal skips the chain. Sorted by chain.json
+ *  mtime, most recent first — the restore takes chains[0]. */
+export function scanActiveExpeditionChains(chainRootDir:string):{chains:RestorableExpeditionChain[]}|"root_missing"{
+  let names:string[];
+  try{names=readdirSync(chainRootDir);}catch(e:any){if(e?.code==="ENOENT")return "root_missing";return {chains:[]};}
+  const chains:RestorableExpeditionChain[]=[];
+  for(const name of names){
+    const dir=join(chainRootDir,name);
+    if(existsSync(join(dir,MANUAL_FILE)))continue;
+    let entries:ChainEntry[]=[];
+    try{
+      const journal=readFileSync(join(dir,CHAIN_FILE),"utf8");
+      for(const line of journal.split(/\r?\n/)){if(!line.trim())continue;try{entries.push(JSON.parse(line) as ChainEntry);}catch{continue;}}
+    }catch{continue;}
+    const created=entries.find(e2=>e2.type==="expedition_created");if(!created)continue;
+    let status="";let campaignId="";
+    for(const e2 of entries){
+      if(e2.type==="status_change"&&typeof e2.status==="string")status=e2.status;
+      if(e2.type==="campaign_added"&&typeof e2.campaign_id==="string")campaignId=e2.campaign_id;
+    }
+    if(status!=="active"&&status!=="awaiting_child")continue;
+    const marker=readExpeditionMarker(dir);if(!marker.ok)continue;
+    if(marker.marker.doc_sha256!==created.doc_sha256)continue;
+    let mtimeMs=0;try{mtimeMs=statSync(join(dir,CHAIN_FILE)).mtimeMs;}catch{continue;}
+    chains.push({chainId:name,dir,status:status as "active"|"awaiting_child",goal:typeof created.goal==="string"?created.goal:"",docSha256:marker.marker.doc_sha256,docPath:marker.marker.doc_path,charterSha256:marker.marker.doc_sha256,charter:marker.marker.charter,campaignId,mtimeMs});
+  }
+  chains.sort((a,b)=>b.mtimeMs-a.mtimeMs);
+  return {chains};
+}

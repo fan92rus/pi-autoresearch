@@ -98,6 +98,7 @@ export function createFakePi({
   const sentMessages = [];
   const chatMessages = [];
   const notifications = [];
+  const widgets = [];
   const entries = [];
   const execCalls = [];
   const events = createEventBus();
@@ -116,6 +117,7 @@ export function createFakePi({
     sentMessages,
     chatMessages,
     notifications,
+    widgets,
     entries,
     execCalls,
     events,
@@ -274,7 +276,9 @@ export function makeCtx(dir, sessionId, piRef) {
       notify(text, type) {
         piRef?.notifications.push({ text, type });
       },
-      setWidget() {},
+      setWidget(name, widget) {
+        piRef?.widgets.push({ name, widget });
+      },
       input: async () => "",
       select: async () => "",
     },
