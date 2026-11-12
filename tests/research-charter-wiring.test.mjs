@@ -727,3 +727,63 @@ test("review-B2: a failed limit_reached write keeps the mode ON (M4/N2 invariant
   assert.match(res2, /Research mode is OFF/i, res2);
   assert.equal(chainStatus(dir, "c1-chain"), "limit_reached");
 });
+
+// ─── Child-brief steer continuation + honest stop-rule self-report (2026-11-12) ─
+
+test("chain child brief approval sends a steer continuation with the start instruction (agent cannot stall in briefing)", async () => {
+  const dir = makeWorkDir("child-steer");
+  writeStoppedRootCampaign(dir, "c1");
+  const charterPath = writeCharter(dir, {});
+  const h = await loadExtensionBare(dir, "child-steer", true);
+  await launchWithCharter(h, charterPath, "c1");
+  await call(h, "research", { action: "report" }); // chain -> awaiting_child
+  const before = h.pi.sentMessages.length;
+
+  const childBrief = briefFixture();
+  childBrief.questions[0].finding_refs = [{ campaign: "c1", question: "Q1" }];
+  const res = textOf(await call(h, "research_brief", { action: "draft", brief: childBrief }));
+  assert.match(res, /auto-approved/i, res);
+
+  // Bug fix (2026-11-12 live stall): the child campaign is created in phase
+  // briefing and the tool reply alone was the only instruction; when the turn
+  // ended the agent idled and the campaign never started. A steer message
+  // must go out with the start command and the sha256.
+  assert.equal(h.pi.sentMessages.length, before + 1, "exactly one steer message after the child brief approval");
+  const sent = h.pi.sentMessages[h.pi.sentMessages.length - 1];
+  assert.match(sent.text, /action="start"/, "the steer names the start action");
+  assert.match(sent.text, /expected_sha256="[0-9a-f]{64}"/, "the steer carries the brief sha256");
+  assert.match(sent.text, /c1-chain-c1/, "the steer names the child campaign id");
+  // steerIfBusy: mid-turn the message goes out as deliverAs "steer"; when the
+  // agent is already idle (fake-pi is always idle) it is delivered at once
+  // without deliverAs — both must carry the same instruction text.
+  assert.ok(sent.opts?.deliverAs === "steer" || sent.opts?.deliverAs === undefined, "delivered as steer or immediately (idle)");
+});
+
+test("chain stop-rule reply carries the self-report note; continuation forbids borrowing an unfired rule", async () => {
+  const dir = makeWorkDir("stop-selfreport");
+  writeStoppedRootCampaign(dir, "c1");
+  const charterPath = writeCharter(dir, { stop_rules: ["two rejected findings in a row"] });
+  const h = await loadExtensionBare(dir, "stop-selfreport", true);
+  await launchWithCharter(h, charterPath, "c1");
+  await call(h, "research", { action: "report" });
+  assert.equal(chainStatus(dir, "c1-chain"), "awaiting_child");
+
+  // The rule self-report reply must mark itself as a self-report so the owner
+  // sees in the transcript that the condition was agent-asserted, not proven.
+  const res = textOf(await call(h, "research", { action: "chain_stop", rule_id: "two rejected findings in a row" }));
+  assert.match(res, /stopped by charter rule/, res);
+  assert.match(res, /\(self-report: verify the rule condition actually fired\)/, res);
+
+  // The chain continuation message must teach the agent to use the owner
+  // stop (no rule_id) instead of borrowing an unfired charter rule.
+  const dir2 = makeWorkDir("cont-noborrow");
+  writeStoppedRootCampaign(dir2, "c1");
+  const h2 = await loadExtensionBare(dir2, "cont-noborrow", true);
+  await launchWithCharter(h2, writeCharter(dir2, {}), "c1");
+  const before = h2.pi.sentMessages.length;
+  await call(h2, "research", { action: "report" });
+  assert.equal(h2.pi.sentMessages.length, before + 1, "continuation sent");
+  const cont = h2.pi.sentMessages[h2.pi.sentMessages.length - 1].text;
+  assert.match(cont, /never borrow a charter rule whose condition has not fired/, "continuation forbids borrowing rules");
+  assert.match(cont, /chain_stop without rule_id/i, "continuation names the owner stop path");
+});

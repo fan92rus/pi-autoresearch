@@ -9653,6 +9653,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         getRuntime(ctx).researchCampaignId = childId;
         getRuntime(ctx).chainContinuationSent = false;
         briefPreviewDir = created.dir;
+        // Live-stall fix (2026-11-12): the tool reply is the only place the
+        // start instruction lived; when the agent's turn ended right after the
+        // brief approval the child campaign sat in briefing forever. The steer
+        // message reaches the agent mid-turn so the campaign actually starts.
+        sendWhenReady(ctx, `Campaign ${childId} created and brief approved (sha256 ${written.sha256}). Continue now: research_questions(action="start", expected_sha256="${written.sha256}"), then research_questions(action="open", question_id=<id>) for the first question; keep going until the campaign stops and reports.`, { steerIfBusy: true });
         return reply(`✅ Chain brief auto-approved by the charter checks (source: charter, sha256 ${written.sha256}). Campaign ${childId} created (parent ${parentId}, depth ${newDepth}). Next: research_questions(action=start, expected_sha256=<this sha256>).`);
       }
       // The campaign id is never taken from the model: the pinned id (launch
@@ -10060,9 +10065,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           const reportNote = chain.expedition ? await writeExpeditionFinalReport(chain, "stopped_by_rule") : "";
           if (status === "awaiting_child") {
             exitChainModeFromPause(ctx, chain.chainId);
-            return reply(`🛑 Research chain ${chain.chainId} stopped by charter rule ${JSON.stringify(ruleId)} (charter stop rule, pause): research mode is OFF.${reportNote ? ` ${reportNote}.` : ""}`);
+            return reply(`🛑 Research chain ${chain.chainId} stopped by charter rule ${JSON.stringify(ruleId)} (charter stop rule, pause): research mode is OFF. (self-report: verify the rule condition actually fired)${reportNote ? ` ${reportNote}.` : ""}`);
           }
-          return reply(`🛑 Research chain ${chain.chainId} stopped by charter rule ${JSON.stringify(ruleId)}. ${reportNote ? `${reportNote}. ` : ""}New chain briefs are refused; the active campaign finishes its work and writes the final report, which turns research mode OFF.`);
+          return reply(`🛑 Research chain ${chain.chainId} stopped by charter rule ${JSON.stringify(ruleId)} (self-report: verify the rule condition actually fired). ${reportNote ? `${reportNote}. ` : ""}New chain briefs are refused; the active campaign finishes its work and writes the final report, which turns research mode OFF.`);
         }
         // Owner stop: the model cannot confirm for the owner — a dialog is required.
         if (!ctx.hasUI || !ctx.ui || typeof ctx.ui.confirm !== "function") {
@@ -10764,6 +10769,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       `- keep the caveat_block, the verdict set and the evidence_gate exactly as in the parent brief;`,
       `- the brief is auto-approved by the charter checks (no owner dialog) and the next campaign id is assigned by the system.`,
       "If you have nothing more to research, report and wait: the owner can stop the chain with research chain_stop.",
+      "Owner-stop rule: if the OWNER asks to finish/stop the expedition and NO charter stop rule has actually fired, call chain_stop WITHOUT rule_id (owner decision, interactive dialog) — never borrow a charter rule whose condition has not fired; a stop rule is a factual self-report, not a way to dress up an owner request.",
       ...(slice ? ["Expedition map snapshot:", slice] : []),
     ].join("\n");
     runtime.chainContinuationSent = true;
