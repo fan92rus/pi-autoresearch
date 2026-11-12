@@ -45,9 +45,9 @@
     "package.json"
   ],
   "scripts": {
-    "test": "node --experimental-strip-types --experimental-loader ./tests/redirect-loader.mjs --test tests/*.test.mjs",
+    "test": "node --experimental-strip-types --env-file=./tests/test.env --experimental-loader ./tests/redirect-loader.mjs --test tests/*.test.mjs",
     "test:core": "node --experimental-strip-types --test tests/observer.test.mjs",
-    "test:ext": "node --experimental-strip-types --experimental-loader ./tests/redirect-loader.mjs --test tests/smoke.test.mjs tests/pbt.test.mjs",
+    "test:ext": "node --experimental-strip-types --env-file=./tests/test.env --experimental-loader ./tests/redirect-loader.mjs --test tests/smoke.test.mjs tests/pbt.test.mjs",
     "test:upstream": "node --experimental-strip-types --test tests/upstream-reference/*.test.mjs"
   }
 }

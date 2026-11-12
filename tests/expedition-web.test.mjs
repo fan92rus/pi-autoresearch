@@ -199,7 +199,7 @@ test('export command stays the ordinary ledger path inside an expedition (no exp
   // exportDashboard must NOT branch to the expedition page: the spec keeps the ledger dashboard for export.
   // Slice precisely: from the exportDashboard signature to the next helper (the expedition detector).
   const start = source.indexOf('async function exportDashboard');
-  const end = source.indexOf('/** Detects the active expedition', start);
+  const end = source.indexOf('/** Detects an expedition', start);
   const exportFn = source.slice(start, end);
   assert.ok(exportFn.includes('Export failed'), 'slice captured the real exportDashboard body');
   assert.doesNotMatch(exportFn, /buildExpeditionHtml/, 'export must not render the expedition page');

@@ -195,16 +195,20 @@ export function readExpeditionMarker(chainDir:string):Result<{marker:ExpeditionM
   }catch(e){return refuse("marker_unreadable",`cannot read expedition.json: ${String(e)}`);}
 }
 export interface RestorableExpeditionChain { chainId:string; dir:string; status:"active"|"awaiting_child"; goal:string; docSha256:string; docPath:string; charterSha256:string; charter:charter.Charter; campaignId:string; mtimeMs:number }
-/** Disk scan for restorable expeditions (called on session start). A chain is
- *  restorable when its journal shows expedition_created, the latest status is
- *  active/awaiting_child, and a valid marker with a matching doc_sha256 exists
- *  (no marker = not restorable, fail closed). Broken journal lines are skipped
- *  (fail-soft); an unreadable journal skips the chain. Sorted by chain.json
- *  mtime, most recent first — the restore takes chains[0]. */
-export function scanActiveExpeditionChains(chainRootDir:string):{chains:RestorableExpeditionChain[]}|"root_missing"{
+/** Expedition chain on disk with ANY last status (the web dashboard shows
+ *  stopped/completed expeditions too — owner request 2026-11-12). Same shape
+ *  as RestorableExpeditionChain; the status is widened to string. */
+export interface ExpeditionChain extends Omit<RestorableExpeditionChain,"status"> { status:string }
+/** Shared disk walk behind scanActiveExpeditionChains / scanExpeditionChains:
+ *  fail-closed integrity (readable journal, expedition_created, matching
+ *  marker digest) + fail-soft line skipping; manual-check dirs are always
+ *  excluded. When onlyActive is true the final status must additionally be
+ *  active/awaiting_child (restore contract, unchanged). Sorted by chain.json
+ *  mtime, most recent first. */
+function scanExpeditionChainsImpl(chainRootDir:string, onlyActive:boolean):{chains:Array<RestorableExpeditionChain|ExpeditionChain>}|"root_missing"{
   let names:string[];
   try{names=readdirSync(chainRootDir);}catch(e:any){if(e?.code==="ENOENT")return "root_missing";return {chains:[]};}
-  const chains:RestorableExpeditionChain[]=[];
+  const chains:Array<RestorableExpeditionChain|ExpeditionChain>=[];
   for(const name of names){
     const dir=join(chainRootDir,name);
     if(existsSync(join(dir,MANUAL_FILE)))continue;
@@ -219,12 +223,29 @@ export function scanActiveExpeditionChains(chainRootDir:string):{chains:Restorab
       if(e2.type==="status_change"&&typeof e2.status==="string")status=e2.status;
       if(e2.type==="campaign_added"&&typeof e2.campaign_id==="string")campaignId=e2.campaign_id;
     }
-    if(status!=="active"&&status!=="awaiting_child")continue;
+    if(onlyActive&&(status!=="active"&&status!=="awaiting_child"))continue;
     const marker=readExpeditionMarker(dir);if(!marker.ok)continue;
     if(marker.marker.doc_sha256!==created.doc_sha256)continue;
     let mtimeMs=0;try{mtimeMs=statSync(join(dir,CHAIN_FILE)).mtimeMs;}catch{continue;}
-    chains.push({chainId:name,dir,status:status as "active"|"awaiting_child",goal:typeof created.goal==="string"?created.goal:"",docSha256:marker.marker.doc_sha256,docPath:marker.marker.doc_path,charterSha256:marker.marker.doc_sha256,charter:marker.marker.charter,campaignId,mtimeMs});
+    const base={chainId:name,dir,goal:typeof created.goal==="string"?created.goal:"",docSha256:marker.marker.doc_sha256,docPath:marker.marker.doc_path,charterSha256:marker.marker.doc_sha256,charter:marker.marker.charter,campaignId,mtimeMs};
+    chains.push(onlyActive?{...base,status:status as "active"|"awaiting_child"}:{...base,status});
   }
   chains.sort((a,b)=>b.mtimeMs-a.mtimeMs);
   return {chains};
+}
+/** Disk scan for restorable expeditions (called on session start). A chain is
+ *  restorable when its journal shows expedition_created, the latest status is
+ *  active/awaiting_child, and a valid marker with a matching doc_sha256 exists
+ *  (no marker = not restorable, fail closed). Broken journal lines are skipped
+ *  (fail-soft); an unreadable journal skips the chain. Sorted by chain.json
+ *  mtime, most recent first — the restore takes chains[0]. Shared walk with
+ *  scanExpeditionChains (which accepts ANY final status for the web
+ *  dashboard). */
+export function scanActiveExpeditionChains(chainRootDir:string):{chains:RestorableExpeditionChain[]}|"root_missing"{
+  const scan=scanExpeditionChainsImpl(chainRootDir,true);
+  return scan==="root_missing"?scan:{chains:scan.chains as RestorableExpeditionChain[]};
+}
+export function scanExpeditionChains(chainRootDir:string):{chains:ExpeditionChain[]}|"root_missing"{
+  const scan=scanExpeditionChainsImpl(chainRootDir,false);
+  return scan==="root_missing"?scan:{chains:scan.chains as ExpeditionChain[]};
 }

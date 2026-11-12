@@ -106,6 +106,16 @@ test('deterministic: identical arguments produce bit-identical pages; page is vi
   assert.equal(a, c, 'same arguments → bit-identical');
 });
 
+test('chain-status badge: stopped chain badge + live badge wiring in the page source', () => {
+  const html = buildExpeditionHtml(seedView(), campaigns);
+  // The badge renders client-side from payload.chainStatus (data-agnostic page).
+  assert.ok(html.includes('chainChip'), 'badge element present');
+  assert.ok(html.includes('цепочка остановлена'), 'stopped badge text');
+  assert.ok(html.includes('цепочка: '), 'live badge text');
+  assert.ok(html.includes('chainStatus'), 'badge reads payload.chainStatus');
+  assert.ok(html.includes('classList.toggle("live",live)'), 'live class toggle');
+});
+
 test('K2 UX essentials carried over from the approved mockup', () => {
   const html = buildExpeditionHtml(seedView(), campaigns);
   // campaign strip chips with flash wiring + unbound-campaign chip response

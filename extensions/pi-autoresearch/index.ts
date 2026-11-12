@@ -306,7 +306,7 @@ export let restoreExpeditionForTest: ((ctx: ExtensionContext) => Promise<void>) 
 /** Test/CLI hook for the expedition web payload (expedition-tui group 4): the
  *  shared builder behind GET /expedition and the initial page. Bound when the
  *  extension initializes; typed as a const export so tests can call it. */
-export let resolveExpeditionPayload: ((workDir: string) => (ExpeditionView & { schema_version: number; campaigns: ExpeditionWebCampaign[] }) | null) | null = null;
+export let resolveExpeditionPayload: ((workDir: string) => (ExpeditionView & { schema_version: number; campaigns: ExpeditionWebCampaign[]; chainStatus: string | null }) | null) | null = null;
 /** Test hook: stops the dashboard static server so tests that started it can
  *  release the listen socket and let the process exit. */
 export let stopDashboardServerForTest: (() => void) | null = null;
@@ -2716,7 +2716,37 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const researchCompletionText = "Continue the research campaign: all brief questions are closed — pick a stop rule and call research_questions(action=stop, rule_id=<rule_id>, reason=<why the stop condition is met>), then research_questions(action=report); STOP on manual_check_required.";
 
+  /** Expedition-aware drift branch (review blocker 2026-11-12: the legacy
+   *  'pick a stop rule' push fired in an expedition with an active direction
+   *  still on the map). Returns the continuation text for an expedition
+   *  campaign in the research phase, or null for the legacy selection. The
+   *  decision reuses expeditionCloseNudge: open directions / finding-driven
+   *  hypotheses route to open/activate/reopen, stop appears ONLY in the
+   *  exhaustion branch (all questions closed AND no new vectors in sight). */
+  const expeditionDriftBranchText = async (ctx: ExtensionContext): Promise<string | null> => {
+    const chain = activeChain(ctx);
+    if (!chain?.expedition) return null;
+    const campaignId = getRuntime(ctx).researchCampaignId;
+    if (campaignId === null) return null;
+    const resolved = researchState.resolveCampaignDir(chain.workDir, campaignId);
+    if (!resolved.ok) return null;
+    const state = await researchState.readState(resolved.dir);
+    if (!state.ok || state.state.phase !== "research") return null;
+    const verified = await chainJournal.verifyChain(chain.workDir, chain.chainId);
+    if (!verified.ok) return null;
+    const replay = expedition.replayExpeditionMap(verified.entries);
+    if (!replay.ok) return null;
+    const nudge = await expeditionCloseNudge(ctx, chain, replay.map);
+    return nudge === null ? null : `Continue the expedition now: ${nudge.replySuffix} STOP on manual_check_required.`;
+  };
+
   const composeResearchDriftMessage = async (ctx: ExtensionContext): Promise<string> => {
+    // Expedition branch first: the legacy completion text prescribes a stop
+    // while the map still has active/open directions (review blocker).
+    const expeditionBranch = await expeditionDriftBranchText(ctx);
+    if (expeditionBranch !== null) {
+      return ["⚠ Last turn did no research-campaign work.", expeditionBranch, "Questions and decision rules come only from the approved brief."].join(" ");
+    }
     const snapshot = await researchCompletionSnapshot(ctx);
     const next = snapshot.readable && snapshot.allClosed && !snapshot.stopTriggered && snapshot.phase === "research"
       ? researchCompletionText
@@ -2759,6 +2789,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       researchScanSync(workDir).blocks ||
       (stateRoot !== null && stateRoot !== workDir && researchScanSync(stateRoot).blocks);
     if (research) {
+      const expeditionBranch = await expeditionDriftBranchText(ctx);
+      if (expeditionBranch !== null) return expeditionBranch;
       const snapshot = await researchCompletionSnapshot(ctx);
       return snapshot.readable && snapshot.allClosed && !snapshot.stopTriggered && snapshot.phase === "research"
         ? researchCompletionText
@@ -7213,14 +7245,23 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const dashboardSseClients = new Set<ServerResponse>();
 
   function openInBrowser(url: string): void {
+    // bd pi-autoresearch-dif: npm test executed the dashboard handler and
+    // REALLY opened Firefox on a port that died with the test process —
+    // every test run popped a console window and a dead-port tab. The env
+    // guard makes the side effect opt-out for tests/CI; the URL is still
+    // printed via notify so nothing is lost.
+    if (process.env.PI_AUTORESEARCH_NO_BROWSER) return;
     const child = process.platform === "win32"
-      ? spawn("cmd", ["/c", "start", "", url], {
+      // rundll32 without shell: no console window flash (windowsHide alone
+      // does not help with `cmd /c start`, the shell IS the console).
+      ? spawn("rundll32", ["url.dll,FileProtocolHandler", url], {
           detached: true,
-          shell: true,
+          windowsHide: true,
           stdio: "ignore",
         })
       : spawn(process.platform === "darwin" ? "open" : "xdg-open", [url], {
           detached: true,
+          windowsHide: true,
           stdio: "ignore",
         });
     // Swallow launcher errors (e.g. xdg-open missing); caller prints the URL
@@ -7326,9 +7367,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   /** The /expedition JSON payload: ExpeditionView + the per-campaign array
    *  (expedition-tui spec group 4 + the wiring contract). One shared builder
    *  serves BOTH the initial page and the live route, so they can never drift.
-   *  Returns null when no active expedition chain exists on disk. */
-  function buildExpeditionPayload(workDir: string): (ExpeditionView & { schema_version: number; campaigns: ExpeditionWebCampaign[] }) | null {
-    const scan = expedition.scanActiveExpeditionChains(path.join(workDir, ".auto", "research-chain"));
+   *  Returns null when NO expedition chain exists on disk at all (any final
+   *  status qualifies: the dashboard opens for stopped/completed chains too,
+   *  bd pi-autoresearch owner request 2026-11-12). */
+  function buildExpeditionPayload(workDir: string): (ExpeditionView & { schema_version: number; campaigns: ExpeditionWebCampaign[]; chainStatus: string | null }) | null {
+    // ANY final status: the dashboard opens for stopped/completed expeditions
+    // too (owner request 2026-11-12); null only when no expedition exists at all.
+    const scan = expedition.scanExpeditionChains(path.join(workDir, ".auto", "research-chain"));
     if (scan === "root_missing" || scan.chains.length === 0) return null;
     const chain = scan.chains[0];
     const chainDir = path.join(workDir, ".auto", "research-chain", chain.chainId);
@@ -7363,7 +7408,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     } catch { /* unreadable journal here → the view's own fail payload already reports damage */ }
     if (view.fail === "journal") campaignIds = [];
     const campaigns = campaignIds.map((id) => expeditionCampaignPayload(campaignRoot, id));
-    return { schema_version: 1, ...view, dirs, campaigns };
+    return { schema_version: 1, ...view, dirs, campaigns, chainStatus: chain.status };
   }
 
   function registerSseClient(res: ServerResponse): void {
@@ -7431,7 +7476,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               // cannot be read anymore (damage while the page was open):
               // serve the honest damage payload (spec scenario).
               res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-              res.end(JSON.stringify({ schema_version: 1, fail: "journal", mapError: null, goal: "", dirs: [], timeline: [], timelineTotal: 0, campaignId: null, campaignState: "none", campaignPhase: null, questions: [], evidence: [], counters: { done: 0, total: 0, campaignsUsed: 0, campaignsMax: null, qClosed: 0, qTotal: 0, next: "" }, campaigns: [] }));
+              res.end(JSON.stringify({ schema_version: 1, fail: "journal", mapError: null, goal: "", dirs: [], timeline: [], timelineTotal: 0, campaignId: null, campaignState: "none", campaignPhase: null, questions: [], evidence: [], counters: { done: 0, total: 0, campaignsUsed: 0, campaignsMax: null, qClosed: 0, qTotal: 0, next: "" }, campaigns: [], chainStatus: null }));
               return;
             }
             res.writeHead(404);
@@ -7494,14 +7539,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
   }
 
-  /** Detects the active expedition for the web dashboard: the runtime pin
-   *  first, then the fail-closed disk scan (a restart loses the pin but the
-   *  chain stays on disk — same fallback as the widget restore). */
-  const activeExpeditionForWeb = (ctx: ExtensionContext): boolean => {
+  /** Detects an expedition for the web dashboard: the runtime pin first, then
+   *  the fail-closed disk scan over ALL expedition chains regardless of the
+   *  final status — the dashboard opens for stopped/completed expeditions too
+   *  (owner request 2026-11-12). A restart loses the pin but the chain stays
+   *  on disk — same fallback as the widget restore. */
+  const expeditionForWeb = (ctx: ExtensionContext): boolean => {
     const runtime = getRuntime(ctx);
     if (runtime.researchChain?.expedition === true) return true;
     const workDir = resolveWorkDir(ctx.cwd);
-    const scan = expedition.scanActiveExpeditionChains(path.join(workDir, ".auto", "research-chain"));
+    const scan = expedition.scanExpeditionChains(path.join(workDir, ".auto", "research-chain"));
     return scan !== "root_missing" && scan.chains.length > 0;
   };
 
@@ -7519,8 +7566,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     try {
       const workDir = resolveWorkDir(ctx.cwd);
       const payload = buildExpeditionPayload(workDir);
-      // The active-chain check made the branch; a damaged journal still shows
-      // the honest damage banner on the page (spec scenario), so we proceed.
+      // The ANY-STATUS expedition check made the branch (stopped/completed
+      // chains included); a damaged journal still shows the honest damage
+      // banner on the page (spec scenario), so we proceed.
       const viewForPage: ExpeditionView = payload ?? {
         fail: "journal", mapError: null, goal: "", dirs: [], timeline: [], timelineTotal: 0,
         campaignId: null, campaignState: "none", campaignPhase: null, questions: [], evidence: [],
@@ -10204,6 +10252,25 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (!chainDirPath) return fail("manual_check_required", "chain directory is unavailable");
         const written = await chainJournal.appendEntry(chainDirPath, chain.workDir, chain.chainId, type, payload);
         if (!written.ok) return fail(written.reason as never, written.message);
+        // Direction nudge (live-stall fix 2026-11-12): after a closing
+        // transition the bare "map recorded" reply left the agent with no
+        // next step and the expedition stalled. Only expedition chains with
+        // the pinned campaign in the research phase get the nudge; every
+        // other reply stays bit-identical (regression-tested).
+        if (["resolve", "reject", "advisory", "park"].includes(subaction)) {
+          const postReplay = expedition.replayExpeditionMap([...verified.entries, written.entry]);
+          if (!postReplay.ok) return reply(`Expedition map recorded: ${subaction} ${params.dir ?? params.from ?? ""}.`);
+          const nudge = await expeditionCloseNudge(ctx, chain, postReplay.map);
+          if (nudge !== null) {
+            // Review blockers B2/B3 resolution: the steer is per closing
+            // EVENT, not per chain — every qualifying close of the last
+            // active direction continues the turn (one send per call by
+            // construction; a repeated event requires a new, distinct tool
+            // call, so duplicates are structurally impossible).
+            if (nudge.steerMessage !== null) sendWhenReady(ctx, nudge.steerMessage, { steerIfBusy: true });
+            return reply(`Expedition map recorded: ${subaction} ${params.dir ?? params.from ?? ""}. ${nudge.replySuffix}`);
+          }
+        }
         return reply(`Expedition map recorded: ${subaction} ${params.dir ?? params.from ?? ""}.`);
       }
 
@@ -10247,11 +10314,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           const ruleWrite = await chainJournal.setChainStatus(chain.workDir, chain.chainId, "stopped_by_rule");
           if (!ruleWrite.ok) return fail(ruleWrite.reason as never, `chain stop not recorded: ${ruleWrite.message}`);
           const reportNote = chain.expedition ? await writeExpeditionFinalReport(chain, "stopped_by_rule") : "";
+          const territoryNote = chain.expedition ? expeditionTerritoryNote(verified.entries) : "";
           if (status === "awaiting_child") {
             exitChainModeFromPause(ctx, chain.chainId);
-            return reply(`🛑 Research chain ${chain.chainId} stopped by charter rule ${JSON.stringify(ruleId)} (charter stop rule, pause): research mode is OFF. (self-report: verify the rule condition actually fired)${reportNote ? ` ${reportNote}.` : ""}`);
+            return reply(`🛑 Research chain ${chain.chainId} stopped by charter rule ${JSON.stringify(ruleId)} (charter stop rule, pause): research mode is OFF. (self-report: verify the rule condition actually fired)${reportNote ? ` ${reportNote}.` : ""}${territoryNote}`);
           }
-          return reply(`🛑 Research chain ${chain.chainId} stopped by charter rule ${JSON.stringify(ruleId)} (self-report: verify the rule condition actually fired). ${reportNote ? `${reportNote}. ` : ""}New chain briefs are refused; the active campaign finishes its work and writes the final report, which turns research mode OFF.`);
+          return reply(`🛑 Research chain ${chain.chainId} stopped by charter rule ${JSON.stringify(ruleId)} (self-report: verify the rule condition actually fired). ${reportNote ? `${reportNote}. ` : ""}New chain briefs are refused; the active campaign finishes its work and writes the final report, which turns research mode OFF.${territoryNote}`);
         }
         // Owner stop: the model cannot confirm for the owner — a dialog is required.
         if (!ctx.hasUI || !ctx.ui || typeof ctx.ui.confirm !== "function") {
@@ -10273,11 +10341,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const ownerWrite = await chainJournal.setChainStatus(chain.workDir, chain.chainId, "stopped_by_owner");
         if (!ownerWrite.ok) return fail(ownerWrite.reason as never, `chain stop not recorded: ${ownerWrite.message}`);
         const reportNote = chain.expedition ? await writeExpeditionFinalReport(chain, "stopped_by_owner") : "";
+        const territoryNote = chain.expedition ? expeditionTerritoryNote(verified.entries) : "";
         if (status === "awaiting_child") {
           exitChainModeFromPause(ctx, chain.chainId);
-          return reply(`🛑 Research chain ${chain.chainId} stopped by the owner (pause): research mode is OFF.${reportNote ? ` ${reportNote}.` : ""}`);
+          return reply(`🛑 Research chain ${chain.chainId} stopped by the owner (pause): research mode is OFF.${reportNote ? ` ${reportNote}.` : ""}${territoryNote}`);
         }
-        return reply(`🛑 Research chain ${chain.chainId} stopped by the owner. ${reportNote ? `${reportNote}. ` : ""}New chain briefs are refused; the open vector is not interrupted; the active campaign finishes its work per research rules and writes the final report, which turns research mode OFF.`);
+        return reply(`🛑 Research chain ${chain.chainId} stopped by the owner. ${reportNote ? `${reportNote}. ` : ""}New chain briefs are refused; the open vector is not interrupted; the active campaign finishes its work per research rules and writes the final report, which turns research mode OFF.${territoryNote}`);
       }
 
       if (action === "start") {
@@ -10574,10 +10643,24 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const afterClose = await researchSnapshot(dir);
         const allClosed = afterClose.ok && afterClose.brief !== null && afterClose.replay.vectors.size > 0 &&
           afterClose.brief.questions.every((q) => afterClose.replay.vectors.get(q.id)?.status === "closed");
-        const closingNudge = allClosed && afterClose.ok && afterClose.replay.stop === null
+        // Expedition chains (live-stall fix 2026-11-12): after the LAST question
+        // closes, the next executable step is closing the MAP DIRECTION — the
+        // agent stalled in the live run because nothing said question close ≠
+        // direction resolve at that point. Non-expedition campaigns keep the
+        // exact legacy nudge (regression contract). Review blocker B1: in an
+        // expedition the stop suggestion is NOT offered here — campaign stop is
+        // legal only in the exhaustion branch of the post-close nudge (all
+        // questions closed AND no new vectors in sight); with open directions
+        // or finding-driven hypotheses the map hint routes to resolve/open, so
+        // a premature "pick a stop rule" would contradict the owner contract.
+        const chainCtx = activeChain(ctx);
+        const mapHint = allClosed && afterClose.ok && afterClose.replay.stop === null && chainCtx?.expedition
+          ? " Then close the map direction with a separate expedition_map call — expedition_map(subaction=resolve, dir=<name>, refs=[{campaign,question}]) citing the closed questions, or expedition_map(subaction=reject, dir=<name>, refs=[...]) / expedition_map(subaction=advisory, ...) / expedition_map(subaction=park, ...): question close is not direction resolve."
+          : "";
+        const closingNudge = allClosed && afterClose.ok && afterClose.replay.stop === null && !chainCtx?.expedition
           ? " All questions are closed: pick a stop rule, then call research_questions(action=stop, rule_id=<rule_id>, reason=<why the stop condition is met>) and research_questions(action=report)."
           : "";
-        return reply(`✅ Vector ${qid} closed: ${verdict} by rule ${rid}.` + findingNote + closingNudge);
+        return reply(`✅ Vector ${qid} closed: ${verdict} by rule ${rid}.` + findingNote + closingNudge + mapHint);
       }
 
       if (action === "stop") {
@@ -10936,6 +11019,99 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     catch (e) { return `warning: expedition report could not be saved (${String(e)})`; }
   };
 
+  /** Direction-close nudge (live-stall fix 2026-11-12, owner-refined flow):
+   *  after resolve/reject/advisory/park the reply must keep the expedition
+   *  moving without ever pushing a premature campaign stop. Two-step order:
+   *  step 1 — open NEW vectors from the findings (as many as the findings
+   *  justify); reopen of a parked/closed direction is the same finding-driven
+   *  option. Step 2 — pick WHICH accumulated open direction to activate (a
+   *  separate priority decision, never bundled with opening). Campaign stop
+   *  (research_questions action=stop → report) is offered ONLY in the
+   *  exhaustion branch: every candidate is gone AND every brief question is
+   *  closed. When candidates are gone but questions remain open, the path is
+   *  the next chain campaign brief (research_brief draft). Non-expedition
+   *  chains and non-research campaign phases get null → bare reply (regression
+   *  contract). The steer variant (same decision, delivered so the agent cannot
+   *  stall on a finished turn) is returned for the transitions that removed
+   *  the LAST active direction. */
+  const expeditionCloseNudge = async (
+    ctx: ExtensionContext,
+    chain: NonNullable<ReturnType<typeof activeChain>>,
+    map: expedition.ExpeditionMap,
+  ): Promise<{ replySuffix: string; steerMessage: string | null } | null> => {
+    if (!chain.expedition) return null;
+    const campaignId = getRuntime(ctx).researchCampaignId;
+    if (campaignId === null) return null;
+    const resolved = researchState.resolveCampaignDir(chain.workDir, campaignId);
+    if (!resolved.ok) return null;
+    const state = await researchState.readState(resolved.dir);
+    if (!state.ok || state.state.phase !== "research") return null;
+
+    const dirs = [...map.directions.values()];
+    const openDirs = dirs.filter((d) => d.status === "open").map((d) => d.dir);
+    const reopenable = dirs.filter((d) => ["parked", "advisory_exhausted", "resolved", "rejected"].includes(d.status)).map((d) => d.dir);
+    const reopenExample = dirs.find((d) => d.status === "parked")?.dir ?? reopenable[0];
+    const hasActive = dirs.some((d) => d.status === "active");
+
+    // Open brief questions of the pinned campaign (stop is legal only at zero).
+    let openQuestions = 0;
+    try {
+      const snap = await researchSnapshot(resolved.dir);
+      if (snap.ok && snap.brief !== null) {
+        for (const q of snap.brief.questions) {
+          const st = snap.replay.vectors.get(q.id)?.status;
+          if (st !== "closed") openQuestions += 1;
+        }
+      }
+    } catch { /* snapshot failure: treat questions as open (conservative — no stop) */ }
+
+    const step1Open = "Step 1 — open new vectors from the findings: if the findings support a new testable hypothesis, call expedition_map(subaction=open, dir=<new name>, why=<finding>); open as many as the findings justify.";
+    const reopenLine = reopenExample !== undefined
+      ? ` If a result re-justifies an earlier direction, expedition_map(subaction=reopen, dir=${reopenExample}, reason=<new hypothesis>) is the same finding-driven option.`
+      : "";
+    const step2Activate = "Step 2 — separately choose WHICH accumulated open direction has priority and call expedition_map(subaction=activate, dir=<chosen>, why=<rationale>) (activation is a deliberate priority decision, not part of opening).";
+
+    // Exhaustion branch (owner rule): campaign stop is legal only when
+    // (a) every brief question is closed AND (b) no NEW vectors are in sight —
+    // no active, no open direction. Reopenable (parked/resolved/rejected/
+    // advisory) is deliberately NOT a blocking candidate: reopening one is the
+    // same finding-driven judgment as opening a new direction, so both live in
+    // step 1 of the same message and never block the honest finish path.
+    const hasCandidates = hasActive || openDirs.length > 0;
+    if (!hasCandidates && openQuestions === 0) {
+      const exhausted = `${step1Open}${reopenLine} If the findings support no further hypothesis, that is a valid outcome: close the campaign — research_questions(action=stop, rule_id=<rule_id>, reason=<why the stop condition is met>) then research_questions(action=report).`;
+      return { replySuffix: `Next: ${exhausted}`, steerMessage: `Expedition: the last active direction is closed and every brief question has a verdict. ${exhausted}` };
+    }
+
+    // Candidates gone but the campaign still has open questions → next chain
+    // campaign brief keeps the expedition moving (never a premature stop).
+    if (!hasCandidates && openQuestions > 0) {
+      const briefPath = `${step1Open}${reopenLine} If no new hypothesis emerges, continue the expedition with the next campaign: research_brief draft (finding_refs cite closed questions of this chain; auto-approved by the charter checks).`;
+      return { replySuffix: `Next: ${briefPath}`, steerMessage: `Expedition: the last active direction is closed; the campaign still has open questions. ${briefPath}` };
+    }
+
+    // Open directions exist: two-step flow, stop never offered.
+    const suffix = `Next: ${step1Open}${reopenLine} ${step2Activate}`;
+    const steer = !hasActive
+      ? `Expedition: the last active direction is closed. ${step1Open}${reopenLine} ${step2Activate}`
+      : null;
+    return { replySuffix: suffix, steerMessage: steer };
+  };
+
+  /** Final-stop territory note (owner decision 2026-11-12): when an expedition
+   *  stops with unworked directions left, the stop reply must say so honestly
+   *  and name the continuation path — a NEW expedition over the remaining
+   *  territory (expedition_brief draft → propose → confirm). Empty string when
+   *  the territory is exhausted (nothing left to promise). */
+  const expeditionTerritoryNote = (entries: chainJournal.ChainEntry[]): string => {
+    const replay = expedition.replayExpeditionMap(entries);
+    if (!replay.ok) return "";
+    const remaining = [...replay.map.directions.values()].filter((d) => ["open", "parked", "active"].includes(d.status));
+    if (remaining.length === 0) return "";
+    const listing = remaining.map((d) => `${d.dir} (${d.status})`).join(", ");
+    return ` Territory not exhausted: ${remaining.length} direction(s) remain: ${listing}. A new expedition over them: expedition_brief draft (propose → owner confirm), then a fresh work session.`;
+  };
+
   const sendChainContinuation = async (ctx: ExtensionContext, parentCampaignId: string): Promise<void> => {
     const runtime = getRuntime(ctx);
     let slice = "";
@@ -11112,7 +11288,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // Expedition chain active → the expedition WEB dashboard (spec group 4:
         // the browser kanban). Otherwise the ordinary fullscreen overlay path —
         // byte-for-byte unchanged, including its own TUI gate and notifies.
-        if (activeExpeditionForWeb(ctx)) {
+        if (expeditionForWeb(ctx)) {
           await openExpeditionWebDashboard(ctx);
           return;
         }

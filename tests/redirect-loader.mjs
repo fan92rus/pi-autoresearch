@@ -14,6 +14,13 @@ import { pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+// bd pi-autoresearch-dif: the dashboard handler opens a real browser via
+// openInBrowser; inside unit tests that spawns cmd.exe/start and a Firefox tab
+// on a port that dies with the test process. The env guard in openInBrowser
+// makes the side effect opt-out — every test process sets it before any
+// extension code is imported (the loader runs first).
+process.env.PI_AUTORESEARCH_NO_BROWSER = "1";
+
 const testsDir = dirname(fileURLToPath(import.meta.url));
 
 const STUB_MAP = {

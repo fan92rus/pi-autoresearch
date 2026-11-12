@@ -54,6 +54,8 @@ header{padding:10px 16px 8px;border-bottom:1px solid var(--line);flex:none}
 h1{margin:0;font-size:15px;color:#fff;font-weight:650}
 .chip{font-size:10px;border:1px solid var(--line);border-radius:999px;padding:2px 9px;
   color:var(--muted);white-space:nowrap}
+#chainChip{border-color:#3d3320;color:#d2a54a}
+#chainChip.live{border-color:#1e4620;color:#7dc47f}
 #histBtn{margin-left:auto;all:unset;cursor:pointer;font-size:11px;color:var(--accent);
   border:1px solid #1f4a6e;border-radius:7px;padding:2px 10px;white-space:nowrap}
 #histBtn:hover{background:#12233a}
@@ -351,6 +353,18 @@ function render(){
 
   // goal + damage-free header
   const g=$("goal");g.textContent=v.goal||"(цель не указана)";g.title=v.goal||"";
+  // honest chain-status badge: stopped/completed expeditions are first-class
+  // viewers now (payload.chainStatus; owner request 2026-11-12)
+  const chip=$("chainChip");
+  const cs=v.chainStatus||null;
+  if(cs){
+    const live=cs==="active"||cs==="awaiting_child";
+    chip.textContent=live?"цепочка: "+cs:"цепочка остановлена: "+cs;
+    chip.hidden=false;
+    chip.classList.toggle("live",live);
+  }else{
+    chip.hidden=true;
+  }
 
   // counters: last event age + done/total + campaigns + questions (from the view counters)
   let lastTxt="";

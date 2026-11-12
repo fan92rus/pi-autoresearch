@@ -191,3 +191,23 @@ test('CR/LF in goal/why/reason texts are collapsed to one visual line', () => {
   assert.ok(lines.every((l) => !/[\r\n]/.test(l)));
   assert.ok(lines.some((l) => l.includes('Bad Name') && l.includes('multi line why')));
 });
+
+// ─── Status-aware next hint (review minor 2026-11-12, blind spot closed) ────
+test('counters.next is status-aware: active/awaiting_child → activate hint, stopped_* → report', () => {
+  const f = seed(false);
+  try {
+    const active = view.buildExpeditionView(f.chainDir, null);
+    assert.equal(active.counters.next, 'expedition_map(subaction=activate, dir=<name>, why=<rationale>)');
+    const stopped = [...entries, { type: 'status_change', status: 'stopped_by_rule', at: '2026-11-12T03:06:00.000Z' }];
+    writeJournal(f.chainDir, stopped);
+    const v = view.buildExpeditionView(f.chainDir, null);
+    assert.equal(v.counters.next, 'research_questions(action=report)',
+      'a stopped chain refuses every map action; the hint must be the report');
+    writeJournal(f.chainDir, [...entries, { type: 'status_change', status: 'completed', at: '2026-11-12T03:06:00.000Z' }]);
+    assert.equal(view.buildExpeditionView(f.chainDir, null).counters.next, 'research_questions(action=report)');
+    writeJournal(f.chainDir, [...entries, { type: 'status_change', status: 'awaiting_child', at: '2026-11-12T03:06:00.000Z' }]);
+    assert.equal(view.buildExpeditionView(f.chainDir, null).counters.next, 'expedition_map(subaction=activate, dir=<name>, why=<rationale>)');
+  } finally {
+    rmSync(f.chainDir, { recursive: true, force: true });
+  }
+});

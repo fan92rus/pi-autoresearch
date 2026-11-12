@@ -94,6 +94,15 @@ export function buildExpeditionView(chainDir: string, campaignDir: string | null
   const created = entries.find((e) => e.type === "expedition_created");
   if (!created) return emptyView("not_expedition");
 
+  // Chain status from the journal (last status_change wins) — drives the
+  // next-hint: a stopped/completed chain refuses every map action, so the
+  // hint must be the report, not an activate (review minor 2026-11-12).
+  let chainStatus = "active";
+  for (const e of entries) if (e.type === "status_change" && typeof e.status === "string" && e.status) chainStatus = e.status;
+  const nextHint = ["active", "awaiting_child"].includes(chainStatus)
+    ? NEXT_HINT
+    : "research_questions(action=report)";
+
   const replay = expedition.replayExpeditionMap(entries);
   const dirs: ExpeditionViewDir[] = replay.ok
     ? [...replay.map.directions.values()].map((d) => ({ name: d.dir, status: d.status, why: d.why, refs: d.refs ?? [], campaign: d.campaign ?? null }))
@@ -183,7 +192,7 @@ export function buildExpeditionView(chainDir: string, campaignDir: string | null
     campaignPhase,
     questions,
     evidence,
-    counters: { done, total: dirs.length, campaignsUsed: campaignIds.length, campaignsMax, qClosed, qTotal: questions.length, next: NEXT_HINT },
+    counters: { done, total: dirs.length, campaignsUsed: campaignIds.length, campaignsMax, qClosed, qTotal: questions.length, next: nextHint },
   };
 }
 
