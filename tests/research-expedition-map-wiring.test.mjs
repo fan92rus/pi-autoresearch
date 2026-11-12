@@ -22,7 +22,7 @@ async function setup(){
   const campaignId=text(proposed).match(/campaign (exp-[A-Za-z0-9-]+)/)?.[1]; assert.ok(campaignId,text(proposed));
   const chainId=`${campaignId}-chain`;
   const chainDir=chainJournal.chainDir(dir,chainId); assert.ok(chainDir);
-  return {dir,ctx,call,chainId,chainDir};
+  return {dir,ctx,pi,call,chainId,chainDir};
 }
 async function append(h,type,payload){assert.equal((await chainJournal.appendEntry(h.chainDir,h.dir,h.chainId,type,payload)).ok,true);}
 
@@ -106,4 +106,55 @@ test("review-B1b: active direction with no campaign field is flagged as without 
   const body=fs.readFileSync(report,"utf8");
   assert.match(body,/active direction without a live campaign/,body);
   assert.match(body,/cache/,body);
+});
+
+test("continuation message prescribes close direction → activate next → brief",async()=>{
+  const h=await setup();
+  // A stopped campaign whose report is saved moves the chain to awaiting_child
+  // and sends ONE continuation; the message must keep the map cycle explicit:
+  // close the finished direction, activate the next one, THEN draft the brief.
+  const campaignId=text(await h.call("research",{action:"status"})).match(/(exp-[A-Za-z0-9-]+)/)?.[1];
+  assert.ok(campaignId,"campaign id not found");
+  const campaignDir=path.join(h.dir,".auto","research",campaignId);
+  const statePath=path.join(campaignDir,"state.json");
+  fs.writeFileSync(statePath,JSON.stringify({...JSON.parse(fs.readFileSync(statePath,"utf8")),phase:"stopped"},null,2)+"\n");
+  const logPath=path.join(campaignDir,"log.jsonl");
+  fs.writeFileSync(logPath,[
+    JSON.stringify({at:new Date().toISOString(),event:"open",question_id:"Q1"}),
+    JSON.stringify({at:new Date().toISOString(),event:"close",question_id:"Q1",rule_id:"yes",verdict:"confirmed",reason:null}),
+    JSON.stringify({at:new Date().toISOString(),event:"stop",rule_id:"S1",reason:"done"}),
+  ].join("\n")+"\n");
+  fs.writeFileSync(path.join(campaignDir,"report.md"),"# report\n");
+  const before=h.pi.sentMessages.length;
+  await h.call("research",{action:"report"});
+  assert.equal(h.pi.sentMessages.length,before+1,"exactly one continuation sent");
+  const continuation=h.pi.sentMessages[h.pi.sentMessages.length-1].text;
+  assert.match(continuation,/subaction resolve or reject/,"step 1: close the finished direction");
+  assert.match(continuation,/research expedition activate|research expedition pivot/,"step 2: activate the next direction");
+  assert.match(continuation,/research_brief draft/,"step 3: then write the brief");
+  assert.match(continuation,/finding_refs/,"finding_refs requirement preserved");
+  assert.match(continuation,/caveat_block/,"caveat requirement preserved");
+});
+
+test("continuation is delivered as steer when the agent is busy",async()=>{
+  const h=await setup();
+  // Same stop-the-campaign setup as above, but the agent is mid-turn: the
+  // continuation must interrupt (steer), not queue behind the turn (followUp).
+  const campaignId=text(await h.call("research",{action:"status"})).match(/(exp-[A-Za-z0-9-]+)/)?.[1];
+  assert.ok(campaignId,"campaign id not found");
+  const campaignDir=path.join(h.dir,".auto","research",campaignId);
+  const statePath=path.join(campaignDir,"state.json");
+  fs.writeFileSync(statePath,JSON.stringify({...JSON.parse(fs.readFileSync(statePath,"utf8")),phase:"stopped"},null,2)+"\n");
+  fs.writeFileSync(path.join(campaignDir,"log.jsonl"),[
+    JSON.stringify({at:new Date().toISOString(),event:"open",question_id:"Q1"}),
+    JSON.stringify({at:new Date().toISOString(),event:"close",question_id:"Q1",rule_id:"yes",verdict:"confirmed",reason:null}),
+    JSON.stringify({at:new Date().toISOString(),event:"stop",rule_id:"S1",reason:"done"}),
+  ].join("\n")+"\n");
+  fs.writeFileSync(path.join(campaignDir,"report.md"),"# report\n");
+  h.ctx.isIdle=()=>false;
+  const before=h.pi.sentMessages.length;
+  await h.call("research",{action:"report"});
+  assert.equal(h.pi.sentMessages.length,before+1,"exactly one continuation sent");
+  const last=h.pi.sentMessages[h.pi.sentMessages.length-1];
+  assert.equal(last.opts?.deliverAs,"steer","busy agent: continuation must interrupt the turn, not queue as followUp");
 });

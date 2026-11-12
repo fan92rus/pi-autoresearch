@@ -300,11 +300,13 @@ export let sendPendingResumeIfReadyForTest: ((ctx: ExtensionContext, runtime: Au
 /** Test hook for the async auto-resume limit notification. */
 export let notifyAutoResumeLimitReachedAsyncForTest: ((ctx: ExtensionContext, reason?: string | null) => Promise<void>) | null = null;
 
-/** Synchronously reads expedition artifacts for the TUI. The map intentionally does not verify journal hashes. */
+/** Synchronously reads expedition artifacts for the TUI. The map intentionally does not verify journal hashes.
+ *  Campaign facts (phase, question progress) are re-read from files on every call: the caller reads
+ *  them inside render(), so the widget is a pure function of files and never goes stale. */
 export function buildExpeditionWidgetLines(
   chainDir: string,
   campaignDir: string | null,
-  info: { campaignId: string | null; campaignPhase: string | null; campaignsUsed: number; campaignsLimit: number | null; chainStatus: string },
+  info: { campaignId: string | null; campaignsUsed: number; campaignsLimit: number | null; chainStatus: string },
 ): string[] {
   try {
     const journal = fs.readFileSync(path.join(chainDir, "chain.json"), "utf8");
@@ -312,6 +314,9 @@ export function buildExpeditionWidgetLines(
     const replay = expedition.replayExpeditionMap(entries);
     if (!replay.ok) return ["(map unavailable: journal damaged)"];
     const openQuestions: string[] = [];
+    let campaignPhase: string | null = null;
+    let closedQuestions = 0;
+    let totalQuestions = 0;
     if (campaignDir) {
       // Independent try blocks: an unreadable brief.json must not discard the
       // open-question set from a perfectly readable log.jsonl (the ids fallback).
@@ -319,22 +324,30 @@ export function buildExpeditionWidgetLines(
       try {
         const brief = JSON.parse(fs.readFileSync(path.join(campaignDir, "brief.json"), "utf8"));
         questionTexts = new Map((Array.isArray(brief.questions) ? brief.questions : []).map((q: any) => [q.id, q.text ?? q.id]));
+        totalQuestions = questionTexts.size;
       } catch { /* brief is optional; question texts fall back to ids */ }
       try {
         const log = fs.readFileSync(path.join(campaignDir, "log.jsonl"), "utf8");
         const opened = new Set<string>();
+        const closed = new Set<string>();
         for (const line of log.split(/\r?\n/).filter(Boolean)) {
           const event = JSON.parse(line);
           const id = event.question_id ?? event.questionId;
           if (typeof id !== "string") continue;
           const action = event.event ?? event.type;
           if (action === "question_opened" || action === "open") opened.add(id);
-          if (action === "question_closed" || action === "close") opened.delete(id);
+          if (action === "question_closed" || action === "close") { opened.delete(id); closed.add(id); }
         }
         for (const id of opened) openQuestions.push(String(questionTexts?.get(id) ?? id));
+        closedQuestions = closed.size;
       } catch { /* log is optional for rendering; map remains useful */ }
+      try {
+        // Sync phase read (inspectCampaign is async; the widget render must stay sync).
+        const state = JSON.parse(fs.readFileSync(path.join(campaignDir, "state.json"), "utf8"));
+        if (typeof state.phase === "string") campaignPhase = state.phase;
+      } catch { /* unreadable state degrades the phase to null */ }
     }
-    return expedition.expeditionWidgetLines(replay.map, { ...info, openQuestions });
+    return expedition.expeditionWidgetLines(replay.map, { ...info, campaignPhase, openQuestions, closedQuestions: totalQuestions > 0 ? Math.min(closedQuestions, totalQuestions) : closedQuestions, totalQuestions });
   } catch {
     return ["(map unavailable)"];
   }
@@ -2942,9 +2955,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   };
 
   // Without `expandPromptTemplates` a `/skill:<name>` kickoff reaches the model as literal text.
-  const sendWhenReady = (ctx: ExtensionContext, message: string): void => {
+  // steerIfBusy: deliver as "steer" (in-turn interruption) instead of "followUp" (queued until
+  // the turn ends) — for messages sent from tool executes mid-turn that must reach the agent
+  // immediately (expedition kickoff + chain continuation; followUp can sit behind a long turn).
+  const sendWhenReady = (ctx: ExtensionContext, message: string, opts?: { steerIfBusy?: boolean }): void => {
     if (ctx.isIdle()) {
       pi.sendUserMessage(message, { expandPromptTemplates: true });
+      return;
+    }
+    if (opts?.steerIfBusy) {
+      pi.sendUserMessage(message, { expandPromptTemplates: true, deliverAs: "steer" });
       return;
     }
     pi.sendUserMessage(message, { expandPromptTemplates: true, deliverAs: "followUp" });
@@ -3225,23 +3245,24 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const chainDir = path.join(chain.workDir, ".auto", "research-chain", chain.chainId);
       const campaignRoot = runtime.researchStateRoot ?? researchState.researchRoot(chain.workDir);
       const campaignDir = runtime.researchCampaignId ? path.join(campaignRoot, runtime.researchCampaignId) : null;
-      let chainStatus = "unknown";
-      let campaignsUsed = 0;
-      try {
-        const journal = fs.readFileSync(path.join(chainDir, "chain.json"), "utf8");
-        for (const line of journal.split(/\r?\n/).filter(Boolean)) {
-          const entry = JSON.parse(line);
-          if (entry.type === "status_change" && typeof entry.status === "string") chainStatus = entry.status;
-          if (entry.type === "campaign_added") campaignsUsed++;
-        }
-      } catch { /* use conservative status below */ }
-      if (chainStatus === "unknown") chainStatus = "active";
       ctx.ui.setWidget("autoresearch", (tui, theme) => ({
         render(width: number): string[] {
           const safeWidth = Math.max(1, width || getTuiSize(tui).width);
+          // Chain facts are re-read inside render (fail-soft): the widget is a
+          // pure function of files and never shows a stale status/count.
+          let chainStatus = "unknown";
+          let campaignsUsed = 0;
+          try {
+            const journal = fs.readFileSync(path.join(chainDir, "chain.json"), "utf8");
+            for (const line of journal.split(/\r?\n/).filter(Boolean)) {
+              const entry = JSON.parse(line);
+              if (entry.type === "status_change" && typeof entry.status === "string") chainStatus = entry.status;
+              if (entry.type === "campaign_added") campaignsUsed++;
+            }
+          } catch { /* use conservative status below */ }
+          if (chainStatus === "unknown") chainStatus = "active";
           return buildExpeditionWidgetLines(chainDir, campaignDir, {
             campaignId: runtime.researchCampaignId,
-            campaignPhase: null,
             campaignsUsed,
             campaignsLimit: chain.charter.max_campaigns ?? null,
             chainStatus,
@@ -9401,8 +9422,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (!runtime.autoresearchMode) { recordAutoresearchActivation(workDir,true); setAutoresearchMode(ctx,true); updateWidget(ctx); }
       runtime.researchCampaignId = id;
       runtime.researchChain = {chainId,workDir,charterPath:docPath,charterSha256:current.sha256,charter:current.doc.charter,expedition:true,docSha256:current.sha256};
-      sendWhenReady(ctx, `Expedition ${id} created. Campaign 0 is running. Continue with research status/open/record/close; the campaign brief is approved by the expedition confirmation.`);
-      return reply(`✅ Expedition ${chainId} created; campaign ${id} started (document sha256 ${current.sha256}).`);
+      sendWhenReady(ctx, `Expedition ${id} created. Campaign 0 is running; the campaign brief is approved by the expedition confirmation. Before question work: pick a direction and activate it on the map with research expedition activate (action "expedition", subaction "activate", dir + why; the campaign is set automatically) — questions of campaign 0 belong to that direction. Then continue with research status/open/record/close. When the direction is closed (resolve/reject/advisory/park), activate the next direction and only then brief the next campaign.`, { steerIfBusy: true });
+      return reply(`✅ Expedition ${chainId} created; campaign ${id} started (document sha256 ${current.sha256}). Next: research expedition activate dir=<name> why=<rationale> before campaign work; after closing a direction activate the next one, then brief the next campaign.`);
     },
   });
 
@@ -10477,7 +10498,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
     const message = [
       `Research chain: the report of campaign ${parentCampaignId} is recorded and the chain can continue.`,
-      `Write the brief for the NEXT campaign now with research_brief draft:`,
+      `1. Close the direction of the finished campaign on the map: research expedition with subaction resolve or reject (refs citing closed questions of this chain) — or advisory with a review file, or park with a reason if the direction should stay unresearched.`,
+      `2. Activate the next direction (research expedition activate) or pivot from the closed one.`,
+      `3. Write the brief for the NEXT campaign now with research_brief draft:`,
       `- every question must carry finding_refs: [{ campaign: "${parentCampaignId}", question: "<closed question id>" }] citing a closed question of this chain;`,
       `- keep the caveat_block, the verdict set and the evidence_gate exactly as in the parent brief;`,
       `- the brief is auto-approved by the charter checks (no owner dialog) and the next campaign id is assigned by the system.`,
@@ -10485,7 +10508,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       ...(slice ? ["Expedition map snapshot:", slice] : []),
     ].join("\n");
     runtime.chainContinuationSent = true;
-    sendWhenReady(ctx, message);
+    sendWhenReady(ctx, message, { steerIfBusy: true });
   };
 
   const exitChainModeFromPause = (ctx: ExtensionContext, chainId: string): void => {

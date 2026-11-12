@@ -910,8 +910,16 @@ export async function writeBriefDraft(dir: string, raw: unknown): Promise<Result
 
 function approvalProblem(v: unknown): string | null {
   if (!isRecord(v)) return "approval is not an object";
-  const fields = fieldSetProblems(v, APPROVAL_KEYS, "approval");
+  // Chain-sourced approvals (writeChainApproval) add provenance fields on top
+  // of the base approval; accept them only together (both present or both absent).
+  const chainProvenance = ["source", "charter_sha256"];
+  const hasChain = chainProvenance.some((k) => k in v);
+  const allChain = chainProvenance.every((k) => k in v);
+  if (hasChain && !allChain) return "chain provenance fields must be present together (source + charter_sha256)";
+  const keys = [...APPROVAL_KEYS, ...(hasChain ? chainProvenance : [])];
+  const fields = fieldSetProblems(v, keys, "approval");
   if (fields.length > 0) return fields[0];
+  if (hasChain && v.source !== "charter") return "chain approval source must be \"charter\"";
   if (v.schema_version !== APPROVAL_SCHEMA_VERSION) return "unsupported approval schema_version";
   if (typeof v.brief_sha256 !== "string" || !SHA256_RE.test(v.brief_sha256)) {
     return "brief_sha256 must be 64 lowercase hex characters";

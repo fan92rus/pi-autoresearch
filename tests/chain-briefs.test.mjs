@@ -12,11 +12,12 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import * as CB from "../extensions/pi-autoresearch/chain-briefs.ts";
+import * as RS from "../extensions/pi-autoresearch/research-state.ts";
 import { sha256Hex } from "../extensions/pi-autoresearch/research-state.ts";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -146,6 +147,64 @@ test("2.1 writeChainApproval validates hash formats", async () => {
   await withWorkDir(async (dir) => {
     assertRefusal(await CB.writeChainApproval(dir, "nothex", "b".repeat(64)), "invalid_argument");
     assertRefusal(await CB.writeChainApproval(dir, "a".repeat(64), "UPPER".padEnd(64, "0")), "invalid_argument");
+  });
+});
+
+// bd pi-autoresearch-x8c: readApproval must accept exactly what writeChainApproval
+// writes (writer/reader agreement) — a live expedition blocked research start on
+// the chain-sourced approval because the validator rejected its own provenance.
+test("2.1 readApproval accepts the chain-sourced approval writeChainApproval wrote (x8c roundtrip)", async () => {
+  await withWorkDir(async (dir) => {
+    const written = await CB.writeChainApproval(dir, "a".repeat(64), "b".repeat(64));
+    assert.equal(written.ok, true, JSON.stringify(written));
+    const read = await RS.readApproval(dir);
+    assert.equal(read.ok, true, JSON.stringify(read));
+    assert.equal(read.approval.source, "charter");
+    assert.equal(read.approval.charter_sha256, "b".repeat(64));
+  });
+});
+
+test("2.1 readApproval rejects chain provenance fields present only together", async () => {
+  await withWorkDir(async (dir) => {
+    await writeFile(join(dir, "approval.json"), JSON.stringify({
+      schema_version: 1, brief_sha256: "a".repeat(64), approved_at: "2026-01-01T00:00:00Z", confirmed: true, source: "charter",
+    }), "utf8");
+    const read = await RS.readApproval(dir);
+    assert.equal(read.ok, false);
+    assert.match(String(read.message), /chain provenance fields must be present together/);
+  });
+});
+
+test("2.1 readApproval rejects a chain approval whose source is not charter", async () => {
+  await withWorkDir(async (dir) => {
+    await writeFile(join(dir, "approval.json"), JSON.stringify({
+      schema_version: 1, brief_sha256: "a".repeat(64), approved_at: "2026-01-01T00:00:00Z", confirmed: true,
+      source: "expedition", charter_sha256: "b".repeat(64),
+    }), "utf8");
+    const read = await RS.readApproval(dir);
+    assert.equal(read.ok, false);
+    assert.match(String(read.message), /chain approval source must be/);
+  });
+});
+
+test("2.1 readApproval still accepts the plain 4-field approval", async () => {
+  await withWorkDir(async (dir) => {
+    await writeFile(join(dir, "approval.json"), JSON.stringify({
+      schema_version: 1, brief_sha256: "a".repeat(64), approved_at: "2026-01-01T00:00:00Z", confirmed: true,
+    }), "utf8");
+    const read = await RS.readApproval(dir);
+    assert.equal(read.ok, true, JSON.stringify(read));
+  });
+});
+
+test("2.1 readApproval still rejects an unknown extra field", async () => {
+  await withWorkDir(async (dir) => {
+    await writeFile(join(dir, "approval.json"), JSON.stringify({
+      schema_version: 1, brief_sha256: "a".repeat(64), approved_at: "2026-01-01T00:00:00Z", confirmed: true, hack: 1,
+    }), "utf8");
+    const read = await RS.readApproval(dir);
+    assert.equal(read.ok, false);
+    assert.match(String(read.message), /unknown field/);
   });
 });
 

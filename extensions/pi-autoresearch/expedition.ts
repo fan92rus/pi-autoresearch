@@ -96,12 +96,40 @@ export function mapSliceText(map:ExpeditionMap):string{return [...map.directions
  *  row would break the TUI widget layout contract (render returns one string
  *  per visual line). */
 function oneLine(s:string):string{return s.replace(/\s*[\r\n]+\s*/g," ");}
-export function expeditionWidgetLines(map:ExpeditionMap,info:{campaignId:string|null;campaignPhase:string|null;openQuestions:string[];campaignsUsed:number;campaignsLimit:number|null;chainStatus:string}):string[]{
-  const done=[...map.directions.values()].filter(d=>["resolved","rejected"].includes(d.status)).length;
-  const goal=oneLine(map.goal),camp=oneLine(info.campaignId??info.chainStatus);
-  const phase=info.campaignPhase?oneLine(info.campaignPhase):null;
-  const head="🧭 "+goal+" │ campaign "+camp+(phase?(" ("+phase+")"):"");
-  const rows=[...map.directions.values()].map(d=>{
+/** One-line action hint for the footer's `next:` segment (falls back to the raw status). */
+function nextAction(info:{campaignPhase:string|null;chainStatus:string},hasActive:boolean):string{
+  const s=info.chainStatus;
+  if(s==="manual_check_required")return "устраните блокер (research status)";
+  if(s==="stopped_by_owner"||s==="stopped_by_rule"||s==="completed"||s==="limit_reached")return "expedition report";
+  if(s==="awaiting_child")return "закрыть направление → activate следующее → бриф";
+  if(s==="active"&&info.campaignPhase==="research"&&!hasActive)return "research expedition activate";
+  if(s==="active"&&info.campaignPhase==="research")return "open/record/close → research stop → report";
+  return s;
+}
+/** Code-point-safe truncation: slicing by UTF-16 index can split a surrogate
+ *  pair (emoji) and render mojibake in the TUI; Array.from walks code points. */
+function truncateGoal(goal:string,max:number):string{return goal.length<=max?goal:Array.from(goal).slice(0,max-1).join("")+"…";}
+export function expeditionWidgetLines(map:ExpeditionMap,info:{campaignId:string|null;campaignPhase:string|null;openQuestions:string[];closedQuestions?:number;totalQuestions?:number;campaignsUsed:number;campaignsLimit:number|null;chainStatus:string}):string[]{
+  const dirs=[...map.directions.values()];
+  const done=dirs.filter(d=>["resolved","rejected"].includes(d.status)).length;
+  const hasActive=dirs.some(d=>d.status==="active");
+  const goal=oneLine(map.goal);const goalView=truncateGoal(goal,60);
+  const head="🧭 "+goalView+" ("+dirs.length+" напр.) │ campaign "+oneLine(info.campaignId??info.chainStatus)+(info.campaignPhase?(" ("+oneLine(info.campaignPhase)+")"):"");
+  const lines=[head];
+  // Divergence: a campaign is running its research phase but the map has no
+  // active direction — the agent forgot `research expedition activate`.
+  if(info.campaignId&&info.campaignPhase==="research"&&!hasActive){
+    const open=dirs.find(d=>d.status==="open");
+    if(open)lines.push("⚠ нет активного направления — research expedition activate dir="+open.dir);
+    else{
+      // No open directions either: activating is impossible — suggest reopen
+      // (state machine allows parked/advisory/resolved/rejected) or campaign
+      // completion, never a dead-end activate hint.
+      const reopenable=dirs.find(d=>["parked","advisory_exhausted","resolved","rejected"].includes(d.status));
+      lines.push("⚠ нет активного направления — все направления закрыты: research expedition reopen"+(reopenable?" dir="+reopenable.dir:" (research expedition open)")+" | или закрой кампанию (research stop → report)");
+    }
+  }
+  for(const d of dirs){
     const why=oneLine(d.why);
     const dcamp=oneLine(d.campaign??info.campaignId??"?");
     const qs=info.openQuestions.map(oneLine).join(", ");
@@ -109,10 +137,13 @@ export function expeditionWidgetLines(map:ExpeditionMap,info:{campaignId:string|
     if(d.status==="active")row+=" campaign "+dcamp+(qs.length?" — "+qs:"");
     else row+=" — "+why;
     if(d.status==="advisory_exhausted")row+=" (самоотчёт, не доказательство)";
-    return row;
-  });
-  const foot="territory "+done+"/"+map.directions.size+" │ campaigns "+info.campaignsUsed+(info.campaignsLimit===null?"":"/"+info.campaignsLimit)+" │ next: "+oneLine(info.chainStatus);
-  return [head,...rows,foot];
+    lines.push(row);
+  }
+  const bar="█".repeat(Math.min(done,10))+"░".repeat(Math.min(map.directions.size,10)-Math.min(done,10));
+  const q=(info.totalQuestions??0)>0?" │ Q "+(info.closedQuestions??0)+"/"+info.totalQuestions:"";
+  const foot="territory "+bar+" done/"+map.directions.size+" │ campaigns "+info.campaignsUsed+(info.campaignsLimit===null?"":"/"+info.campaignsLimit)+q+" │ next: "+oneLine(nextAction(info,hasActive));
+  lines.push(foot);
+  return lines;
 }
 /** Produces a conservative markdown final report; never claims successful coverage. */
 export function expeditionReportText(map:ExpeditionMap,opts:{chainId:string;finalStatus:string;campaigns:Array<{id:string;reportPath:string}>;computedAt:string;activeDirWithoutCampaign?:string}):string{const pred=territoryComplete(map),unclosed=[...map.directions.values()].filter(d=>["parked","advisory_exhausted","active","open"].includes(d.status));const lines=[`# Expedition report — ${opts.chainId}`,`Status: ${opts.finalStatus}`,`Stop: ${map.stopEvent?`${map.stopEvent.rule} (${map.stopEvent.basis})`:"not recorded"}`,"Campaigns:",...opts.campaigns.map(c=>`- ${c.id}: ${c.reportPath}`),"",`Goal: ${map.goal}`,"","## Map (final)","| Dir | Status | Basis | Evidence |","|---|---|---|---|"];for(const d of map.directions.values())lines.push(`| ${d.dir} | ${d.status} | ${d.status==="advisory_exhausted"?"UNKNOWN basis: self-report — NOT proof":d.why} | ${(d.refs??[]).map(r=>`${r.campaign}/${r.question}`).join(", ")} |`);lines.push("","## Timeline",...map.timeline.map((e,i)=>`${i+1}. ${e.at} ${e.type}${e.dir?` ${e.dir}`:""}${e.to?` → ${e.to}`:""}${e.note?` — ${e.note}`:""}`),"","## Unfinished",...(unclosed.length?unclosed.map(d=>`- ${d.dir}: ${d.status==="parked"?"не исследовано":d.status==="advisory_exhausted"?"не доказательство":d.status}${d.status==="active"&&opts.activeDirWithoutCampaign===d.dir?" — active direction without a live campaign":""}`):["- none recorded"]),`territory_complete: ${pred.value} (computed ${opts.computedAt})${pred.openDirs.length?`; open: ${pred.openDirs.join(", ")}`:""}`);return lines.join("\n");}
