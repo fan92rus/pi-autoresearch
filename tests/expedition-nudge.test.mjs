@@ -360,3 +360,40 @@ test("activate with an OPEN question on the pinned campaign still works (no fals
   const reply = text(out);
   assert.doesNotMatch(reply, /campaign_exhausted/, "an open question keeps activation legal");
 }, { timeout: 90000 });
+
+test("nudge warns up-front when the pinned campaign is exhausted (brief-first note) — hook visibility", async () => {
+  const h = await setup([{ name: "first", why: "First" }, { name: "second", why: "Second" }]);
+  await activateAndCloseQuestion(h, "first");
+  await h.call("research", { action: "open", question_id: "Q2" });
+  await h.call("research", { action: "record", evidence_ref: "evidence.txt:1" });
+  await h.call("research", { action: "close", question_id: "Q2", rule_id: "Q2-yes", verdict: "confirmed" });
+  const out = await h.call("research", { action: "expedition", subaction: "resolve", dir: "first", refs: [{ campaign: h.campaignId, question: "Q1" }] });
+  const reply = text(out);
+  // the direction-close nudge (and the drift branch that reuses it) must carry
+  // the exhausted-campaign note while open directions still exist: the agent
+  // briefs FIRST instead of cycling activate-on-exhausted
+  assert.match(reply, /every brief question closed/, "exhausted note present in the nudge");
+  assert.match(reply, /research_brief draft/, "brief-first path in the nudge");
+  assert.match(reply, /campaign_exhausted/, "names the refusal the agent would hit");
+  assert.match(reply, /Step 1/, "two-step flow still offered (open directions exist)");
+}, { timeout: 90000 });
+
+test("agent_end hook carries the expedition continuation with the exhausted note (not generic resume)", async () => {
+  const h = await setup([{ name: "first", why: "First" }, { name: "second", why: "Second" }]);
+  await activateAndCloseQuestion(h, "first");
+  await h.call("research", { action: "open", question_id: "Q2" });
+  await h.call("research", { action: "record", evidence_ref: "evidence.txt:1" });
+  await h.call("research", { action: "close", question_id: "Q2", rule_id: "Q2-yes", verdict: "confirmed" });
+  // the turn used campaign tools -> partial-cycle push on agent_end; the drift
+  // settle window (800ms) must elapse before delivery
+  const before = h.pi.sentMessages.length;
+  await h.hook("agent_start")({}, h.ctx);
+  await h.hook("agent_end")({ messages: [] }, h.ctx);
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  assert.ok(h.pi.sentMessages.length > before, "agent_end pushes a continuation");
+  const last = h.pi.sentMessages[h.pi.sentMessages.length - 1]?.text ?? "";
+  assert.match(last, /Continue the expedition now/, "expedition branch (not generic resume)");
+  assert.match(last, /every brief question closed/, "exhausted note reaches the hook path");
+  assert.match(last, /research_brief draft/, "brief-first path on the hook");
+  assert.doesNotMatch(last, /pick a stop rule/i, "no premature stop while open directions exist");
+}, { timeout: 90000 });

@@ -11143,13 +11143,20 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       return { replySuffix: `Next: ${briefPath}`, steerMessage: closedLast ? `Expedition: the last active direction is closed; the campaign still has open questions. ${briefPath}` : null };
     }
 
-    // Open directions exist: two-step flow, stop never offered.
-    const suffix = `Next: ${step1Open}${reopenLine} ${step2Activate}`;
+    // Open directions exist: two-step flow, stop never offered. When the pinned
+    // campaign is exhausted (every question closed — positively verified), say
+    // so UP FRONT: activation on it is refused (campaign_exhausted), so the
+    // honest first move is briefing the next chain campaign (live stall
+    // 2026-11-13: the agent cycled activate-on-exhausted and idled until pushed).
+    const exhaustedNote = questionsKnown && openQuestions === 0
+      ? ` NOTE: campaign ${campaignId} has every brief question closed — activating a direction on it is refused (campaign_exhausted). FIRST brief the next chain campaign: research_brief draft (finding_refs cite closed questions of this chain) -> research_questions(action=start, expected_sha256=<sha>); the activation afterwards pins the new campaign.`
+      : "";
+    const suffix = `Next: ${step1Open}${reopenLine} ${step2Activate}${exhaustedNote}`;
     // Steer only when THIS event closed the LAST active direction (review R1B:
     // parking an already-open direction with no active before it is not a
     // "last active closed" event and must not wake the agent).
     const steer = !hasActive && opts.eventClosedActive
-      ? `Expedition: the last active direction is closed. ${step1Open}${reopenLine} ${step2Activate}`
+      ? `Expedition: the last active direction is closed. ${step1Open}${reopenLine} ${step2Activate}${exhaustedNote}`
       : null;
     return { replySuffix: suffix, steerMessage: steer };
   };
