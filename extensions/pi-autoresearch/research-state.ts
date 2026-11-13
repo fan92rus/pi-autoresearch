@@ -390,11 +390,28 @@ export async function writeFileAtomic(target: string, text: string): Promise<voi
     await unlink(tmp).catch(() => undefined);
     throw err;
   }
-  try {
-    await rename(tmp, target);
-  } catch (err) {
+  // Windows: rename over an existing file fails with EPERM when another
+  // process holds the target open (antivirus/indexer scanning the freshly
+  // written file). Live case (2026-11-13, lob-collector-data): the EPERM hit
+  // mid-way through the chain-brief auto-approval — brief_approved was already
+  // journaled, campaign_added was not — which stranded the runtime pin on a
+  // stopped campaign and every research_questions(action=start) refused with
+  // "campaign is in phase stopped". Such locks are transient (milliseconds),
+  // so retry the rename with a short backoff before giving up.
+  let lastErr: unknown;
+  for (const delayMs of [0, 50, 150, 400]) {
+    if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+    try {
+      await rename(tmp, target);
+      lastErr = undefined;
+      break;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  if (lastErr !== undefined) {
     await unlink(tmp).catch(() => undefined);
-    throw err;
+    throw lastErr;
   }
 }
 

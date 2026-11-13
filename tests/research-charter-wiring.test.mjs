@@ -106,12 +106,12 @@ async function loadExtensionBare(dir, label, confirmReply = undefined) {
   const { pi, tool, command, hook } = createFakePi({ dir, sessionId: `charter-w-${label}`, realGit: false });
   const ctx = makeCtx(dir, `charter-w-${label}`, pi);
   if (confirmReply !== undefined) ctx.ui.confirm = async () => confirmReply;
-  const { default: autoresearchExtension } = await import(
+  const arModule = await import(
     pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")).href
   );
-  autoresearchExtension(pi);
+  arModule.default(pi);
   await command("autoresearch").handler("on", ctx);
-  return { pi, tool, command, hook, ctx, dir };
+  return { pi, tool, command, hook, ctx, dir, arModule };
 }
 
 function call(h, name, params) {
@@ -786,4 +786,75 @@ test("chain stop-rule reply carries the self-report note; continuation forbids b
   const cont = h2.pi.sentMessages[h2.pi.sentMessages.length - 1].text;
   assert.match(cont, /never borrow a charter rule whose condition has not fired/, "continuation forbids borrowing rules");
   assert.match(cont, /chain_stop without rule_id/i, "continuation names the owner stop path");
+});
+
+// ─── Crash-recovery: the runtime pin stranded on a stopped campaign ─────────
+
+test("review-EPERM-recovery: re-drafting the brief of a briefing-phase approved campaign re-pins it and teaches continuation", async () => {
+  // Live case (2026-11-13, lob-collector-data): the auto-approval died between
+  // brief_approved and campaign_added (EPERM on the Windows rename), the pin
+  // stayed on the stopped parent, and every start refused with "campaign is
+  // in phase stopped". Re-drafting the same brief must recover: pin the
+  // approved campaign (it exists in briefing) instead of refusing forever.
+  const dir = makeWorkDir("eperm-recovery");
+  writeStoppedRootCampaign(dir, "c1");
+  const charterPath = writeCharter(dir, {});
+  const h = await loadExtensionBare(dir, "eperm-1", true);
+  await launchWithCharter(h, charterPath, "c1");
+  const runtimeForTest = h.arModule.runtimeForTest;
+  await call(h, "research", { action: "report" });
+  const childBrief = briefFixture();
+  childBrief.questions[0].finding_refs = [{ campaign: "c1", question: "Q1" }];
+  const childText = JSON.stringify(childBrief, null, 2) + "\n";
+  const draftRes = textOf(await call(h, "research_brief", { action: "draft", brief: childBrief }));
+  assert.match(draftRes, /auto-approved/i, draftRes);
+  const childId = fs.readdirSync(path.join(dir, ".auto", "research")).filter((d) => d !== "c1")[0];
+  assert.ok(childId, "child campaign created by the first draft");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, ".auto", "research", childId, "state.json"), "utf8")).phase, "briefing");
+  // The crash stranded the pin on the stopped parent (the live EPERM state):
+  runtimeForTest(h.ctx).researchCampaignId = "c1";
+
+  const res = textOf(await call(h, "research_brief", { action: "draft", brief: childBrief }));
+
+  assert.match(res, /already approved/i, res);
+  assert.match(res, new RegExp(childId), "reply names the approved campaign");
+  assert.match(res, /Continue it now/, res);
+  assert.match(res, /research_questions\(action="status"\)/, res);
+  assert.equal(runtimeForTest(h.ctx).researchCampaignId, childId, "the approved campaign is re-pinned");
+  // The recovery must not create a second campaign.
+  assert.deepEqual(fs.readdirSync(path.join(dir, ".auto", "research")).sort(), [childId, "c1"].sort(), "no second campaign created");
+  // The campaign stays in briefing, now pinned: the next start with the
+  // approved sha256 must succeed instead of refusing "stopped".
+  const startRes = textOf(await call(h, "research", { action: "start", expected_sha256: sha256Hex(childText) }));
+  assert.doesNotMatch(startRes, /campaign is in phase stopped/, "start no longer refuses with the stranded-pin error");
+  assert.match(startRes, /Research phase started/, startRes);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, ".auto", "research", childId, "state.json"), "utf8")).phase, "research");
+});
+
+test("review-EPERM-recovery: an approved campaign already in research phase is re-pinned too", async () => {
+  // A live (research-phase) approved campaign is also a valid recovery target:
+  // re-pinning it lets the session continue open/record/close against it.
+  const dir = makeWorkDir("eperm-research-phase");
+  writeStoppedRootCampaign(dir, "c1");
+  const charterPath = writeCharter(dir, {});
+  const h = await loadExtensionBare(dir, "eperm-r1", true);
+  await launchWithCharter(h, charterPath, "c1");
+  const runtimeForTest = h.arModule.runtimeForTest;
+  await call(h, "research", { action: "report" });
+  const childBrief = briefFixture();
+  childBrief.questions[0].finding_refs = [{ campaign: "c1", question: "Q1" }];
+  await call(h, "research_brief", { action: "draft", brief: childBrief });
+  const childId = fs.readdirSync(path.join(dir, ".auto", "research")).filter((d) => d !== "c1")[0];
+  // Move the child to research phase manually (as if its start already ran).
+  const statePath = path.join(dir, ".auto", "research", childId, "state.json");
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  state.phase = "research";
+  fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
+  runtimeForTest(h.ctx).researchCampaignId = "c1";
+
+  const res = textOf(await call(h, "research_brief", { action: "draft", brief: childBrief }));
+
+  assert.match(res, /already approved/i, res);
+  assert.match(res, /Continue it now/, res);
+  assert.equal(runtimeForTest(h.ctx).researchCampaignId, childId, "the live campaign is re-pinned");
 });

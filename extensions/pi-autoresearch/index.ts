@@ -299,6 +299,8 @@ export const CONSECUTIVE_FAILURE_OVERRIDE_LIMIT = 20;
 export let closeStaleCampaign: ((dir: string) => Promise<researchState.Result<{ state: researchState.CampaignState }>>) | null = null;
 /** Test hook for send-time pending-resume policy. */
 export let sendPendingResumeIfReadyForTest: ((ctx: ExtensionContext, runtime: AutoresearchRuntime) => Promise<void>) | null = null;
+/** Test hook: direct access to the session runtime (pin/recovery tests). */
+export let runtimeForTest: ((ctx: ExtensionContext) => AutoresearchRuntime) | null = null;
 /** Test hook for the async auto-resume limit notification. */
 export let notifyAutoResumeLimitReachedAsyncForTest: ((ctx: ExtensionContext, reason?: string | null) => Promise<void>) | null = null;
 /** Test hook for expedition restart restore (bd pi-autoresearch-es1.3). */
@@ -2529,6 +2531,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     pi.sendUserMessage(sendText);
   };
   sendPendingResumeIfReadyForTest = sendPendingResumeIfReady;
+  runtimeForTest = (ctx: ExtensionContext) => getRuntime(ctx);
 
   const schedulePendingResume = (ctx: ExtensionContext, runtime: AutoresearchRuntime, message: string): void => {
     pausePendingResume(runtime);
@@ -9819,7 +9822,23 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             (e) => e.type === "brief_approved" && (e as { brief_sha256?: string }).brief_sha256 === resentSha,
           );
           if (firstApproval !== undefined) {
-            return reply("ℹ️ This brief was already approved in this chain (first confirmation: campaign " + String((firstApproval as { campaign_id?: string }).campaign_id) + "): no second campaign is created.");
+            const firstId = String((firstApproval as { campaign_id?: string }).campaign_id ?? "");
+            // Crash-recovery (live case 2026-11-13): the auto-approval died
+            // between the brief_approved and campaign_added journal writes
+            // (EPERM on the Windows rename), so the approved campaign exists
+            // on disk in briefing but is NOT the last campaign_added entry —
+            // the runtime pin still points at the stopped parent and every
+            // start refuses. Pin the already-approved campaign and teach the
+            // continuation instead of refusing the same way forever.
+            const firstDir = researchState.resolveCampaignDir(effectiveResearchBase(workDir, ctx), firstId);
+            if (firstDir.ok) {
+              const insp = await researchState.inspectCampaign(firstDir.dir);
+              if (insp.state?.phase === "briefing" || insp.state?.phase === "research") {
+                getRuntime(ctx).researchCampaignId = firstId;
+                return reply(`ℹ️ This brief was already approved in this chain (campaign ${firstId}, phase ${insp.state.phase}): no second campaign is created. Continue it now: research_questions(action="status"), then open questions and work the campaign.`);
+              }
+            }
+            return reply("ℹ️ This brief was already approved in this chain (first confirmation: campaign " + firstId + "): no second campaign is created.");
           }
         }
         if (status !== "awaiting_child") {
