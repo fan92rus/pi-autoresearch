@@ -3423,7 +3423,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // active/awaiting_child expedition chain with a valid marker and re-binds it
   // (widget, mode ON, resume message with the map slice). Never interrupts a
   // session that already holds a chain.
+  // Subagent sessions NEVER restore: the subagent runner marks its dedicated
+  // child pi processes with PI_SUBAGENT_CHILD=1 / PI_SUBAGENT_PARENT_SESSION.
+  // Without this guard the restore message raced the runner's initial task
+  // prompt — the child started processing the restore text, the task arrived
+  // mid-turn and was refused with "Agent is already processing", and the whole
+  // run failed at step 0 (live lob-collector-data case, 2026-11-13).
+  const isSubagentSession = (): boolean => process.env.PI_SUBAGENT_CHILD === "1" || (process.env.PI_SUBAGENT_PARENT_SESSION ?? "").trim() !== "";
   const restoreExpeditionFromDisk = async (ctx: ExtensionContext): Promise<void> => {
+    if (isSubagentSession()) return;
     const runtime = getRuntime(ctx);
     if (runtime.researchChain !== null) return;
     const workDir = resolveWorkDir(ctx.cwd);

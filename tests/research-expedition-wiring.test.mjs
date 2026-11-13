@@ -48,6 +48,28 @@ assert.match(lines.join("\n"),new RegExp(id),"widget shows the restored campaign
 const before=h.pi.sentMessages.length;
 await ext.restoreExpeditionForTest(restCtx);
 assert.equal(h.pi.sentMessages.length,before,"second restore on a bound session is a no-op");});
+test("restore is a no-op in a subagent session (PI_SUBAGENT_CHILD/PARENT_SESSION): no message, no mode, no activation entry",async()=>{const dir=workdir(),h=await harness(dir,true); const ext=await import(pathToFileURL(path.join(import.meta.dirname,"..","extensions","pi-autoresearch","index.ts")).href);
+// Build a live expedition first (guard must skip restore even though an expedition EXISTS on disk).
+await h.command("autoresearch").handler("expedition goal",h.ctx); await h.tool("expedition_brief").execute("id",{action:"draft",doc},null,null,h.ctx); const out=await h.tool("expedition_brief").execute("id",{action:"propose"},null,null,h.ctx);
+const id=text(out).match(/campaign (exp-[A-Za-z0-9-]+)/)?.[1];
+const childCtx=makeCtx(dir,"subagent-child-1",h.pi);
+const savedChild=process.env.PI_SUBAGENT_CHILD, savedParent=process.env.PI_SUBAGENT_PARENT_SESSION;
+process.env.PI_SUBAGENT_CHILD="1"; delete process.env.PI_SUBAGENT_PARENT_SESSION;
+try{
+  const before=h.pi.sentMessages.length;
+  const beforeWidgets=h.pi.widgets.length;
+  await ext.restoreExpeditionForTest(childCtx);
+  assert.equal(h.pi.sentMessages.length,before,"no restore message reaches the child");
+  assert.equal(h.pi.widgets.length,beforeWidgets,"no widget pinned in the child");
+  // A child marked only via the parent-session env is equally skipped.
+  delete process.env.PI_SUBAGENT_CHILD;
+  process.env.PI_SUBAGENT_PARENT_SESSION="01a1b078-parent";
+  await ext.restoreExpeditionForTest(makeCtx(dir,"subagent-child-2",h.pi));
+  assert.equal(h.pi.sentMessages.length,before,"PARENT_SESSION marker also suppresses restore");
+}finally{
+  if(savedChild===undefined) delete process.env.PI_SUBAGENT_CHILD; else process.env.PI_SUBAGENT_CHILD=savedChild;
+  if(savedParent===undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION; else process.env.PI_SUBAGENT_PARENT_SESSION=savedParent;
+}});
 test("restore skips a stopped chain and reports a second active chain as NOT restored",async()=>{const dir=workdir(),h=await harness(dir,true); const ext=await import(pathToFileURL(path.join(import.meta.dirname,"..","extensions","pi-autoresearch","index.ts")).href);
 // Build two expeditions; the re-entry guard on /autoresearch expedition blocks the second command,
 // so build the second chain by direct disk manipulation: stop the first and add a second active chain dir.
