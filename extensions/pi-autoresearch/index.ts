@@ -9414,7 +9414,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const abs = path.resolve(workDir, filePart);
     const rel = path.relative(workDir, abs);
     if (rel === "" || path.isAbsolute(rel) || rel.split(path.sep)[0] === "..") {
-      return researchRefusal("invalid_argument", "evidence must be a file inside the work directory");
+      return researchRefusal(
+        "invalid_argument",
+        `evidence must be a file INSIDE the work directory (${workDir}); got ${JSON.stringify(filePart)}. ` +
+          "External sources must be copied in first — e.g. save the log/output under .auto/research/evidence/ (or any workdir path) and cite it relatively, like .auto/research/evidence/run.log:5-9",
+      );
     }
     try {
       const st = await fs.promises.stat(abs);
@@ -10178,6 +10182,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (hasCloseOnly && (action === "open" || action === "record")) {
           return "rule_id/verdict belong to research_questions(action=close, question_id, rule_id, verdict), not to this action";
         }
+        if (action === "record" && extraKeys.includes("question_id")) {
+          return "record binds evidence to the CURRENTLY OPEN question automatically (the campaign decides which question is open); drop question_id — or open the intended question first with research_questions(action=open, question_id)";
+        }
+        if (action === "open" && extraKeys.includes("evidence_ref")) {
+          return "evidence is recorded by a separate call research_questions(action=record, evidence_ref) AFTER opening; open only declares the question";
+        }
         return null;
       };
       const extraKeys = Object.keys(params ?? {}).filter((k) => !allowed.includes(k));
@@ -10722,6 +10732,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     promptSnippet: "Campaign questions: open, record evidence, close questions under the approved brief; expedition map is a separate tool",
     promptGuidelines: [
       "Use research_questions(action=close) to close a campaign question: provide question_id, rule_id from that question, verdict, and recorded evidence.",
+      "Workflow per question: action=open(question_id) -> action=record(evidence_ref) -> action=close(question_id, rule_id, verdict). record takes ONLY evidence_ref (a file:lines or file#anchor INSIDE the work directory) and binds to the currently open question — never pass question_id to record. If the evidence file lives outside the work directory, copy it in first (e.g. under .auto/research/evidence/) and cite the relative path.",
       "This tool's resolve is only an operator-confirmed pending-op cleanup; it does not resolve map directions.",
       "Do not pass map refs/review_ref/from/to here; use expedition_map for map operations.",
     ],
@@ -10732,7 +10743,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         action: { type: "string", enum: ["start", "open", "record", "close", "stop", "status", "report", "resolve", "chain_stop"], description: "Campaign/question action." },
         expected_sha256: { type: "string", description: "start only: approved brief SHA-256." },
         question_id: { type: "string", description: "open/close: question id from the approved brief." },
-        evidence_ref: { type: "string", description: "record only: path:lines or path#anchor." },
+        evidence_ref: { type: "string", description: "record only: path:lines or path#anchor pointing INSIDE the work directory (copy external evidence in first); binds to the currently open question — question_id is not taken." },
         rule_id: { type: "string", description: "close: decision rule for that question; stop: stop rule of the approved brief; chain_stop: charter stop rule." },
         verdict: { type: "string", description: "close only: verdict declared by the approved brief." },
         reason: { type: "string", description: "stop: required; close: required for inconclusive/waiting_for_data verdicts." },
