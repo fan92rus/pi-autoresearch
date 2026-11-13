@@ -333,3 +333,30 @@ test("advisory triggers the nudge too (wiring list regression, review R1C/R2 P2)
   assert.match(reply, /Step 1/i, "advisory is a closing event: nudge present");
   assert.doesNotMatch(reply, /action=stop/);
 }, { timeout: 90000 });
+
+test("activate on an EXHAUSTED campaign (every question closed) is refused with the brief-next hint — live lob-collector-data stall", async () => {
+  const h = await setup([{ name: "first", why: "First" }, { name: "second", why: "Second" }]);
+  const campaignDir = await activateAndCloseQuestion(h, "first");
+  // close Q2 too: now EVERY brief question is closed while phase is research
+  await h.call("research", { action: "open", question_id: "Q2" });
+  await h.call("research", { action: "record", evidence_ref: "evidence.txt:1" });
+  await h.call("research", { action: "close", question_id: "Q2", rule_id: "Q2-yes", verdict: "confirmed" });
+  // resolve the finished direction (all questions closed — refs are proven)
+  await h.call("research", { action: "expedition", subaction: "resolve", dir: "first", refs: [{ campaign: h.campaignId, question: "Q1" }] });
+  // the agent tries the live-stall move: open + activate the next direction on the SAME exhausted campaign
+  await h.call("research", { action: "expedition", subaction: "open", dir: "third", why: "From the findings" });
+  const out = await h.call("research", { action: "expedition", subaction: "activate", dir: "third", why: "Next priority" });
+  const reply = text(out);
+  assert.match(reply, /campaign_exhausted/, "the exhausted-campaign activation is refused");
+  assert.match(reply, /every brief question closed/, "the refusal names the condition");
+  assert.match(reply, /research_brief draft/, "the refusal teaches the honest next step");
+}, { timeout: 90000 });
+
+test("activate with an OPEN question on the pinned campaign still works (no false positive)", async () => {
+  const h = await setup([{ name: "first", why: "First" }, { name: "second", why: "Second" }]);
+  await activateAndCloseQuestion(h, "first"); // Q2 remains open
+  await h.call("research", { action: "expedition", subaction: "resolve", dir: "first", refs: [{ campaign: h.campaignId, question: "Q1" }] });
+  const out = await h.call("research", { action: "expedition", subaction: "activate", dir: "second", why: "Next" });
+  const reply = text(out);
+  assert.doesNotMatch(reply, /campaign_exhausted/, "an open question keeps activation legal");
+}, { timeout: 90000 });

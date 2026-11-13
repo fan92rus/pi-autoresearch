@@ -10257,6 +10257,31 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const payload: Record<string, unknown> = {dir:params.dir,from:params.from,to:params.to,why:params.why ?? params.reason,reason:params.reason ?? params.why,refs:params.refs,review_ref:params.review_ref,review_sha256:params.review_sha256,...(subaction === "activate" ? {campaign:getRuntime(ctx).researchCampaignId} : {})};
         const journals = new Map<string, Array<{questionId:string;verdict:string;hasEvidence:boolean}>>();
         for (const j of await collectChainJournals(workDir, ctx, effectiveResearchBase(workDir, ctx), chain.chainId)) journals.set(j.campaignId, j.closedQuestions);
+        // Exhausted-campaign guard (live lob-collector-data 2026-11-13): the agent
+        // kept activating new directions on ONE campaign whose every question was
+        // already closed, then stalled — there was nothing left to record against.
+        // Activation on an exhausted (all-closed, research-phase) campaign is
+        // refused with the honest next step: brief the next chain campaign first.
+        if (subaction === "activate") {
+          const pinnedId = getRuntime(ctx).researchCampaignId;
+          if (typeof pinnedId === "string" && pinnedId.length > 0) {
+            const pinnedResolved = researchState.resolveCampaignDir(workDir, pinnedId);
+            if (pinnedResolved.ok) {
+              try {
+                const pinnedSnap = await researchSnapshot(pinnedResolved.dir);
+                if (pinnedSnap.ok && pinnedSnap.brief !== null && pinnedSnap.state.phase === "research" && pinnedSnap.brief.questions.length > 0) {
+                  const anyOpen = pinnedSnap.brief.questions.some((q) => pinnedSnap.replay.vectors.get(q.id)?.status !== "closed");
+                  if (!anyOpen) {
+                    return fail(
+                      "campaign_exhausted",
+                      `Campaign ${pinnedId} has every brief question closed (phase research) — activating another direction on it gives the agent nothing to record against. Brief a NEW chain campaign first: research_brief draft (finding_refs cite closed questions of this chain; auto-approved by the charter checks) -> research_questions(action=start, expected_sha256=<approved brief sha256>), then activate the next direction (it will pin the new campaign).`,
+                    );
+                  }
+                }
+              } catch { /* snapshot failure: keep the legacy behavior */ }
+            }
+          }
+        }
         const transition = expedition.validateMapTransition(replay.map, type, payload, journals);
         if (!transition.ok) return fail(transition.reason, transition.message);
         const chainDirPath = chainJournal.chainDir(chain.workDir, chain.chainId);
