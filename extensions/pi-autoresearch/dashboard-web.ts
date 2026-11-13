@@ -87,17 +87,10 @@ h1{margin:0;font-size:15px;color:#fff;font-weight:650}
 
 /* ---------- kanban ---------- */
 main{flex:1;min-height:0;padding:8px 16px;overflow:auto}
-.kanban{height:100%;display:grid;grid-template-columns:
-  minmax(150px,1.5fr) minmax(200px,2fr) minmax(150px,1.5fr) minmax(96px,.6fr) minmax(96px,.6fr) minmax(140px,1.2fr);
-  gap:8px}
+.kanban{height:100%;display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px}
 .kcol{background:#10151d;border:1px solid var(--line);border-radius:10px;display:flex;
   flex-direction:column;min-height:0;overflow:hidden}
-/* empty non-active columns: narrow column (~96px) with the title on top */
-.kcol-empty{min-width:96px;flex-direction:column}
-.kcol-empty .kcards{display:none}
-.kcol-empty h2{justify-content:center;gap:6px}
-.kcol-empty .n{background:#21262d}
-.kcol-empty::after{content:"—";color:#484f58;font-size:11px;text-align:center;padding:8px 0}
+
 .kcol h2{margin:0;padding:7px 10px 5px;font-size:10px;text-transform:uppercase;letter-spacing:.05em;
   color:var(--muted);font-weight:600;display:flex;justify-content:space-between;align-items:center;
   gap:6px;border-bottom:1px solid #1c232d}
@@ -117,6 +110,8 @@ main{flex:1;min-height:0;padding:8px 16px;overflow:auto}
 .card:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
 .card.sel-active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
 .card.flash{animation:flash 1.1s ease}
+.cres{margin-top:4px;font-size:10.5px;color:#9aa7b4;line-height:1.35;word-break:break-word;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.cres-g{margin-right:4px}
 @keyframes flash{0%{border-color:var(--accent);background:#12233a}100%{background:#141a22}}
 .cname{font-size:12px;font-weight:600;color:#fff;line-height:1.25;display:-webkit-box;
   -webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
@@ -185,9 +180,6 @@ footer{flex:none;padding:6px 16px;border-top:1px solid var(--line);display:flex;
   body{overflow:auto;height:auto}
   main{min-height:420px}
   .kanban{grid-template-columns:repeat(3,minmax(0,1fr));height:auto}
-  .kcol-empty::after{display:none}
-  .kcol-empty .kcards{display:block}
-  .kcol-empty .kcards .empty{display:block}
   #histList{columns:2}
 }
 @media (max-width:640px){.kanban{grid-template-columns:repeat(2,minmax(0,1fr))}#histList{columns:1}}
@@ -233,6 +225,7 @@ const DIR_GLYPH = {open:"○",active:"🔄",resolved:"✅",rejected:"❌",adviso
 const DONE_STATUSES = ["resolved","rejected","advisory_exhausted"];
 const PH_GLYPH = {briefing:"○",research:"●",stopped:"■"};
 const V_GLYPH = {confirmed:"✓",rejected:"✗",inconclusive:"❓",waiting_for_data:"⏳"};
+const RESULT_GLYPH = {resolved:"✓",rejected:"✗",advisory_exhausted:"❓",parked:"💤",open:"○",active:"🔄"};
 const Q_CLOSED = (v) => !!v && v !== "waiting_for_data";
 const TL_LABEL = {
   chain_created:"Цепочка создана", expedition_created:"Экспедиция создана",
@@ -254,6 +247,7 @@ let lastFetchFailed = false;
 
 /* ---------- helpers ---------- */
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+function clip(t,n){t=String(t);return t.length>n?t.slice(0,n-1)+"…":t;}
 function pct(a,b){return b?Math.round(100*a/b):0;}
 function fmtTime(iso){return (iso||"").slice(11,16);}
 function fmtDay(iso){return (iso||"").slice(5,10);}
@@ -297,6 +291,11 @@ function cardHTML(d){
   const vrow=q.length?'<span class="cvg" title="вердикты кампании">'+q.map(x=>x.verdict?(V_GLYPH[x.verdict]||"*"):"·").join("")+'</span>':"";
   if(q.length) qmini=vrow+'<span class="qmini"><span class="mbar q"><i style="width:'+pct(closed,q.length)+'%"></i></span><span class="qn">'+closed+'/'+q.length+'</span></span>';
   else if(!camp) qmini='<span class="nocamp-tag">ждёт активации</span>';
+  // result note: closing reason (owner request 2026-11-13) — what the experiment
+  // gave / why it was cancelled. resolve/reject/park/advisory/reopen/pivot all
+  // carry reason in the journal replay (DirectionState.reason).
+  const res=(d.reason&&typeof d.reason==="string")?String(d.reason):"";
+  const resRow=res?'<div class="cres" title="'+esc(res)+'"><span class="cres-g">'+(RESULT_GLYPH[d.status]||"•")+'</span>'+esc(clip(res,110))+'</div>':'';
   const rows=q.map(x=>{
     const det=(x.verdict||x.text)?'<div class="qdetail"></div>':"";
     return '<div class="q"><span class="qid">'+esc(x.id)+'</span><span class="qg">'+
@@ -304,14 +303,15 @@ function cardHTML(d){
       '</span><span class="qt" title="'+esc(x.text||"")+'">'+esc(x.text||"—")+'</span></div>'+det;
   }).join("");
   const inline='<div class="inline" hidden>'+
-    (d.why?'<div class="iwhy">'+esc(d.why)+'</div>':'')+
+    (d.why?'<div class="iwhy"><b>почему открыт:</b> '+esc(d.why)+'</div>':'')+
+    (res?'<div class="iwhy"><b>результат:</b> '+esc(res)+'</div>':'')+
     (d.refs&&d.refs.length?'<div class="iwhy">refs: '+esc(d.refs.map(r=>r.campaign+"/"+r.question).join(", "))+'</div>':'')+
     (camp?rows:'<div class="nocamp">нет привязанной кампании</div>')+
   '</div>';
   return '<article class="card'+(d.status==="active"?' sel-active':'')+'" role="button" tabindex="0" '+
     'aria-expanded="false" data-name="'+esc(d.name)+'"'+(d.campaign?' data-camp="'+esc(d.campaign)+'"':'')+'>'+
     '<div class="cname"><span class="g">'+(DIR_GLYPH[d.status]||"○")+'</span>'+esc(d.name)+'</div>'+
-    '<div class="meta">'+metaBits+qmini+'</div>'+inline+'</article>';
+    '<div class="meta">'+metaBits+qmini+'</div>'+resRow+inline+'</article>';
 }
 
 function renderHistory(v){
@@ -401,8 +401,7 @@ function render(){
       if(activeCount===1){nCls="n wip-ok";nTitle="WIP-инвариант: ровно одно активное направление — ок";}
       else{nCls="n wip-bad";nTitle="WIP-инвариант: активных направлений "+activeCount;}
     }
-    const collapse=!by[s].length&&s!=="active";
-    return '<div class="kcol h-'+s+(collapse?' kcol-empty':'')+'"><h2>'+DIR_LABEL[s]+' <span class="'+nCls+'"'+(nTitle?' title="'+esc(nTitle)+'"':'')+'>'+by[s].length+'</span></h2>'+
+    return '<div class="kcol h-'+s+'"><h2>'+DIR_LABEL[s]+' <span class="'+nCls+'"'+(nTitle?' title="'+esc(nTitle)+'"':'')+'>'+by[s].length+'</span></h2>'+
       '<div class="kcards">'+(by[s].length?by[s].map(cardHTML).join(""):'<div class="empty">—</div>')+'</div></div>';
   }).join("")+
   (v.mapError?'<div style="grid-column:1/-1" class="banner warn">'+esc(v.mapError)+'</div>':"");

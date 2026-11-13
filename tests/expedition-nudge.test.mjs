@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
+import { createHash } from "node:crypto";
 import { createFakePi, makeCtx } from "./fake-pi.ts";
 import * as chainJournal from "../extensions/pi-autoresearch/chain-journal.ts";
 
@@ -271,4 +272,64 @@ test("drift resume in an expedition with live directions: expedition continuatio
   assert.match(last, /Continue the expedition now/, "expedition branch must replace the legacy selection");
   assert.match(last, /expedition_map/, "nudge content (open/activate/reopen) is carried into the drift resume");
   assert.doesNotMatch(last, /pick a stop rule/i, "review blocker: no premature stop in the drift path");
+}, { timeout: 90000 });
+
+test("unverifiable campaign snapshot in drift falls back to the safe legacy resume (no stop) — review R1B P1", async () => {
+  const h = await setup([{ name: "first", why: "First" }]);
+  await activateAndCloseQuestion(h, "first");
+  await h.call("research", { action: "open", question_id: "Q2" });
+  await h.call("research", { action: "record", evidence_ref: "evidence.txt:1" });
+  await h.call("research", { action: "close", question_id: "Q2", rule_id: "Q2-yes", verdict: "confirmed" });
+  // Corrupt the brief AFTER closing Q2 and resolving the direction: the map
+  // has no active/open, the state.json is healthy, but the question state is
+  // UNVERIFIABLE. The exhaustion stop branch MUST be suppressed: the drift
+  // nudge continues with the safe next-campaign-brief path instead.
+  await h.call("research", { action: "expedition", subaction: "resolve", dir: "first", refs: [{ campaign: h.campaignId, question: "Q1" }] });
+  fs.writeFileSync(path.join(h.dir, ".auto", "research", h.campaignId, "brief.json"), "{ broken");
+  await h.hook("agent_start")({}, h.ctx);
+  await h.hook("agent_end")({ messages: [] }, h.ctx);
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  const last = h.pi.sentMessages[h.pi.sentMessages.length - 1]?.text ?? "";
+  assert.match(last, /Continue the expedition now/, "expedition branch still guides (safe brief path)");
+  assert.match(last, /research_brief draft/, "unknown question state -> next-campaign brief path, not stop");
+  assert.doesNotMatch(last, /action=stop/, "unknown question state must NEVER suggest a stop");
+}, { timeout: 90000 });
+
+test("park of an OPEN direction with no active before it sends NO steer (review R1B P2)", async () => {
+  const h = await setup([{ name: "first", why: "First" }, { name: "second", why: "Second" }]);
+  await activateAndCloseQuestion(h, "first");
+  // Cycle 1: resolve the active "first" → qualifying event → exactly 1 steer.
+  const before = h.pi.sentMessages.length;
+  await h.call("research", { action: "expedition", subaction: "resolve", dir: "first", refs: [{ campaign: h.campaignId, question: "Q1" }] });
+  assert.equal(h.pi.sentMessages.length, before + 1, "resolve of the active direction steers");
+  // Event 2: park the OPEN "second" — no active existed before this event, so
+  // this is not a "last active closed" event and must not steer.
+  await h.call("research", { action: "expedition", subaction: "park", dir: "second", reason: "Deprioritized" });
+  assert.equal(h.pi.sentMessages.length, before + 1, "park of an open direction does NOT steer (reply nudge still present)");
+  const reply = text((await h.call("research", { action: "expedition", subaction: "status" })));
+  assert.match(reply, /second/);
+}, { timeout: 90000 });
+
+test("reject triggers the nudge too (wiring list regression, review R1C P2)", async () => {
+  const h = await setup([{ name: "first", why: "First" }]);
+  await activateAndCloseQuestion(h, "first");
+  const out = await h.call("research", { action: "expedition", subaction: "reject", dir: "first", refs: [{ campaign: h.campaignId, question: "Q1" }] });
+  const reply = text(out);
+  assert.match(reply, /Expedition map recorded: reject first/);
+  assert.match(reply, /Step 1/i, "reject is a closing event: nudge present");
+  assert.doesNotMatch(reply, /action=stop/);
+}, { timeout: 90000 });
+
+test("advisory triggers the nudge too (wiring list regression, review R1C/R2 P2)", async () => {
+  const h = await setup([{ name: "first", why: "First" }]);
+  await activateAndCloseQuestion(h, "first");
+  // advisory requires an existing review file with matching sha256 (validator)
+  const reviewPath = path.join(h.dir, "review.md");
+  fs.writeFileSync(reviewPath, "# review\n");
+  const sha = createHash("sha256").update(fs.readFileSync(reviewPath)).digest("hex");
+  const out = await h.call("research", { action: "expedition", subaction: "advisory", dir: "first", review_ref: reviewPath, review_sha256: sha });
+  const reply = text(out);
+  assert.match(reply, /Expedition map recorded: advisory first/, "advisory close recorded");
+  assert.match(reply, /Step 1/i, "advisory is a closing event: nudge present");
+  assert.doesNotMatch(reply, /action=stop/);
 }, { timeout: 90000 });

@@ -127,6 +127,10 @@ test("continuation message prescribes close direction → activate next → brie
   fs.writeFileSync(path.join(campaignDir,"report.md"),"# report\n");
   const before=h.pi.sentMessages.length;
   await h.call("research",{action:"report"});
+  // waitFor: sendWhenReady delivery can race the assertion on a slow runner
+  // (R2 flake: 0 messages seen at assert time); poll up to 2s, then require exactly one.
+  const wDeadline=Date.now()+2000;
+  while(h.pi.sentMessages.length<before+1&&Date.now()<wDeadline) await new Promise(r=>setTimeout(r,25));
   assert.equal(h.pi.sentMessages.length,before+1,"exactly one continuation sent");
   const continuation=h.pi.sentMessages[h.pi.sentMessages.length-1].text;
   assert.match(continuation,/expedition_map\(subaction="resolve", dir=<name>, refs=\[\{campaign,question\}\]\).*expedition_map\(subaction="reject", dir=<name>, refs=\[\{campaign,question\}\]\)/,"step 1: close the finished direction with valid separate calls");
@@ -154,6 +158,10 @@ test("continuation is delivered as steer when the agent is busy",async()=>{
   h.ctx.isIdle=()=>false;
   const before=h.pi.sentMessages.length;
   await h.call("research",{action:"report"});
+  // waitFor: sendWhenReady delivery can race the assertion on a slow runner
+  // (R2 flake: 0 messages seen at assert time); poll up to 2s, then require exactly one.
+  const wDeadline=Date.now()+2000;
+  while(h.pi.sentMessages.length<before+1&&Date.now()<wDeadline) await new Promise(r=>setTimeout(r,25));
   assert.equal(h.pi.sentMessages.length,before+1,"exactly one continuation sent");
   const last=h.pi.sentMessages[h.pi.sentMessages.length-1];
   assert.equal(last.opts?.deliverAs,"steer","busy agent: continuation must interrupt the turn, not queue as followUp");

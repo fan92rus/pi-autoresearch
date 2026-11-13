@@ -2736,8 +2736,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (!verified.ok) return null;
     const replay = expedition.replayExpeditionMap(verified.entries);
     if (!replay.ok) return null;
-    const nudge = await expeditionCloseNudge(ctx, chain, replay.map);
-    return nudge === null ? null : `Continue the expedition now: ${nudge.replySuffix} STOP on manual_check_required.`;
+    const nudge = await expeditionCloseNudge(ctx, chain, replay.map, { eventClosedActive: false });
+    const body = nudge.replySuffix.replace(/^Next: /, "");
+    return nudge === null ? null : `Continue the expedition now: ${body} STOP on manual_check_required.`;
   };
 
   const composeResearchDriftMessage = async (ctx: ExtensionContext): Promise<string> => {
@@ -10260,7 +10261,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (["resolve", "reject", "advisory", "park"].includes(subaction)) {
           const postReplay = expedition.replayExpeditionMap([...verified.entries, written.entry]);
           if (!postReplay.ok) return reply(`Expedition map recorded: ${subaction} ${params.dir ?? params.from ?? ""}.`);
-          const nudge = await expeditionCloseNudge(ctx, chain, postReplay.map);
+          const preActive = replay.map.directions.get(String(payload.dir ?? ""))?.status === "active";
+          const nudge = await expeditionCloseNudge(ctx, chain, postReplay.map, { eventClosedActive: preActive });
           if (nudge !== null) {
             // Review blockers B2/B3 resolution: the steer is per closing
             // EVENT, not per chain — every qualifying close of the last
@@ -10823,6 +10825,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     recordAutoresearchActivation(resolveWorkDir(ctx.cwd), false);
     setAutoresearchMode(ctx, false);
     runtime.researchCampaignId = null;
+    // Review R1A: re-arm the continuation flag at the chain boundary — a NEW
+    // chain bound in the same session must be able to send its first
+    // awaiting_child continuation (once-per-period is per CHAIN, not per
+    // session).
+    runtime.chainContinuationSent = false;
     // Review B4: leaving research mode ends the chain in memory too, so later
     // campaigns in this session are not routed into a finished chain.
     runtime.researchChain = null;
@@ -11015,7 +11022,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (!dir) return "warning: expedition report unavailable (chain directory is unavailable)";
     const reportPath = path.join(dir, "expedition-report.md");
     const report = expedition.expeditionReportText(replay.map,{chainId:chain.chainId,finalStatus,campaigns,computedAt:new Date().toISOString(),...(activeDirWithoutCampaign ? {activeDirWithoutCampaign} : {})});
-    try { await researchState.writeFileAtomic(reportPath, report + "\\n"); return `Expedition report saved to ${reportPath}`; }
+    try { await researchState.writeFileAtomic(reportPath, report + "\n"); return `Expedition report saved to ${reportPath}`; }
     catch (e) { return `warning: expedition report could not be saved (${String(e)})`; }
   };
 
@@ -11038,6 +11045,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     ctx: ExtensionContext,
     chain: NonNullable<ReturnType<typeof activeChain>>,
     map: expedition.ExpeditionMap,
+    opts: { eventClosedActive: boolean },
   ): Promise<{ replySuffix: string; steerMessage: string | null } | null> => {
     if (!chain.expedition) return null;
     const campaignId = getRuntime(ctx).researchCampaignId;
@@ -11053,8 +11061,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const reopenExample = dirs.find((d) => d.status === "parked")?.dir ?? reopenable[0];
     const hasActive = dirs.some((d) => d.status === "active");
 
-    // Open brief questions of the pinned campaign (stop is legal only at zero).
+    // Open brief questions of the pinned campaign (stop is legal only at zero,
+    // POSITIVELY verified: an unreadable snapshot/brief leaves the question
+    // state UNKNOWN and the exhaustion stop branch is suppressed — review R1B
+    // P1: suggesting stop without establishing that every question is closed
+    // violates the owner contract).
     let openQuestions = 0;
+    let questionsKnown = false;
     try {
       const snap = await researchSnapshot(resolved.dir);
       if (snap.ok && snap.brief !== null) {
@@ -11062,8 +11075,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           const st = snap.replay.vectors.get(q.id)?.status;
           if (st !== "closed") openQuestions += 1;
         }
+        questionsKnown = true;
       }
-    } catch { /* snapshot failure: treat questions as open (conservative — no stop) */ }
+    } catch { /* snapshot failure: questions UNKNOWN -> exhaustion suppressed */ }
 
     const step1Open = "Step 1 — open new vectors from the findings: if the findings support a new testable hypothesis, call expedition_map(subaction=open, dir=<new name>, why=<finding>); open as many as the findings justify.";
     const reopenLine = reopenExample !== undefined
@@ -11078,21 +11092,27 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // same finding-driven judgment as opening a new direction, so both live in
     // step 1 of the same message and never block the honest finish path.
     const hasCandidates = hasActive || openDirs.length > 0;
-    if (!hasCandidates && openQuestions === 0) {
+    if (!hasCandidates && questionsKnown && openQuestions === 0) {
       const exhausted = `${step1Open}${reopenLine} If the findings support no further hypothesis, that is a valid outcome: close the campaign — research_questions(action=stop, rule_id=<rule_id>, reason=<why the stop condition is met>) then research_questions(action=report).`;
-      return { replySuffix: `Next: ${exhausted}`, steerMessage: `Expedition: the last active direction is closed and every brief question has a verdict. ${exhausted}` };
+      const closedLast = opts.eventClosedActive && !hasActive;
+      return { replySuffix: `Next: ${exhausted}`, steerMessage: closedLast ? `Expedition: the last active direction is closed and every brief question has a verdict. ${exhausted}` : null };
     }
 
-    // Candidates gone but the campaign still has open questions → next chain
-    // campaign brief keeps the expedition moving (never a premature stop).
-    if (!hasCandidates && openQuestions > 0) {
+    // Candidates gone but the campaign still has open (or UNKNOWN) questions →
+    // next chain campaign brief keeps the expedition moving (never a premature
+    // stop; unknown question state never reaches the stop branch).
+    if (!hasCandidates) {
       const briefPath = `${step1Open}${reopenLine} If no new hypothesis emerges, continue the expedition with the next campaign: research_brief draft (finding_refs cite closed questions of this chain; auto-approved by the charter checks).`;
-      return { replySuffix: `Next: ${briefPath}`, steerMessage: `Expedition: the last active direction is closed; the campaign still has open questions. ${briefPath}` };
+      const closedLast = opts.eventClosedActive && !hasActive;
+      return { replySuffix: `Next: ${briefPath}`, steerMessage: closedLast ? `Expedition: the last active direction is closed; the campaign still has open questions. ${briefPath}` : null };
     }
 
     // Open directions exist: two-step flow, stop never offered.
     const suffix = `Next: ${step1Open}${reopenLine} ${step2Activate}`;
-    const steer = !hasActive
+    // Steer only when THIS event closed the LAST active direction (review R1B:
+    // parking an already-open direction with no active before it is not a
+    // "last active closed" event and must not wake the agent).
+    const steer = !hasActive && opts.eventClosedActive
       ? `Expedition: the last active direction is closed. ${step1Open}${reopenLine} ${step2Activate}`
       : null;
     return { replySuffix: suffix, steerMessage: steer };

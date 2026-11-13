@@ -10,7 +10,7 @@ import { type ChainEntry } from "./chain-journal.ts";
 import * as expedition from "./expedition.ts";
 import { DEFAULT_VERDICTS } from "./research-state.ts";
 
-export interface ExpeditionViewDir { name: string; status: expedition.DirectionStatus; why: string; refs: Array<{ campaign: string; question: string }>; campaign: string | null }
+export interface ExpeditionViewDir { name: string; status: expedition.DirectionStatus; why: string; refs: Array<{ campaign: string; question: string }>; campaign: string | null; reason: string | null }
 export interface ExpeditionViewQuestion { id: string; text: string; closed: boolean; verdict: string | null; ruleId: string | null; reason: string | null; hasEvidence: boolean }
 export interface ExpeditionViewTimelineItem { type: string; dir: string | null; to: string | null; at: string; note: string | null }
 export interface ExpeditionViewCounters { done: number; total: number; campaignsUsed: number; campaignsMax: number | null; qClosed: number; qTotal: number; next: string }
@@ -105,8 +105,8 @@ export function buildExpeditionView(chainDir: string, campaignDir: string | null
 
   const replay = expedition.replayExpeditionMap(entries);
   const dirs: ExpeditionViewDir[] = replay.ok
-    ? [...replay.map.directions.values()].map((d) => ({ name: d.dir, status: d.status, why: d.why, refs: d.refs ?? [], campaign: d.campaign ?? null }))
-    : [];
+    ? [...replay.map.directions.values()].map((d) => ({ name: d.dir, status: d.status, why: d.why, refs: d.refs ?? [], campaign: d.campaign ?? null, reason: typeof d.reason === "string" && d.reason.length > 0 ? d.reason : null }))
+    : [] as ExpeditionViewDir[];
   const mapError = replay.ok ? null : `(map unavailable: ${oneLine(replay.message)})`;
 
   // Restart marker (optional for the view): lenient read — goal fallback and

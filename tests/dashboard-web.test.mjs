@@ -20,6 +20,8 @@ const entries = [
   { type: 'direction_opened', dir: 'D1', why: 'first basis', at: '2026-11-12T03:04:00.000Z' },
   { type: 'direction_activated', dir: 'D1', campaign: 'c1', why: 'start', at: '2026-11-12T03:05:00.000Z' },
   { type: 'campaign_added', campaign_id: 'c1', at: '2026-11-12T03:05:10.000Z' },
+  { type: 'direction_rejected', dir: 'D1', reason: 'sign signal broke on fresh: hit 0.5419 vs control 0.5808', at: '2026-11-12T03:06:00.000Z' },
+  { type: 'direction_opened', dir: 'D2', why: 'second basis', at: '2026-11-12T03:07:00.000Z' },
 ];
 const campaignLog = [
   { at: 'a', event: 'open', question_id: 'Q1' },
@@ -133,9 +135,32 @@ test('K2 UX essentials carried over from the approved mockup', () => {
   assert.ok(html.includes('execCommand("copy")'), 'textarea fallback');
   // WIP invariant on active column
   assert.ok(html.includes('wip-ok') && html.includes('wip-bad'), 'WIP invariant classes');
-  // empty columns: narrow ~96px, title on top, no popups
-  assert.ok(html.includes('kcol-empty'), 'collapsed empty columns');
-  assert.ok(html.includes('min-width:96px'), '96px minimum');
+  // equal-width columns (owner request 2026-11-13): all six 1fr, no collapse stubs
+  assert.ok(html.includes('repeat(6,minmax(0,1fr))'), 'equal-width kanban columns');
+  assert.ok(!html.includes('kcol-empty'), 'no collapsed empty columns');
   // no expeditions tabs: single-expedition page
   assert.ok(!html.includes('role="tablist"'), 'no tab list (single expedition)');
+});
+
+test('page template renders result notes from payload reasons; equal-width columns (static page carries no data)', () => {
+  // The static page embeds NO view data (XSS-proof); client renders from /expedition
+  // JSON. So the template must carry the result-note renderer + labeled detail, and
+  // the equal-width grid; payload-level reason coverage lives in expedition-view tests.
+  const html = buildExpeditionHtml(seedView(), campaigns);
+  assert.ok(html.includes('cres-g'), 'result-note glyph renderer in template');
+  assert.ok(/class="cres"[^]*?RESULT_GLYPH/.test(html), 'result row renders the status glyph + reason');
+  assert.ok(html.includes("clip(res,110)"), 'long reasons are clipped on the card');
+  assert.ok(html.includes('результат:</b>'), 'labeled result detail in template');
+  assert.ok(html.includes('d.reason'), 'template reads d.reason from the fetched JSON');
+  assert.ok(html.includes('repeat(6,minmax(0,1fr))'), 'equal-width kanban columns');
+  assert.ok(!html.includes('kcol-empty'), 'no collapsed empty columns');
+});
+
+test('embedded client script parses as valid JavaScript (R2 blocker regression)', () => {
+  const html = buildExpeditionHtml(seedView(), campaigns);
+  const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((x) => x[1]);
+  assert.ok(scripts.length >= 1, 'page has an embedded script');
+  for (const [i, src] of scripts.entries()) {
+    assert.doesNotThrow(() => new Function(src), `script block ${i} must parse as valid JS`);
+  }
 });

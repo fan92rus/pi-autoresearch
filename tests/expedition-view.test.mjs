@@ -211,3 +211,22 @@ test('counters.next is status-aware: active/awaiting_child → activate hint, st
     rmSync(f.chainDir, { recursive: true, force: true });
   }
 });
+
+test('directions carry the closing reason (result note): rejected has it, open is null', () => {
+  const chainDir = join(mkdtempSync(join(tmpdir(), 'ev-')), 'ch');
+  mkdirSync(chainDir, { recursive: true });
+  const entries2 = [
+    { type: 'chain_created', root_campaign_id: 'c1', at: '2026-11-12T03:03:00.000Z' },
+    { type: 'expedition_created', goal: 'G', doc_sha256: 'a'.repeat(64), at: '2026-11-12T03:03:10.000Z' },
+    { type: 'direction_opened', dir: 'D1', why: 'basis one', at: '2026-11-12T03:04:00.000Z' },
+    { type: 'direction_activated', dir: 'D1', campaign: 'c1', why: 'start', at: '2026-11-12T03:05:00.000Z' },
+    { type: 'direction_rejected', dir: 'D1', reason: 'signal broke on fresh', at: '2026-11-12T03:06:00.000Z' },
+    { type: 'direction_opened', dir: 'D2', why: 'basis two', at: '2026-11-12T03:07:00.000Z' },
+  ];
+  writeFileSync(join(chainDir, 'chain.json'), entries2.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  const v = view.buildExpeditionView(chainDir, null);
+  const d1 = v.dirs.find((d) => d.name === 'D1');
+  const d2 = v.dirs.find((d) => d.name === 'D2');
+  assert.equal(d1.reason, 'signal broke on fresh', 'rejected direction carries its closing reason');
+  assert.equal(d2.reason, null, 'open direction has no result note');
+});
