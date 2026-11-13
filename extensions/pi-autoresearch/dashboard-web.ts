@@ -20,7 +20,7 @@ import { type ExpeditionView } from "./expedition-view.ts";
 export interface ExpeditionWebCampaign {
   id: string;
   phase: string | null;
-  q: Array<{ id: string; text: string; verdict: string | null }>;
+  q: Array<{ id: string; text: string; verdict: string | null; rule: string | null; reason: string | null }>;
   evidenceCount: number;
 }
 
@@ -132,7 +132,10 @@ main{flex:1;min-height:0;padding:8px 16px;overflow:auto}
 .q .qid{color:var(--accent);font-family:ui-monospace,Menlo,monospace;white-space:nowrap}
 .q .qg{white-space:nowrap}
 .q .qt{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.qdetail{font-size:10px;color:var(--muted);padding:2px 0 3px 40px;white-space:normal}
+.qclick{cursor:pointer}
+.qclick:hover .qt{color:var(--accent)}
+.qdetail{font-size:10px;color:var(--muted);padding:2px 0 3px 40px;white-space:normal;display:none}
+.qopen + .qdetail{display:block}
 
 /* ---------- damage / campaign banners ---------- */
 .banner{margin:14px 16px 0;background:#20161a;border:1px solid #6e2a31;border-radius:10px;
@@ -297,10 +300,15 @@ function cardHTML(d){
   const res=(d.reason&&typeof d.reason==="string")?String(d.reason):"";
   const resRow=res?'<div class="cres" title="'+esc(res)+'"><span class="cres-g">'+(RESULT_GLYPH[d.status]||"•")+'</span>'+esc(clip(res,110))+'</div>':'';
   const rows=q.map(x=>{
-    const det=(x.verdict||x.text)?'<div class="qdetail"></div>':"";
-    return '<div class="q"><span class="qid">'+esc(x.id)+'</span><span class="qg">'+
+    // question detail (owner request 2026-11-13: answers must be readable):
+    // the deciding rule + the close reason, revealed on question-row click.
+    const detailBits=[];
+    if(x.rule) detailBits.push('<div><b>правило:</b> '+esc(x.rule)+'</div>');
+    if(x.reason) detailBits.push('<div><b>итог:</b> '+esc(x.reason)+'</div>');
+    const det=(detailBits.length)?'<div class="qdetail">'+detailBits.join("")+'</div>':"";
+    return '<div class="q qclick" role="button" tabindex="0" title="раскрыть правило/итог"><span class="qid">'+esc(x.id)+'</span><span class="qg">'+
       (x.verdict?'<span class="v-'+esc(x.verdict)+'">'+(V_GLYPH[x.verdict]||"*")+'</span>':'<span class="v-open">·</span>')+
-      '</span><span class="qt" title="'+esc(x.text||"")+'">'+esc(x.text||"—")+'</span></div>'+det;
+      '</span><span class="qt">'+esc(x.text||"—")+'</span></div>'+det;
   }).join("");
   const inline='<div class="inline" hidden>'+
     (d.why?'<div class="iwhy"><b>почему открыт:</b> '+esc(d.why)+'</div>':'')+
@@ -465,6 +473,8 @@ function hideTip(){tip.hidden=true;}
 /* ---------- wiring (delegated once; containers survive innerHTML swaps) ---------- */
 const mainEl=document.querySelector("main");
 mainEl.addEventListener("click",e=>{
+  const qrow=e.target.closest(".qclick");
+  if(qrow){ qrow.classList.toggle("qopen"); return; }
   const card=e.target.closest(".card");if(!card)return;
   const inline=card.querySelector(".inline");
   if(!inline)return;

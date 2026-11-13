@@ -7341,23 +7341,31 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         id: typeof question?.id === "string" ? question.id : "",
         text: typeof question?.text === "string" ? question.text : "",
         verdict: null as string | null,
+        rule: null as string | null,
+        reason: null as string | null,
       })).filter((question: ExpeditionWebCampaign["q"][number]) => question.id.length > 0);
     } catch { /* broken brief → empty questions */ }
     if (q.length > 0 || phase !== null) {
       try {
         const log = fs.readFileSync(path.join(dir, "log.jsonl"), "utf8");
         const verdicts = new Map<string, string>();
+        const rules = new Map<string, string>();
+        const reasons = new Map<string, string>();
         for (const line of log.split(/\r?\n/)) {
           if (!line.trim()) continue;
-          let ev: { event?: unknown; question_id?: unknown; verdict?: unknown } | null = null;
+          let ev: { event?: unknown; question_id?: unknown; verdict?: unknown; rule_id?: unknown; reason?: unknown } | null = null;
           try { ev = JSON.parse(line); } catch { continue; }
           const id = typeof ev?.question_id === "string" ? ev.question_id : null;
           if (id === null) continue;
           const action = typeof ev?.event === "string" ? ev.event : "";
-          if (action === "close") verdicts.set(id, typeof ev?.verdict === "string" ? ev.verdict : "");
-          else if (action === "open") verdicts.delete(id);
+          if (action === "close") {
+            verdicts.set(id, typeof ev?.verdict === "string" ? ev.verdict : "");
+            if (typeof ev?.rule_id === "string" && ev.rule_id !== "") rules.set(id, ev.rule_id);
+            if (typeof ev?.reason === "string" && ev.reason !== "") reasons.set(id, ev.reason);
+          }
+          else if (action === "open") { verdicts.delete(id); rules.delete(id); reasons.delete(id); }
         }
-        q = q.map((question: ExpeditionWebCampaign["q"][number]) => ({ ...question, verdict: verdicts.get(question.id) ?? null }));
+        q = q.map((question: ExpeditionWebCampaign["q"][number]) => ({ ...question, verdict: verdicts.get(question.id) ?? null, rule: rules.get(question.id) ?? null, reason: reasons.get(question.id) ?? null }));
       } catch { /* unreadable log → verdicts stay null */ }
     }
     let evidenceCount = 0;

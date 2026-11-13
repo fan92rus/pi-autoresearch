@@ -175,3 +175,30 @@ test('dashboard command outside any expedition → the ordinary fullscreen path 
   assert.doesNotMatch(notified, /Expedition dashboard at/);
 });
 
+test('payload questions carry rule and reason from close events (dashboard answers)', () => {
+  const workDir = fs.mkdtempSync(join(tmpdir(), 'expinact-wd-'));
+  const chainDir = join(workDir, '.auto', 'research-chain', 'exp-qa-chain');
+  fs.mkdirSync(chainDir, { recursive: true });
+  const entries = [
+    { type: 'chain_created', root_campaign_id: 'c0', at: '0' },
+    { type: 'expedition_created', goal: 'G', doc_sha256: 'a'.repeat(64), at: '1' },
+    { type: 'campaign_added', campaign_id: 'c0', at: '2' },
+    { type: 'status_change', status: 'active', at: '3' },
+  ];
+  fs.writeFileSync(join(chainDir, 'chain.json'), entries.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  expedition.writeExpeditionMarker(chainDir, { goal: 'G', docPath: 'doc.json', docSha256: 'a'.repeat(64), campaignId: 'c0', charter: doc.charter });
+  const campDir = join(workDir, '.auto', 'research', 'c0');
+  fs.mkdirSync(campDir, { recursive: true });
+  fs.writeFileSync(join(campDir, 'state.json'), JSON.stringify({ schema_version: 1, campaign_id: 'c0', created_at: 't', phase: 'stopped' }));
+  fs.writeFileSync(join(campDir, 'brief.json'), JSON.stringify({ schema_version: 1, goal: 'g', plan_source: 'p', caveat_block: 'c', data_roles: { explore: [], validate: [], confirm: [] }, questions: [{ id: 'Q1', text: 'Q?', decision_rules: [{ id: 'r-yes', verdict: 'confirmed', when: 'y' }], needs_data: null }], process_metrics: [], stop_rules: [] }));
+  const logLines = [
+    { at: 'a', event: 'open', question_id: 'Q1' },
+    { at: 'b', event: 'close', question_id: 'Q1', rule_id: 'r-no', verdict: 'rejected', reason: 'signal broke on fresh data' },
+  ];
+  fs.writeFileSync(join(campDir, 'log.jsonl'), logLines.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  const payload = extensionModule.resolveExpeditionPayload(workDir);
+  const q = payload.campaigns[0].q[0];
+  assert.equal(q.verdict, 'rejected');
+  assert.equal(q.rule, 'r-no', 'deciding rule exposed in the payload');
+  assert.equal(q.reason, 'signal broke on fresh data', 'close reason exposed in the payload');
+});

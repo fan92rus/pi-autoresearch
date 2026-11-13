@@ -164,3 +164,12 @@ test('embedded client script parses as valid JavaScript (R2 blocker regression)'
     assert.doesNotThrow(() => new Function(src), `script block ${i} must parse as valid JS`);
   }
 });
+
+test('question rows are clickable and reveal rule/reason detail (answers on the board)', () => {
+  const html = buildExpeditionHtml(seedView(), campaigns);
+  assert.ok(html.includes('qclick'), 'question rows carry the click affordance');
+  assert.ok(html.includes('<b>правило:</b>'), 'rule detail renderer in template');
+  assert.ok(html.includes('<b>итог:</b>'), 'reason detail renderer in template');
+  assert.ok(html.includes('.qopen + .qdetail'), 'detail expansion css present');
+  assert.match(html, /closest\("\.qclick"\)/, 'click handler toggles the question detail');
+});
