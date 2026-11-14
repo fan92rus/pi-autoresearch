@@ -2633,7 +2633,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         ) {
           phase = raw.phase;
         }
-      } catch {
+      } catch (err) {
+        // Live case 2026-11-14: service directories (.auto/research/briefs,
+        // .auto/research/evidence) match the campaign-id regex but have NO
+        // state.json - they are not campaigns and must not block. A missing
+        // state.json skips the directory; a corrupt one still fails closed.
+        if ((err as { code?: string }).code === "ENOENT") continue;
         phase = null;
       }
       if (phase === null) {
@@ -2680,7 +2685,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const dir = path.join(root, name);
       if (fs.existsSync(path.join(dir, researchState.PENDING_OP_FILE))) return true;
       try {
-        const raw = JSON.parse(fs.readFileSync(path.join(dir, researchState.STATE_FILE), "utf8"));
+        // Live case 2026-11-14: a directory without state.json (service dirs
+        // .auto/research/briefs, .auto/research/evidence) is not a campaign -
+        // skip it instead of failing closed forever.
+        const statePath = path.join(dir, researchState.STATE_FILE);
+        if (!fs.existsSync(statePath)) continue;
+        const raw = JSON.parse(fs.readFileSync(statePath, "utf8"));
         const valid = raw && typeof raw === "object" && raw.schema_version === researchState.RESEARCH_STATE_SCHEMA_VERSION && raw.campaign_id === name && (researchState.CAMPAIGN_PHASES as readonly string[]).includes(raw.phase);
         if (!valid) return true;
         if (raw.phase !== "stopped") return true;
@@ -8989,7 +8999,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const root = researchState.researchRoot(base);
     if (!fs.existsSync(root)) return [];
     try {
-      return fs.readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name).sort();
+      // Live case 2026-11-14: only directories WITH state.json are campaigns.
+      // Service dirs (.auto/research/briefs, .auto/research/evidence) matched
+      // the id regex and poisoned every scan ("several campaigns exist",
+      // "campaigns need attention", blocked git). createCampaign writes
+      // state.json atomically right after mkdir, so every real campaign has it.
+      return fs.readdirSync(root, { withFileTypes: true })
+        .filter((d) => d.isDirectory())
+        .filter((d) => fs.existsSync(path.join(root, d.name, researchState.STATE_FILE)))
+        .map((d) => d.name)
+        .sort();
     } catch {
       return null;
     }
@@ -11538,6 +11557,27 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           if (!verified.ok) { ctx.ui.notify(`Expedition refused (manual_check_required): ${verified.message}`, "error"); return; }
           const status = await chainJournal.statusOf(chain.workDir, chain.chainId);
           if (status === "active" || status === "awaiting_child") {
+            // Continuation fix (live case 2026-11-14): the previous refusal
+            // suggested 'research --id <last campaign>', but a stopped campaign
+            // is terminal and never resumes - a dead-end message loop. For an
+            // awaiting_child chain the designed next step is the chain
+            // continuation itself (report already recorded): turn the mode ON
+            // and send the same continuation the report path sends, so the
+            // agent closes the finished direction, activates the next one and
+            // drafts the next child campaign brief (auto-approved by charter).
+            // An 'active' chain still refuses: its campaign is live and the
+            // existing wording stays correct.
+            if (status === "awaiting_child") {
+              recordAutoresearchActivation(workDir, true);
+              setAutoresearchMode(ctx, true);
+              runtime.autoResumeTurns = 0;
+              runtime.consecutiveDriftResumes = 0;
+              updateWidget(ctx);
+              const ids = await chainCampaignIds(ctx);
+              await sendChainContinuation(ctx, ids.at(-1) ?? runtime.researchCampaignId ?? "<campaign>");
+              ctx.ui.notify(`Expedition ${chain.chainId} continues (awaiting_child): the agent closes the finished direction and drafts the next campaign brief (auto-approved).`, "info");
+              return;
+            }
             const ids = await chainCampaignIds(ctx);
             ctx.ui.notify(`Resume or finish the existing expedition; resume with /autoresearch research --id ${ids.at(-1) ?? runtime.researchCampaignId ?? "<campaign>"}`, "error"); return;
           }
@@ -11698,6 +11738,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               const dir = path.resolve(resolved.dir);
               if (seenDirs.has(dir)) continue;
               seenDirs.add(dir);
+              // Live case 2026-11-14: service directories without state.json
+              // (.auto/research/briefs, evidence) are not campaigns - skip.
+              if (!fs.existsSync(path.join(dir, researchState.STATE_FILE))) continue;
               const name = refusalName(id, base);
               const state = await researchState.readState(dir);
               if (!state.ok) { refusals.push(`${name} (unreadable state)`); continue; }
