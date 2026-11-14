@@ -3451,17 +3451,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const scan = expedition.scanActiveExpeditionChains(path.join(workDir, ".auto", "research-chain"));
     if (scan === "root_missing" || scan.chains.length === 0) return;
     const fresh = scan.chains[0];
-    // The pinned campaign must still be live; a stopped campaign stays unpinned
-    // (the continuation flow decides the next step), but the chain itself is
-    // still restored so the map and widget stay visible.
-    let campaignId: string | null = null;
-    if (fresh.campaignId) {
-      const campaignDir = path.join(researchState.researchRoot(workDir), fresh.campaignId);
-      if (fs.existsSync(campaignDir)) {
-        const insp = await researchState.inspectCampaign(campaignDir);
-        if (insp.state?.phase === "briefing" || insp.state?.phase === "research") campaignId = fresh.campaignId;
-      }
-    }
+    // Pin the chain's LAST campaign even when stopped (live case 2026-11-14:
+    // an unpinned session with 18 stopped campaigns made every chain tool die
+    // on 'several campaigns exist'; the chain continuation resolves exactly
+    // to this campaign). A stopped pin is a legal chain root: research_brief
+    // draft of the next child uses chainCampaignIds, and research_questions
+    // resolve to the pinned dir instead of the multi-campaign scan.
+    const campaignId: string | null = fresh.campaignId ?? null;
     runtime.researchCampaignId = campaignId;
     runtime.researchChain = { chainId: fresh.chainId, workDir, charterPath: fresh.docPath, charterSha256: fresh.docSha256, charter: fresh.charter, expedition: true, docSha256: fresh.docSha256 };
     if (!runtime.autoresearchMode) { recordAutoresearchActivation(workDir, true); setAutoresearchMode(ctx, true); }
