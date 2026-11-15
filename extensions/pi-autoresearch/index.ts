@@ -3831,7 +3831,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\npropose_hypothesis() BEFORE each run_experiment. tree_status() \u2014 hypothesis list with statuses and the current best." +
       "\nRepeat: propose_hypothesis(repeat_of=\"nX\", force=true). A keep stays preliminary until repeated." +
       "\n\n## Finalization" +
-      "\nfinalize_research({reason, evidence, confidence}) only with PROOF (mathematical floor, noise floor reached, search space exhausted). A subjective \u201cthis seems hard\u201d is NOT proof \u2014 try orthogonal approaches first. It is a RECOMMENDATION; the observer arbitrates and suppresses premature signals." +
+      "\nfinalize_research({reason, evidence, confidence}) only with PROOF (mathematical floor, noise floor reached, search space exhausted). A subjective \u201cthis seems hard\u201d is NOT proof \u2014 try orthogonal approaches first. It is a RECOMMENDATION; the observer arbitrates and suppresses premature signals. On a pinned expedition chain finalize marks the expedition COMPLETED (chain journal + final report + mode OFF); it refuses while a chain campaign is still in phase research — stop and report that campaign first." +
       "\n\n## Stagnation Council" +
       "\nWhen the observer convenes a STAGNATION COUNCIL, call council_convene({ note: \"...\" }) immediately — the tool convenes the whole council itself (analysts, dispute, chair), BLOCKS for several minutes and returns the validated, persisted slate; register each slate experiment with propose_hypothesis. You may append ONLY objective-facts blackboard entries (phase: \"facts\") — never judge hypotheses yourself. A council opinion is not evidence; the benchmark is." +
       "\nYou can convene a council YOURSELF at any time, with no limits, when you feel stuck: the same council_convene tool — one call, it blocks, you execute the returned slate." +
@@ -7986,7 +7986,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "Signal that the optimization target has reached its structural limit or is otherwise complete. " +
       "Records a finalize entry in .auto/log.jsonl and sends a completion steer. " +
       "The agent retains control — this does NOT force-stop the session. " +
-      "Use when profiling or analysis proves further optimization is impossible or not worth the cost.",
+      "Use when profiling or analysis proves further optimization is impossible or not worth the cost. " +
+      "When an expedition research chain is pinned, finalize marks the expedition COMPLETED " +
+      "(journal expedition_stop + completed status + final expedition report), leaves research mode " +
+      "and archives its finished campaigns, so the chain does not restore on restart.",
     promptSnippet: "Signal that optimization is complete (floor reached, goal met, etc.)",
     parameters: {
       type: "object",
@@ -7998,13 +8001,63 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       required: ["reason"],
     } as any,
     async execute(_toolCallId: string, params: { reason: string; evidence?: string; confidence?: number }, _signal, _onUpdate, ctx: ExtensionContext) {
-      if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return campaignBlockedResponse();
-      if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd), ctx)) return researchBlockedResponse();
-      assertModeActive(ctx);
       const workDir = resolveWorkDir(ctx.cwd);
       const runtime = getRuntime(ctx);
       const state = runtime.state;
       const conf = typeof params.confidence === "number" ? Math.max(0, Math.min(1, params.confidence)) : 0.8;
+      // Expedition completion (owner request 2026-11-14, live lob-collector-data):
+      // finalize on a pinned expedition chain marks the expedition COMPLETED
+      // instead of refusing on the research block — otherwise a finished chain
+      // (all campaigns stopped, awaiting_child) restores on every restart forever.
+      // A campaign still in phase research is refused (finalize would strand it);
+      // otherwise the journal records expedition_stop + completed, the final
+      // expedition report is written, research mode is left and the finished
+      // campaigns are archived so nothing blocks or restores afterwards.
+      let expeditionNote = "";
+      let archiveNote = "";
+      const expeditionChain = runtime.researchChain?.expedition === true ? runtime.researchChain : null;
+      if (expeditionChain !== null) {
+        if (await campaignBlocksOrdinaryLoop(workDir, ctx)) return campaignBlockedResponse();
+        const verified = await chainJournal.verifyChain(expeditionChain.workDir, expeditionChain.chainId);
+        if (!verified.ok) {
+          await chainJournal.markManualCheckRequired(expeditionChain.workDir, expeditionChain.chainId, verified.message).catch(() => undefined);
+          return { content: [{ type: "text", text: `⛔ Research chain ${expeditionChain.chainId} journal is damaged: actions are blocked until manual check (research_questions(action=status)); finalize refused.` }], details: {} };
+        }
+        const chainStatus = await chainJournal.statusOf(expeditionChain.workDir, expeditionChain.chainId);
+        if (!chainJournal.isFinal(chainStatus)) {
+          let researching: string | null = null;
+          for (const cid of await chainCampaignIds(ctx)) {
+            const resolved = researchState.resolveCampaignDir(expeditionChain.workDir, cid);
+            if (!resolved.ok) continue;
+            const st = await researchState.readState(resolved.dir);
+            if (st.ok && st.state.phase === "research") { researching = cid; break; }
+          }
+          if (researching !== null) {
+            return { content: [{ type: "text", text: `⛔ finalize would strand campaign ${researching} in phase research: close its questions, then research_questions(action=stop, rule_id=<rule>, reason=<why>) and research_questions(action=report), and try finalize again.` }], details: {} };
+          }
+          const chainDirPath = chainJournal.chainDir(expeditionChain.workDir, expeditionChain.chainId);
+          if (!chainDirPath) return { content: [{ type: "text", text: "⛔ chain directory is unavailable; finalize refused." }], details: {} };
+          const stop = await chainJournal.appendEntry(chainDirPath, expeditionChain.workDir, expeditionChain.chainId, "expedition_stop", { rule: "finalize_research", basis: "rule" });
+          if (!stop.ok) return { content: [{ type: "text", text: `⛔ expedition stop not recorded (${stop.message}); the chain stays ${chainStatus}; finalize refused.` }], details: {} };
+          const completed = await chainJournal.setChainStatus(expeditionChain.workDir, expeditionChain.chainId, "completed");
+          if (!completed.ok) return { content: [{ type: "text", text: `⛔ completed status not recorded (${completed.message}); the chain stays ${chainStatus}; finalize refused.` }], details: {} };
+          expeditionNote = `🧭 Expedition ${expeditionChain.chainId} marked completed${params.reason ? ` (reason: ${params.reason})` : ""}. ${await writeExpeditionFinalReport(expeditionChain, "completed", verified.entries)}`;
+        } else {
+          expeditionNote = `🧭 Expedition chain ${expeditionChain.chainId} was already ${chainStatus} (final); nothing to finalize on it.`;
+        }
+        // MINOR-3 (review 2026-11-15): this also runs on a manual_check_required
+        // chain — the runtime unbinds while the on-disk marker keeps chain
+        // actions blocked; recovery stays research_questions(action=status).
+        exitResearchMode(ctx, expeditionChain.chainId);
+        try {
+          const archived = await archiveFinishedCampaigns(workDir, effectiveResearchBase(workDir, ctx), ctx);
+          if (archived !== null && archived.length > 0) archiveNote = `\n🗄 Archived finished campaigns: ${archived.join(", ")}.`;
+        } catch { /* archival is best effort; the ordinary loop unblocks on the next draft */ }
+      } else {
+        if (await campaignBlocksOrdinaryLoop(workDir)) return campaignBlockedResponse();
+        if (await researchBlocksOrdinaryLoop(workDir, ctx)) return researchBlockedResponse();
+        assertModeActive(ctx);
+      }
 
       const entry = {
         type: "finalize",
@@ -8051,8 +8104,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       );
 
       return {
-        content: [{ type: "text", text: `🏁 Finalize signal recorded (confidence=${conf}). The observer will now recommend /autoresearch off in its steers.${reportNote}` }],
-        details: { finalized: true, confidence: conf, bestMetric: state.bestMetric, reportPath },
+        content: [{ type: "text", text: `${expeditionNote ? `${expeditionNote}\n` : ""}${archiveNote ? `${archiveNote}\n` : ""}🏁 Finalize signal recorded (confidence=${conf}). The observer will now recommend /autoresearch off in its steers.${reportNote}` }],
+        details: { finalized: true, confidence: conf, bestMetric: state.bestMetric, reportPath, expeditionNote: expeditionNote || undefined },
       };
     },
   });
