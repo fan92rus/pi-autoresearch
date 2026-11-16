@@ -2463,6 +2463,29 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       workDir: canonicalPath(workDir),
       active,
     });
+    // Persisted manual-off marker (live lob-collector-data case 2026-11-16):
+    // the session-branch entry dies with the session, but the owner's intent
+    // must survive a restart — without this, a still-awaiting_child expedition
+    // chain resurrects research mode on every new session. Only OFF is
+    // persisted: mode-on decisions stay ephemeral so a fresh session never
+    // silently re-activates the loop just because someone once ran /autoresearch on.
+    try {
+      const markerPath = path.join(resolveWorkDir(workDir), ".auto", "autoresearch-off.json");
+      if (active) {
+        if (fs.existsSync(markerPath)) fs.unlinkSync(markerPath);
+      } else {
+        fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+        fs.writeFileSync(markerPath, JSON.stringify({ version: 1, workDir: canonicalPath(workDir), off_at: new Date().toISOString() }, null, 2) + "\n");
+      }
+    } catch { /* best-effort: session-branch record remains the fallback */ }
+  };
+
+  const readPersistedOffMarker = (workDir: string): boolean => {
+    try {
+      return fs.existsSync(path.join(resolveWorkDir(workDir), ".auto", "autoresearch-off.json"));
+    } catch {
+      return false;
+    }
   };
 
   const isAgentSettled = (ctx: ExtensionContext): boolean =>
@@ -3500,12 +3523,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (runtime.researchChain !== null) return;
     const workDir = resolveWorkDir(ctx.cwd);
     // A recorded `/autoresearch off` in THIS session wins over disk restore
-    // (live lob-collector-data case 2026-11-15): the owner closed the session
+    // (live lob-collector-data case 2026-11-14): the owner closed the session
     // with the loop off, so `pi --continue` and `/tree` must not resurrect
     // research mode from a still-awaiting_child chain on disk. Same semantics
     // as shouldAutoActivateAutoresearch: an explicit off beats a persisted
     // campaign, a fresh session (no recorded decision) still restores.
     if (recordedActivationDecision(ctx, workDir) === false) return;
+    // Cross-session: a persisted manual-off marker (written by /autoresearch
+    // off / exitResearchMode into <workDir>/.auto/autoresearch-off.json)
+    // suppresses restore in NEW sessions too. Mode-on paths delete the marker.
+    if (readPersistedOffMarker(workDir)) return;
     const scan = expedition.scanActiveExpeditionChains(path.join(workDir, ".auto", "research-chain"));
     if (scan === "root_missing" || scan.chains.length === 0) return;
     const fresh = scan.chains[0];
@@ -11572,15 +11599,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // Per-campaign experiment artifacts are stale after clear; preserve
         // owner configuration and research/candidate campaign history.
         const autoDir = path.join(workDir, ".auto");
-        for (const relative of ["findings.jsonl", "observations.jsonl", "analysis.jsonl", "report.md"]) {
+        for (const relative of ["findings.jsonl", "observations.jsonl", "analysis.jsonl", "report.md", "autoresearch-off.json"]) {
           if (!removePath(path.join(autoDir, relative))) return;
         }
         for (const relative of ["ideas", "runs"]) {
           if (!removePath(path.join(autoDir, relative), true)) return;
         }
 
-        if (deletedPaths.length > 0) {
-          ctx.ui.notify(`Deleted ${deletedPaths.join(", ")} and turned autoresearch mode OFF`, "info");
+        // The off marker is housekeeping, not session data: deleting it alone
+        // is not a "deleted something" report — the empty-workdir message stays.
+        const deletedData = deletedPaths.filter((p) => !p.endsWith("autoresearch-off.json"));
+        if (deletedData.length > 0) {
+          ctx.ui.notify(`Deleted ${deletedData.join(", ")} and turned autoresearch mode OFF`, "info");
         } else {
           ctx.ui.notify("No session log found. Autoresearch mode OFF", "info");
         }

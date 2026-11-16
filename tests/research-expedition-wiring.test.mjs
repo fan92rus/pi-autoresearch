@@ -83,11 +83,25 @@ freshCtx.sessionManager.getBranch=()=>h.pi.entries.map(e=>({type:"custom",custom
 await ext.restoreExpeditionForTest(freshCtx);
 assert.ok(!h.pi.sentMessages.some(m=>/restored after restart/.test(m.text)),"recorded off must suppress the restore message");
 assert.equal(ext.runtimeForTest(freshCtx).autoresearchMode,false,"recorded off must keep the mode OFF");
-// Control: a genuinely fresh session (own empty branch, no recorded decision) still restores.
-const controlCtx=makeCtx(dir,`${id}-fresh-restore`,h.pi);
-await ext.restoreExpeditionForTest(controlCtx);
-assert.ok(h.pi.sentMessages.some(m=>/restored after restart/.test(m.text)),"fresh session without a recorded off still restores");
-assert.equal(ext.runtimeForTest(controlCtx).autoresearchMode,true);});
+// Control (covered fully by the next test): with the persisted marker present,
+// even a genuinely fresh session stays OFF until an explicit /autoresearch on.
+});
+test("a persisted off marker (.auto/autoresearch-off.json) suppresses restore in NEW sessions; on clears it",async()=>{const dir=workdir(),h=await harness(dir,true); const ext=await import(pathToFileURL(path.join(import.meta.dirname,"..","extensions","pi-autoresearch","index.ts")).href);
+await h.command("autoresearch").handler("expedition goal",h.ctx); await h.tool("expedition_brief").execute("id",{action:"draft",doc},null,null,h.ctx); const out=await h.tool("expedition_brief").execute("id",{action:"propose"},null,null,h.ctx);
+const id=text(out).match(/campaign (exp-[A-Za-z0-9-]+)/)?.[1];
+await h.command("autoresearch").handler("off",h.ctx);
+assert.ok(fs.existsSync(path.join(dir,".auto","autoresearch-off.json")),"off writes the persisted marker");
+// A genuinely new session: empty branch, no session entries — only the marker suppresses.
+const newCtx=makeCtx(dir,`${id}-new-session`,h.pi);
+await ext.restoreExpeditionForTest(newCtx);
+assert.ok(!h.pi.sentMessages.some(m=>/restored after restart/.test(m.text)),"persisted off must suppress restore across sessions");
+assert.equal(ext.runtimeForTest(newCtx).autoresearchMode,false);
+// Owner explicitly re-enables: the marker is gone, restore works again.
+await h.command("autoresearch").handler("on",h.ctx);
+assert.equal(fs.existsSync(path.join(dir,".auto","autoresearch-off.json")),false,"on clears the marker");
+const againCtx=makeCtx(dir,`${id}-after-on`,h.pi);
+await ext.restoreExpeditionForTest(againCtx);
+assert.ok(h.pi.sentMessages.some(m=>/restored after restart/.test(m.text)),"after an explicit on the chain restores again");});
 test("restore skips a stopped chain and reports a second active chain as NOT restored",async()=>{const dir=workdir(),h=await harness(dir,true); const ext=await import(pathToFileURL(path.join(import.meta.dirname,"..","extensions","pi-autoresearch","index.ts")).href);
 // Build two expeditions; the re-entry guard on /autoresearch expedition blocks the second command,
 // so build the second chain by direct disk manipulation: stop the first and add a second active chain dir.
