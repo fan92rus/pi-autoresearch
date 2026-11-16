@@ -101,7 +101,13 @@ test("stop keeps research mode on; the report of a stopped campaign leaves it", 
     h.pi.entries.slice(entriesBefore).some((e) => e === "pi-autoresearch.activation" || e?.customType === "pi-autoresearch.activation"),
     `the OFF activation must be persisted: ${JSON.stringify(h.pi.entries.slice(entriesBefore))}`,
   );
-  assert.ok(fs.existsSync(path.join(dir, ".auto", "research", "c1", "report.md")), "report.md must be written before the exit");
+  // bd 8af.6 (owner decision 2026-11-16): the finished campaign is ARCHIVED
+  // at the report — it moves (never deleted) to .auto/research-archive/ with
+  // report.md inside, and the ordinary loop is unblocked immediately.
+  const archiveRoot = path.join(dir, ".auto", "research-archive");
+  assert.ok(fs.existsSync(archiveRoot) && fs.readdirSync(archiveRoot).some((n) => n.startsWith("c1")), "finished campaign must be archived at the report");
+  assert.ok(fs.existsSync(path.join(archiveRoot, fs.readdirSync(archiveRoot).find((n) => n.startsWith("c1")), "report.md")), "report.md must be inside the archived campaign");
+  assert.equal(fs.existsSync(path.join(dir, ".auto", "research", "c1", "state.json")), false, "no campaign may stay behind to block the loop");
   const afterExit = textOf(await call(h, "research_brief", { action: "draft", brief: briefFixture() }));
   assert.match(afterExit, /Autoresearch mode is OFF/, `gated tools must refuse after the exit: ${afterExit}`);
 }, { timeout: 30000 });

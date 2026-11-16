@@ -113,7 +113,12 @@ test("2.1 a failed report save keeps research mode on; a retry that saves leaves
   fs.rmdirSync(blocker);
   const saved = textOf(await call(h, "research", { action: "report" }));
   assert.match(saved, /Research mode is OFF\./, saved);
-  assert.ok(fs.existsSync(path.join(dir, ".auto", "research", "c1", "report.md")), "report.md written on retry");
+  // bd 8af.6 (owner decision): on the successful retry the finished campaign
+  // is archived at the report — report.md lives inside the archive now.
+  const archiveRoot2 = path.join(dir, ".auto", "research-archive");
+  const archivedName = fs.existsSync(archiveRoot2) ? fs.readdirSync(archiveRoot2).find((n) => n.startsWith("c1")) : undefined;
+  assert.ok(archivedName, "the finished campaign must be archived on the saving retry");
+  assert.ok(fs.existsSync(path.join(archiveRoot2, archivedName, "report.md")), "report.md written on retry (inside the archive)");
 }, { timeout: 60000 });
 
 // ─── 2.2 pinned new draft archives finished campaigns ───────────────────────

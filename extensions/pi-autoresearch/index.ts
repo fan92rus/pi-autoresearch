@@ -10691,9 +10691,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           // Exception (spec): the final report of the active campaign of a chain
           // STOPPED during work turns the mode OFF regardless of the campaign phase.
           if (chainJournal.isFinal(chainStatusNow)) {
-            const expeditionNote = chain.expedition ? await writeExpeditionFinalReport(chain, chainStatusNow, verified.entries) : "";
+            // bd 8af.6 (owner decision): exit FIRST (clears the chain pin so the
+            // reported campaign is not skipped as chain-protected), THEN archive.
             exitResearchMode(ctx, id);
-            return reply(reportText + "\n\n" + savedNote + (expeditionNote ? `\n${expeditionNote}` : "") + "\nResearch mode is OFF. The chain is " + chainStatusNow + ".");
+            let archiveNote1 = "";
+            try {
+            const archived = await archiveFinishedCampaigns(workDir, effectiveResearchBase(workDir, ctx), ctx);
+            if (archived !== null && archived.length > 0) archiveNote1 = `
+🗄 Archived finished campaigns: ${archived.join(", ")}.`;
+            } catch { /* archival is best effort */ }
+            const expeditionNote = chain.expedition ? await writeExpeditionFinalReport(chain, chainStatusNow, verified.entries) : "";
+            return reply(reportText + (archiveNote1 ? archiveNote1 + "\n" : "\n") + "\n\n" + savedNote + (expeditionNote ? `\n${expeditionNote}` : "") + "\n" + "Research mode is OFF. The chain is " + chainStatusNow + "." + (archiveNote1 ? " Note: the finished campaign moved to .auto/research-archive (report.md is inside the archive)." : ""));
           }
           if (chainStatusNow === "awaiting_child") {
             // Already waiting: no new continuation without a new agent action.
@@ -10707,7 +10715,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             // manual_check_required; it must not be overwritten by limit_reached.
             if ((await chainJournal.statusOf(chain.workDir, chain.chainId)) === "manual_check_required") {
               exitResearchMode(ctx, id);
-              return reply(reportText + "\n\n" + savedNote + "\nThe charter file changed since the owner confirmed it: chain status manual_check_required. Research mode is OFF (spec: the predicate is false after the report).");
+              // bd 8af.6 (owner decision): exit FIRST, THEN archive.
+              let archiveNote3 = "";
+              try {
+                const archived = await archiveFinishedCampaigns(workDir, effectiveResearchBase(workDir, ctx), ctx);
+                if (archived !== null && archived.length > 0) archiveNote3 = `\n🗄 Archived finished campaigns: ${archived.join(", ")}.`;
+              } catch { /* archival is best effort */ }
+              return reply(reportText + (archiveNote3 ? archiveNote3 + "\n" : "\n") + "\n\n" + savedNote + "\nThe charter file changed since the owner confirmed it: chain status manual_check_required. Research mode is OFF (spec: the predicate is false after the report)." + (archiveNote3 ? " Note: the finished campaign moved to .auto/research-archive." : ""));
             }
             const limitWrite = await chainJournal.setChainStatus(chain.workDir, chain.chainId, "limit_reached");
             if (!limitWrite.ok) {
@@ -10720,7 +10734,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               return reply(reportText + "\n\n" + savedNote + `\nwarning: limit_reached could not be recorded (${limitWrite.message}); the chain stays ${freshStatus}; research mode stays ON; fix the journal and report again.`);
             }
             exitResearchMode(ctx, id);
-            return reply(reportText + "\n\n" + savedNote + "\nResearch mode is OFF: the charter limit is reached (chain limit_reached). No further chain campaigns are created.");
+            // bd 8af.6 (owner decision): exit FIRST, THEN archive.
+            let archiveNote4 = "";
+            try {
+              const archived = await archiveFinishedCampaigns(workDir, effectiveResearchBase(workDir, ctx), ctx);
+              if (archived !== null && archived.length > 0) archiveNote4 = `\n🗄 Archived finished campaigns: ${archived.join(", ")}.`;
+            } catch { /* archival is best effort */ }
+            return reply(reportText + (archiveNote4 ? archiveNote4 + "\n" : "\n") + "\n\n" + savedNote + "\nResearch mode is OFF: the charter limit is reached (chain limit_reached). No further chain campaigns are created." + (archiveNote4 ? " Note: the finished campaign moved to .auto/research-archive." : ""));
           }
           // Owner decision (review M1): the chain advances only on a report of a
           // campaign in phase stopped. A report written in phase research leaves
@@ -10740,7 +10760,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // research mode now (the report is already on disk).
         if (snap.state.phase === "stopped" && saved) {
           exitResearchMode(ctx, id);
-          return reply(reportText + "\n\n" + savedNote + "\nResearch mode is OFF.");
+        // bd 8af.6 (owner decision): exit FIRST (clears the chain pin so the
+        // reported campaign is not skipped as chain-protected), THEN archive.
+        let archiveNote2 = "";
+        try {
+          const archived = await archiveFinishedCampaigns(workDir, effectiveResearchBase(workDir, ctx), ctx);
+          if (archived !== null && archived.length > 0) archiveNote2 = `\n🗄 Archived finished campaigns: ${archived.join(", ")}.`;
+        } catch { /* archival is best effort */ }
+          return reply(reportText + (archiveNote2 ? archiveNote2 + "\n" : "\n") + "\n\n" + savedNote + "\nResearch mode is OFF.");
         }
         if (snap.state.phase === "stopped") {
           return reply(reportText + "\n\n" + savedNote + "\nResearch mode stays ON: the report is not saved. Fix the cause and run research_questions(action=report) again.");
