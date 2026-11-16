@@ -38,6 +38,7 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { mkdir, open, readFile, rename, rm, stat, unlink } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
@@ -617,6 +618,69 @@ export async function transitionPhase(
     work);
 }
 
+/**
+ * bd 8af.1: ONE synchronous campaign scanner. The five per-caller scanners in
+ * index.ts (researchScanSync / researchGitBlockingScan / researchLaunchBlockingScan /
+ * listResearchCampaignIds / blockingCampaignIds) each walked the same root,
+ * copy-pasted the state-validation predicate, and applied a different phase
+ * rule. This scan returns neutral facts once; callers apply their policy:
+ *   - dirs without state.json are service dirs (briefs/evidence), skipped;
+ *   - a corrupt state.json or a pending-op marker is reported per campaign
+ *     (callers fail closed);
+ *   - `state` is null for unreadable/corrupt entries.
+ * Sync by contract: called from the resume timer and the tool_call hook.
+ */
+export interface ScannedCampaign {
+  id: string;
+  dir: string;
+  pendingOp: boolean;
+  state: CampaignState | null;
+}
+
+export type CampaignScan =
+  | { ok: true; campaigns: ScannedCampaign[] }
+  | { ok: false; reason: "root_missing" | "unlistable" };
+
+export function scanCampaignsSync(base: string): CampaignScan {
+  const root = researchRoot(base);
+  if (!existsSync(root)) return { ok: true, campaigns: [] };
+  let entries: { name: string; isDirectory: boolean }[];
+  try {
+    entries = readdirSync(root, { withFileTypes: true }).map((d) => ({ name: d.name, isDirectory: d.isDirectory() }));
+  } catch {
+    return { ok: false, reason: "unlistable" };
+  }
+  const campaigns: ScannedCampaign[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory) continue;
+    const dir = join(root, entry.name);
+    const statePath = join(dir, STATE_FILE);
+    // Live case 2026-11-14: service dirs (briefs/evidence) have no state.json
+    // and are not campaigns — skip, never fail closed on them.
+    if (!existsSync(statePath)) continue;
+    const pendingOp = existsSync(join(dir, PENDING_OP_FILE));
+    let state: CampaignState | null = null;
+    try {
+      const raw = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, unknown>;
+      // The SAME four-field predicate the pre-unification inline scanners
+      // used (review round 1): schema_version, campaign_id === dirname,
+      // known phase. Deliberately NOT stateProblem - that also rejects
+      // unknown/extra fields, which would silently tighten the scanners'
+      // semantics (a hand-extended state.json would flip from passing to
+      // fail-closed blocking).
+      const valid =
+        raw && typeof raw === "object" &&
+        raw.schema_version === RESEARCH_STATE_SCHEMA_VERSION &&
+        raw.campaign_id === entry.name &&
+        (CAMPAIGN_PHASES as readonly string[]).includes(raw.phase as string);
+      if (valid) state = raw as unknown as CampaignState;
+    } catch {
+      state = null; // corrupt = unreadable, the caller decides
+    }
+    campaigns.push({ id: entry.name, dir, pendingOp, state });
+  }
+  return { ok: true, campaigns };
+}
 /**
  * One locked state update. Order: lock, pending-operation check, state read
  * (fail-closed), approved-brief check, decision, marker, optional work, state

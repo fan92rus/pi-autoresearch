@@ -2660,52 +2660,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
    * one with a pending operation (fail closed). A missing research root blocks nothing.
    * halted: automatic continuation must not run (stopped, unreadable, or pending operation).
    */
+  // bd 8af.1: policy over the ONE shared scan (researchState.scanCampaignsSync).
   const researchScanSync = (workDir: string): { blocks: boolean; halted: boolean } => {
-    const root = researchState.researchRoot(workDir);
-    if (!fs.existsSync(root)) return { blocks: false, halted: false };
-    let names: string[];
-    try {
-      names = fs.readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
-    } catch {
-      return { blocks: true, halted: true };
-    }
+    const scan = researchState.scanCampaignsSync(workDir);
+    if (!scan.ok) return { blocks: true, halted: true };
     let blocks = false;
     let halted = false;
-    for (const name of names) {
-      const dir = path.join(root, name);
-      if (fs.existsSync(path.join(dir, researchState.PENDING_OP_FILE))) {
-        blocks = true;
-        halted = true;
-        continue;
-      }
-      let phase: string | null = null;
-      try {
-        const raw = JSON.parse(fs.readFileSync(path.join(dir, researchState.STATE_FILE), "utf8"));
-        if (
-          raw && typeof raw === "object" &&
-          raw.schema_version === researchState.RESEARCH_STATE_SCHEMA_VERSION &&
-          raw.campaign_id === name &&
-          (researchState.CAMPAIGN_PHASES as readonly string[]).includes(raw.phase)
-        ) {
-          phase = raw.phase;
-        }
-      } catch (err) {
-        // Live case 2026-11-14: service directories (.auto/research/briefs,
-        // .auto/research/evidence) match the campaign-id regex but have NO
-        // state.json - they are not campaigns and must not block. A missing
-        // state.json skips the directory; a corrupt one still fails closed.
-        if ((err as { code?: string }).code === "ENOENT") continue;
-        phase = null;
-      }
-      if (phase === null) {
-        blocks = true;
-        halted = true;
-      } else if (phase === "research") {
-        blocks = true;
-      } else if (phase === "stopped") {
-        blocks = true;
-        halted = true;
-      }
+    for (const c of scan.campaigns) {
+      if (c.pendingOp) { blocks = true; halted = true; continue; }
+      if (c.state === null) { blocks = true; halted = true; continue; } // corrupt = fail closed
+      if (c.state.phase === "research") { blocks = true; }
+      else if (c.state.phase === "stopped") { blocks = true; halted = true; }
     }
     return { blocks, halted };
   };
@@ -2731,29 +2696,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
    * not the shell.
    */
   const researchGitBlockingScan = (workDir: string): boolean => {
-    const root = researchState.researchRoot(workDir);
-    if (!fs.existsSync(root)) return false;
-    let names: string[];
-    try {
-      names = fs.readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
-    } catch {
-      return true;
-    }
-    for (const name of names) {
-      const dir = path.join(root, name);
-      if (fs.existsSync(path.join(dir, researchState.PENDING_OP_FILE))) return true;
-      try {
-        const statePath = path.join(dir, researchState.STATE_FILE);
-        if (!fs.existsSync(statePath)) continue; // service dirs (briefs/evidence)
-        const raw = JSON.parse(fs.readFileSync(statePath, "utf8"));
-        const valid = raw && typeof raw === "object" && raw.schema_version === researchState.RESEARCH_STATE_SCHEMA_VERSION && raw.campaign_id === name && (researchState.CAMPAIGN_PHASES as readonly string[]).includes(raw.phase);
-        if (!valid) return true;
-        if (raw.phase === "research") return true;
-        // briefing and stopped do not block the shell Git ban
-      } catch (err) {
-        if ((err as { code?: string }).code === "ENOENT") continue;
-        return true;
-      }
+    const scan = researchState.scanCampaignsSync(workDir);
+    if (!scan.ok) return true;
+    for (const c of scan.campaigns) {
+      if (c.pendingOp) return true;
+      if (c.state === null) return true; // unreadable/invalid = fail closed
+      if (c.state.phase === "research") return true;
+      // briefing and stopped do not block the shell Git ban
     }
     return false;
   };
@@ -2780,30 +2729,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
    * stopped as blocking for auto-continuations (design §8/§9).
    */
   const researchLaunchBlockingScan = (workDir: string): boolean => {
-    const root = researchState.researchRoot(workDir);
-    if (!fs.existsSync(root)) return false;
-    let names: string[];
-    try {
-      names = fs.readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
-    } catch {
-      return true;
-    }
-    for (const name of names) {
-      const dir = path.join(root, name);
-      if (fs.existsSync(path.join(dir, researchState.PENDING_OP_FILE))) return true;
-      try {
-        // Live case 2026-11-14: a directory without state.json (service dirs
-        // .auto/research/briefs, .auto/research/evidence) is not a campaign -
-        // skip it instead of failing closed forever.
-        const statePath = path.join(dir, researchState.STATE_FILE);
-        if (!fs.existsSync(statePath)) continue;
-        const raw = JSON.parse(fs.readFileSync(statePath, "utf8"));
-        const valid = raw && typeof raw === "object" && raw.schema_version === researchState.RESEARCH_STATE_SCHEMA_VERSION && raw.campaign_id === name && (researchState.CAMPAIGN_PHASES as readonly string[]).includes(raw.phase);
-        if (!valid) return true;
-        if (raw.phase !== "stopped") return true;
-      } catch {
-        return true;
-      }
+    const scan = researchState.scanCampaignsSync(workDir);
+    if (!scan.ok) return true;
+    for (const c of scan.campaigns) {
+      if (c.pendingOp) return true;
+      if (c.state === null) return true; // unreadable/invalid = fail closed
+      if (c.state.phase !== "stopped") return true; // briefing and research block a launch
     }
     return false;
   };
@@ -9389,16 +9320,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return ids;
   };
 
-  /** Whether any campaign directory exists in a given base (fail closed on
-   *  an unreadable root). */
+  /** Whether any CAMPAIGN exists in a given base (fail closed on an
+   *  unlistable root). bd 8af.4: this used to count every directory —
+   *  including the briefs/evidence service dirs that every other scanner
+   *  skips (live case 2026-11-14) — so leftover service dirs refused
+   *  /autoresearch clear forever with zero real campaigns. Same campaign
+   *  definition as listResearchCampaignIds (state.json present). */
   const baseHasCampaign = (base: string): boolean => {
-    const root = researchState.researchRoot(base);
-    if (!fs.existsSync(root)) return false;
-    try {
-      return fs.readdirSync(root, { withFileTypes: true }).some((d) => d.isDirectory());
-    } catch {
-      return true;
-    }
+    const ids = listResearchCampaignIds(base);
+    if (ids === null) return true;
+    return ids.length > 0;
   };
 
   /** Review B3: only one campaign may work at a time. Returns a reason string

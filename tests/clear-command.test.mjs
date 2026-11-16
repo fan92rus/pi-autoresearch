@@ -112,3 +112,27 @@ test("clear preserves owner config", async () => {
   await h.clear();
   assert.equal(fs.readFileSync(path.join(auto, "config.json"), "utf8"), "{\"owner\":true}\n");
 });
+
+// ─── bd 8af.4: leftover service dirs must not poison the campaign guard ──────
+
+test("clear succeeds with only service dirs (.auto/research/briefs, evidence) — no phantom campaign", async () => {
+  const dir = makeWorkDir("service-dirs");
+  const auto = path.join(dir, ".auto");
+  fs.mkdirSync(path.join(auto, "research", "briefs"), { recursive: true });
+  fs.mkdirSync(path.join(auto, "research", "evidence"), { recursive: true });
+  fs.writeFileSync(path.join(auto, "research", "briefs", "something.json"), "{}\n");
+  fs.writeFileSync(path.join(auto, "research", "evidence", "cs1.txt"), "data\n");
+  const h = await load(dir, "service-dirs");
+  await h.clear();
+  assert.ok(notifications(h.pi).some((t) => /No session log found|Deleted/i.test(t)), notifications(h.pi).join("\n"));
+  assert.ok(!notifications(h.pi).some((t) => /Research campaign active/i.test(t)), `service dirs must not read as campaigns: ${notifications(h.pi).join("\n")}`);
+});
+
+test("clear still refuses under a REAL research campaign (state.json present)", async () => {
+  const dir = makeWorkDir("real-campaign");
+  writeResearchCampaign(dir, "c1", "research");
+  fs.mkdirSync(path.join(dir, ".auto", "research", "briefs"), { recursive: true });
+  const h = await load(dir, "real-campaign");
+  await h.clear();
+  assert.ok(notifications(h.pi).some((t) => /Research campaign active.*complete or remove/i.test(t)), notifications(h.pi).join("\n"));
+});
