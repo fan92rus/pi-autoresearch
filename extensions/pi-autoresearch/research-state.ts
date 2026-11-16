@@ -598,11 +598,32 @@ export async function readState(dir: string): Promise<Result<{ state: CampaignSt
 }
 
 /**
+ * bd lrx.5: the briefing→research / research→stopped phase transitions were
+ * written as inline updateState closures at four call sites with slightly
+ * different refusal texts. One helper: same lock/pending-op/brief-guard
+ * discipline as updateState (it delegates to it), one refusal wording.
+ */
+export async function transitionPhase(
+  dir: string,
+  opName: string,
+  from: CampaignPhase,
+  to: CampaignPhase,
+  work?: () => Promise<void>,
+): Promise<Result<{ state: CampaignState }>> {
+  return updateState(dir, opName, (s) =>
+    s.phase === from
+      ? { ok: true, next: { ...s, phase: to } }
+      : refuse("invalid_transition", `campaign is in phase ${s.phase}; ${opName} needs phase ${from}`),
+    work);
+}
+
+/**
  * One locked state update. Order: lock, pending-operation check, state read
  * (fail-closed), approved-brief check, decision, marker, optional work, state
  * write, marker removal. A refusal touches no file. If work or the state write
  * throws, the marker stays and the update reports operation_failed.
  */
+
 export async function updateState(
   dir: string,
   opName: string,

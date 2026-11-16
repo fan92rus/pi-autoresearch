@@ -62,7 +62,7 @@ function nonEmptyLines(text: string): string[] {
   return text.split("\n").filter(Boolean);
 }
 
-function inferMetricUnit(name: string): string {
+export function inferMetricUnit(name: string): string {
   if (name.endsWith("µs")) return "µs";
   if (name.endsWith("_ms")) return "ms";
   if (name.endsWith("_s") || name.endsWith("_sec")) return "s";

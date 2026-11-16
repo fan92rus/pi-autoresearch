@@ -8,7 +8,7 @@
  * цепочки» and «Статусы цепочки», tasks 3.1-3.4 (bd pi-autoresearch-5ys).
  *
  * Deliberately standalone: no imports from the extension UI, no Git. It
- * imports writeFileAtomic from research-state.ts and keeps a local sha256Hex
+ * imports writeFileAtomic and sha256Hex from research-state.ts
  * copy; the file formats:
  *
  *   <workDir>/.auto/research-chain/<chainId>/chain.json   JSON Lines, one
@@ -26,12 +26,12 @@
  * repaired or retried automatically (fail closed, like research-state.ts).
  */
 
-import { randomBytes, createHash } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { mkdir, readFile } from "node:fs/promises";
 import { closeSync, fsyncSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
 import { join } from "node:path";
 
-import { writeFileAtomic } from "./research-state.ts";
+import { writeFileAtomic, sha256Hex } from "./research-state.ts";
 
 // ─── Paths and file names ────────────────────────────────────────────────────
 
@@ -92,11 +92,6 @@ function errorCode(err: unknown): string | undefined {
   return typeof err === "object" && err !== null && typeof (err as { code?: unknown }).code === "string"
     ? (err as { code: string }).code
     : undefined;
-}
-
-/** Lowercase hex SHA-256 of the given bytes. */
-export function sha256Hex(bytes: Uint8Array | string): string {
-  return createHash("sha256").update(bytes).digest("hex");
 }
 
 function sleep(ms: number): Promise<void> {

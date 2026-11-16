@@ -1,7 +1,8 @@
 /** Pure expedition document, map, transition, and presentation logic (research-expedition spec scenarios). */
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { sha256Hex, CHAIN_FILE, MANUAL_FILE, type ChainEntry, type Result } from "./chain-journal.ts";
+import { CHAIN_FILE, MANUAL_FILE, type ChainEntry, type Result } from "./chain-journal.ts";
+import { sha256Hex } from "./research-state.ts";
 import * as charter from "./charter.ts";
 import * as researchState from "./research-state.ts";
 

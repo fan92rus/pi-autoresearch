@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, utimesSync } from 'node:fs';
-import { sha256Hex } from '../extensions/pi-autoresearch/chain-journal.ts';
+import { sha256Hex } from '../extensions/pi-autoresearch/research-state.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as e from '../extensions/pi-autoresearch/expedition.ts';

@@ -180,6 +180,7 @@ import {
   isAutoresearchRunEntry,
   extractAutoresearchSessionName,
   reconstructJsonlState,
+  inferMetricUnit,
 } from "./jsonl.ts";
 import {
   autoresearchSummaryPathsFor,
@@ -1366,6 +1367,35 @@ export function findBaselineMetric(
   return cur.length > 0 ? cur[0].metric : null;
 }
 
+/**
+ * One best-scan for both findBestMetric and findBestRunNumber (bd lrx.4):
+ * the two pre-unification implementations were NOT identical — findBestMetric
+ * did not filter keep metric===0 (would return 0 as "best"); the unified scan
+ * applies the metric!==0 invariant everywhere, matching the rest of the
+ * codebase. The linear fold also replaces Math.min(...kept)/Math.max(...)
+ * spread, which throws RangeError on very large segments (~>100k entries). The linear fold also replaces Math.min(...kept)/Math.max(...)
+ * spread, which throws RangeError on very large segments (~>100k entries).
+ * Returns null when no keep exists in the epoch.
+ */
+function findBest(
+  results: ExperimentResult[],
+  segment: number,
+  direction: "lower" | "higher",
+  epoch: number,
+): { metric: number; position: number } | null {
+  const seg = currentResults(results, segment);
+  let best: { metric: number; position: number } | null = null;
+  for (let i = 0; i < seg.length; i++) {
+    const r = seg[i];
+    if (resultEpoch(r) !== epoch) continue;
+    if (r.status !== "keep" || r.metric === 0) continue;
+    if (best === null || (direction === "lower" ? r.metric < best.metric : r.metric > best.metric)) {
+      best = { metric: r.metric, position: i };
+    }
+  }
+  return best;
+}
+
 /** Best = optimal metric across kept experiments of the current epoch (min for lower, max for higher) */
 export function findBestMetric(
   results: ExperimentResult[],
@@ -1373,11 +1403,7 @@ export function findBestMetric(
   direction: "lower" | "higher",
   epoch: number = segmentEpoch(results, segment),
 ): number | null {
-  const kept = epochResults(results, segment, epoch)
-    .filter((r) => r.status === "keep")
-    .map((r) => r.metric);
-  if (kept.length === 0) return null;
-  return direction === "lower" ? Math.min(...kept) : Math.max(...kept);
+  return findBest(results, segment, direction, epoch)?.metric ?? null;
 }
 
 /** T5: Find the run number (1-based) where the current best metric was set. */
@@ -1388,19 +1414,9 @@ function findBestRunNumber(
   epoch: number = segmentEpoch(results, segment),
 ): number {
   const seg = currentResults(results, segment);
-  let bestIdx = -1;
-  let bestVal: number | null = null;
-  for (let i = 0; i < seg.length; i++) {
-    if (resultEpoch(seg[i]) !== epoch) continue;
-    if (seg[i].status !== "keep" || seg[i].metric === 0) continue;
-    const m = seg[i].metric;
-    if (bestVal === null || (direction === "lower" ? m < bestVal : m > bestVal)) {
-      bestVal = m;
-      bestIdx = i;
-    }
-  }
+  const best = findBest(results, segment, direction, epoch);
   // results are stored per-segment; run numbers are global (1-based within segment)
-  return bestIdx >= 0 ? bestIdx + 1 : seg.length;
+  return best ? best.position + 1 : seg.length;
 }
 
 // -----------------------------------------------------------------------
@@ -5826,16 +5842,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       state.results.push(experiment);
       runtime.experimentsThisSession++;
 
-      // Register any new secondary metric names
+      // Register any new secondary metric names. Unit inference is the SAME
+      // rule jsonl.ts's reconstruction uses (bd lrx.2): one implementation,
+      // otherwise the reconstructed state and the live state drift apart.
       for (const name of Object.keys(secondaryMetrics)) {
         if (!state.secondaryMetrics.find((m) => m.name === name)) {
-          let unit = "";
-          if (name.endsWith("µs")) unit = "µs";
-          else if (name.endsWith("_ms")) unit = "ms";
-          else if (name.endsWith("_s") || name.endsWith("_sec")) unit = "s";
-          else if (name.endsWith("_kb")) unit = "kb";
-          else if (name.endsWith("_mb")) unit = "mb";
-          state.secondaryMetrics.push({ name, unit });
+          state.secondaryMetrics.push({ name, unit: inferMetricUnit(name) });
         }
       }
 
@@ -9948,7 +9960,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (!r.ok) return reply(`${r.reason}: ${r.message}`, r.reason);
       r = await add("campaign_added", {campaign_id:id});
       if (!r.ok) return reply(`${r.reason}: ${r.message}`, r.reason);
-      const started = await researchState.updateState(campaign.dir, "start expedition campaign", s => s.phase === "briefing" ? {ok:true,next:{...s,phase:"research"}} : researchRefusal("invalid_transition", "campaign cannot start"));
+      const started = await researchState.transitionPhase(campaign.dir, "start expedition campaign", "briefing", "research");
       if (!started.ok) return reply(`${started.reason}: ${started.message}`, started.reason);
       const status = await chainJournal.setChainStatus(workDir, chainId, "active");
       if (!status.ok) return reply(`${status.reason}: ${status.message}`, status.reason);
@@ -10663,11 +10675,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (otherBusy) return fail("invalid_transition", otherBusy);
         const checked = await researchState.checkBriefApproval(dir, expected);
         if (!checked.ok) return fail(checked.reason, checked.message);
-        const started = await researchState.updateState(dir, "start research phase", (s) =>
-          s.phase === "briefing"
-            ? { ok: true, next: { ...s, phase: "research" } }
-            : researchRefusal("invalid_transition", `campaign is in phase ${s.phase}; start needs phase briefing`),
-        );
+        const started = await researchState.transitionPhase(dir, "start research phase", "briefing", "research");
         if (!started.ok) return fail(started.reason, started.message);
         return reply(
           `✅ Research phase started for campaign ${id} (brief sha256 ${checked.sha256}). Questions come only from the brief. Next: research_questions(action="open", question_id=<id from brief>).`,
@@ -10965,13 +10973,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const stopRule = brief.stop_rules.find((s) => s.id === rid);
         if (!stopRule) return fail("invalid_argument", `stop rule ${JSON.stringify(rid)} is not in the approved brief`);
         if (snap.state.phase !== "research") return phaseRefusal();
-        const done = await researchState.updateState(
+        const done = await researchState.transitionPhase(
           dir,
           "stop research phase",
-          (cur) =>
-            inResearchPhase(cur)
-              ? { ok: true, next: { ...cur, phase: "stopped" } }
-              : researchRefusal("invalid_transition", `campaign is in phase ${cur.phase}; stop needs phase research`),
+          "research",
+          "stopped",
           async () => appendResearchEvent(dir, { event: "stop", rule_id: rid, stop_when: stopRule.when, reason }),
         );
         if (!done.ok) return fail(done.reason, done.message);
