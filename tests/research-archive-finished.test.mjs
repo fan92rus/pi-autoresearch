@@ -134,3 +134,26 @@ test("an unreadable state keeps the refusal and nothing is moved", async () => {
   assert.deepEqual(listDirs(path.join(dir, ".auto", "research")), ["broken", "old1"]);
   assert.equal(fs.existsSync(path.join(dir, ".auto", "research-archive")), false);
 });
+
+// ─── bd pi-autoresearch-vhr / 51n.12: pending-op blocks archiving ────────────
+
+test("a stopped campaign with a pending-op marker is NOT archived; draft refuses (fail closed)", async () => {
+  const dir = makeWorkDir("pending-op");
+  writeCampaignState(dir, "old1", "stopped");
+  fs.writeFileSync(path.join(dir, ".auto", "research", "old1", "report.md"), "# old report\n");
+  fs.writeFileSync(
+    path.join(dir, ".auto", "research", "old1", "pending-op.json"),
+    JSON.stringify({ name: "interrupted operation", started_at: new Date().toISOString() }),
+  );
+  const h = await loadExtensionBare(dir, "pending-op");
+
+  const res = textOf(await call(h, "research_brief", { action: "draft", brief: briefFixture() }));
+  assert.match(res, /pending|manual_check|unreadable/i, `draft must refuse on the pending op: ${res}`);
+
+  // Nothing moved: the campaign stays byte-for-byte in research/.
+  assert.equal(fs.existsSync(path.join(dir, ".auto", "research", "old1", "report.md")), true, "campaign must stay in place");
+  assert.equal(fs.existsSync(path.join(dir, ".auto", "research", "old1", "pending-op.json")), true, "marker survives");
+  const archiveRoot = path.join(dir, ".auto", "research-archive");
+  const archived = fs.existsSync(archiveRoot) ? listDirs(archiveRoot) : [];
+  assert.equal(archived.length, 0, `nothing may be archived while a pending op exists: ${archived}`);
+});

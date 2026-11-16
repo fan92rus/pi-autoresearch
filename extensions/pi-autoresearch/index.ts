@@ -8676,7 +8676,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           const activeWt = path.join(candidateWtRootOf(workDir), preActive.id);
           if (fs.existsSync(activeWt)) {
             const activeChanges = await candidateWorktree.collectWorktreeChanges(candidateGitExec, activeWt);
-            if (activeChanges.ok && activeChanges.changes.all.length > 0) {
+            if (!activeChanges.ok) {
+              // bd 51n.11: an unreadable worktree must NOT pass as clean —
+              // the switch would strand unknown work. Fail closed.
+              return fail("worktree_unreadable", `cannot inspect active candidate ${JSON.stringify(preActive.id)} worktree (${activeChanges.reason}); refusing to create ${JSON.stringify(candidateId)} — resolve the worktree by hand first`);
+            }
+            if (activeChanges.changes.all.length > 0) {
               return fail("unsaved_changes", `active candidate ${JSON.stringify(preActive.id)} worktree has unsaved changes: ${activeChanges.changes.all.join(", ")}. Checkpoint or revert them before creating ${JSON.stringify(candidateId)}; nothing was deleted`);
             }
           }
@@ -8838,7 +8843,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // worktree still carries unsaved changes would strand them (a paused
         // candidate cannot checkpoint, so the only exit would be manual git).
         // Refuse with the path list; nothing is changed or deleted.
-        if (action === "pause" || action === "close") {
+        // bd 51n.11 (review blocker): disable ALSO strands an active candidate
+        // with unsaved/unreadable worktree state — after it no candidate
+        // operation (checkpoint, pause, run) is available, so the only exit
+        // would be manual git. Same fail-closed check for all three actions.
+        if (action === "pause" || action === "close" || action === "disable") {
           const targetId = String(params.candidate_id ?? "");
           const inspP = await candidateState.inspectCampaign(campDir);
           if (inspP.status !== "ready") return fail(inspP.status, inspP.message);
@@ -8851,7 +8860,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             const wtPathP = path.join(candidateWtRootOf(workDir), pCand.id);
             if (fs.existsSync(wtPathP)) {
               const changes = await candidateWorktree.collectWorktreeChanges(candidateGitExec, wtPathP);
-              if (changes.ok && changes.changes.all.length > 0) {
+              if (!changes.ok) {
+                return fail("worktree_unreadable", `cannot inspect candidate ${JSON.stringify(pCand.id)} worktree (${changes.reason}); refusing ${action} — resolve the worktree by hand first`);
+              }
+              if (changes.changes.all.length > 0) {
                 return fail("unsaved_changes", `candidate ${JSON.stringify(pCand.id)} worktree has unsaved changes: ${changes.changes.all.join(", ")}. Checkpoint or revert them before ${action}; nothing was deleted`);
               }
             }
@@ -8880,7 +8892,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           const wtPath = path.join(candidateWtRootOf(workDir), candidateId);
           if (fs.existsSync(wtPath)) {
             const changes = await candidateWorktree.collectWorktreeChanges(candidateGitExec, wtPath);
-            if (changes.ok && changes.changes.all.length > 0) {
+            if (!changes.ok) {
+              return fail("worktree_unreadable", `cannot inspect candidate ${JSON.stringify(candidateId)} worktree (${changes.reason}); refusing resume — resolve the worktree by hand first`);
+            }
+            if (changes.changes.all.length > 0) {
               return fail("unsaved_changes", `candidate ${JSON.stringify(candidateId)} worktree has unsaved changes: ${changes.changes.all.join(", ")}. Checkpoint or revert them first; nothing was deleted`);
             }
           }
@@ -8903,7 +8918,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           const wtPathSel = path.join(candidateWtRootOf(workDir), candidateId);
           if (fs.existsSync(wtPathSel)) {
             const changes = await candidateWorktree.collectWorktreeChanges(candidateGitExec, wtPathSel);
-            if (changes.ok && changes.changes.all.length > 0) {
+            if (!changes.ok) {
+              return fail("worktree_unreadable", `cannot inspect candidate ${JSON.stringify(candidateId)} worktree (${changes.reason}); refusing select — resolve the worktree by hand first`);
+            }
+            if (changes.changes.all.length > 0) {
               return fail("unsaved_changes", `candidate ${JSON.stringify(candidateId)} worktree has unsaved changes: ${changes.changes.all.join(", ")}. Checkpoint or revert them first; nothing was deleted`);
             }
           }
@@ -9210,6 +9228,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (!resolved.ok) return null;
         const read = await researchState.readState(resolved.dir);
         if (!read.ok || read.state.phase !== "stopped") return null;
+        // bd pi-autoresearch-vhr / 51n.12: a pending-operation marker means an
+        // interrupted operation — the campaign must NOT be archived silently
+        // (the finalize/archive note would claim success over stranded work).
+        // Archive nothing and keep the caller's refusal semantics.
+        if (await researchState.readPendingOp(resolved.dir) !== null) return null;
         found.push({ base, id, dir: resolved.dir });
       }
     }

@@ -224,6 +224,20 @@ test("policy rewrite after init refuses (policy immutable)", async () => {
 // create / run / checkpoint happy path
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Windows-safe corrupt/restore of the worktree gitfile (direct overwrite hits EPERM there). */
+async function withCorruptedWorktreeGit(wt, fn) {
+  const gitFile = path.join(wt, ".git");
+  const bak = gitFile + ".bd-test-bak";
+  fs.renameSync(gitFile, bak);
+  fs.writeFileSync(gitFile, "garbage: not a gitfile\n");
+  try {
+    return await fn();
+  } finally {
+    fs.unlinkSync(gitFile); // remove the garbage gitfile
+    fs.renameSync(bak, gitFile);
+  }
+}
+
 async function campaignWithCandidate(label, bench = BENCH_DETERMINISTIC) {
   const s = await setupRepo(label);
   const { h, dir } = s;
@@ -1158,3 +1172,45 @@ test("propose_hypothesis is refused under an active candidate campaign (writes r
   const res = await propose.execute("id", { description: "try a faster loop" }, null, null, h.ctx);
   assert.match(textOf(res), /candidate campaign active/i, `propose must be refused under a campaign: ${textOf(res)}`);
 });
+
+// ─── bd 51n.11: an unreadable worktree must refuse, not pass as clean ────────
+
+test("bd 51n.11: pause refuses with worktree_unreadable when git status fails; state stays", async () => {
+  const { h, dir, wtPath: wt } = await campaignWithCandidate("unreadable", BENCH_DETERMINISTIC);
+  const paused = await withCorruptedWorktreeGit(wt, () => callTool(h, "pause", { candidate_id: "cand-a" }));
+  const t = textOf(paused);
+  const st = JSON.parse(fs.readFileSync(path.join(dir, ".auto", "candidate", "state.json"), "utf8"));
+  assert.equal(st.candidates.find((c) => c.id === "cand-a").status, "active", "candidate must stay active after the refusal");
+  // After restoring .git the same pause succeeds.
+  const paused2 = await callTool(h, "pause", { candidate_id: "cand-a" });
+  assert.match(textOf(paused2), /pause done/i, `pause after repair must succeed: ${textOf(paused2)}`);
+}, { timeout: 60000 });
+
+test("bd 51n.11: create refuses with worktree_unreadable for a broken active worktree", async () => {
+  const { h, wtPath: wt } = await campaignWithCandidate("unreadable-create", BENCH_DETERMINISTIC);
+  const created = await withCorruptedWorktreeGit(wt, () => callTool(h, "create", { candidate_id: "cand-b" }));
+  const t = textOf(created);
+  assert.match(t, /worktree_unreadable/, `create must fail closed on an unreadable active worktree: ${t}`);
+}, { timeout: 60000 });
+
+test("bd 51n.11: resume refuses with worktree_unreadable for a broken target worktree", async () => {
+  const { h, wtPath: wt } = await campaignWithCandidate("unreadable-resume", BENCH_DETERMINISTIC);
+  await callTool(h, "pause", { candidate_id: "cand-a" });
+  const resumed = await withCorruptedWorktreeGit(wt, () => callTool(h, "resume", { candidate_id: "cand-a" }));
+  const t = textOf(resumed);
+  assert.match(t, /worktree_unreadable/, `resume must fail closed on an unreadable worktree: ${t}`);
+}, { timeout: 60000 });
+
+test("bd 51n.11: disable refuses with worktree_unreadable too (no candidate ops afterwards)", async () => {
+  const { h, dir, wtPath: wt } = await campaignWithCandidate("unreadable-disable", BENCH_DETERMINISTIC);
+  const disabled = await withCorruptedWorktreeGit(wt, () => callTool(h, "disable", {}));
+  const t = textOf(disabled);
+  assert.match(t, /worktree_unreadable/, `disable must fail closed on an unreadable worktree: ${t}`);
+  const st = JSON.parse(fs.readFileSync(path.join(dir, ".auto", "candidate", "state.json"), "utf8"));
+  assert.equal(st.disabled ?? false, false, "campaign must stay enabled after the refusal");
+  // dirty worktree also refuses disable
+  writeFileSyncSafe(path.join(wt, "STRAY.txt"), "stray\n");
+  const dirty = await callTool(h, "disable", {});
+  assert.match(textOf(dirty), /unsaved_changes/, `dirty disable must refuse: ${textOf(dirty)}`);
+  fs.rmSync(path.join(wt, "STRAY.txt"), { force: true });
+}, { timeout: 60000 });
