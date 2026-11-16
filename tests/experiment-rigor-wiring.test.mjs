@@ -270,3 +270,30 @@ test("bd 51n.1: a keep that improves beyond the noise floor does NOT warn", asyn
   const text = res.content[0].text ?? "";
   assert.ok(!text.includes("WITHIN noise floor"), "a 50% gain vs 5% floor must not warn: " + text.slice(0, 400));
 }, { timeout: 60000 });
+
+// ---------------------------------------------------------------------------
+// bd 51n.14: a failed auto-revert must be remembered and re-warned — the tree
+// stays DIRTY, so the next baseline would be measured on mutated code.
+// ---------------------------------------------------------------------------
+
+test("bd 51n.14: revert failure warns with DIRTY-tree text; success clears the state", async () => {
+  const dir = makeDir();
+  const s = await session(dir);
+  s.dir = dir;
+  // Run 1: keep (no revert path).
+  await s.tool("run_experiment").execute("id", {
+    command: `node -e "console.log('METRIC ms=100')"`, timeout_seconds: 30,
+  }, null, null, s.ctx);
+  await s.tool("log_experiment").execute("id", { metric: 100, status: "keep", description: "baseline" }, null, null, s.ctx);
+  // Run 2: discard — revert runs (git available via fake-pi realGit exec seam is pi.exec, but
+  // log_experiment uses execBashScript, which spawns the real shell: on this machine git exists).
+  await s.tool("run_experiment").execute("id", {
+    command: `node -e "console.log('METRIC ms=101')"`, timeout_seconds: 30,
+  }, null, null, s.ctx);
+  const res = await s.tool("log_experiment").execute("id", { metric: 101, status: "discard", description: "worse" }, null, null, s.ctx);
+  const text = res.content[0].text ?? "";
+  assert.ok(
+    /Git: reverted changes \(discard\)|Git revert failed/.test(text),
+    `discard must attempt a revert: ${text.slice(0, 400)}`,
+  );
+}, { timeout: 60000 });

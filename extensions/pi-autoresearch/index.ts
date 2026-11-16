@@ -474,6 +474,11 @@ interface AutoresearchRuntime {
   subagentDeferral: { since: number; timer: ReturnType<typeof setTimeout> | null } | null;
   /** Provenance warning from the LAST log_experiment (e.g. "manual"/"unmeasured"). Null when the last log was measured. Re-injected into every resume until an honest (measured) log lands — goal-x [AUDITOR REJECTION] pattern. */
   lastLogFlag: string | null;
+  /** bd 51n.14: set when the auto-revert of a non-keep log failed (git lock,
+   *  bad pathspec...). The tree stays DIRTY, so the next run_experiment's
+   *  baseline would be measured on mutated code. Re-warned on every resume
+   *  until a successful revert clears it. */
+  lastRevertFailure: string | null;
   /** research-charter: the active chain of this session (bd pi-autoresearch-5ol). Null = no chain:
    *  campaigns behave exactly as before the charter change. Created by '/autoresearch research
    *  --charter <path>' after the owner confirms the Charter SHA-256 dialog. Cleared when the chain
@@ -1922,6 +1927,7 @@ function createSessionRuntime(): AutoresearchRuntime {
     consecutiveDriftResumes: 0,
     subagentDeferral: null,
     lastLogFlag: null,
+    lastRevertFailure: null,
     researchChain: null,
     chainContinuationSent: false,
     lastMeasurement: null,
@@ -2871,12 +2877,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     ].join(" ");
 
   const composeResumeMessage = (ctx: ExtensionContext): string => {
-    const flag = getRuntime(ctx).lastLogFlag;
+    const runtime = getRuntime(ctx);
+    const flag = runtime.lastLogFlag;
     const head = flag
       ? `⚠ Last log_experiment was flagged (${flag}) — that value was agent-claimed, NOT measured. Run run_experiment and log the parsed METRIC. `
       : "";
+    // bd 51n.14: a failed auto-revert left the tree DIRTY; the next baseline
+    // would be measured on mutated code. Keep warning until a clean revert.
+    const revertWarn = runtime.lastRevertFailure
+      ? `⚠ The last auto-revert FAILED (${runtime.lastRevertFailure}) — the working tree still carries the discarded experiment's changes. Run a manual git checkout/clean (excluding .auto) and verify git status is clean BEFORE trusting the next baseline. `
+      : "";
     return [
-      head + "Run the next iteration now.",
+      revertWarn + head + "Run the next iteration now.",
       "Use the persisted autoresearch state as needed, pick the most promising hypothesis, then call run_experiment + log_experiment.",
       MEASUREMENT_GUARDRAIL,
       experimentLimitClause(ctx.cwd),
@@ -6181,33 +6193,50 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
-      if (params.status !== "keep" && params.status !== "budget_exceeded") {
+      // bd 51n.14 (dedup + fail-closed flag): the two revert branches carried the
+      // same script verbatim; a fix to the exclude patterns had to be applied
+      // twice. One shared revert; a failure sets runtime.lastRevertFailure so
+      // the loop keeps re-warning — the tree is DIRTY and the next baseline
+      // would be measured on mutated code.
+      const revertFor = async (_status: string): Promise<string | null> => {
         try {
           const revertScript = `
             git checkout -- . ':(exclude,glob)**/${AUTO_DIR}' ':(exclude,glob)**/${AUTO_DIR}/**' ':(exclude,glob)**/autoresearch.*' ':(exclude,glob)**/autoresearch.*/**'
             git clean -fd -e '${AUTO_DIR}' -e '**/${AUTO_DIR}/**' -e 'autoresearch.*' -e '**/autoresearch.*/**' 2>/dev/null
           `;
           await execBashScript(["-c", revertScript], { cwd: workDir, timeout: 10000 });
-          text += `\n📝 Git: reverted changes (${params.status}) — autoresearch files preserved`;
+          return null;
         } catch (e) {
-          text += `\n⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
+          return e instanceof Error ? e.message : String(e);
+        }
+      };
+      if (params.status !== "keep" && params.status !== "budget_exceeded") {
+        const revertError = await revertFor(params.status);
+        if (revertError === null) {
+          runtime.lastRevertFailure = null;
+          text += `
+📝 Git: reverted changes (${params.status}) — autoresearch files preserved`;
+        } else {
+          runtime.lastRevertFailure = `${params.status}: ${revertError}`;
+          text += `
+⚠️ Git revert failed (${params.status}): ${revertError}. The tree stays DIRTY — the next baseline is unreliable until a manual revert succeeds.`;
         }
       }
 
       // budget_exceeded: revert like crash, but emit a dedicated steer so the
       // loop does not keep burning budget on a too-slow measure.sh.
       if (params.status === "budget_exceeded") {
-        try {
-          const revertScript = `
-            git checkout -- . ':(exclude,glob)**/${AUTO_DIR}' ':(exclude,glob)**/${AUTO_DIR}/**' ':(exclude,glob)**/autoresearch.*' ':(exclude,glob)**/autoresearch.*/**'
-            git clean -fd -e '${AUTO_DIR}' -e '**/${AUTO_DIR}/**' -e 'autoresearch.*' -e '**/autoresearch.*/**' 2>/dev/null
-          `;
-          await execBashScript(["-c", revertScript], { cwd: workDir, timeout: 10000 });
-          text += `\n📝 Git: reverted changes (budget_exceeded) — autoresearch files preserved`;
-        } catch (e) {
-          text += `\n⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
+        const revertError = await revertFor("budget_exceeded");
+        if (revertError === null) {
+          runtime.lastRevertFailure = null;
+          text += `
+📝 Git: reverted changes (budget_exceeded) — autoresearch files preserved`;
+        } else {
+          runtime.lastRevertFailure = `budget_exceeded: ${revertError}`;
+          text += `
+⚠️ Git revert failed (budget_exceeded): ${revertError}. The tree stays DIRTY — the next baseline is unreliable until a manual revert succeeds.`;
         }
-        pi.sendUserMessage(
+      pi.sendUserMessage(
           `⏰ Experiment exceeded the time budget. DO NOT continue the loop with this slow measure.sh.\nOptions: 1) add a BENCH_MODE=quick subset to measure.sh; 2) cache prebuilt setup steps; 3) cut fixture/iter count. Rewrite measure.sh, then re-run.`,
           { deliverAs: "steer" }
         );
