@@ -217,3 +217,56 @@ test("B6: a repeat logged WITHOUT hypothesis_id still joins its original's group
   const conf = repeatConfidence(rows.filter((r) => r.metric > 0), 100, "lower");
   assert.ok(conf !== null, "the repeat is counted in the group, so confidence is not null");
 });
+
+// ---------------------------------------------------------------------------
+// bd 51n.1: the prev-best noise-floor filter must exclude the run being
+// logged. Regression: ExperimentResult.runNumber was never set, so the old
+// `r.runNumber !== experiment.runNumber` filter (undefined !== undefined ===
+// false) kept the current run inside prevBest, improvement became 0 and the
+// WITHIN-noise warning never fired for a keep that merely matched the
+// previous best.
+// ---------------------------------------------------------------------------
+
+test("bd 51n.1: a keep within the noise floor warns (prev-best excludes the logged run)", async () => {
+  const dir = makeDir();
+  const s = await session(dir);
+  s.dir = dir;
+  mergeConfig(dir, { noiseFloor: 0.05, noiseFloorUnit: "metric", noiseFloorEpoch: 1 });
+  // Run 1: best = 100.
+  await s.tool("run_experiment").execute("id", {
+    command: `node -e "console.log('METRIC ms=100')"`, timeout_seconds: 30,
+  }, null, null, s.ctx);
+  await s.tool("log_experiment").execute("id", { metric: 100, status: "keep", description: "baseline best" }, null, null, s.ctx);
+  // Run 2: keep at 97 — a 3% "improvement" against the 5% floor. Before the
+  // fix, prevBest INCLUDED the run being logged (identity never excluded it),
+  // so prevBest collapsed to 97, improvement became 0 and the warning was
+  // dead code for every within-noise keep.
+  await s.tool("run_experiment").execute("id", {
+    command: `node -e "console.log('METRIC ms=97')"`, timeout_seconds: 30,
+  }, null, null, s.ctx);
+  const res = await s.tool("log_experiment").execute("id", { metric: 97, status: "keep", description: "within noise" }, null, null, s.ctx);
+  const text = res.content[0].text ?? "";
+  assert.ok(text.includes("NOISE FLOOR"), "3% gain vs 5% floor must carry the noise-floor warning: " + text.slice(0, 400));
+
+  // The in-memory entry must carry the real ledger run number now.
+  const rows = ledgerRows(dir);
+  assert.equal(rows.length, 2, "two run rows logged");
+  assert.equal(rows[1].run, 2, "second row is run #2");
+}, { timeout: 60000 });
+
+test("bd 51n.1: a keep that improves beyond the noise floor does NOT warn", async () => {
+  const dir = makeDir();
+  const s = await session(dir);
+  s.dir = dir;
+  mergeConfig(dir, { noiseFloor: 0.05, noiseFloorUnit: "metric", noiseFloorEpoch: 1 });
+  await s.tool("run_experiment").execute("id", {
+    command: `node -e "console.log('METRIC ms=100')"`, timeout_seconds: 30,
+  }, null, null, s.ctx);
+  await s.tool("log_experiment").execute("id", { metric: 100, status: "keep", description: "baseline best" }, null, null, s.ctx);
+  await s.tool("run_experiment").execute("id", {
+    command: `node -e "console.log('METRIC ms=50')"`, timeout_seconds: 30,
+  }, null, null, s.ctx);
+  const res = await s.tool("log_experiment").execute("id", { metric: 50, status: "keep", description: "real improvement" }, null, null, s.ctx);
+  const text = res.content[0].text ?? "";
+  assert.ok(!text.includes("WITHIN noise floor"), "a 50% gain vs 5% floor must not warn: " + text.slice(0, 400));
+}, { timeout: 60000 });

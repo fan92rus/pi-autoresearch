@@ -263,6 +263,10 @@ interface ExperimentResult {
   segment: number;
   /** Measurement epoch (task 2.3). Absent or broken = epoch 1 (see resultEpoch). */
   epoch?: number;
+  /** Ledger run number (bd 51n.1). Populated at log_experiment; ledger rows
+   *  reconstructed before this field existed have runNumber undefined, so
+   *  comparisons must treat undefined as "unknown, never equal a real number". */
+  runNumber?: number;
   /** Session-level confidence score at the time this result was logged. null if insufficient data. */
   confidence: number | null;
   /** Actionable Side Information — structured diagnostics for this run */
@@ -2831,8 +2835,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const replay = expedition.replayExpeditionMap(verified.entries);
     if (!replay.ok) return null;
     const nudge = await expeditionCloseNudge(ctx, chain, replay.map, { eventClosedActive: false });
+    // Null-check FIRST (bd 51n.9): expeditionCloseNudge re-reads state on its
+    // own and can return null even after the pre-checks above (fs reads are
+    // not atomic across the two call sites). The old code dereferenced
+    // nudge.replySuffix before the null guard — a latent TypeError inside a
+    // drift-resume composer.
+    if (nudge === null) return null;
     const body = nudge.replySuffix.replace(/^Next: /, "");
-    return nudge === null ? null : `Continue the expedition now: ${body} STOP on manual_check_required.`;
+    return `Continue the expedition now: ${body} STOP on manual_check_required.`;
   };
 
   const composeResearchDriftMessage = async (ctx: ExtensionContext): Promise<string> => {
@@ -3279,6 +3289,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         state.currentSegment = reconstructed.currentSegment;
         state.results = reconstructed.results.map((result) => ({
           ...result,
+          // Ledger run number (bd 51n.1): reconstructJsonlState carries it as
+          // `run`; expose it as runNumber so display and noise-floor logic see
+          // real numbers for reconstructed rows too.
+          runNumber: isRunNumber(result.run) ? result.run : undefined,
           metrics: { ...result.metrics },
         }));
         state.secondaryMetrics = reconstructed.secondaryMetrics.map((metric) => ({ ...metric }));
@@ -5788,6 +5802,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         timestamp: Date.now(),
         segment: state.currentSegment,
         epoch: runEpoch,
+        // Ledger run number (bd 51n.1): the prev-best noise-floor filter
+        // excludes THIS run by it; without the field the filter was a no-op
+        // (undefined !== undefined === false) and prevBest included the run
+        // being logged.
+        runNumber,
         confidence: null,
         asi: mergedASI,
       };
@@ -5904,6 +5923,36 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
       const confidenceSuppression = confidenceSuppressionReason(scaleStatus, floorStatus);
 
+      // Noise floor warning for keep: check if improvement is within calibrated noise.
+      // bd 51n.1: this is an INDEPENDENT check — it used to live inside the
+      // confidence branch and never ran when confidence was null (no repeat
+      // group), which made it dead code for most logs. The floor status comes
+      // from the single source (noiseFloorStatusOfDir); prev-best excludes the
+      // run being logged BY OBJECT IDENTITY (experiment IS the last pushed
+      // entry of state.results) — the old r.runNumber !== experiment.runNumber
+      // filter was a no-op (undefined !== undefined === false).
+      if (params.status === "keep") {
+        try {
+          const nf = floorStatus.floor;
+          if (nf !== null && state.results.length >= 2) {
+            const prevBest = state.results
+              .filter((r) => r.segment === state.currentSegment && resultEpoch(r) === runEpoch && r.status === "keep" && r !== experiment)
+              .reduce((best, r) => {
+                if (state.bestDirection === "lower") return best === null || r.metric < best ? r.metric : best;
+                return best === null || r.metric > best ? r.metric : best;
+              }, null as number | null);
+            if (prevBest !== null) {
+              const improvement = state.bestDirection === "lower"
+                ? (prevBest - params.metric) / prevBest
+                : (params.metric - prevBest) / prevBest;
+              if (improvement > 0 && improvement < nf) {
+                text += `\n⚠️ NOISE FLOOR: Improvement (${(improvement * 100).toFixed(1)}%) is WITHIN noise floor (±${(nf * 100).toFixed(1)}%). Likely not real.`;
+              }
+            }
+          }
+        } catch { /* best-effort */ }
+      }
+
       // Show confidence score (T5: context-aware — different message for keep vs discard)
       if (confidenceSuppression !== null) {
         text +=
@@ -5918,29 +5967,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // Find the run number where the current best was set
         const bestRunNum = findBestRunNumber(state.results, state.currentSegment, state.bestDirection, runEpoch);
 
-        // Noise floor warning for keep: check if improvement is within calibrated noise
-        // (task 2.5: the floor VALUE comes from the single floor source, noiseFloorStatusOfDir)
-        if (isKeep) {
-          try {
-            const nf = floorStatus.floor;
-            if (nf !== null && state.results.length >= 2) {
-              const prevBest = state.results
-                .filter((r) => r.segment === state.currentSegment && resultEpoch(r) === runEpoch && r.status === "keep" && r.runNumber !== experiment.runNumber)
-                .reduce((best, r) => {
-                  if (state.bestDirection === "lower") return best === null || r.metric < best ? r.metric : best;
-                  return best === null || r.metric > best ? r.metric : best;
-                }, null as number | null);
-              if (prevBest !== null) {
-                const improvement = state.bestDirection === "lower"
-                  ? (prevBest - params.metric) / prevBest
-                  : (params.metric - prevBest) / prevBest;
-                if (improvement > 0 && improvement < nf) {
-                  text += `\n⚠️ NOISE FLOOR: Improvement (${(improvement * 100).toFixed(1)}%) is WITHIN noise floor (±${(nf * 100).toFixed(1)}%). Likely not real.`;
-                }
-              }
-            }
-          } catch { /* best-effort */ }
-        }
 
         if (isKeep) {
           // This run IS the improvement — confidence refers to THIS run
@@ -6029,6 +6055,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         run: runNumber,
         ...experiment,
       };
+      // The ledger row contract is byte-stable (run-links-wiring "bytes unchanged",
+      // §5.1): runNumber is the in-memory twin of the `run` key, never a ledger key.
+      delete jsonlEntry.runNumber;
       if (!mergedASI) delete jsonlEntry.asi;
       // Optional label: written only when supplied, so an absent parameter leaves the row unchanged.
       if (params.activity_type !== undefined) jsonlEntry.activity_type = params.activity_type;
