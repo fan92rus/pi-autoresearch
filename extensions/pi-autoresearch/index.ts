@@ -4523,7 +4523,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return { content: [{ type: "text", text: `❌ ${workDirError}` }], details: {} };
       }
       const workDir = resolveWorkDir(ctx.cwd);
-      const res = recordFinding(workDir, params);
+      const res = await recordFinding(workDir, params);
       if (!res.ok) {
         return { content: [{ type: "text", text: `❌ record_finding rejected:\n  ${res.errors.join("\n  ")}` }], details: {} };
       }
@@ -4565,7 +4565,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return { content: [{ type: "text", text: `❌ ${workDirError}` }], details: {} };
       }
       const workDir = resolveWorkDir(ctx.cwd);
-      const res = updateFinding(workDir, params);
+      const res = await updateFinding(workDir, params);
       if (!res.ok) {
         return { content: [{ type: "text", text: `❌ update_finding rejected:\n  ${res.errors.join("\n  ")}` }], details: {} };
       }
@@ -10870,7 +10870,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (verdict === "confirmed" || verdict === "rejected") {
           const qText = question.text.length > 200 ? question.text.slice(0, 197) + "..." : question.text;
           try {
-            const res = recordFinding(workDir, {
+            const res = await recordFinding(workDir, {
               theme: "behavior",
               description: `${id}/${qid}: ${verdict} by ${rid} — ${qText}`,
               evidence_ref: vector.evidence[0].evidence_ref,

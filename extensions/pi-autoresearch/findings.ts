@@ -38,6 +38,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { AUTO_DIR } from "./paths.ts";
+import { journalTarget, withJournalLock, type JournalLockResult } from "./research-journal.ts";
 
 export const FINDINGS_FILE = "findings.jsonl";
 
@@ -438,6 +439,36 @@ function appendLine(workDir: string, record: FindingRecord | FindingTransitionRe
   fs.appendFileSync(file, JSON.stringify(record) + "\n", "utf-8");
 }
 
+/**
+ * bd 51n.10: creation and transition are load-then-validate-then-append
+ * sequences; two concurrent writers could both fold the same file and mint the
+ * same id, or validate a transition against a stale status. Serialise every
+ * read-modify-append cycle under the findings lock (same primitive as the
+ * research-map journals: exclusive wx lock file + bounded retry). The critical
+ * section must be synchronous (withJournalLock contract).
+ */
+async function withFindingsLock<T>(
+  workDir: string,
+  critical: () => FindingResult<T>,
+): Promise<FindingResult<T>> {
+  // The lock file lives under <workDir>/.auto; a first-ever write into a fresh
+  // project has no .auto yet — create it or openSync("wx") fails with ENOENT.
+  fs.mkdirSync(path.join(workDir, AUTO_DIR), { recursive: true });
+  const target = journalTarget(path.join(workDir, AUTO_DIR), "findings");
+  const locked: JournalLockResult<FindingResult<T>> = await withJournalLock(target, () => critical());
+  if (locked.status === "acquired") return locked.value;
+  if (locked.status === "lock_busy") {
+    return {
+      ok: false,
+      errors: [
+        `${FINDINGS_FILE} занята другим писателем (${locked.code}); запись отклонена, ничего не записано.`,
+        `Повторите вызов, когда параллельная запись завершится. ${locked.message}`,
+      ],
+    };
+  }
+  return { ok: false, errors: [`${FINDINGS_FILE}: не удалось взять lock записи: ${locked.message}`] };
+}
+
 function storeErrors(loaded: { ok: false; errors: string[] }): FindingResult<never> {
   return {
     ok: false,
@@ -449,10 +480,19 @@ function storeErrors(loaded: { ok: false; errors: string[] }): FindingResult<nev
  * Create a finding (status open) and append it. Rejections collect every
  * problem at once. `now` is injectable for deterministic tests.
  */
-export function recordFinding(
+export async function recordFinding(
   workDir: string,
   input: RecordFindingInput,
   now: Date = new Date(),
+): Promise<FindingResult<FindingRecord>> {
+  return withFindingsLock(workDir, () => recordFindingLocked(workDir, input, now));
+}
+
+/** Critical section of recordFinding: run under the findings lock (bd 51n.10). */
+function recordFindingLocked(
+  workDir: string,
+  input: RecordFindingInput,
+  now: Date,
 ): FindingResult<FindingRecord> {
   const errors: string[] = [];
 
@@ -530,10 +570,19 @@ export function recordFinding(
  * Enforces FINDING_TRANSITIONS; `verified`/`revised` require evidence_ref,
  * and any evidence_ref given (for any target) must pass checkEvidenceRef.
  */
-export function updateFinding(
+export async function updateFinding(
   workDir: string,
   input: UpdateFindingInput,
   now: Date = new Date(),
+): Promise<FindingResult<FindingTransitionRecord>> {
+  return withFindingsLock(workDir, () => updateFindingLocked(workDir, input, now));
+}
+
+/** Critical section of updateFinding: run under the findings lock (bd 51n.10). */
+function updateFindingLocked(
+  workDir: string,
+  input: UpdateFindingInput,
+  now: Date,
 ): FindingResult<FindingTransitionRecord> {
   const errors: string[] = [];
 

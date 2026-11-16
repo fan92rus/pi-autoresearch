@@ -105,7 +105,7 @@ function writeRunOutput(workDir, run, text = "METRIC ms=76\nsome output line\n")
 }
 
 async function addFinding(workDir, { theme, description, evidenceRef, run, impact }) {
-  const result = recordFinding(
+  const result = await recordFinding(
     workDir,
     {
       theme,
@@ -142,11 +142,11 @@ const FACTS_HEALTHY = { epoch: 1, measurement_change_count: 0, floor_stale: fals
 // measurement.ts — ledger fold
 // ---------------------------------------------------------------------------
 
-test("measurementLedgerFacts: empty text → epoch 1, no changes, floor fresh", () => {
+test("measurementLedgerFacts: empty text → epoch 1, no changes, floor fresh", async () => {
   assert.deepEqual(measurementLedgerFacts(""), { epoch: 1, measurement_change_count: 0, floor_stale: false });
 });
 
-test("measurementLedgerFacts: entries without epoch stay in epoch 1; epochs fold to the max", () => {
+test("measurementLedgerFacts: entries without epoch stay in epoch 1; epochs fold to the max", async () => {
   const facts = measurementLedgerFacts(
     [
       JSON.stringify(configEntry()),
@@ -160,7 +160,7 @@ test("measurementLedgerFacts: entries without epoch stay in epoch 1; epochs fold
   assert.equal(facts.floor_stale, false);
 });
 
-test("measurementLedgerFacts: measurement_change records count and stale the floor", () => {
+test("measurementLedgerFacts: measurement_change records count and stale the floor", async () => {
   const facts = measurementLedgerFacts(
     [
       JSON.stringify(configEntry()),
@@ -179,7 +179,7 @@ test("measurementLedgerFacts: measurement_change records count and stale the flo
 // measurement.ts — summary fields (spec: the four fields)
 // ---------------------------------------------------------------------------
 
-test("measurementHealthFromFacts: no findings → zeros and null impact", () => {
+test("measurementHealthFromFacts: no findings → zeros and null impact", async () => {
   assert.deepEqual(
     measurementHealthFromFacts(FACTS_HEALTHY, findingsState([])),
     { epoch: 1, floor_stale: false, open_measurement_count: 0, top_impact: null },
@@ -190,7 +190,7 @@ test("measurementHealthFromFacts: no findings → zeros and null impact", () => 
   );
 });
 
-test("measurementHealthFromFacts: only OPEN measurement findings count; top_impact is the largest percent", () => {
+test("measurementHealthFromFacts: only OPEN measurement findings count; top_impact is the largest percent", async () => {
   const state = findingsState([
     view("f1", "measurement", "open", "~3% всех ошибок"),
     view("f2", "measurement", "open", "~14% всех ошибок"),
@@ -206,7 +206,7 @@ test("measurementHealthFromFacts: only OPEN measurement findings count; top_impa
   });
 });
 
-test("measurementHealthFromFacts: unparseable impacts keep file order; missing impact ignored", () => {
+test("measurementHealthFromFacts: unparseable impacts keep file order; missing impact ignored", async () => {
   const state = findingsState([
     view("f1", "measurement", "open"), // no impact
     view("f2", "measurement", "open", "заметно замедляет"),
@@ -244,7 +244,7 @@ test("measurementHealthSummary: folds ledger + findings from disk", async () => 
   assert.match(line, /\btop_impact: ~14% всех ошибок/);
 });
 
-test("measurementHealthSummary: mixed layout (.auto/config.json + legacy autoresearch.jsonl) reads the same ledger as observer/council (review N2)", () => {
+test("measurementHealthSummary: mixed layout (.auto/config.json + legacy autoresearch.jsonl) reads the same ledger as observer/council (review N2)", async () => {
   const workDir = makeWorkDir("summary-mixed");
   // Current layout marker without a current ledger: sessionFilePath would pick
   // the missing .auto/log.jsonl, but observer.ts/council.ts fall back to the legacy file.
@@ -270,14 +270,14 @@ test("measurementHealthSummary: mixed layout (.auto/config.json + legacy autores
   assert.doesNotMatch(line, /здоровое состояние/);
 });
 
-test("measurementHealthSummary: empty workDir → healthy defaults (old campaign compat)", () => {
+test("measurementHealthSummary: empty workDir → healthy defaults (old campaign compat)", async () => {
   const workDir = makeWorkDir("empty");
   const summary = measurementHealthSummary(workDir);
   assert.deepEqual(summary, { epoch: 1, floor_stale: false, open_measurement_count: 0, top_impact: null });
   assert.match(formatMeasurementHealth(summary), /Measurement health: изменений измерителя не зарегистрировано \(здоровое состояние\)/);
 });
 
-test("formatMeasurementHealth: healthy state with no findings shows all four field names (review B2)", () => {
+test("formatMeasurementHealth: healthy state with no findings shows all four field names (review B2)", async () => {
   const line = formatMeasurementHealth(measurementHealthFromFacts(FACTS_HEALTHY, findingsState([])));
   assert.match(line, /\bepoch\b/);
   assert.match(line, /\bfloor_stale\b/);
@@ -287,7 +287,7 @@ test("formatMeasurementHealth: healthy state with no findings shows all four fie
   assert.match(line, /изменений измерителя не зарегистрировано \(здоровое состояние\)/);
 });
 
-test("formatMeasurementHealth: healthy state with open findings keeps the annotation and all four fields", () => {
+test("formatMeasurementHealth: healthy state with open findings keeps the annotation and all four fields", async () => {
   const line = formatMeasurementHealth(
     measurementHealthFromFacts(FACTS_HEALTHY, findingsState([view("f1", "measurement", "open", "~5% прогонов")])),
   );
@@ -314,32 +314,32 @@ function reflectionState() {
   };
 }
 
-test("checkReflection: checkpoint fires at decidedRuns multiple of the interval", () => {
+test("checkReflection: checkpoint fires at decidedRuns multiple of the interval", async () => {
   const steer = checkReflection(reflectionState(), payload("/dev/null"), DEFAULT_OBSERVER_CONFIG);
   assert.ok(steer);
   assert.match(steer, /REFLECTION CHECKPOINT \(10 decided runs/);
 });
 
-test("checkReflection: no checkpoint → null even with lens context", () => {
+test("checkReflection: no checkpoint → null even with lens context", async () => {
   const state = { ...reflectionState(), streak: 3 };
   assert.equal(checkReflection(state, payload("/dev/null"), DEFAULT_OBSERVER_CONFIG, { lensDone: false }), null);
 });
 
-test("checkReflection: lens nudge present by default (no findings for the segment)", () => {
+test("checkReflection: lens nudge present by default (no findings for the segment)", async () => {
   const steer = checkReflection(reflectionState(), payload("/dev/null"), DEFAULT_OBSERVER_CONFIG);
   assert.match(steer, /RESULT LENS/);
   assert.match(steer, /inspect_results/);
   assert.match(steer, /record_finding/);
 });
 
-test("checkReflection: lens nudge suppressed when the segment already has findings (spec scenario)", () => {
+test("checkReflection: lens nudge suppressed when the segment already has findings (spec scenario)", async () => {
   const steer = checkReflection(reflectionState(), payload("/dev/null"), DEFAULT_OBSERVER_CONFIG, { lensDone: true });
   assert.ok(steer);
   assert.doesNotMatch(steer, /RESULT LENS/);
   assert.doesNotMatch(steer, /inspect_results/);
 });
 
-test("checkReflection: measurement health line appended; absent without context", () => {
+test("checkReflection: measurement health line appended; absent without context", async () => {
   const withLine = checkReflection(reflectionState(), payload("/dev/null"), DEFAULT_OBSERVER_CONFIG, {
     lensDone: true,
     measurementHealth: "Measurement health: изменений измерителя не зарегистрировано (здоровое состояние)",
@@ -366,7 +366,7 @@ function progressState() {
   };
 }
 
-test("checkProgress: measurement health line present with context, absent without", () => {
+test("checkProgress: measurement health line present with context, absent without", async () => {
   const dir = makeWorkDir("progress");
   const withLine = checkProgress(progressState(), payload(dir), dir, DEFAULT_OBSERVER_CONFIG, {
     measurementHealth: "Measurement health: изменений измерителя не зарегистрировано (здоровое состояние)",
@@ -405,7 +405,7 @@ function stagnationState() {
 
 const STAG_ASI = { floor: false, profiled: false, noise: false, exhausted: false };
 
-test("checkStagnation: inspection required before the council when the segment has no findings", () => {
+test("checkStagnation: inspection required before the council when the segment has no findings", async () => {
   const dir = makeWorkDir("stag");
   const steer = checkStagnation(stagnationState(), STAG_ASI, payload(dir), dir, DEFAULT_OBSERVER_CONFIG);
   assert.ok(steer);
@@ -416,7 +416,7 @@ test("checkStagnation: inspection required before the council when the segment h
   assert.ok(steer.indexOf("RESULT LENS") < steer.indexOf("COUNCIL"), "lens requirement must precede the council hint");
 });
 
-test("checkStagnation: measurement health line present with context, absent without", () => {
+test("checkStagnation: measurement health line present with context, absent without", async () => {
   const dir = makeWorkDir("stag-health");
   const withLine = checkStagnation(stagnationState(), STAG_ASI, payload(dir), dir, DEFAULT_OBSERVER_CONFIG, {
     lensDone: true,
@@ -431,7 +431,7 @@ test("checkStagnation: measurement health line present with context, absent with
   assert.doesNotMatch(without, /Measurement health/);
 });
 
-test("checkStagnation: lens requirement suppressed when inspection is done for the segment", () => {
+test("checkStagnation: lens requirement suppressed when inspection is done for the segment", async () => {
   const dir = makeWorkDir("stag-done");
   const steer = checkStagnation(stagnationState(), STAG_ASI, payload(dir), dir, DEFAULT_OBSERVER_CONFIG, { lensDone: true });
   assert.ok(steer);
@@ -449,30 +449,30 @@ function findingWith(run, evidence_ref) {
 
 const SEGMENT_RUNS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 
-test("findingTargetsSegment: run field inside the segment", () => {
+test("findingTargetsSegment: run field inside the segment", async () => {
   assert.equal(findingTargetsSegment(findingWith(2, "elsewhere:1-1"), SEGMENT_RUNS), true);
 });
 
-test("findingTargetsSegment: no run, evidence path inside the segment (review B1)", () => {
+test("findingTargetsSegment: no run, evidence path inside the segment (review B1)", async () => {
   assert.equal(findingTargetsSegment(findingWith(undefined, ".auto/runs/2/output.txt:1-2"), SEGMENT_RUNS), true);
 });
 
-test("findingTargetsSegment: leading ./ in evidence_ref is normalized before matching (review N1)", () => {
+test("findingTargetsSegment: leading ./ in evidence_ref is normalized before matching (review N1)", async () => {
   assert.equal(findingTargetsSegment(findingWith(undefined, "./.auto/runs/2/output.txt:1-2"), SEGMENT_RUNS), true);
   assert.equal(findingTargetsSegment(findingWith(undefined, ".\\.auto\\runs\\2\\output.txt:1-2"), SEGMENT_RUNS), true);
   assert.equal(findingTargetsSegment(findingWith(undefined, "./.auto/runs/999/output.txt:1-2"), SEGMENT_RUNS), false);
 });
 
-test("findingTargetsSegment: no run, evidence path in another run", () => {
+test("findingTargetsSegment: no run, evidence path in another run", async () => {
   assert.equal(findingTargetsSegment(findingWith(undefined, ".auto/runs/999/output.txt:1-1"), SEGMENT_RUNS), false);
 });
 
-test("findingTargetsSegment: evidence_ref with backslashes is normalized before matching", () => {
+test("findingTargetsSegment: evidence_ref with backslashes is normalized before matching", async () => {
   assert.equal(findingTargetsSegment(findingWith(undefined, ".auto\\runs\\2\\output.txt:1-2"), SEGMENT_RUNS), true);
   assert.equal(findingTargetsSegment(findingWith(undefined, ".auto\\runs\\999\\output.txt:1-2"), SEGMENT_RUNS), false);
 });
 
-test("findingTargetsSegment: run field wins over out-of-segment evidence, unrelated evidence never matches", () => {
+test("findingTargetsSegment: run field wins over out-of-segment evidence, unrelated evidence never matches", async () => {
   assert.equal(findingTargetsSegment(findingWith(2, ".auto/runs/999/output.txt:1-1"), SEGMENT_RUNS), true);
   assert.equal(findingTargetsSegment(findingWith(undefined, ".auto/log.jsonl:1-5"), SEGMENT_RUNS), false);
   assert.equal(findingTargetsSegment(findingWith(undefined, "src/autoruns/2/output.txt:1-1"), SEGMENT_RUNS), false);
@@ -482,7 +482,7 @@ test("findingTargetsSegment: run field wins over out-of-segment evidence, unrela
 // observer.ts — runObserver wiring (fixture campaigns)
 // ---------------------------------------------------------------------------
 
-test("runObserver reflection checkpoint: lens nudge + healthy measurement line (no findings, runs persisted)", () => {
+test("runObserver reflection checkpoint: lens nudge + healthy measurement line (no findings, runs persisted)", async () => {
   const workDir = makeWorkDir("wire-reflect");
   reflectionCampaign(workDir);
   writeRunOutput(workDir, 2);
@@ -549,7 +549,7 @@ test("runObserver reflection checkpoint: finding without run, evidence outside t
   assert.match(steer, /RESULT LENS/);
 });
 
-test("runObserver: old campaign without .auto/runs is never nudged (compat)", () => {
+test("runObserver: old campaign without .auto/runs is never nudged (compat)", async () => {
   const workDir = makeWorkDir("wire-old");
   reflectionCampaign(workDir); // ledger only, no .auto/runs
 
@@ -562,7 +562,7 @@ test("runObserver: old campaign without .auto/runs is never nudged (compat)", ()
   assert.match(steer, /Measurement health: изменений измерителя не зарегистрировано/);
 });
 
-test("runObserver stagnation: lens inspection required before the council", () => {
+test("runObserver stagnation: lens inspection required before the council", async () => {
   const workDir = makeWorkDir("wire-stag");
   stagnationCampaign(workDir);
   writeRunOutput(workDir, 1);

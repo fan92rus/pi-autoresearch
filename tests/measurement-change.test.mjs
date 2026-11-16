@@ -123,7 +123,7 @@ function symlinkDir(target, linkPath) {
 // Correct record
 // ---------------------------------------------------------------------------
 
-test("корректная запись: epoch+1, needs_verification, числа распарсены из артефакта", () => {
+test("корректная запись: epoch+1, needs_verification, числа распарсены из артефакта", async () => {
   const dir = makeWorkDir("ok");
   // Записи без epoch = эпоха 1 → первое изменение открывает эпоху 2.
   seedLedger(dir, [{ type: "config", name: "bench", metricName: "ms" }, { run: 45, metric: 1.2, status: "keep" }]);
@@ -149,7 +149,7 @@ test("корректная запись: epoch+1, needs_verification, числа
   assert.deepEqual(lines[2], rec);
 });
 
-test("epoch растёт: второе изменение открывает следующую эпоху", () => {
+test("epoch растёт: второе изменение открывает следующую эпоху", async () => {
   const dir = makeWorkDir("epochs");
   seedLedger(dir, [{ type: "measurement_change", epoch: 2, needs_verification: true }]);
 
@@ -163,7 +163,7 @@ test("epoch растёт: второе изменение открывает с�
   assert.equal(ledgerCount(dir, "measurement_change"), 3);
 });
 
-test("артефакт в markdown-обёртке ``` читается", () => {
+test("артефакт в markdown-обёртке ``` читается", async () => {
   const dir = makeWorkDir("fenced");
   const fenced = "```json\n" + JSON.stringify(FULL_ARTIFACT, null, 2) + "\n```";
   const res = logMeasurementChange(dir, {
@@ -181,7 +181,7 @@ test("артефакт в markdown-обёртке ``` читается", () => {
 // Rejections: diff / artifact / justification
 // ---------------------------------------------------------------------------
 
-test("отказ: нет diff_ref — требование зафиксировать дифф в .auto/measurement/", () => {
+test("отказ: нет diff_ref — требование зафиксировать дифф в .auto/measurement/", async () => {
   const dir = makeWorkDir("no-diff");
   const input = validInput(dir);
   delete input.diff_ref;
@@ -193,7 +193,7 @@ test("отказ: нет diff_ref — требование зафиксиров�
   assert.equal(fs.existsSync(path.join(dir, ".auto", "log.jsonl")), false, "rejected call must not write the ledger");
 });
 
-test("отказ: diff_ref не существует", () => {
+test("отказ: diff_ref не существует", async () => {
   const dir = makeWorkDir("diff-missing");
   const input = validInput(dir);
   input.diff_ref = ".auto/measurement/missing.diff";
@@ -204,7 +204,7 @@ test("отказ: diff_ref не существует", () => {
   assert.equal(fs.existsSync(path.join(dir, ".auto", "log.jsonl")), false);
 });
 
-test("отказ: diff_ref внутри workDir, но вне .auto/measurement/", () => {
+test("отказ: diff_ref внутри workDir, но вне .auto/measurement/", async () => {
   const dir = makeWorkDir("diff-wrongdir");
   const input = validInput(dir);
   input.diff_ref = writeMeasurementFile(dir, "eval/gold_v16.diff", "--- a\n+++ b\n");
@@ -215,7 +215,7 @@ test("отказ: diff_ref внутри workDir, но вне .auto/measurement/"
   assert.match(text, /путь должен находиться в \.auto\/measurement\//);
 });
 
-test("отказ: пустой дифф", () => {
+test("отказ: пустой дифф", async () => {
   const dir = makeWorkDir("diff-empty");
   const input = validInput(dir);
   input.diff_ref = writeMeasurementFile(dir, ".auto/measurement/empty.diff", "   \n");
@@ -225,7 +225,7 @@ test("отказ: пустой дифф", () => {
   assert.match(text, /diff_ref: ".*" пуст/);
 });
 
-test("отказ: нет rescore_ref", () => {
+test("отказ: нет rescore_ref", async () => {
   const dir = makeWorkDir("no-rescore");
   const input = validInput(dir);
   delete input.rescore_ref;
@@ -238,7 +238,7 @@ test("отказ: нет rescore_ref", () => {
   assert.equal(fs.existsSync(path.join(dir, ".auto", "log.jsonl")), false);
 });
 
-test("отказ: rescore_ref не существует", () => {
+test("отказ: rescore_ref не существует", async () => {
   const dir = makeWorkDir("rescore-missing");
   const input = validInput(dir);
   input.rescore_ref = ".auto/measurement/e2/absent.md";
@@ -248,7 +248,7 @@ test("отказ: rescore_ref не существует", () => {
   assert.match(text, /rescore_ref: "\.auto\/measurement\/e2\/absent\.md": файл не найден/);
 });
 
-test("отказ: нет justification", () => {
+test("отказ: нет justification", async () => {
   const dir = makeWorkDir("no-just");
   const input = validInput(dir);
   delete input.justification;
@@ -259,7 +259,7 @@ test("отказ: нет justification", () => {
   assert.equal(fs.existsSync(path.join(dir, ".auto", "log.jsonl")), false);
 });
 
-test("justification: несуществующий finding id отвергается, существующий принимается", () => {
+test("justification: несуществующий finding id отвергается, существующий принимается", async () => {
   const dir = makeWorkDir("just-finding");
   const input = validInput(dir);
   const outRel = writeMeasurementFile(dir, ".auto/runs/45/output.txt", "MISMATCH gold=заместитель pred=зампред\n");
@@ -268,7 +268,7 @@ test("justification: несуществующий finding id отвергает�
   assert.match(bad, /justification: "f99" — находка с таким id не найдена/);
   assert.equal(fs.existsSync(path.join(dir, ".auto", "log.jsonl")), false);
 
-  const created = recordFinding(dir, {
+  const created = await recordFinding(dir, {
     theme: "measurement",
     description: "scorer double-counts form variants",
     evidence_ref: `${outRel}:1`,
@@ -284,7 +284,7 @@ test("justification: несуществующий finding id отвергает�
 // Pending
 // ---------------------------------------------------------------------------
 
-test("pending: артефакт с якорем и командами без оценок → запись pending, эпоха открыта без завершения", () => {
+test("pending: артефакт с якорем и командами без оценок → запись pending, эпоха открыта без завершения", async () => {
   const dir = makeWorkDir("pending");
   const res = logMeasurementChange(dir, {
     diff_ref: writeDiff(dir),
@@ -304,7 +304,7 @@ test("pending: артефакт с якорем и командами без о�
   assert.deepEqual(readLedger(dir), [rec]);
 });
 
-test("отказ: артефакт без оценок, а rescore_pending не установлен", () => {
+test("отказ: артефакт без оценок, а rescore_pending не установлен", async () => {
   const dir = makeWorkDir("pending-noflag");
   const text = errorsOf(logMeasurementChange(dir, {
     diff_ref: writeDiff(dir),
@@ -317,7 +317,7 @@ test("отказ: артефакт без оценок, а rescore_pending не 
   assert.equal(fs.existsSync(path.join(dir, ".auto", "log.jsonl")), false);
 });
 
-test("rescore_pending: true при полном артефакте — оценки записаны, pending-флага нет (артефакт — источник истины)", () => {
+test("rescore_pending: true при полном артефакте — оценки записаны, pending-флага нет (артефакт — источник истины)", async () => {
   const dir = makeWorkDir("pending-full");
   const res = logMeasurementChange(dir, { ...validInput(dir), rescore_pending: true }, FIXED_NOW);
 
@@ -331,7 +331,7 @@ test("rescore_pending: true при полном артефакте — оцен�
 // Completion of a pending change (numbers from the FULL artifact)
 // ---------------------------------------------------------------------------
 
-test("завершение pending: measurement_change_completed в той же эпохе, числа из полного артефакта", () => {
+test("завершение pending: measurement_change_completed в той же эпохе, числа из полного артефакта", async () => {
   const dir = makeWorkDir("complete");
   const rescoreRel = ".auto/measurement/e2/rescore.md";
   const pending = logMeasurementChange(dir, {
@@ -361,7 +361,7 @@ test("завершение pending: measurement_change_completed в той же 
   assert.deepEqual(readLedger(dir)[1], rec);
 });
 
-test("завершение: change_ref без префикса e нормализуется в e<n>", () => {
+test("завершение: change_ref без префикса e нормализуется в e<n>", async () => {
   const dir = makeWorkDir("complete-bare");
   assert.equal(logMeasurementChange(dir, {
     diff_ref: writeDiff(dir),
@@ -376,7 +376,7 @@ test("завершение: change_ref без префикса e нормали�
   assert.equal(res.value.change_ref, "e2");
 });
 
-test("отказ завершения: неизвестный change_ref, не-pending изменение, повторное завершение, неполный артефакт", () => {
+test("отказ завершения: неизвестный change_ref, не-pending изменение, повторное завершение, неполный артефакт", async () => {
   const dir = makeWorkDir("complete-rejects");
 
   // Ни одного изменения в леджере:
@@ -424,7 +424,7 @@ test("отказ завершения: неизвестный change_ref, не-p
 // Paths outside workDir
 // ---------------------------------------------------------------------------
 
-test("отказ: путь вне workDir (абсолютный и относительный выход за корень)", () => {
+test("отказ: путь вне workDir (абсолютный и относительный выход за корень)", async () => {
   const dir = makeWorkDir("outside");
   const sibling = makeWorkDir("outside-sibling");
   const outsideDiff = path.join(sibling, "evil.diff");
@@ -541,7 +541,7 @@ test("отказ: каталог .auto/measurement — junction на катал�
 // Broken artifacts
 // ---------------------------------------------------------------------------
 
-test("битый артефакт: не-JSON, массив, нет anchor, пустые commands, строковая оценка", () => {
+test("битый артефакт: не-JSON, массив, нет anchor, пустые commands, строковая оценка", async () => {
   const dir = makeWorkDir("broken");
   const cases = [
     { content: "это вообще не json", match: /не читается как JSON/ },

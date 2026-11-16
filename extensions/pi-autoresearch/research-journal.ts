@@ -27,7 +27,7 @@ export const JOURNAL_LOCK_RETRY_COUNT = 40;
 /** Pause between lock attempts, outside the critical section. */
 export const JOURNAL_LOCK_RETRY_DELAY_MS = 50;
 
-export type JournalName = "observations" | "analysis" | "run-links";
+export type JournalName = "observations" | "analysis" | "run-links" | "findings";
 
 export interface JournalTarget {
   readonly name: JournalName;
@@ -43,6 +43,7 @@ const BUSY_CODES: Record<JournalName, string> = {
   observations: "observation_lock_busy",
   analysis: "analysis_lock_busy",
   "run-links": "run_links_lock_busy",
+  findings: "findings_lock_busy",
 };
 
 /** Build the file and lock paths of one of the three research-map journals. */

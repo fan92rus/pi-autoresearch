@@ -63,8 +63,8 @@ function finding(description, evidence, extra = {}) {
 }
 
 /** Create one finding and return its id (asserting success). */
-function seed(workDir, description, evidence, extra = {}) {
-  const res = recordFinding(workDir, finding(description, evidence, extra), FIXED_NOW);
+async function seed(workDir, description, evidence, extra = {}) {
+  const res = await recordFinding(workDir, finding(description, evidence, extra), FIXED_NOW);
   assert.equal(res.ok, true, res.ok ? "" : res.errors.join("; "));
   return res.value.id;
 }
@@ -73,38 +73,38 @@ function seed(workDir, description, evidence, extra = {}) {
 // Pattern check: positive examples
 // ---------------------------------------------------------------------------
 
-test("claim patterns: «0/N» флагует заявление о нулевом охвате (пример из спеки)", () => {
+test("claim patterns: «0/N» флагует заявление о нулевом охвате (пример из спеки)", async () => {
   assert.equal(needsVerificationClaim("FN-replay: 0/87 недостижимы"), true);
   assert.equal(needsVerificationClaim("Совпадений 0/12 в dev-окне"), true);
   assert.equal(needsVerificationClaim("0/0 кандидатов"), true);
 });
 
-test("claim patterns: «unreachable» и «impossible» флагуют без учёта регистра", () => {
+test("claim patterns: «unreachable» и «impossible» флагуют без учёта регистра", async () => {
   assert.equal(needsVerificationClaim("Ветка правила unreachable для gold-форм"), true);
   assert.equal(needsVerificationClaim("UNREACHABLE: путь не вызывается"), true);
   assert.equal(needsVerificationClaim("Совпадение impossible при текущем нормализаторе"), true);
   assert.equal(needsVerificationClaim("Impossible to hit with dev split"), true);
 });
 
-test("claim patterns: «никогда не» флагует в любом регистре", () => {
+test("claim patterns: «никогда не» флагует в любом регистре", async () => {
   assert.equal(needsVerificationClaim("Для формы зампред правило никогда не срабатывает"), true);
   assert.equal(needsVerificationClaim("Никогда не попадает в gold-набор"), true);
   assert.equal(needsVerificationClaim("значение  никогда   не сравнивается"), true);
 });
 
-test("claim patterns: «recall 0» флагует нулевой recall, включая 0.0 и конец предложения", () => {
+test("claim patterns: «recall 0» флагует нулевой recall, включая 0.0 и конец предложения", async () => {
   assert.equal(needsVerificationClaim("recall 0 на dev-окне"), true);
   assert.equal(needsVerificationClaim("Recall 0)"), true);
   assert.equal(needsVerificationClaim("вариант дал recall 0.0 на всех прогонах"), true);
   assert.equal(needsVerificationClaim("вариант дал recall 0."), true);
 });
 
-test("claim patterns: флаг ставится для любой темы, не только measurement", () => {
+test("claim patterns: флаг ставится для любой темы, не только measurement", async () => {
   // Spec: "Находка с темой measurement (или любая находка)".
   for (const theme of ["measurement", "behavior", "capability", "tradeoff"]) {
     const dir = makeWorkDir(`theme-ok-${theme}`);
     const rel = writeRunOutput(dir);
-    const res = recordFinding(
+    const res = await recordFinding(
       dir,
       { theme, description: "FN-replay: 0/87 недостижимы", evidence_ref: `${rel}:125` },
       FIXED_NOW,
@@ -118,7 +118,7 @@ test("claim patterns: флаг ставится для любой темы, не
 // Pattern check: negative examples (must not flag)
 // ---------------------------------------------------------------------------
 
-test("claim patterns: «recall» с ненулевым значением не флагуется", () => {
+test("claim patterns: «recall» с ненулевым значением не флагуется", async () => {
   assert.equal(needsVerificationClaim("recall 0.85 на dev-окне"), false);
   assert.equal(needsVerificationClaim("recall 0,85 на dev-окне"), false);
   assert.equal(needsVerificationClaim("recall 0.05 после правки"), false);
@@ -127,14 +127,14 @@ test("claim patterns: «recall» с ненулевым значением не �
   assert.equal(needsVerificationClaim("recall 1.0"), false);
 });
 
-test("claim patterns: «0/N» внутри большего числа не флагуется", () => {
+test("claim patterns: «0/N» внутри большего числа не флагуется", async () => {
   assert.equal(needsVerificationClaim("ошибок 10/87"), false);
   assert.equal(needsVerificationClaim("доля 20/87 от всех"), false);
   assert.equal(needsVerificationClaim("доля 1/0 не определена"), false);
   assert.equal(needsVerificationClaim("версия 1.0/87"), false);
 });
 
-test("claim patterns: обычные описания и близкие слова не флагуются", () => {
+test("claim patterns: обычные описания и близкие слова не флагуются", async () => {
   assert.equal(needsVerificationClaim("Зампред штрафуется как ошибка, хотя совпадает с gold"), false);
   assert.equal(needsVerificationClaim("Ветка reachable и вызывается на всех прогонах"), false);
   assert.equal(needsVerificationClaim("Possible regression in the parser"), false);
@@ -146,11 +146,11 @@ test("claim patterns: обычные описания и близкие слов
 // record_finding: the flag is written and never blocks
 // ---------------------------------------------------------------------------
 
-test("record_finding: описание с шаблоном получает needs_verification и пишется в строку finding", () => {
+test("record_finding: описание с шаблоном получает needs_verification и пишется в строку finding", async () => {
   const dir = makeWorkDir("record-flag");
   const rel = writeRunOutput(dir);
 
-  const res = recordFinding(dir, finding("FN-replay: 0/87 недостижимы", `${rel}:125`), FIXED_NOW);
+  const res = await recordFinding(dir, finding("FN-replay: 0/87 недостижимы", `${rel}:125`), FIXED_NOW);
 
   assert.equal(res.ok, true, res.ok ? "" : res.errors.join("; "));
   assert.equal(res.value.needs_verification, true);
@@ -160,11 +160,11 @@ test("record_finding: описание с шаблоном получает need
   assert.equal(loadFindings(dir).value.findings.get(res.value.id).needs_verification, true);
 });
 
-test("record_finding: описание без шаблона не получает поле в записи и во view", () => {
+test("record_finding: описание без шаблона не получает поле в записи и во view", async () => {
   const dir = makeWorkDir("record-noflag");
   const rel = writeRunOutput(dir);
 
-  const res = recordFinding(dir, finding("Зампред штрафуется дважды", `${rel}:125`), FIXED_NOW);
+  const res = await recordFinding(dir, finding("Зампред штрафуется дважды", `${rel}:125`), FIXED_NOW);
 
   assert.equal(res.ok, true);
   assert.equal("needs_verification" in res.value, false);
@@ -172,25 +172,25 @@ test("record_finding: описание без шаблона не получае
   assert.equal(loadFindings(dir).value.findings.get(res.value.id).needs_verification, false);
 });
 
-test("record_finding: флаг не блокирует запись и не требует владельца", () => {
+test("record_finding: флаг не блокирует запись и не требует владельца", async () => {
   const dir = makeWorkDir("record-nonblocking");
   const rel = writeRunOutput(dir);
 
   // Flagged claim with a valid evidence_ref: accepted in one call, no owner step.
-  const created = recordFinding(dir, finding("impossible: ветка никогда не достигается", `${rel}:125`), FIXED_NOW);
+  const created = await recordFinding(dir, finding("impossible: ветка никогда не достигается", `${rel}:125`), FIXED_NOW);
   assert.equal(created.ok, true, created.ok ? "" : created.errors.join("; "));
   assert.equal(created.value.status, "open");
 
   // The cycle continues: the flagged finding can be deferred without any evidence.
-  const deferred = updateFinding(dir, { id: created.value.id, status: "deferred" }, LATER);
+  const deferred = await updateFinding(dir, { id: created.value.id, status: "deferred" }, LATER);
   assert.equal(deferred.ok, true, deferred.ok ? "" : deferred.errors.join("; "));
 });
 
-test("record_finding: флаг не отменяет остальные проверки evidence_ref", () => {
+test("record_finding: флаг не отменяет остальные проверки evidence_ref", async () => {
   const dir = makeWorkDir("record-still-validated");
   writeRunOutput(dir);
 
-  const noEvidence = recordFinding(dir, finding("0/87 недостижимы", undefined), FIXED_NOW);
+  const noEvidence = await recordFinding(dir, finding("0/87 недостижимы", undefined), FIXED_NOW);
   assert.equal(noEvidence.ok, false);
   assert.match(noEvidence.errors.join("\n"), /evidence_ref: отсутствует/);
   assert.equal(fs.existsSync(path.join(dir, ".auto", FINDINGS_FILE)), false);
@@ -200,12 +200,12 @@ test("record_finding: флаг не отменяет остальные пров
 // update_finding: the flag is re-set on transitions and kept by the fold
 // ---------------------------------------------------------------------------
 
-test("update_finding: переход находки с шаблоном ставит флаг в строке finding_transition", () => {
+test("update_finding: переход находки с шаблоном ставит флаг в строке finding_transition", async () => {
   const dir = makeWorkDir("transition-flag");
   const rel = writeRunOutput(dir);
-  const id = seed(dir, "FN-replay: 0/87 недостижимы", `${rel}:125`);
+  const id = await seed(dir, "FN-replay: 0/87 недостижимы", `${rel}:125`);
 
-  const res = updateFinding(dir, { id, status: "verified", evidence_ref: `${rel}#MISMATCH gold=` }, LATER);
+  const res = await updateFinding(dir, { id, status: "verified", evidence_ref: `${rel}#MISMATCH gold=` }, LATER);
 
   assert.equal(res.ok, true, res.ok ? "" : res.errors.join("; "));
   assert.equal(res.value.needs_verification, true);
@@ -213,19 +213,19 @@ test("update_finding: переход находки с шаблоном став
   assert.equal(loadFindings(dir).value.findings.get(id).needs_verification, true);
 });
 
-test("update_finding: переход находки без шаблона не добавляет флаг", () => {
+test("update_finding: переход находки без шаблона не добавляет флаг", async () => {
   const dir = makeWorkDir("transition-noflag");
   const rel = writeRunOutput(dir);
-  const id = seed(dir, "Зампред штрафуется дважды", `${rel}:125`);
+  const id = await seed(dir, "Зампред штрафуется дважды", `${rel}:125`);
 
-  const res = updateFinding(dir, { id, status: "verified", evidence_ref: `${rel}#MISMATCH gold=` }, LATER);
+  const res = await updateFinding(dir, { id, status: "verified", evidence_ref: `${rel}#MISMATCH gold=` }, LATER);
 
   assert.equal(res.ok, true);
   assert.equal("needs_verification" in readJsonl(dir).at(-1), false);
   assert.equal(loadFindings(dir).value.findings.get(id).needs_verification, false);
 });
 
-test("update_finding: старая запись без флага получает его при первом переходе", () => {
+test("update_finding: старая запись без флага получает его при первом переходе", async () => {
   const dir = makeWorkDir("transition-legacy");
   const rel = writeRunOutput(dir);
   // Pre-flag store: the creation line has no needs_verification.
@@ -242,21 +242,21 @@ test("update_finding: старая запись без флага получае
   fs.writeFileSync(path.join(dir, ".auto", FINDINGS_FILE), JSON.stringify(legacy) + "\n", "utf-8");
   assert.equal(loadFindings(dir).value.findings.get("f1").needs_verification, false);
 
-  const res = updateFinding(dir, { id: "f1", status: "deferred" }, LATER);
+  const res = await updateFinding(dir, { id: "f1", status: "deferred" }, LATER);
 
   assert.equal(res.ok, true, res.ok ? "" : res.errors.join("; "));
   assert.equal(res.value.needs_verification, true);
   assert.equal(loadFindings(dir).value.findings.get("f1").needs_verification, true);
 });
 
-test("update_finding: флаг сохраняется через verified → revised (контрпример не снимает пометку)", () => {
+test("update_finding: флаг сохраняется через verified → revised (контрпример не снимает пометку)", async () => {
   const dir = makeWorkDir("transition-chain");
   const rel = writeRunOutput(dir);
-  const id = seed(dir, "FN-replay: 0/87 недостижимы", `${rel}:125`);
-  const verified = updateFinding(dir, { id, status: "verified", evidence_ref: `${rel}#MISMATCH gold=` }, LATER);
+  const id = await seed(dir, "FN-replay: 0/87 недостижимы", `${rel}:125`);
+  const verified = await updateFinding(dir, { id, status: "verified", evidence_ref: `${rel}#MISMATCH gold=` }, LATER);
   assert.equal(verified.ok, true, verified.ok ? "" : verified.errors.join("; "));
 
-  const revised = updateFinding(dir, { id, status: "revised", evidence_ref: `${rel}:120-130` }, LATER);
+  const revised = await updateFinding(dir, { id, status: "revised", evidence_ref: `${rel}:120-130` }, LATER);
 
   assert.equal(revised.ok, true, revised.ok ? "" : revised.errors.join("; "));
   assert.equal(loadFindings(dir).value.findings.get(id).status, "revised");
@@ -264,13 +264,13 @@ test("update_finding: флаг сохраняется через verified → re
   assert.equal(readJsonl(dir).at(-1).needs_verification, true);
 });
 
-test("update_finding: флаг не мешает карте переходов — запрещённый переход отвергается как раньше", () => {
+test("update_finding: флаг не мешает карте переходов — запрещённый переход отвергается как раньше", async () => {
   const dir = makeWorkDir("transition-forbidden");
   const rel = writeRunOutput(dir);
-  const id = seed(dir, "FN-replay: 0/87 недостижимы", `${rel}:125`);
-  updateFinding(dir, { id, status: "verified", evidence_ref: `${rel}#MISMATCH gold=` }, LATER);
+  const id = await seed(dir, "FN-replay: 0/87 недостижимы", `${rel}:125`);
+  await updateFinding(dir, { id, status: "verified", evidence_ref: `${rel}#MISMATCH gold=` }, LATER);
 
-  const res = updateFinding(dir, { id, status: "open" }, LATER);
+  const res = await updateFinding(dir, { id, status: "open" }, LATER);
 
   assert.equal(res.ok, false);
   assert.match(res.errors.join("\n"), /verified → open запрещён/);

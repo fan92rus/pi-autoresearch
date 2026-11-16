@@ -214,39 +214,39 @@ function writeIdeas(workDir) {
   fs.writeFileSync(path.join(dir, "n2.md"), "---\nnode: n2\n---\nregistered hypothesis\n", "utf-8");
 }
 
-function seedFindings(workDir) {
+async function seedFindings(workDir) {
   const mk = (theme, description, evidence_ref, extra = {}) => ({ theme, description, evidence_ref, ...extra });
-  const r1 = recordFinding(
+  const r1 = await recordFinding(
     workDir,
     mk("measurement", "Правило недостижимо (unreachable) для верных форм: 0/87 примеров в dev-окне", ".auto/runs/5/output.txt:2-4", { run: 5, estimated_impact: "~14% всех ошибок" }),
     FIXED_NOW,
   );
   assert.equal(r1.ok, true, r1.ok ? "" : r1.errors.join("; "));
-  const r2 = recordFinding(
+  const r2 = await recordFinding(
     workDir,
     mk("behavior", "Дубликаты гипотез повторяют discard-ветку без изменения предположения", ".auto/runs/5/output.txt#MISMATCH gold=", { run: 5 }),
     FIXED_NOW,
   );
   assert.equal(r2.ok, true, r2.ok ? "" : r2.errors.join("; "));
-  const r3 = recordFinding(
+  const r3 = await recordFinding(
     workDir,
     mk("capability", "Кэш-френдли структура данных не попробована — нужно решение о направлении", ".auto/runs/5/output.txt:6-8", { estimated_impact: "~8% потенциала" }),
     FIXED_NOW,
   );
   assert.equal(r3.ok, true, r3.ok ? "" : r3.errors.join("; "));
-  const r4 = recordFinding(
+  const r4 = await recordFinding(
     workDir,
     mk("tradeoff", "Точность против задержки: развилка не выбрана", ".auto/runs/5/output.txt:7-8"),
     FIXED_NOW,
   );
   assert.equal(r4.ok, true, r4.ok ? "" : r4.errors.join("; "));
-  const r5 = recordFinding(
+  const r5 = await recordFinding(
     workDir,
     mk("measurement", "Шум между запусками до 2% без признаков недостижимости", ".auto/runs/1/output.txt:1-2", { run: 1 }),
     FIXED_NOW,
   );
   assert.equal(r5.ok, true, r5.ok ? "" : r5.errors.join("; "));
-  const v2 = updateFinding(
+  const v2 = await updateFinding(
     workDir,
     { id: r2.value.id, status: "verified", evidence_ref: ".auto/runs/5/output.txt:5-6", note: "подтверждено повторным чтением" },
     LATER,
@@ -255,7 +255,7 @@ function seedFindings(workDir) {
 }
 
 /** Full fixture campaign; `withFindings: false` leaves findings.jsonl absent. */
-function buildFullCampaign(label, { withFindings = true } = {}) {
+async function buildFullCampaign(label, { withFindings = true } = {}) {
   const dir = makeWorkDir(label);
   writeLedger(dir);
   fs.writeFileSync(path.join(dir, "measurer.py"), MEASURER, "utf-8");
@@ -297,7 +297,7 @@ function buildFullCampaign(label, { withFindings = true } = {}) {
     JSON.stringify({ noiseFloor: 0.04, noiseFloorUnit: "metric", noiseFloorEpoch: 2 }),
     "utf-8",
   );
-  if (withFindings) seedFindings(dir);
+  if (withFindings) await seedFindings(dir);
   return dir;
 }
 
@@ -323,8 +323,8 @@ function sectionOf(report, title, nextTitle) {
 // Полный отчёт fixture-кампании
 // ---------------------------------------------------------------------------
 
-test("полный отчёт: семь секций, заголовок кампании, без служебного мусора", () => {
-  const dir = buildFullCampaign("full");
+test("полный отчёт: семь секций, заголовок кампании, без служебного мусора", async () => {
+  const dir = await buildFullCampaign("full");
   const report = buildReport(dir);
 
   assertSevenSections(report);
@@ -334,8 +334,8 @@ test("полный отчёт: семь секций, заголовок кам�
   assert.ok(!report.includes("NaN"));
 });
 
-test("полный отчёт: секция 1 — прогоны, метрики активной эпохи, инвентарь артефактов", () => {
-  const dir = buildFullCampaign("full-runs");
+test("полный отчёт: секция 1 — прогоны, метрики активной эпохи, инвентарь артефактов", async () => {
+  const dir = await buildFullCampaign("full-runs");
   const s1 = sectionOf(buildReport(dir), S1, S2);
 
   assert.ok(s1.includes("Метрика: accuracy · лучше: больше"));
@@ -365,8 +365,8 @@ test("полный отчёт: секция 1 — прогоны, метрики
   assert.ok(s1.includes("команда /autoresearch report — промежуточный отчёт по кампании"));
 });
 
-test("полный отчёт: секция 2 — находки по темам со статусами и флагом", () => {
-  const dir = buildFullCampaign("full-findings");
+test("полный отчёт: секция 2 — находки по темам со статусами и флагом", async () => {
+  const dir = await buildFullCampaign("full-findings");
   const s2 = sectionOf(buildReport(dir), S2, S3);
 
   assert.ok(s2.includes("### measurement (2)"));
@@ -382,8 +382,8 @@ test("полный отчёт: секция 2 — находки по темам
   assert.ok(!/- f5 \[needs_verification\]/.test(s2));
 });
 
-test("полный отчёт: секция 3 — measurement-трек с эпохами и верификацией", () => {
-  const dir = buildFullCampaign("full-measure");
+test("полный отчёт: секция 3 — measurement-трек с эпохами и верификацией", async () => {
+  const dir = await buildFullCampaign("full-measure");
   const s3 = sectionOf(buildReport(dir), S3, S4);
 
   assert.ok(s3.includes("Активная шкала: эпоха 2 · счётчик эпох: 2."));
@@ -396,8 +396,8 @@ test("полный отчёт: секция 3 — measurement-трек с эпо
   assert.ok(s3.includes("e2/rescore.md"));
 });
 
-test("полный отчёт: секция 4 — шум и уверенность", () => {
-  const dir = buildFullCampaign("full-noise");
+test("полный отчёт: секция 4 — шум и уверенность", async () => {
+  const dir = await buildFullCampaign("full-noise");
   const s4 = sectionOf(buildReport(dir), S4, S5);
 
   // floor 0.04, калиброван на эпохе 2, активная шкала — эпоха 2: свежий
@@ -407,8 +407,8 @@ test("полный отчёт: секция 4 — шум и уверенност
   assert.ok(s4.includes("baseline 0.61 → лучший 0.66"));
 });
 
-test("полный отчёт: секция 5 — исчерпанные каналы и неразобранные идеи", () => {
-  const dir = buildFullCampaign("full-ideas");
+test("полный отчёт: секция 5 — исчерпанные каналы и неразобранные идеи", async () => {
+  const dir = await buildFullCampaign("full-ideas");
   const s5 = sectionOf(buildReport(dir), S5, S6);
 
   assert.ok(s5.includes("Исчерпанные каналы (семейства отклонённых гипотез):"));
@@ -420,8 +420,8 @@ test("полный отчёт: секция 5 — исчерпанные кан�
   assert.ok(!s5.includes("n2.md"), "файл гипотезы с frontmatter не является неразобранной идеей");
 });
 
-test("полный отчёт: секция 6 — owner-input gates без measurement-находок, контроль чист", () => {
-  const dir = buildFullCampaign("full-gates");
+test("полный отчёт: секция 6 — owner-input gates без measurement-находок, контроль чист", async () => {
+  const dir = await buildFullCampaign("full-gates");
   const report = buildReport(dir);
   const s6 = sectionOf(report, S6, S7);
 
@@ -437,8 +437,8 @@ test("полный отчёт: секция 6 — owner-input gates без measu
   assert.ok(s6.includes("Ограничения контроля: нет данных (нарушений контроля не обнаружено)"));
 });
 
-test("полный отчёт: секция 7 — сводка", () => {
-  const dir = buildFullCampaign("full-summary");
+test("полный отчёт: секция 7 — сводка", async () => {
+  const dir = await buildFullCampaign("full-summary");
   const s7 = sectionOf(buildReport(dir), S7, null);
 
   assert.ok(s7.includes('- Кампания: "fixture-campaign" · метрика accuracy · лучше: больше'));
@@ -453,8 +453,8 @@ test("полный отчёт: секция 7 — сводка", () => {
 // Отчёт без находок
 // ---------------------------------------------------------------------------
 
-test("отчёт без находок: «линза не применялась», остальные секции строятся", () => {
-  const dir = buildFullCampaign("no-findings", { withFindings: false });
+test("отчёт без находок: «линза не применялась», остальные секции строятся", async () => {
+  const dir = await buildFullCampaign("no-findings", { withFindings: false });
   const report = buildReport(dir);
 
   assertSevenSections(report);
@@ -473,7 +473,7 @@ test("отчёт без находок: «линза не применялась
 // Отчёт пустой кампании
 // ---------------------------------------------------------------------------
 
-test("пустая кампания: все семь секций с явными отметками, генератор не падает", () => {
+test("пустая кампания: все семь секций с явными отметками, генератор не падает", async () => {
   const dir = makeWorkDir("empty");
   const report = buildReport(dir);
 
@@ -500,8 +500,8 @@ test("пустая кампания: все семь секций с явным�
 // Идемпотентность
 // ---------------------------------------------------------------------------
 
-test("идемпотентность: два вызова на неизменных данных — одинаковый вывод", () => {
-  const dir = buildFullCampaign("idempotent");
+test("идемпотентность: два вызова на неизменных данных — одинаковый вывод", async () => {
+  const dir = await buildFullCampaign("idempotent");
   const first = buildReport(dir);
   const second = buildReport(dir);
   const third = buildReport(dir);
@@ -513,10 +513,10 @@ test("идемпотентность: два вызова на неизменн�
   assert.ok(!first.includes("сгенерирован"));
 });
 
-test("идемпотентность: вывод меняется вместе с данными, а не между вызовами", () => {
-  const dir = buildFullCampaign("idem-data");
+test("идемпотентность: вывод меняется вместе с данными, а не между вызовами", async () => {
+  const dir = await buildFullCampaign("idem-data");
   const before = buildReport(dir);
-  const res = recordFinding(
+  const res = await recordFinding(
     dir,
     { theme: "behavior", description: "Новая находка после первого отчёта", evidence_ref: ".auto/runs/1/output.txt:1-2", run: 1 },
     LATER,
@@ -533,8 +533,8 @@ test("идемпотентность: вывод меняется вместе �
 // needs_verification
 // ---------------------------------------------------------------------------
 
-test("needs_verification: попадает в очередь проверки с пометкой, вне owner-гейтов", () => {
-  const dir = buildFullCampaign("verification");
+test("needs_verification: попадает в очередь проверки с пометкой, вне owner-гейтов", async () => {
+  const dir = await buildFullCampaign("verification");
   const report = buildReport(dir);
   const s2 = sectionOf(report, S2, S3);
 
@@ -554,9 +554,9 @@ test("needs_verification: попадает в очередь проверки с
   assert.ok(!s6.includes("unreachable"));
 });
 
-test("needs_verification: deferred-находка с флагом остаётся в очереди, verified — нет", () => {
-  const dir = buildFullCampaign("verification-deferred");
-  const d1 = updateFinding(
+test("needs_verification: deferred-находка с флагом остаётся в очереди, verified — нет", async () => {
+  const dir = await buildFullCampaign("verification-deferred");
+  const d1 = await updateFinding(
     dir,
     { id: "f1", status: "deferred", note: "отложено до следующей эпохи" },
     LATER,
@@ -573,10 +573,10 @@ test("needs_verification: deferred-находка с флагом остаётс
   assert.ok(s7.includes("требуют независимой проверки 1"));
 });
 
-test("needs_verification: behavior-находка с флагом и статусом open не попадает в очередь проверки", () => {
-  const dir = buildFullCampaign("verification-behavior");
+test("needs_verification: behavior-находка с флагом и статусом open не попадает в очередь проверки", async () => {
+  const dir = await buildFullCampaign("verification-behavior");
   // описание с паттерном unreachable → флаг needs_verification ставится findings.ts
-  const b = recordFinding(
+  const b = await recordFinding(
     dir,
     { theme: "behavior", description: "Ветка повтора unreachable при пустом кэше", evidence_ref: ".auto/runs/5/output.txt:2-4", run: 5 },
     LATER,
@@ -599,9 +599,9 @@ test("needs_verification: behavior-находка с флагом и стату�
   assert.ok(s7.includes("требуют независимой проверки 1"));
 });
 
-test("owner-input gates: capability-находка попадает в гейт при любом статусе", () => {
-  const dir = buildFullCampaign("gates-verified");
-  const v3 = updateFinding(
+test("owner-input gates: capability-находка попадает в гейт при любом статусе", async () => {
+  const dir = await buildFullCampaign("gates-verified");
+  const v3 = await updateFinding(
     dir,
     { id: "f3", status: "verified", evidence_ref: ".auto/runs/5/output.txt:6-8", note: "направление подтверждено" },
     LATER,

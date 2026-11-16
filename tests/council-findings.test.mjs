@@ -39,7 +39,7 @@ function makeWorkDir(label) {
 }
 
 /** Ledger with runs 1–3 in segment 0 (no segment restarts → currentSegment 0). */
-function plantLedger(dir) {
+async function plantLedger(dir) {
   const autoDir = path.join(dir, ".auto");
   fs.mkdirSync(autoDir, { recursive: true });
   const lines = [JSON.stringify({ type: "config", name: "bench", metricName: "ms", metricUnit: "ms", bestDirection: "lower" })];
@@ -68,13 +68,13 @@ const BRIEF_INPUT = {
   goal: "bench",
 };
 
-function buildInto(dir) {
+async function buildInto(dir) {
   return buildBrief(dir, path.join(dir, ".auto", "councils", "1"), BRIEF_INPUT);
 }
 
 /** Two open findings (one flagged) + one deferred finding that must not show. */
-function plantFindings(dir, evidenceRef) {
-  const flagged = recordFinding(dir, {
+async function plantFindings(dir, evidenceRef) {
+  const flagged = await recordFinding(dir, {
     theme: "measurement",
     description: "FN-replay: 0/87 unreachable — form variants of correct facts never scored",
     evidence_ref: `${evidenceRef}:1-2`,
@@ -82,7 +82,7 @@ function plantFindings(dir, evidenceRef) {
     run: 3,
   });
   assert.equal(flagged.ok, true, `fixture finding f1 rejected: ${JSON.stringify(flagged)}`);
-  const plain = recordFinding(dir, {
+  const plain = await recordFinding(dir, {
     theme: "behavior",
     description: "Form variants of correct facts are scored as mismatches (зампред vs заместитель)",
     evidence_ref: `${evidenceRef}#MISMATCH`,
@@ -90,14 +90,14 @@ function plantFindings(dir, evidenceRef) {
     run: 3,
   });
   assert.equal(plain.ok, true, `fixture finding f2 rejected: ${JSON.stringify(plain)}`);
-  const closing = recordFinding(dir, {
+  const closing = await recordFinding(dir, {
     theme: "tradeoff",
     description: "Speed-vs-recall tradeoff in the extractor",
     evidence_ref: `${evidenceRef}:1`,
     run: 3,
   });
   assert.equal(closing.ok, true, `fixture finding f3 rejected: ${JSON.stringify(closing)}`);
-  const deferred = updateFinding(dir, { id: "f3", status: "deferred", note: "owner input pending" });
+  const deferred = await updateFinding(dir, { id: "f3", status: "deferred", note: "owner input pending" });
   assert.equal(deferred.ok, true, `fixture transition rejected: ${JSON.stringify(deferred)}`);
 }
 
@@ -157,13 +157,13 @@ const stdEngine = (req) => {
 // Brief with open findings
 // ---------------------------------------------------------------------------
 
-await test("brief with open findings: grouped by theme, impact, needs_verification flag, health line", () => {
+test("brief with open findings: grouped by theme, impact, needs_verification flag, health line", async () => {
   const dir = makeWorkDir("with");
-  plantLedger(dir);
+  await plantLedger(dir);
   const evidenceRef = plantRunOutput(dir, 3);
-  plantFindings(dir, evidenceRef);
+  await plantFindings(dir, evidenceRef);
 
-  const { text } = buildInto(dir);
+  const { text } = await buildInto(dir);
 
   // Section + grouping headers, in FINDING_THEMES order.
   assert.ok(text.includes("## Open findings"), "brief must contain the Open findings section");
@@ -196,7 +196,7 @@ await test("brief with open findings: grouped by theme, impact, needs_verificati
   assert.ok(text.includes("~14% всех ошибок"), "top impact surfaced in health line");
 
   // Deterministic (smoke suite asserts brief determinism — keep it true).
-  const again = buildInto(dir);
+  const again = await buildInto(dir);
   assert.equal(again.text, text, "brief is deterministic");
 });
 
@@ -204,11 +204,11 @@ await test("brief with open findings: grouped by theme, impact, needs_verificati
 // Old campaigns: no findings.jsonl, no .auto/runs
 // ---------------------------------------------------------------------------
 
-await test("brief without findings.jsonl (old campaign): no findings section, no marker, nothing throws", () => {
+test("brief without findings.jsonl (old campaign): no findings section, no marker, nothing throws", async () => {
   const dir = makeWorkDir("old");
-  plantLedger(dir);
+  await plantLedger(dir);
 
-  const { text } = buildInto(dir);
+  const { text } = await buildInto(dir);
 
   assert.ok(!text.includes("## Open findings"), "no findings section without findings.jsonl");
   assert.ok(!text.includes("[needs_verification]"), "no flag anywhere");
@@ -227,39 +227,39 @@ await test("brief without findings.jsonl (old campaign): no findings section, no
 // Result-lens marker
 // ---------------------------------------------------------------------------
 
-await test("lens: not done marker shown when runs exist but the current segment has no findings", () => {
+test("lens: not done marker shown when runs exist but the current segment has no findings", async () => {
   const dir = makeWorkDir("marker");
-  plantLedger(dir);
+  await plantLedger(dir);
   plantRunOutput(dir, 3);
 
   // (a) no findings at all.
-  const { text } = buildInto(dir);
+  const { text } = await buildInto(dir);
   assert.ok(text.includes("lens: not done"), "marker present without any inspection");
   assert.ok(text.includes("without reading raw results are guesses"), "marker explains the risk");
   assert.ok(!text.includes("## Open findings"), "no findings section when nothing was recorded");
   assert.ok(text.includes("## Result lens"), "marker is a visible section");
 
   // (b) findings exist but reference a run outside the current segment.
-  const planted = recordFinding(dir, {
+  const planted = await recordFinding(dir, {
     theme: "capability",
     description: "Caching layer untouched so far",
     evidence_ref: ".auto/runs/3/output.txt:1",
     run: 99, // not a run of the current segment
   });
   assert.equal(planted.ok, true, `fixture finding rejected: ${JSON.stringify(planted)}`);
-  const text2 = buildInto(dir).text;
+  const text2 = (await buildInto(dir)).text;
   assert.ok(text2.includes("lens: not done"), "marker stays when segment has no findings");
   assert.ok(text2.includes("## Open findings") && text2.includes("- f1 "), "open findings from other segments are still listed");
 });
 
-await test("corrupt findings.jsonl degrades gracefully: no findings section, marker still by inspection state", () => {
+test("corrupt findings.jsonl degrades gracefully: no findings section, marker still by inspection state", async () => {
   const dir = makeWorkDir("corrupt");
-  plantLedger(dir);
+  await plantLedger(dir);
   plantRunOutput(dir, 3);
   const findingsPath = path.join(dir, ".auto", "findings.jsonl");
   fs.writeFileSync(findingsPath, "{ not json\n", "utf-8");
 
-  const { text } = buildInto(dir);
+  const { text } = await buildInto(dir);
   assert.ok(!text.includes("## Open findings"), "unreadable store → no findings section");
   assert.ok(text.includes("lens: not done"), "marker reflects the (absent) inspection");
   assert.ok(text.includes("## Rules"), "brief still fully built");
@@ -269,12 +269,12 @@ await test("corrupt findings.jsonl degrades gracefully: no findings section, mar
 // extractOpenFindingsSection
 // ---------------------------------------------------------------------------
 
-await test("extractOpenFindingsSection: returns the section body, null without one", () => {
+test("extractOpenFindingsSection: returns the section body, null without one", async () => {
   const dir = makeWorkDir("extract");
-  plantLedger(dir);
+  await plantLedger(dir);
   const evidenceRef = plantRunOutput(dir, 3);
-  plantFindings(dir, evidenceRef);
-  const { text } = buildInto(dir);
+  await plantFindings(dir, evidenceRef);
+  const { text } = await buildInto(dir);
 
   const section = extractOpenFindingsSection(text);
   assert.ok(section, "section extracted from a findings brief");
@@ -283,7 +283,7 @@ await test("extractOpenFindingsSection: returns the section body, null without o
   assert.ok(!section.startsWith("## Open findings"), "header line excluded");
 
   const oldDir = makeWorkDir("extract-old");
-  plantLedger(oldDir);
+  await plantLedger(oldDir);
   const oldBrief = buildBrief(oldDir, path.join(oldDir, ".auto", "councils", "1"), BRIEF_INPUT);
   assert.equal(extractOpenFindingsSection(oldBrief.text), null, "null when the brief has no findings section");
   assert.equal(extractOpenFindingsSection(""), null, "empty brief → null");
@@ -293,12 +293,12 @@ await test("extractOpenFindingsSection: returns the section body, null without o
 // Challenge phase receives findings as input
 // ---------------------------------------------------------------------------
 
-await test("council-delegation: challenge tasks carry the open findings with the flag highlighted", async () => {
+test("council-delegation: challenge tasks carry the open findings with the flag highlighted", async () => {
   const dir = makeWorkDir("deleg");
-  plantLedger(dir);
+  await plantLedger(dir);
   const evidenceRef = plantRunOutput(dir, 3);
-  plantFindings(dir, evidenceRef);
-  const briefText = buildInto(dir).text;
+  await plantFindings(dir, evidenceRef);
+  const briefText = (await buildInto(dir)).text;
 
   const requests = [];
   const pi = miniPi((req) => { requests.push(req); return stdEngine(req); });
@@ -322,10 +322,10 @@ await test("council-delegation: challenge tasks carry the open findings with the
   assert.ok(chair && chair.task.includes("- f1 [needs_verification]"), "chair sees the findings via the brief");
 });
 
-await test("council-delegation: no findings block in challenge tasks when the brief has none (old campaign)", async () => {
+test("council-delegation: no findings block in challenge tasks when the brief has none (old campaign)", async () => {
   const dir = makeWorkDir("deleg-old");
-  plantLedger(dir);
-  const briefText = buildInto(dir).text;
+  await plantLedger(dir);
+  const briefText = (await buildInto(dir)).text;
   assert.equal(extractOpenFindingsSection(briefText), null);
 
   const requests = [];

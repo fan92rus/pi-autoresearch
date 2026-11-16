@@ -73,8 +73,8 @@ function validFinding(evidence) {
 }
 
 /** Create one finding and return its id (asserting success). */
-function seedFinding(workDir, evidence, extra = {}) {
-  const res = recordFinding(workDir, { ...validFinding(evidence), ...extra }, FIXED_NOW);
+async function seedFinding(workDir, evidence, extra = {}) {
+  const res = await recordFinding(workDir, { ...validFinding(evidence), ...extra }, FIXED_NOW);
   assert.equal(res.ok, true, res.ok ? "" : res.errors.join("; "));
   return res.value.id;
 }
@@ -88,11 +88,11 @@ function errorsOf(res) {
 // record_finding
 // ---------------------------------------------------------------------------
 
-test("record_finding: корректная находка дописывается со статусом open и id", () => {
+test("record_finding: корректная находка дописывается со статусом open и id", async () => {
   const dir = makeWorkDir("ok");
   const evidence = writeRunOutput(dir) + ":120-134";
 
-  const res = recordFinding(dir, { ...validFinding(evidence), run: 45, estimated_impact: "~14% ошибок" }, FIXED_NOW);
+  const res = await recordFinding(dir, { ...validFinding(evidence), run: 45, estimated_impact: "~14% ошибок" }, FIXED_NOW);
 
   assert.equal(res.ok, true);
   assert.equal(res.value.id, "f1");
@@ -110,11 +110,11 @@ test("record_finding: корректная находка дописываетс
   assert.equal(lines[0].estimated_impact, "~14% ошибок");
 });
 
-test("record_finding: id растёт монотонно, состояние восстанавливается из файла", () => {
+test("record_finding: id растёт монотонно, состояние восстанавливается из файла", async () => {
   const dir = makeWorkDir("ids");
   const evidence = writeRunOutput(dir) + ":10";
-  assert.equal(seedFinding(dir, evidence), "f1");
-  assert.equal(seedFinding(dir, evidence), "f2");
+  assert.equal(await seedFinding(dir, evidence), "f1");
+  assert.equal(await seedFinding(dir, evidence), "f2");
 
   const loaded = loadFindings(dir);
   assert.equal(loaded.ok, true);
@@ -123,11 +123,11 @@ test("record_finding: id растёт монотонно, состояние в�
   assert.equal(loaded.value.findings.get("f2").status, "open");
 });
 
-test("record_finding: отказ без evidence_ref с конкретным примером", () => {
+test("record_finding: отказ без evidence_ref с конкретным примером", async () => {
   const dir = makeWorkDir("noev");
   writeRunOutput(dir);
 
-  const text = errorsOf(recordFinding(dir, { theme: "behavior", description: "многие FP — верные факты" }, FIXED_NOW));
+  const text = errorsOf(await recordFinding(dir, { theme: "behavior", description: "многие FP — верные факты" }, FIXED_NOW));
 
   assert.match(text, /evidence_ref: отсутствует/);
   assert.match(text, /\.auto\/runs\/45\/output\.txt:120-134/);
@@ -135,72 +135,72 @@ test("record_finding: отказ без evidence_ref с конкретным п�
   assert.equal(fs.existsSync(path.join(dir, ".auto", FINDINGS_FILE)), false, "rejected record must not create the file");
 });
 
-test("record_finding: неизвестная тема отвергается с перечислением допустимых", () => {
+test("record_finding: неизвестная тема отвергается с перечислением допустимых", async () => {
   const dir = makeWorkDir("theme");
   const evidence = writeRunOutput(dir) + ":1";
 
-  const text = errorsOf(recordFinding(dir, { ...validFinding(evidence), theme: "other" }, FIXED_NOW));
+  const text = errorsOf(await recordFinding(dir, { ...validFinding(evidence), theme: "other" }, FIXED_NOW));
 
   assert.match(text, /theme: "other" не входит в допустимые темы/);
   assert.match(text, /measurement, behavior, capability, tradeoff/);
 });
 
-test("record_finding: якорь не найден — отказ с именем якоря", () => {
+test("record_finding: якорь не найден — отказ с именем якоря", async () => {
   const dir = makeWorkDir("anchor-miss");
   const rel = writeRunOutput(dir);
 
-  const text = errorsOf(recordFinding(dir, validFinding(`${rel}#NO SUCH TEXT`), FIXED_NOW));
+  const text = errorsOf(await recordFinding(dir, validFinding(`${rel}#NO SUCH TEXT`), FIXED_NOW));
 
   assert.match(text, /якорь "NO SUCH TEXT" не найден/);
 });
 
-test("record_finding: якорь найден — находка принята", () => {
+test("record_finding: якорь найден — находка принята", async () => {
   const dir = makeWorkDir("anchor-hit");
   const rel = writeRunOutput(dir);
 
-  const res = recordFinding(dir, validFinding(`${rel}#MISMATCH gold=заместитель`), FIXED_NOW);
+  const res = await recordFinding(dir, validFinding(`${rel}#MISMATCH gold=заместитель`), FIXED_NOW);
 
   assert.equal(res.ok, true);
   assert.equal(res.value.id, "f1");
 });
 
-test("record_finding: строки за пределами файла — отказ", () => {
+test("record_finding: строки за пределами файла — отказ", async () => {
   const dir = makeWorkDir("range");
   const rel = writeRunOutput(dir); // 140 lines
 
-  const text = errorsOf(recordFinding(dir, validFinding(`${rel}:138-141`), FIXED_NOW));
+  const text = errorsOf(await recordFinding(dir, validFinding(`${rel}:138-141`), FIXED_NOW));
 
   assert.match(text, /строки 138-141 выходят за пределы файла \(в .*output\.txt 140 строк\)/);
 });
 
-test("record_finding: граничные строки 1 и последняя принимаются, 0 и start>end — нет", () => {
+test("record_finding: граничные строки 1 и последняя принимаются, 0 и start>end — нет", async () => {
   const dir = makeWorkDir("bounds");
   const rel = writeRunOutput(dir);
 
-  assert.equal(recordFinding(dir, validFinding(`${rel}:1`), FIXED_NOW).ok, true);
-  assert.equal(recordFinding(dir, validFinding(`${rel}:140`), FIXED_NOW).ok, true);
-  assert.match(errorsOf(recordFinding(dir, validFinding(`${rel}:0-3`), FIXED_NOW)), /1-based/);
-  assert.match(errorsOf(recordFinding(dir, validFinding(`${rel}:9-3`), FIXED_NOW)), /1-based и start ≤ end/);
+  assert.equal((await recordFinding(dir, validFinding(`${rel}:1`), FIXED_NOW)).ok, true);
+  assert.equal((await recordFinding(dir, validFinding(`${rel}:140`), FIXED_NOW)).ok, true);
+  assert.match(errorsOf(await recordFinding(dir, validFinding(`${rel}:0-3`), FIXED_NOW)), /1-based/);
+  assert.match(errorsOf(await recordFinding(dir, validFinding(`${rel}:9-3`), FIXED_NOW)), /1-based и start ≤ end/);
 });
 
-test("record_finding: путь вне workDir отвергается без чтения файла", () => {
+test("record_finding: путь вне workDir отвергается без чтения файла", async () => {
   const dir = makeWorkDir("outside");
   const outsideFile = path.join(os.tmpdir(), `pi-ar-findings-outside-${Date.now()}.txt`);
   fs.writeFileSync(outsideFile, "secret evidence\n", "utf-8");
 
-  const relOutside = errorsOf(recordFinding(dir, validFinding("../" + path.basename(outsideFile) + ":1"), FIXED_NOW));
+  const relOutside = errorsOf(await recordFinding(dir, validFinding("../" + path.basename(outsideFile) + ":1"), FIXED_NOW));
   assert.match(relOutside, /вне workDir/);
-  const absOutside = errorsOf(recordFinding(dir, validFinding(outsideFile + "#secret"), FIXED_NOW));
+  const absOutside = errorsOf(await recordFinding(dir, validFinding(outsideFile + "#secret"), FIXED_NOW));
   assert.match(absOutside, /вне workDir/);
 });
 
-test("record_finding: несуществующий файл отвергается", () => {
+test("record_finding: несуществующий файл отвергается", async () => {
   const dir = makeWorkDir("missing");
-  const text = errorsOf(recordFinding(dir, validFinding(".auto/runs/9/output.txt:1"), FIXED_NOW));
+  const text = errorsOf(await recordFinding(dir, validFinding(".auto/runs/9/output.txt:1"), FIXED_NOW));
   assert.match(text, /файл не найден/);
 });
 
-test("parseEvidenceRef: формы путь:строки, путь:строка, путь#якорь и отказ на прочее", () => {
+test("parseEvidenceRef: формы путь:строки, путь:строка, путь#якорь и отказ на прочее", async () => {
   assert.deepEqual(parseEvidenceRef(".auto/runs/45/output.txt:120-134").value, {
     kind: "lines", path: ".auto/runs/45/output.txt", start: 120, end: 134,
   });
@@ -212,7 +212,7 @@ test("parseEvidenceRef: формы путь:строки, путь:строка,
   assert.equal(parseEvidenceRef("a.txt#").ok, false);
 });
 
-test("checkEvidenceRef: строки и якорь проверяются против реального файла", () => {
+test("checkEvidenceRef: строки и якорь проверяются против реального файла", async () => {
   const dir = makeWorkDir("check");
   const rel = writeRunOutput(dir);
   assert.equal(checkEvidenceRef(dir, `${rel}:125`).ok, true);
@@ -224,12 +224,12 @@ test("checkEvidenceRef: строки и якорь проверяются про
 // update_finding: transitions
 // ---------------------------------------------------------------------------
 
-test("update_finding: open → verified с доказательством сохраняет ссылку в переходе", () => {
+test("update_finding: open → verified с доказательством сохраняет ссылку в переходе", async () => {
   const dir = makeWorkDir("verify");
   const rel = writeRunOutput(dir);
-  const id = seedFinding(dir, `${rel}:125`);
+  const id = await seedFinding(dir, `${rel}:125`);
 
-  const res = updateFinding(dir, { id, status: "verified", evidence_ref: `${rel}#MISMATCH gold=`, note: "перечитано" }, LATER);
+  const res = await updateFinding(dir, { id, status: "verified", evidence_ref: `${rel}#MISMATCH gold=`, note: "перечитано" }, LATER);
 
   assert.equal(res.ok, true);
   assert.equal(res.value.from, "open");
@@ -243,10 +243,10 @@ test("update_finding: open → verified с доказательством сох
   assert.equal(last.note, "перечитано");
 });
 
-test("update_finding: разрешённые переходы по карте принимаются", () => {
+test("update_finding: разрешённые переходы по карте принимаются", async () => {
   const dir = makeWorkDir("map");
   const rel = writeRunOutput(dir);
-  const id = seedFinding(dir, `${rel}:125`);
+  const id = await seedFinding(dir, `${rel}:125`);
   const ev = `${rel}:125`;
 
   // open → deferred → open → revised → verified → revised → deferred → open
@@ -261,7 +261,7 @@ test("update_finding: разрешённые переходы по карте п
   ];
   let from = "open";
   for (const step of steps) {
-    const res = updateFinding(dir, { id, ...step }, LATER);
+    const res = await updateFinding(dir, { id, ...step }, LATER);
     assert.equal(res.ok, true, res.ok ? "" : res.errors.join("; "));
     assert.equal(res.value.from, from);
     from = step.status;
@@ -269,7 +269,7 @@ test("update_finding: разрешённые переходы по карте п
   assert.equal(loadFindings(dir).value.findings.get(id).status, "open");
 });
 
-test("update_finding: карта переходов совпадает с спецификацией", () => {
+test("update_finding: карта переходов совпадает с спецификацией", async () => {
   assert.deepEqual([...FINDING_TRANSITIONS.open].sort(), ["deferred", "revised", "verified"]);
   assert.deepEqual([...FINDING_TRANSITIONS.revised].sort(), ["deferred", "verified"]);
   assert.deepEqual([...FINDING_TRANSITIONS.deferred], ["open"]);
@@ -280,98 +280,98 @@ test("update_finding: карта переходов совпадает с спе
 // update_finding: rejections
 // ---------------------------------------------------------------------------
 
-test("update_finding: переход в verified без evidence_ref отвергается", () => {
+test("update_finding: переход в verified без evidence_ref отвергается", async () => {
   const dir = makeWorkDir("noproof-v");
   const rel = writeRunOutput(dir);
-  const id = seedFinding(dir, `${rel}:125`);
+  const id = await seedFinding(dir, `${rel}:125`);
 
-  const text = errorsOf(updateFinding(dir, { id, status: "verified" }, LATER));
+  const text = errorsOf(await updateFinding(dir, { id, status: "verified" }, LATER));
 
   assert.match(text, /переход в verified требует доказательство/);
   assert.match(text, /независимую проверку/);
   assert.equal(loadFindings(dir).value.findings.get(id).status, "open");
 });
 
-test("update_finding: переход в revised без evidence_ref отвергается", () => {
+test("update_finding: переход в revised без evidence_ref отвергается", async () => {
   const dir = makeWorkDir("noproof-r");
   const rel = writeRunOutput(dir);
-  const id = seedFinding(dir, `${rel}:125`);
+  const id = await seedFinding(dir, `${rel}:125`);
 
-  const text = errorsOf(updateFinding(dir, { id, status: "revised" }, LATER));
+  const text = errorsOf(await updateFinding(dir, { id, status: "revised" }, LATER));
 
   assert.match(text, /переход в revised требует доказательство/);
   assert.match(text, /контрпример/);
 });
 
-test("update_finding: evidence_ref с неверным якорем отвергает переход", () => {
+test("update_finding: evidence_ref с неверным якорем отвергает переход", async () => {
   const dir = makeWorkDir("badanchor");
   const rel = writeRunOutput(dir);
-  const id = seedFinding(dir, `${rel}:125`);
+  const id = await seedFinding(dir, `${rel}:125`);
 
-  const text = errorsOf(updateFinding(dir, { id, status: "verified", evidence_ref: `${rel}#НЕТ ТАКОГО` }, LATER));
+  const text = errorsOf(await updateFinding(dir, { id, status: "verified", evidence_ref: `${rel}#НЕТ ТАКОГО` }, LATER));
 
   assert.match(text, /якорь "НЕТ ТАКОГО" не найден/);
 });
 
-test("update_finding: запрещённый переход verified → open отвергается со списком допустимых", () => {
+test("update_finding: запрещённый переход verified → open отвергается со списком допустимых", async () => {
   const dir = makeWorkDir("forbidden");
   const rel = writeRunOutput(dir);
-  const id = seedFinding(dir, `${rel}:125`);
-  assert.equal(updateFinding(dir, { id, status: "verified", evidence_ref: `${rel}:125` }, LATER).ok, true);
+  const id = await seedFinding(dir, `${rel}:125`);
+  assert.equal((await updateFinding(dir, { id, status: "verified", evidence_ref: `${rel}:125` }, LATER)).ok, true);
 
-  const text = errorsOf(updateFinding(dir, { id, status: "open" }, LATER));
+  const text = errorsOf(await updateFinding(dir, { id, status: "open" }, LATER));
 
   assert.match(text, /переход verified → open запрещён/);
   assert.match(text, /Допустимо из verified: revised/);
   assert.equal(loadFindings(dir).value.findings.get(id).status, "verified");
 });
 
-test("update_finding: прочие запрещённые переходы (open→open, deferred→verified, revised→open)", () => {
+test("update_finding: прочие запрещённые переходы (open→open, deferred→verified, revised→open)", async () => {
   const dir = makeWorkDir("forbidden2");
   const rel = writeRunOutput(dir);
-  const id = seedFinding(dir, `${rel}:125`);
+  const id = await seedFinding(dir, `${rel}:125`);
 
-  assert.match(errorsOf(updateFinding(dir, { id, status: "open" }, LATER)), /open → open запрещён/);
+  assert.match(errorsOf(await updateFinding(dir, { id, status: "open" }, LATER)), /open → open запрещён/);
 
-  assert.equal(updateFinding(dir, { id, status: "deferred" }, LATER).ok, true);
-  assert.match(errorsOf(updateFinding(dir, { id, status: "verified", evidence_ref: `${rel}:125` }, LATER)), /deferred → verified запрещён/);
+  assert.equal((await updateFinding(dir, { id, status: "deferred" }, LATER)).ok, true);
+  assert.match(errorsOf(await updateFinding(dir, { id, status: "verified", evidence_ref: `${rel}:125` }, LATER)), /deferred → verified запрещён/);
 
-  assert.equal(updateFinding(dir, { id, status: "open" }, LATER).ok, true);
-  assert.equal(updateFinding(dir, { id, status: "revised", evidence_ref: `${rel}:125` }, LATER).ok, true);
-  assert.match(errorsOf(updateFinding(dir, { id, status: "open" }, LATER)), /revised → open запрещён/);
+  assert.equal((await updateFinding(dir, { id, status: "open" }, LATER)).ok, true);
+  assert.equal((await updateFinding(dir, { id, status: "revised", evidence_ref: `${rel}:125` }, LATER)).ok, true);
+  assert.match(errorsOf(await updateFinding(dir, { id, status: "open" }, LATER)), /revised → open запрещён/);
 });
 
-test("update_finding: неизвестный id и неизвестный статус отвергаются", () => {
+test("update_finding: неизвестный id и неизвестный статус отвергаются", async () => {
   const dir = makeWorkDir("unknown");
   const rel = writeRunOutput(dir);
-  seedFinding(dir, `${rel}:125`);
+  await seedFinding(dir, `${rel}:125`);
 
-  assert.match(errorsOf(updateFinding(dir, { id: "f99", status: "deferred" }, LATER)), /находка f99 не найдена/);
-  assert.match(errorsOf(updateFinding(dir, { id: "f1", status: "closed" }, LATER)), /"closed" не входит в статусы/);
+  assert.match(errorsOf(await updateFinding(dir, { id: "f99", status: "deferred" }, LATER)), /находка f99 не найдена/);
+  assert.match(errorsOf(await updateFinding(dir, { id: "f1", status: "closed" }, LATER)), /"closed" не входит в статусы/);
 });
 
 // ---------------------------------------------------------------------------
 // Append-only
 // ---------------------------------------------------------------------------
 
-test("append-only: предыдущие строки findings.jsonl не переписываются", () => {
+test("append-only: предыдущие строки findings.jsonl не переписываются", async () => {
   const dir = makeWorkDir("append");
   const rel = writeRunOutput(dir);
   const file = path.join(dir, ".auto", FINDINGS_FILE);
 
-  const id = seedFinding(dir, `${rel}:125`);
+  const id = await seedFinding(dir, `${rel}:125`);
   const afterCreate = fs.readFileSync(file, "utf-8");
 
-  assert.equal(updateFinding(dir, { id, status: "verified", evidence_ref: `${rel}#MISMATCH gold=` }, LATER).ok, true);
+  assert.equal((await updateFinding(dir, { id, status: "verified", evidence_ref: `${rel}#MISMATCH gold=` }, LATER)).ok, true);
   const afterVerify = fs.readFileSync(file, "utf-8");
   assert.ok(afterVerify.startsWith(afterCreate), "creation line must stay byte-identical");
 
   // Rejected calls must not touch the file at all.
-  assert.equal(updateFinding(dir, { id, status: "open" }, LATER).ok, false);
-  assert.equal(recordFinding(dir, { theme: "behavior", description: "без примера" }, LATER).ok, false);
+  assert.equal((await updateFinding(dir, { id, status: "open" }, LATER)).ok, false);
+  assert.equal((await recordFinding(dir, { theme: "behavior", description: "без примера" }, LATER)).ok, false);
   assert.equal(fs.readFileSync(file, "utf-8"), afterVerify);
 
-  assert.equal(updateFinding(dir, { id, status: "revised", evidence_ref: `${rel}:125` }, LATER).ok, true);
+  assert.equal((await updateFinding(dir, { id, status: "revised", evidence_ref: `${rel}:125` }, LATER)).ok, true);
   const afterRevise = fs.readFileSync(file, "utf-8");
   assert.ok(afterRevise.startsWith(afterVerify), "earlier transition lines must stay byte-identical");
 
@@ -381,10 +381,10 @@ test("append-only: предыдущие строки findings.jsonl не пер�
   assert.equal(loadFindings(dir).value.findings.get(id).status, "revised");
 });
 
-test("loadFindings: переход, не совпадающий с текущим статусом, делает хранилище невалидным", () => {
+test("loadFindings: переход, не совпадающий с текущим статусом, делает хранилище невалидным", async () => {
   const dir = makeWorkDir("tampered");
   const rel = writeRunOutput(dir);
-  const id = seedFinding(dir, `${rel}:125`);
+  const id = await seedFinding(dir, `${rel}:125`);
   const file = path.join(dir, ".auto", FINDINGS_FILE);
   const bogus = { type: "finding_transition", id, from: "verified", status: "open", updated: LATER.toISOString() };
   fs.appendFileSync(file, JSON.stringify(bogus) + "\n", "utf-8");
@@ -393,12 +393,12 @@ test("loadFindings: переход, не совпадающий с текущи�
   assert.equal(loaded.ok, false);
   assert.match(loaded.errors.join("\n"), /переход .* начинается из verified, а текущий статус open/);
 
-  const res = recordFinding(dir, validFinding(`${rel}:1`), LATER);
+  const res = await recordFinding(dir, validFinding(`${rel}:1`), LATER);
   assert.equal(res.ok, false);
   assert.match(res.errors.join("\n"), /запись отклонена/);
 });
 
-test("loadFindings: битая строка и неизвестный type отвергаются явно", () => {
+test("loadFindings: битая строка и неизвестный type отвергаются явно", async () => {
   const dir = makeWorkDir("garbage");
   fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
   fs.writeFileSync(path.join(dir, ".auto", FINDINGS_FILE), "not json\n{\"type\":\"mystery\",\"id\":\"f1\"}\n", "utf-8");
@@ -409,7 +409,7 @@ test("loadFindings: битая строка и неизвестный type от�
   assert.match(loaded.errors[1], /строка 2/);
 });
 
-test("loadFindings: отсутствующий файл — пустое валидное хранилище", () => {
+test("loadFindings: отсутствующий файл — пустое валидное хранилище", async () => {
   const dir = makeWorkDir("empty");
   const loaded = loadFindings(dir);
   assert.equal(loaded.ok, true);
