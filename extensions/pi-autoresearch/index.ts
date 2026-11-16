@@ -814,8 +814,10 @@ function isAutoresearchShCommand(command: string): boolean {
   } while (cmd !== prev);
 
   // Now the core command must be the benchmark script via a known invocation.
-  // Current layout requires the `.auto/measure.sh` path; legacy `autoresearch.sh`
-  // is still accepted for in-flight sessions. An optional path prefix allows
+  // `sessionFilePath("measure")` resolves to `.auto/measure.sh` in the current
+  // layout and to the legacy flat `autoresearch.sh` in pre-.auto projects, so
+  // both spellings stay valid here (paths.ts SESSION_FILE_NAMES.measure.legacy).
+  // An optional path prefix allows
   //   ./.auto/measure.sh, /abs/path/.auto/measure.sh, bash [-flags] autoresearch.sh, etc.
   return /^(?:(?:bash|sh|source)\s+(?:-\w+\s+)*)?(?:\/|\.{1,2}\/|[\w.-]+\/)*(?:autoresearch\.sh|\.auto\/measure\.sh)(?:\s|$)/.test(cmd);
 }
@@ -1037,7 +1039,12 @@ function readConfig(cwd: string): AutoresearchConfig {
     const configPath = autoresearchConfigPath(cwd);
     if (!fs.existsSync(configPath)) return {};
     return JSON.parse(fs.readFileSync(configPath, "utf-8"));
-  } catch {
+  } catch (err) {
+    // Fail-open for resilience, but never silently: a hand-edited config.json
+    // that broke JSON must be visible (workingDir/maxIterations/limit would
+    // otherwise be silently ignored — review 2026-11-16, core-loop §1.2).
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[autoresearch] unreadable ${autoresearchConfigPath(cwd)} — using defaults: ${msg}`);
     return {};
   }
 }
@@ -3188,29 +3195,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       ctx.ui.setWidget("autoresearch", undefined);
     }
   };
-
-  const autoresearchHelp = () =>
-    [
-      "Usage: /autoresearch [off|clear|council [note]|config|limit [minutes|off]|export|<text>|parallel-*]",
-      "",
-      "<text> enters autoresearch mode and starts or resumes the loop.",
-      "off leaves autoresearch mode.",
-      "clear deletes experiment session data (log, findings, observations, analysis, report, ideas, runs) and turns autoresearch mode off; refuses while a research or candidate campaign is active.",
-      "config opens an interactive dialog to set the experiment time limit, worker models, concurrency, and budget.",
-      "limit sets the experiment time limit: limit 5 — 5 minutes per run_experiment; limit off — remove; limit — interactive dialog.",
-      "export opens a local live dashboard for the session log in your browser.",
-      "",
-      "Parallel modes (fan out worker subagents over the event bus):",
-      "  parallel-best-of-n <N> <goal>   — try N hypotheses at once, keep the best (re-measured)",
-      "  parallel-stack <subsystems...>  — stack independent file-scoped optimizations",
-      "  parallel-search <goal>          — beam search (K states × M candidates) for multimodal landscapes",
-      "",
-      "Examples:",
-      "  /autoresearch optimize unit test runtime, monitor correctness",
-      "  /autoresearch model training, run 5 minutes of train.py and note the loss ratio as optimization target",
-      "  /autoresearch parallel-best-of-n 4 speed up JSON parsing in src/parse.ts",
-      "  /autoresearch export",
-    ].join("\n");
 
   // -----------------------------------------------------------------------
   // State reconstruction
