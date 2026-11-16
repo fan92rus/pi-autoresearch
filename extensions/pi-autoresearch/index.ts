@@ -2664,6 +2664,57 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   };
 
   /**
+   * Git-gate scan (live lob-collector-data case 2026-11-15): the shell Git ban
+   * tracks ACTIVE campaign work only — a campaign in phase research, a pending
+   * operation, or an unreadable state (fail closed). A STOPPED (finished)
+   * campaign must not block Git: after stop → report the campaigns sit in
+   * phase stopped until the next draft archives them, and the owner keeps
+   * working with Git normally in the meantime. Briefing never blocks Git
+   * either (test (g)). Deliberately NOT researchBlocksOrdinaryLoop — its
+   * stopped/blocks semantics protect the ordinary-loop tools (design §8/§9),
+   * not the shell.
+   */
+  const researchGitBlockingScan = (workDir: string): boolean => {
+    const root = researchState.researchRoot(workDir);
+    if (!fs.existsSync(root)) return false;
+    let names: string[];
+    try {
+      names = fs.readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+    } catch {
+      return true;
+    }
+    for (const name of names) {
+      const dir = path.join(root, name);
+      if (fs.existsSync(path.join(dir, researchState.PENDING_OP_FILE))) return true;
+      try {
+        const statePath = path.join(dir, researchState.STATE_FILE);
+        if (!fs.existsSync(statePath)) continue; // service dirs (briefs/evidence)
+        const raw = JSON.parse(fs.readFileSync(statePath, "utf8"));
+        const valid = raw && typeof raw === "object" && raw.schema_version === researchState.RESEARCH_STATE_SCHEMA_VERSION && raw.campaign_id === name && (researchState.CAMPAIGN_PHASES as readonly string[]).includes(raw.phase);
+        if (!valid) return true;
+        if (raw.phase === "research") return true;
+        // briefing and stopped do not block the shell Git ban
+      } catch (err) {
+        if ((err as { code?: string }).code === "ENOENT") continue;
+        return true;
+      }
+    }
+    return false;
+  };
+  /** Session-aware wrapper (same pin semantics as researchBlocksOrdinaryLoop).
+   *  Charter chains (research-charter): while a research chain is bound in the
+   *  session and the mode is on, campaign work is continuous (a stopped child
+   *  just awaits the next brief), so Git stays banned — review-4.7. */
+  const researchBlocksGit = async (workDir: string, ctx?: ExtensionContext): Promise<boolean> => {
+    const runtime = ctx ? getRuntime(ctx) : null;
+    if (runtime?.researchChain && runtime.autoresearchMode) return true;
+    if (researchGitBlockingScan(workDir)) return true;
+    const stateRoot = ctx ? getRuntime(ctx).researchStateRoot : null;
+    if (stateRoot && stateRoot !== workDir && researchGitBlockingScan(stateRoot)) return true;
+    return false;
+  };
+
+  /**
    * Launch-guard scan for the expedition entry point (bd pi-autoresearch-4e6):
    * a manual owner launch is the legitimate next step after a campaign
    * finishes, so a TERMINAL (stopped) campaign does not block. Blocking: any
@@ -3448,6 +3499,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const runtime = getRuntime(ctx);
     if (runtime.researchChain !== null) return;
     const workDir = resolveWorkDir(ctx.cwd);
+    // A recorded `/autoresearch off` in THIS session wins over disk restore
+    // (live lob-collector-data case 2026-11-15): the owner closed the session
+    // with the loop off, so `pi --continue` and `/tree` must not resurrect
+    // research mode from a still-awaiting_child chain on disk. Same semantics
+    // as shouldAutoActivateAutoresearch: an explicit off beats a persisted
+    // campaign, a fresh session (no recorded decision) still restores.
+    if (recordedActivationDecision(ctx, workDir) === false) return;
     const scan = expedition.scanActiveExpeditionChains(path.join(workDir, ".auto", "research-chain"));
     if (scan === "root_missing" || scan.chains.length === 0) return;
     const fresh = scan.chains[0];
@@ -3671,8 +3729,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const cmd = typeof (event.input as { command?: unknown })?.command === "string"
       ? (event.input as { command: string }).command
       : "";
-    // Research campaign (design §8): no Git through the shell, regardless of the loop mode.
-    if (cmd && RESEARCH_GIT_RE.test(cmd) && (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd), ctx))) {
+    // Research campaign (design §8): no Git through the shell while campaign
+    // work is active (phase research / pending op / unreadable). Finished
+    // (stopped) campaigns do not block Git — the owner keeps committing.
+    if (cmd && RESEARCH_GIT_RE.test(cmd) && (await researchBlocksGit(resolveWorkDir(ctx.cwd), ctx))) {
       return {
         block: true,
         reason:

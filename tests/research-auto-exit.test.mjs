@@ -98,7 +98,7 @@ test("stop keeps research mode on; the report of a stopped campaign leaves it", 
   assert.match(report, /Research mode is OFF\./, report);
   assert.ok(h.pi.notifications.some((n) => /research mode OFF/.test(n.text)), "owner must be told research mode is OFF");
   assert.ok(
-    h.pi.entries.slice(entriesBefore).some((e) => e === "pi-autoresearch.activation"),
+    h.pi.entries.slice(entriesBefore).some((e) => e === "pi-autoresearch.activation" || e?.customType === "pi-autoresearch.activation"),
     `the OFF activation must be persisted: ${JSON.stringify(h.pi.entries.slice(entriesBefore))}`,
   );
   assert.ok(fs.existsSync(path.join(dir, ".auto", "research", "c1", "report.md")), "report.md must be written before the exit");

@@ -30,7 +30,7 @@ async function load(dir, label) {
 }
 
 const ACTIVATION = "pi-autoresearch.activation";
-const activationCount = (pi) => pi.entries.filter((entry) => entry === ACTIVATION).length;
+const activationCount = (pi) => pi.entries.filter((entry) => entry === ACTIVATION || entry?.customType === ACTIVATION).length;
 const notifications = (pi) => pi.notifications.map((n) => n.text);
 
 test("clear removes run data and ideas, keeps owner config, and reports deleted paths", async () => {

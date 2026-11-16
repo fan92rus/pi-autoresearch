@@ -50,6 +50,11 @@ All notable changes to this project will be documented in this file.
 - Ledger entries carry an `epoch`; entries without one are epoch 1, so existing campaigns keep their numbers.
 - A measurement change starts a new epoch. Confidence scores and best deltas are not computed across epochs, and runs of a refuted epoch are incomparable. Epoch ids are monotonic and never reused.
 
+### Fixed — Git gate and expedition restore after `/autoresearch off` (live lob-collector-data, 2026-11-15)
+
+- **The shell Git ban tracks ACTIVE campaign work only** (phase `research`, a pending operation, or an unreadable state — fail closed). A finished (`stopped`) campaign no longer blocks Git: after `stop` → `report` the campaigns sit in `stopped` until the next draft archives them, and the owner kept getting "git is not allowed while a research campaign is active" on every commit. Briefing keeps not blocking Git (unchanged); an active charter chain with the mode on still bans Git (review-4.7).
+- **A recorded `/autoresearch off` beats the expedition disk restore**: `pi --continue` and `/tree` no longer resurrect research mode from a still-`awaiting_child` chain after the owner closed the session with the loop off. A genuinely fresh session (no recorded decision in the branch) still restores, same semantics as `shouldAutoActivateAutoresearch`.
+
 ### Fixed — council_convene reliability (lobprobe council #5, 2026-11-01)
 
 - **Slate validator tolerates real chair output shapes**: markdown bold around labels (`**EXPECTED_GAIN:**`), parenthetical units (`EXPECTED_GAIN (f1): +0.012`), comparison symbols before the number (`EXPECTED_GAIN: ≥ 0.8`), the Latin token inside a Cyrillic label (`УСЛОВИЕ_ОТМЕНЫ (KILL_WHEN):`), and the fully-Cyrillic aliases the chair actually emitted (`ОЖИДАЕМЫЙ_ПРИРОСТ`, `УСЛОВИЕ_ОТМЕНЫ`). Previously the chair's Russian slate failed mechanical validation twice and the council returned "no slate".

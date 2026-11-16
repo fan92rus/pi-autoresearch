@@ -241,8 +241,9 @@ export function createFakePi({
       notifications.push({ text, type });
     },
 
-    appendEntry(entry) {
-      entries.push(entry);
+    appendEntry(entry, data) {
+      // Real pi passes (customType, data); keep raw strings working for older tests.
+      entries.push(data !== undefined ? { customType: entry, data } : entry);
     },
 
     debug(..._args) {},

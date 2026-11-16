@@ -83,7 +83,7 @@ function textOf(res) {
 
 const ACTIVATION_ENTRY_TYPE = "pi-autoresearch.activation";
 function activationCount(pi) {
-  return pi.entries.filter((e) => e === ACTIVATION_ENTRY_TYPE).length;
+  return pi.entries.filter((e) => e === ACTIVATION_ENTRY_TYPE || e?.customType === ACTIVATION_ENTRY_TYPE).length;
 }
 
 // ─── parsing and validation ──────────────────────────────────────────────────

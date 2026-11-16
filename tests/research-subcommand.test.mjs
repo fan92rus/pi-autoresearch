@@ -66,7 +66,7 @@ async function loadExtension(dir, label) {
  */
 const ACTIVATION_ENTRY_TYPE = "pi-autoresearch.activation";
 function activationEntries(pi) {
-  return pi.entries.filter((e) => e === ACTIVATION_ENTRY_TYPE);
+  return pi.entries.filter((e) => e === ACTIVATION_ENTRY_TYPE || e?.customType === ACTIVATION_ENTRY_TYPE);
 }
 
 function notifyTexts(pi) {

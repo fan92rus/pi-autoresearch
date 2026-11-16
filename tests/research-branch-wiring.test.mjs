@@ -504,6 +504,28 @@ test("(g) git is not blocked during briefing (no research phase yet)", async () 
   assert.equal(await h.hook("tool_call")({ toolName: "bash", input: { command: "git status" } }, h.ctx), undefined);
 });
 
+test("(g) git is not blocked by FINISHED (stopped) campaigns — the owner keeps committing after stop", async () => {
+  const dir = makeWorkDir("git-stopped");
+  writeCampaignState(dir, "c1", "stopped");
+  writeCampaignState(dir, "c2", "stopped");
+  const h = await loadExtension(dir, "git-stopped");
+  const hook = h.hook("tool_call");
+  // Ordinary-loop tools stay blocked (existing semantics), but the shell is free.
+  assert.ok(textOf(await call(h, "init_experiment", {})).includes(BLOCK_TEXT), "stopped still blocks the loop");
+  for (const cmd of ["git status", "git add -A && git commit -m x", "git push"]) {
+    assert.equal(await hook({ toolName: "bash", input: { command: cmd } }, h.ctx), undefined, `${cmd} must pass`);
+  }
+});
+
+test("(g) git stays blocked while a stopped campaign has a pending operation", async () => {
+  const dir = makeWorkDir("git-stopped-pending");
+  const campaignDir = writeCampaignState(dir, "c1", "stopped");
+  fs.writeFileSync(path.join(campaignDir, "pending-op.json"), JSON.stringify({ name: "op", started_at: new Date().toISOString() }));
+  const h = await loadExtension(dir, "git-stopped-pending");
+  const result = await h.hook("tool_call")({ toolName: "bash", input: { command: "git status" } }, h.ctx);
+  assert.equal(result?.block, true, "pending op must keep the git ban (fail closed)");
+});
+
 // ─── (h) resolve is operator-only ───────────────────────────────────────────
 
 test("(h) research resolve requires an interactive operator dialog to clear a pending operation", async () => {

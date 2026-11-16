@@ -70,6 +70,24 @@ try{
   if(savedChild===undefined) delete process.env.PI_SUBAGENT_CHILD; else process.env.PI_SUBAGENT_CHILD=savedChild;
   if(savedParent===undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION; else process.env.PI_SUBAGENT_PARENT_SESSION=savedParent;
 }});
+test("restore respects a recorded /autoresearch off: an awaiting_child chain does not resurrect the mode",async()=>{const dir=workdir(),h=await harness(dir,true); const ext=await import(pathToFileURL(path.join(import.meta.dirname,"..","extensions","pi-autoresearch","index.ts")).href);
+// Live expedition on disk (awaiting_child state: campaign created, nothing stopped).
+await h.command("autoresearch").handler("expedition goal",h.ctx); await h.tool("expedition_brief").execute("id",{action:"draft",doc},null,null,h.ctx); const out=await h.tool("expedition_brief").execute("id",{action:"propose"},null,null,h.ctx);
+const id=text(out).match(/campaign (exp-[A-Za-z0-9-]+)/)?.[1];
+// Owner turns the mode off (as before closing the session).
+await h.command("autoresearch").handler("off",h.ctx);
+// A restart (pi --continue / /tree) restores into a fresh context of the SAME session branch:
+// simulate by re-running restore on a fresh ctx that shares the recorded-off entries.
+const freshCtx=makeCtx(dir,`${id}-off-keep`,h.pi);
+freshCtx.sessionManager.getBranch=()=>h.pi.entries.map(e=>({type:"custom",customType:e.customType,data:e.data}));
+await ext.restoreExpeditionForTest(freshCtx);
+assert.ok(!h.pi.sentMessages.some(m=>/restored after restart/.test(m.text)),"recorded off must suppress the restore message");
+assert.equal(ext.runtimeForTest(freshCtx).autoresearchMode,false,"recorded off must keep the mode OFF");
+// Control: a genuinely fresh session (own empty branch, no recorded decision) still restores.
+const controlCtx=makeCtx(dir,`${id}-fresh-restore`,h.pi);
+await ext.restoreExpeditionForTest(controlCtx);
+assert.ok(h.pi.sentMessages.some(m=>/restored after restart/.test(m.text)),"fresh session without a recorded off still restores");
+assert.equal(ext.runtimeForTest(controlCtx).autoresearchMode,true);});
 test("restore skips a stopped chain and reports a second active chain as NOT restored",async()=>{const dir=workdir(),h=await harness(dir,true); const ext=await import(pathToFileURL(path.join(import.meta.dirname,"..","extensions","pi-autoresearch","index.ts")).href);
 // Build two expeditions; the re-entry guard on /autoresearch expedition blocks the second command,
 // so build the second chain by direct disk manipulation: stop the first and add a second active chain dir.
