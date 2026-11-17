@@ -2384,8 +2384,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   /** Re-probe the deferral: deliver when zero active, else re-arm the timer. Set after the helpers below are defined. */
   let subagentRecheck: (() => void) | null = null;
-  /** Latest session context, set on session_start/agent_start; used by event-driven re-checks that carry no ctx. */
-  let subagentCtx: ExtensionContext | null = null;
+  /** bd 8e5.5 (F7): registry of LIVE session contexts instead of a single
+   *  module-scoped "latest" pointer — a subagent completion re-probes the
+   *  deferrals of ALL sessions that have one, not only the session that
+   *  happened to start last (pi multi-session // /tree). */
+  const subagentSessions = new Map<string, ExtensionContext>();
+  const rememberSubagentSession = (ctx: ExtensionContext): void => {
+    subagentSessions.set(getSessionKey(ctx), ctx);
+  };
+  const forgetSubagentSession = (ctx: ExtensionContext): void => {
+    subagentSessions.delete(getSessionKey(ctx));
+  };
 
   const sendSubagentPing = (): void => {
     if (!pi.events?.on || !pi.events?.emit) return;
@@ -3093,11 +3102,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return true;
   };
   subagentRecheck = () => {
-    // A completion event during ANY turn: re-probe the deferral of the latest session.
-    const ctx = subagentCtx;
-    if (!ctx) return;
-    const runtime = getRuntime(ctx);
-    if (runtime.subagentDeferral && !subagentProbeInFlight) void reprobeSubagentDeferral(ctx, runtime);
+    // bd 8e5.5 (F7): a completion event during ANY turn re-probes the deferral
+    // of EVERY live session that has one (pi multi-session // /tree) — not
+    // only the session that started last. Probe is serialized: the first
+    // session with a deferral wins this tick; the completion event re-fires
+    // and the 30 s re-check timer bounds the rest.
+    if (subagentProbeInFlight) return;
+    for (const [, ctx] of subagentSessions) {
+      const runtime = getRuntime(ctx);
+      if (runtime.subagentDeferral) {
+        void reprobeSubagentDeferral(ctx, runtime);
+        return;
+      }
+    }
   };
 
   const composeCompactionResumeMessage = async (ctx: ExtensionContext): Promise<string> => {
@@ -3614,7 +3631,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     ensureGatedToolsActive();
     // Late load coverage (subagent-wait-guard): ready may have fired before we
     // subscribed — a successful ping arms the guard on every session start.
-    subagentCtx = ctx;
+    rememberSubagentSession(ctx);
     sendSubagentPing();
     cancelSubagentDeferral(getRuntime(ctx));
   });
@@ -3624,8 +3641,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     await restoreExpeditionFromDisk(ctx);
     cancelSubagentDeferral(getRuntime(ctx));
   });
-  pi.on("session_before_switch", async () => {
+  pi.on("session_before_switch", async (_e, ctx) => {
     clearOverlay();
+    // bd 8e5.5 (F9): a deferred nudge must not fire into a session the user
+    // just navigated away from — same symmetry as session_tree/shutdown.
+    cancelPendingResume(getRuntime(ctx));
+    cancelSubagentDeferral(getRuntime(ctx));
   });
   pi.on("session_shutdown", async (_e, ctx) => {
     clearSessionUi(ctx);
@@ -3637,7 +3658,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       try { off(); } catch { /* already detached */ }
     }
     unsubscribeSubagentEvents.length = 0;
-    subagentCtx = null;
+    forgetSubagentSession(ctx);
   });
 
   pi.on("agent_start", async (_event, ctx) => {
@@ -3646,7 +3667,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     pausePendingResume(runtime);
     // New turn: a deferral from the previous settled turn must not fire into it.
     cancelSubagentDeferral(runtime);
-    subagentCtx = ctx;
+    rememberSubagentSession(ctx);
   });
 
   const ensurePendingResume = async (

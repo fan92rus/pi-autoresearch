@@ -13,7 +13,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { createHarness } from "./fake-pi.ts";
+import { createHarness, createSessionManager } from "./fake-pi.ts";
 import { approveOptimizeBrief } from "./optimize-approve-helper.mjs";
 import { SUBAGENT_DEFER_RECHECK_MS, SUBAGENT_DEFER_FUSE_MS } from "../extensions/pi-autoresearch/subagent-probe.ts";
 
@@ -549,4 +549,39 @@ test("bd 8e5.1: a DELIVERED drift nudge increments the drift counter exactly onc
   assert.equal(driftNudges(h).length, 1, "nudge delivered");
   assert.equal(rt.consecutiveDriftResumes, 1, "delivery increments the drift counter exactly once");
   assert.equal(rt.autoResumeTurns, 1, "delivery increments autoResumeTurns");
+});
+
+// ─── bd 8e5.5: before_switch cancels the deferral; per-session registry ──────
+
+test("bd 8e5.5/F9: session_before_switch cancels the deferred nudge (no fire into a navigated-away session)", async () => {
+  const h = await readySession("switch-cancel");
+  installRpcResponder(h.events, { respond: true, totalActive: 1 });
+  await fireSessionStart(h);
+  await settleNoWorkTurn(h);
+  await settleWindow();
+  assert.equal(driftNudges(h).length, 0, "deferred");
+  // The user navigates to another session in the tree.
+  await h.hook("session_before_switch")({}, h.ctx);
+  installRpcResponder(h.events, { respond: true, totalActive: 0 });
+  h.events.emit("subagent:async-complete", {});
+  await settleWindow();
+  await advance(SUBAGENT_DEFER_RECHECK_MS + 1500);
+  assert.equal(driftNudges(h).length, 0, "before_switch killed the deferral: no delivery into the navigated-away session");
+});
+
+test("bd 8e5.5/F7: a session_start of ANOTHER session does not orphan this session's deferral", async () => {
+  const h = await readySession("registry");
+  installRpcResponder(h.events, { respond: true, totalActive: 1 });
+  await fireSessionStart(h);
+  await settleNoWorkTurn(h);
+  // Session B starts (in the same process): the old single-pointer impl would
+  // repoint the re-probe target, leaving A's deferral undiscoverable by the
+  // completion event until the 10-min fuse.
+  const h2ctx = { ...h.ctx, sessionManager: createSessionManager("other-session") };
+  await h.hook("session_start")({}, h2ctx);
+  // The last subagent finishes: A's deferral must still be re-probed.
+  installRpcResponder(h.events, { respond: true, totalActive: 0 });
+  h.events.emit("subagent:async-complete", {});
+  await settleWindow();
+  assert.ok(driftNudges(h).length >= 1, "session A deferral delivered despite session B starting later");
 });
