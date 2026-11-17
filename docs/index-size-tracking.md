@@ -25,12 +25,13 @@ E6 exit criterion: **≤ ~6,000 lines**, with no tool/hook lost (full suite gree
 | a2f0211 | 11,250 | −647 | E5 candidate dispatcher extraction (el3.3) |
 | 27b75f5 | 11,154 | −96 | E2 research scan/dispatch adapters (8af.5, partial) |
 | 2c1e4ac | 10,525 | −629 | E6 widget renderers extraction (161.1) |
-| 048a134 | **10,188** | **−337** | E6 findings/measurement adapters (161.2) |
+| 048a134 | 10,188 | −337 | E6 findings/measurement adapters (161.2) |
+| 6f0c189 | **10,202** | **+14** | F-20 typed test-hooks object (161.3, DI enabler; net +14) |
 
 ## Observations
 
 - Bugfix waves typically ADD lines (+15…+66); only true extractions reduce the file.
-- lrx.1 is the first extraction with a measurable reduction (−152, 1.25% of the file); cumulative reduction across lrx.1+8e5.6+el3.3+8af.5+161.1+161.2 is −1,970 lines (−16.2% from the 12,158 baseline).
+- lrx.1 is the first extraction with a measurable reduction (−152, 1.25% of the file); cumulative reduction across lrx.1+8e5.6+el3.3+8af.5+161.1+161.2+161.3 is −1,956 lines (−16.1% from the 12,158 baseline).
 - Remaining large extractions (in dependency order): 8e5.6 (resume-policy, ~460 lines), el3.3 (candidate orchestration, ~900 lines), 8af.5 (research cluster ~2,500 lines), 161.1 (slash-commands/widget), 161.2 (findings/measurement tool adapters).
 - To reach ≤6k, several of the large extractions MUST land — bugfix-only waves cannot get there.
 
