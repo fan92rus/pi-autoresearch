@@ -96,6 +96,8 @@ import {
   SUBAGENT_DEFER_FUSE_MS,
   SUBAGENT_DEFER_RECHECK_MS,
 } from "./subagent-probe.ts";
+import { createResumePolicy, type PendingResume } from "./resume-policy.ts";
+export { SETTLED_WINDOW_MS } from "./resume-policy.ts";
 import { inspectResults } from "./lens-inspect.ts";
 import { buildReport } from "./report.ts";
 import {
@@ -519,8 +521,8 @@ interface AutoresearchRuntime {
   state: ExperimentState;
   /** Pending auto-resume timer; cancelled when the agent starts a new run or compacts. */
   pendingResumeTimer: ReturnType<typeof setTimeout> | null;
-  /** Resume message to send when the pending timer fires, tagged with the loop mode it prescribes (bd 8e5.2/F4: send-time refresh reads the tag instead of regex-sniffing the text). Empty-string "" is the transient mutex claim of ensurePendingResume. */
-  pendingResumeMessage: { mode: "legacy" | "research" | "candidate"; text: string } | "" | null;
+  /** Resume message to send when the pending timer fires, tagged with the loop mode it prescribes (bd 8e5.2/F4: send-time refresh reads the tag instead of regex-sniffing the text). The transient mutex claim of ensurePendingResume is a typed `{ kind: "claimed" }` state (bd 8e5.6/F14; no empty-string sentinel). */
+  pendingResumeMessage: PendingResume;
   /** bd 8e5.1: drift-mode accounting flag kept on the runtime (delivery-time increment is decided by the pending message’s mode tag + drift kind; see pendingResumeMessage). */
   pendingResumeIsDrift: boolean;
   /** TUI view mode: 'list' (dashboard table) or 'tree' (experiment tree). Toggle with Tab. */
@@ -2280,9 +2282,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     pi.debug?.("autoresearch: removed old auto-installed observer hook (now bundled)", {});
   }
 
-  // Outlasts pi's internal retry (setTimeout 0) and compaction-continue
-  // (setTimeout 100); see badlogic/pi-mono#2023, #2110.
-  const SETTLED_WINDOW_MS = 800;
+  // SETTLED_WINDOW_MS is shared with resume-policy.ts (F6).
   /** Bounded drift-resume (goal-x anti-chat-loop pattern): after this many consecutive no-loop-work turns the loop stops and the user is notified instead of nudged again. */
   const MAX_CONSECUTIVE_DRIFT_RESUMES = 2;
   const shortcuts = resolveAutoresearchShortcuts();
@@ -2389,133 +2389,20 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const hasPendingResume = (runtime: AutoresearchRuntime): boolean =>
     runtime.pendingResumeMessage !== null;
 
-  const pausePendingResume = (runtime: AutoresearchRuntime): void => {
-    if (!runtime.pendingResumeTimer) return;
-    clearTimeout(runtime.pendingResumeTimer);
-    runtime.pendingResumeTimer = null;
-  };
-
-  const cancelPendingResume = (runtime: AutoresearchRuntime): void => {
-    pausePendingResume(runtime);
-    runtime.pendingResumeMessage = null;
-    runtime.pendingResumeIsDrift = false;
-  };
-
-  const markAutoResumeSent = (runtime: AutoresearchRuntime): void => {
-    runtime.autoResumeTurns++;
-  };
-
-  /**
-   * bd 8e5.3 (F10): the ONE documented gate order for all three resume
-   * delivery paths (agent_end drift, deferred-drift delivery, send-time):
-   *   1. mode off        → cancel (Decision 6 reset points handle most of these,
-   *                        this is the send-time backstop)
-   *   2. manual-check    → cancel (pending-op / halted, state-root aware —
-   *                        design §5: unclear state stops, the operator decides)
-   *   3. stop-reason     → cancel + notify (drift/turn/failure limits)
-   *   4. agent unsettled → retry (re-arm; bd 8e5.3/F11: never park the message)
-   *   5. deliver
-   * Side effects (cancel/notify) are applied by the CALLER — the helper only
-   * decides. `workDir`/`researchBlocks` are returned so the caller does not
-   * re-scan (the scans are sync but not free).
-   */
-  const evaluateResumeGates = async (
-    ctx: ExtensionContext,
-    runtime: AutoresearchRuntime,
-  ): Promise<
-    | { verdict: "cancel"; notify?: string | null }
-    | { verdict: "retry" }
-    | { verdict: "deliver"; workDir: string; researchBlocks: boolean }
-  > => {
-    if (!runtime.autoresearchMode) return { verdict: "cancel" };
-    const workDir = resolveWorkDir(ctx.cwd);
-    if (await campaignNeedsManualCheck(workDir, ctx)) return { verdict: "cancel" };
-    const stopReason = autoResumeStopReasonFor(runtime);
-    if (stopReason !== null) return { verdict: "cancel", notify: stopReason };
-    if (!isAgentSettled(ctx)) return { verdict: "retry" };
-    return { verdict: "deliver", workDir, researchBlocks: researchScanSync(workDir).blocks };
-  };
-
-  const sendPendingResumeIfReady = async (ctx: ExtensionContext, runtime: AutoresearchRuntime): Promise<void> => {
-    const pending = runtime.pendingResumeMessage;
-
-    if (!pending || pending === "") return;
-    const message = pending.text;
-    // bd 8e5.3 (F10): one documented gate order for all three delivery paths
-    // (agent_end / deliverDeferredDriftNudge / send-time): mode → manual-check
-    // → stop-reason → settled. evaluateResumeGates returns "deliver" | "cancel"
-    // | "retry"; cancel/notify side effects are decided HERE, only the
-    // ordering lives in the shared helper.
-    const gates = await evaluateResumeGates(ctx, runtime);
-    if (gates.verdict === "cancel") {
-      cancelPendingResume(runtime);
-      if (gates.notify) notifyAutoResumeLimitReached(ctx, gates.notify);
-      return;
-    }
-    if (gates.verdict === "retry") {
-      // bd 8e5.3 (F11): the agent is still busy — re-arm instead of parking the
-      // message forever. The timer was already consumed by this fire, so a bare
-      // return would leave pendingResumeTimer === null with nobody left to
-      // reschedule; retry keeps the nudge alive until the agent settles.
-      reschedulePendingResume(ctx, runtime);
-      return;
-    }
-    // bd 8e5.2 (F4): staleness is decided by the MODE TAG, not regex sniffing.
-    // A candidate-mode message is stale once the campaign is disabled or gone.
-    if (pending.mode === "candidate" && !campaignActiveSync(gates.workDir)) {
-      cancelPendingResume(runtime);
-      return;
-    }
-
-    // bd 8e5.1 (design Decision 3, both paths): drift accounting happens at
-    // DELIVERY — a scheduled-then-cancelled drift nudge (mode off, halted,
-    // stale) must not spend the drift/turn budget for a message never sent.
-    // The drift kind is the pending message’s runtime drift flag; read it
-    // BEFORE cancelPendingResume clears it.
-    const wasDrift = runtime.pendingResumeIsDrift;
-    cancelPendingResume(runtime);
-    if (wasDrift) {
-      runtime.consecutiveDriftResumes++;
-    }
-    markAutoResumeSent(runtime);
-    // bd 8e5.2 (F4): send-time mode refresh WITHOUT regex sniffing — the live
-    // resolver replaces a stored wording that no longer matches reality
-    // (design §5: a legacy-cycle message stored before a campaign started is
-    // replaced by the campaign wording at send time).
-    const liveMode = await resolveLoopMode(gates.workDir, ctx);
-    let sendText = message;
-    if (liveMode.mode === "research" && pending.mode === "legacy") {
-      sendText = gates.researchBlocks ? RESEARCH_RESUME_TEXT : await composeCampaignResumeMessage(ctx);
-    } else if (liveMode.mode === "candidate" && pending.mode !== "candidate") {
-      sendText = await composeCampaignResumeMessage(ctx);
-    }
-    pi.sendUserMessage(sendText);
-  };
+  const pausePendingResume = (runtime: AutoresearchRuntime): void => resumePolicy.pausePendingResume(runtime);
+  const cancelPendingResume = (runtime: AutoresearchRuntime): void => resumePolicy.cancelPendingResume(runtime);
+  const sendPendingResumeIfReady = (ctx: ExtensionContext, runtime: AutoresearchRuntime): Promise<void> =>
+    resumePolicy.sendPendingResumeIfReady(ctx, runtime);
   sendPendingResumeIfReadyForTest = sendPendingResumeIfReady;
   runtimeForTest = (ctx: ExtensionContext) => getRuntime(ctx);
-
   const schedulePendingResume = (
     ctx: ExtensionContext,
     runtime: AutoresearchRuntime,
     message: string,
     opts?: { mode?: "legacy" | "research" | "candidate" },
-  ): void => {
-    pausePendingResume(runtime);
-    // bd 8e5.2 (F4): the message carries its mode tag; send-time refresh and
-    // drift accounting read the tag instead of regex-sniffing the text.
-    runtime.pendingResumeMessage = { mode: opts?.mode ?? "legacy", text: message };
-    runtime.pendingResumeTimer = setTimeout(
-      () => sendPendingResumeIfReady(ctx, runtime),
-      SETTLED_WINDOW_MS,
-    );
-  };
-
-  const reschedulePendingResume = (ctx: ExtensionContext, runtime: AutoresearchRuntime): void => {
-    if (!hasPendingResume(runtime)) return;
-    const pending = runtime.pendingResumeMessage;
-    if (typeof pending === "string" || pending === null) return;
-    schedulePendingResume(ctx, runtime, pending.text, { mode: pending.mode });
-  };
+  ): void => resumePolicy.schedulePendingResume(ctx, runtime, message, opts);
+  const reschedulePendingResume = (ctx: ExtensionContext, runtime: AutoresearchRuntime): void =>
+    resumePolicy.reschedulePendingResume(ctx, runtime);
 
   const hasRunExperimentsThisSession = (runtime: AutoresearchRuntime): boolean =>
     runtime.experimentsThisSession > 0;
@@ -2701,9 +2588,32 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return { mode: "legacy", researchCompletion: false };
   };
 
-  /** bd 8e5.2 (F4): the snapshot condition spelled out 3× before — now once. */
-  const researchNextStepText = (researchCompletion: boolean): string =>
-    researchCompletion ? researchCompletionText : RESEARCH_RESUME_TEXT;
+  const resumePolicy = createResumePolicy({
+    resolveWorkDir,
+    campaignNeedsManualCheck: (workDir, ctx) => campaignNeedsManualCheck(workDir, ctx),
+    autoResumeStopReasonFor,
+    isAgentSettled,
+    researchBlocks: (workDir, ctx) => {
+      if (researchScanSync(workDir).blocks) return true;
+      const stateRoot = getRuntime(ctx).researchStateRoot;
+      return stateRoot !== null && stateRoot !== workDir && researchScanSync(stateRoot).blocks;
+    },
+    researchScanBlocks: (workDir) => researchScanSync(workDir).blocks,
+    campaignActive: (workDir) => campaignActiveSync(workDir),
+    resolveLoopMode,
+    expeditionDriftBranchText: (ctx) => expeditionDriftBranchText(ctx),
+    getRuntime,
+    researchResumeText: RESEARCH_RESUME_TEXT,
+    researchCompletionText,
+    measurementGuardrail: MEASUREMENT_GUARDRAIL,
+    benchmarkGuardrail: BENCHMARK_GUARDRAIL,
+    experimentLimitClause,
+    hasExperimentLedger: (workDir) => fs.existsSync(autoresearchJsonlPath(workDir)),
+    notifyAutoResumeLimitReached: (ctx, reason) => notifyAutoResumeLimitReached(ctx, reason),
+    composeCampaignResumeMessage: (ctx) => composeCampaignResumeMessage(ctx),
+    sendUserMessage: (text) => pi.sendUserMessage(text),
+  });
+  const evaluateResumeGates = resumePolicy.evaluateResumeGates;
 
   /** Expedition-aware drift branch (review blocker 2026-11-12: the legacy
    *  'pick a stop rule' push fired in an expedition with an active direction
@@ -2736,106 +2646,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return `Continue the expedition now: ${body} STOP on manual_check_required.`;
   };
 
-  const composeResearchDriftMessage = async (ctx: ExtensionContext): Promise<string> => {
-    // Expedition branch first: the legacy completion text prescribes a stop
-    // while the map still has active/open directions (review blocker).
-    const expeditionBranch = await expeditionDriftBranchText(ctx);
-    if (expeditionBranch !== null) {
-      return ["⚠ Last turn did no research-campaign work.", expeditionBranch, "Questions and decision rules come only from the approved brief."].join(" ");
-    }
-    // bd 8e5.2 (F4): the snapshot condition lives in resolveLoopMode — this
-    // composer just renders the research wording.
-    const driftMode = await resolveLoopMode(resolveWorkDir(ctx.cwd), ctx);
-    const next = researchNextStepText(driftMode.researchCompletion);
-    return [
-      "⚠ Last turn did no research-campaign work.",
-      next,
-      "Questions and decision rules come only from the approved brief.",
-    ].join(" ");
-  };
+  const composeResearchDriftMessage = resumePolicy.composeResearchDriftMessage;
+  const composeResearchCompactionMessage = resumePolicy.composeResearchCompactionMessage;
 
-  const composeResearchCompactionMessage = (): string =>
-    [
-      "Resume the research campaign now: call research_questions(action=status), then issue separate research_questions calls with action=open, action=record, or action=close per the brief.",
-      "Do not re-read .auto/prompt.md for loop rules (they are not part of the research campaign).",
-      "STOP on manual_check_required.",
-    ].join(" ");
+  const composeResumeMessage = resumePolicy.composeResumeMessage;
 
-  const composeResumeMessage = (ctx: ExtensionContext): string => {
-    const runtime = getRuntime(ctx);
-    const flag = runtime.lastLogFlag;
-    const head = flag
-      ? `⚠ Last log_experiment was flagged (${flag}) — that value was agent-claimed, NOT measured. Run run_experiment and log the parsed METRIC. `
-      : "";
-    // bd 51n.14: a failed auto-revert left the tree DIRTY; the next baseline
-    // would be measured on mutated code. Keep warning until a clean revert.
-    const revertWarn = runtime.lastRevertFailure
-      ? `⚠ The last auto-revert FAILED (${runtime.lastRevertFailure}) — the working tree still carries the discarded experiment's changes. Run a manual git checkout/clean (excluding .auto) and verify git status is clean BEFORE trusting the next baseline. `
-      : "";
-    return [
-      revertWarn + head + "Run the next iteration now.",
-      "Use the persisted autoresearch state as needed, pick the most promising hypothesis, then call run_experiment + log_experiment.",
-      MEASUREMENT_GUARDRAIL,
-      experimentLimitClause(ctx.cwd),
-      BENCHMARK_GUARDRAIL,
-    ].join(" ");
-  };
-
-  /** Campaign-mode default resume used by ensurePendingResume when no explicit
-   *  composer is given: never mentions the blocked legacy tools. Session-aware
-   *  sync variant: also consults the pinned --state-root base. */
-  const composeCampaignResumeMessage = async (ctx: ExtensionContext): Promise<string> => {
-    // bd 8e5.2 (F4): mode decided by the one resolver (session-aware:
-    // resolveLoopMode covers the pinned state-root via researchBlocksOrdinaryLoop).
-    const mode = await resolveLoopMode(resolveWorkDir(ctx.cwd), ctx);
-    if (mode.mode === "research") {
-      const expeditionBranch = await expeditionDriftBranchText(ctx);
-      if (expeditionBranch !== null) return expeditionBranch;
-      return researchNextStepText(mode.researchCompletion);
-    }
-    return [
-          "Continue the candidate campaign now: candidate_branch status, then run/checkpoint on the active candidate.",
-          "The ordinary experiment tools are blocked while the campaign is active.",
-          "If status reports manual_check_required: STOP — report the pending operation and wait for the operator (resolve).",
-        ].join(" ");
-  };
-
-  /** Corrective resume for a settled turn that did no loop work (bounded — see MAX_CONSECUTIVE_DRIFT_RESUMES). */
-  /** bd 8e5.2 (F4): drift composers return {mode, text} so the pending message
-   *  carries its true mode tag — send-time refresh must not replace an
-   *  expedition drift nudge (mode "research") just because its text lacks the
-   *  legacy-tool words the old regex sniffed. */
-  const composeDriftResumeMessage = async (cwd: string, ctx: ExtensionContext): Promise<{ mode: "legacy" | "research" | "candidate"; text: string }> => {
-    // bd 8e5.2 (F4): the mode decision lives in resolveLoopMode (session-aware,
-    // design §8/§5); this composer only renders per-mode wording.
-    const mode = await resolveLoopMode(resolveWorkDir(cwd), ctx);
-    if (mode.mode === "research") return { mode: "research", text: await composeResearchDriftMessage(ctx) };
-    if (mode.mode === "candidate") {
-      return { mode: "candidate", text: [
-        "⚠ Last turn did no candidate-campaign work.",
-        "Resume the campaign now: candidate_branch status, then run/checkpoint on the active candidate.",
-        "If status reports manual_check_required: STOP — report the pending operation and wait for the operator (resolve).",
-      ].join(" ") };
-    }
-    // No campaign is active. Prescribe the legacy cycle ONLY when the loop was
-    // actually initialized: without a ledger (.auto/log.jsonl) nagging a chat
-    // turn with run_experiment/log_experiment is noise (observed live in a
-    // chat-only project, bd drift-nudge fix). Name the start commands instead.
-    if (!fs.existsSync(autoresearchJsonlPath(resolveWorkDir(cwd)))) {
-      return { mode: "legacy", text: [
-        "⚠ Last turn did no experiment work and no campaign is active.",
-        "The experiment loop is not initialized in this project (no .auto/log.jsonl).",
-        "To start a loop run /autoresearch <goal>; to run a research campaign use /autoresearch research <topic>.",
-      ].join(" ") };
-    }
-    return { mode: "legacy", text: [
-      "⚠ Last turn used no experiment tools (chat/reads don't advance the loop).",
-      "Resume the cycle now: propose_hypothesis → run_experiment → log_experiment.",
-      MEASUREMENT_GUARDRAIL,
-      experimentLimitClause(cwd),
-      BENCHMARK_GUARDRAIL,
-    ].join(" ") };
-  };
+  const composeCampaignResumeMessage = resumePolicy.composeCampaignResumeMessage;
+  const composeDriftResumeMessage = resumePolicy.composeDriftResumeMessage;
 
   // ── Subagent-wait guard (task 2.2): defer the drift branch while async subagents run ──
   const cancelSubagentDeferral = (runtime: AutoresearchRuntime): void => {
@@ -2861,14 +2678,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (runtime.consecutiveDriftResumes >= MAX_CONSECUTIVE_DRIFT_RESUMES) {
       // The drift limit is checked BEFORE the probe in agent_end; reaching it
       // while deferred behaves like the ordinary path: stop with a notice.
-      ctx.ui.notify(
-        researchScanSync(resolveWorkDir(ctx.cwd)).blocks
-          ? "Autoresearch paused — the last turns did no research-campaign work. Use research_questions(action=status) to see the state, then resume the campaign."
-          : campaignActiveSync(resolveWorkDir(ctx.cwd))
-          ? "Autoresearch paused — the last turns did no candidate-campaign work. Use candidate_branch status to see the state, then resume the campaign."
-          : "Autoresearch paused — the last turns did no experiment work (no run_experiment/log_experiment). Run /autoresearch <goal> to resume the loop.",
-        "info",
-      );
+      ctx.ui.notify(resumePolicy.composePausedNotice(resolveWorkDir(ctx.cwd), ctx), "info");
       return;
     }
     // bd 8e5.3 (F10): shared gate order (mode → manual-check → stop-reason →
@@ -2965,28 +2775,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
   };
 
-  const composeCompactionResumeMessage = async (ctx: ExtensionContext): Promise<string> => {
-    // bd 8e5.2 (F4): the mode decision lives in resolveLoopMode.
-    const mode = await resolveLoopMode(resolveWorkDir(ctx.cwd), ctx);
-    if (mode.mode === "research") return composeResearchCompactionMessage();
-    if (mode.mode === "candidate") {
-      return [
-        "Resume the candidate campaign now: candidate_branch status, then run/checkpoint on the active candidate.",
-        "If status reports manual_check_required: STOP — report the pending operation and wait for the operator (resolve).",
-        "Read the campaign state with candidate_branch status; do not re-read .auto/prompt.md for loop rules (they are not part of the campaign).",
-      ].join(" ");
-    }
-    // The compaction summary already contains the rules, ideas, and recent
-    // runs — so this resume message just kicks the loop forward.
-    return [
-      "Run the next iteration now.",
-      "Pick the most promising hypothesis from the ideas backlog or the latest `next:` hints in recent runs, then call run_experiment + log_experiment.",
-      "Do not re-read .auto/prompt.md or .auto/log.jsonl — the compaction summary already contains them.",
-      MEASUREMENT_GUARDRAIL,
-      experimentLimitClause(ctx.cwd),
-      BENCHMARK_GUARDRAIL,
-    ].join(" ");
-  };
+  const composeCompactionResumeMessage = resumePolicy.composeCompactionResumeMessage;
 
   const autoresearchCompactionFor = (
     ctx: ExtensionContext,
@@ -3552,10 +3341,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
     // Claim the pending slot BEFORE awaiting the composer: two agent_end events
     // settling in the same window would otherwise both pass hasPendingResume and
-    // double-schedule (review M-4). The empty-string claim is transient (a real
-    // message overwrites it synchronously after the await; sendPendingResumeIfReady
-    // treats an empty message as nothing to send).
-    runtime.pendingResumeMessage = "";
+    // double-schedule (review M-4). The typed claim is distinct from a deliverable
+    // message; send/reschedule ignore it until this composer replaces it.
+    runtime.pendingResumeMessage = { kind: "claimed" };
     const resolved = await composed;
     schedulePendingResume(ctx, runtime, resolved.text, { mode: resolved.mode });
   };
@@ -3618,14 +3406,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
       // Under an active candidate campaign the notice must not prescribe the
       // ordinary loop (design §5); it names the campaign tool instead.
-      ctx.ui.notify(
-        researchScanSync(resolveWorkDir(ctx.cwd)).blocks
-          ? "Autoresearch paused — the last turns did no research-campaign work. Use research_questions(action=status) to see the state, then resume the campaign."
-          : campaignActiveSync(resolveWorkDir(ctx.cwd))
-          ? "Autoresearch paused — the last turns did no candidate-campaign work. Use candidate_branch status to see the state, then resume the campaign."
-          : "Autoresearch paused — the last turns did no experiment work (no run_experiment/log_experiment). Run /autoresearch <goal> to resume the loop.",
-        "info",
-      );
+      ctx.ui.notify(resumePolicy.composePausedNotice(resolveWorkDir(ctx.cwd), ctx), "info");
       return;
     }
 

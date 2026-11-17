@@ -15,6 +15,7 @@ import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
 import { createFakePi, makeCtx } from "./fake-pi.ts";
+import { SETTLED_WINDOW_MS } from "../extensions/pi-autoresearch/index.ts";
 
 const LEGACY_TOOL_NAMES = /run_experiment|log_experiment|propose_hypothesis/;
 const LEGACY_MARKERS = [
@@ -160,7 +161,7 @@ test("(b) agent_end during an active research campaign never steers toward the l
   const h = await loadExtension(dir, "steer");
   await h.hook("agent_start")({ messages: [] }, h.ctx);
   await h.hook("agent_end")({ messages: [] }, h.ctx);
-  await new Promise((r) => setTimeout(r, 1100)); // SETTLED_WINDOW_MS = 800
+  await new Promise((r) => setTimeout(r, SETTLED_WINDOW_MS + 300));
   const legacy = h.pi.sentMessages.filter((m) => LEGACY_TOOL_NAMES.test(m.text));
   assert.equal(legacy.length, 0, `no legacy-loop steers: ${JSON.stringify(legacy.map((m) => m.text))}`);
   // The activation kickoff (sent at load) also mentions research status; the
@@ -175,7 +176,7 @@ test("(b) a stopped research campaign never auto-continues", async () => {
   const h = await loadExtension(dir, "steer-stopped");
   await h.hook("agent_start")({ messages: [] }, h.ctx);
   await h.hook("agent_end")({ messages: [] }, h.ctx);
-  await new Promise((r) => setTimeout(r, 1100));
+  await new Promise((r) => setTimeout(r, SETTLED_WINDOW_MS + 300));
   assert.equal(h.pi.sentMessages.length, 0, `stopped campaign must not be resumed: ${JSON.stringify(h.pi.sentMessages.map((m) => m.text))}`);
 }, { timeout: 30000 });
 
