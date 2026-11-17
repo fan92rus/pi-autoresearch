@@ -1,6 +1,7 @@
 import * as chainJournal from "./chain-journal.ts";
 import * as expedition from "./expedition.ts";
 import * as researchState from "./research-state.ts";
+import { renderRefusal } from "./refusal.ts";
 
 export function createResearchPolicy(): Map<string, string[]> {
   return new Map([
@@ -26,7 +27,7 @@ export async function executeResearchAction(params: any, ctx: any, workDir: stri
   const action = params?.action;
   const reply = (text: string) => ({ content: [{ type: "text", text }], details: { action } });
   const fail = (reason: string, message: string) => ({
-    content: [{ type: "text", text: deps.refusalText({ reason, message }) }],
+    content: [{ type: "text", text: renderRefusal({ reason, message }) }],
     details: { action, reason },
   });
   if (action !== "expedition") return undefined;

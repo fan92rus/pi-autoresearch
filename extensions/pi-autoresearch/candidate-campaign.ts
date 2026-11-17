@@ -4,6 +4,7 @@ import * as path from "node:path";
 import * as candidateState from "./candidate-state.ts";
 import * as candidateWorktree from "./candidate-worktree.ts";
 import * as candidateMeasure from "./candidate-measure.ts";
+import { renderRefusal } from "./refusal.ts";
 import type { CandidatePolicy } from "./candidate-policy.ts";
 import type { spawn as SpawnFn } from "node:child_process";
 
@@ -13,7 +14,7 @@ export async function executeCandidateBranchAction(params: any, ctx: any, workDi
       const action = params?.action;
 
       const fail = (reason: string, message: string, extra = "") => ({
-        content: [{ type: "text", text: `⛔ ${reason}: ${message}${extra}` }],
+        content: [{ type: "text", text: `${renderRefusal({ reason, message })}${extra}` }],
         details: { action, reason },
       });
 

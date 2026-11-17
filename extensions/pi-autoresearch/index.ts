@@ -197,6 +197,7 @@ import * as candidateWorktree from "./candidate-worktree.ts";
 import * as candidateMeasure from "./candidate-measure.ts";
 import { candidateWorktreeRoot, createCandidateExecRunner, executeCandidateBranchAction } from "./candidate-campaign.ts";
 import * as researchState from "./research-state.ts";
+import { renderRefusal } from "./refusal.ts";
 import {
   briefTranscriptText,
   resolveBriefPreviewDir,
@@ -7143,8 +7144,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     details: {},
   });
 
-  /** Single-line refusal text from any module refusal shape. */
-  const refusalText = (r: { reason: string; message: string }): string => `⛔ ${r.reason}: ${r.message}`;
+  /** Single-line refusal text shared with tool adapters (bd pi-autoresearch-161.4). */
+  const refusalText = renderRefusal;
 
   const activeCandidateOf = (state: candidateState.CampaignState | null): candidateState.CandidateRecord | null => {
     if (!state) return null;

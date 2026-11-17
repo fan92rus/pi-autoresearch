@@ -42,6 +42,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { mkdir, open, readFile, rename, rm, stat, unlink } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
+import { inspectionRefusalReason } from "./refusal.ts";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -189,6 +190,8 @@ export type StateDecision = Result<{ next: CampaignState }>;
 
 export interface CampaignInspection {
   status: "uninitialized" | "ready" | "manual_check_required" | "state_unreadable" | "invalid_argument";
+  /** Derived from `status` by inspectionRefusalReason; null means this is not a refusal. */
+  refusal_reason?: RefusalReason | null;
   state: CampaignState | null;
   pendingOp: PendingOp | null;
   lockPresent: boolean;
@@ -725,6 +728,7 @@ export async function inspectCampaign(dir: string): Promise<CampaignInspection> 
   if (contained) {
     return {
       status: "invalid_argument",
+      refusal_reason: inspectionRefusalReason("invalid_argument"),
       state: null,
       pendingOp: null,
       lockPresent: false,
@@ -738,6 +742,7 @@ export async function inspectCampaign(dir: string): Promise<CampaignInspection> 
   if (pendingOp) {
     return {
       status: "manual_check_required",
+      refusal_reason: inspectionRefusalReason("manual_check_required"),
       state,
       pendingOp,
       lockPresent,
@@ -745,15 +750,17 @@ export async function inspectCampaign(dir: string): Promise<CampaignInspection> 
     };
   }
   if (!loaded.ok) {
+    const status = loaded.reason === "not_initialized" ? "uninitialized" : "state_unreadable";
     return {
-      status: loaded.reason === "not_initialized" ? "uninitialized" : "state_unreadable",
+      status,
+      refusal_reason: inspectionRefusalReason(status),
       state: null,
       pendingOp: null,
       lockPresent,
       message: loaded.message,
     };
   }
-  return { status: "ready", state, pendingOp: null, lockPresent, message: "campaign state is readable" };
+  return { status: "ready", refusal_reason: inspectionRefusalReason("ready"), state, pendingOp: null, lockPresent, message: "campaign state is readable" };
 }
 
 // ─── Brief structure ─────────────────────────────────────────────────────────
