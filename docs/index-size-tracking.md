@@ -20,12 +20,14 @@ E6 exit criterion: **≤ ~6,000 lines**, with no tool/hook lost (full suite gree
 | 4fba40d | 12,215 | +35 | E4 evaluateResumeGates (8e5.3) |
 | 5168460 | 12,247 | +32 | E4 resolveLoopMode + mode tag (8e5.2) |
 | 4e30c43 | 12,268 | +21 | E4 session registry (8e5.5) |
-| 3d323ba | **12,116** | **−152** | E3 ledger-metrics extraction (lrx.1) |
+| 3d323ba | 12,116 | −152 | E3 ledger-metrics extraction (lrx.1) |
+| 4ab2088 | 11,897 | −219 | E4 resume-policy extraction (8e5.6) |
+| a2f0211 | **11,250** | **−647** | E5 candidate dispatcher extraction (el3.3) |
 
 ## Observations
 
 - Bugfix waves typically ADD lines (+15…+66); only true extractions reduce the file.
-- lrx.1 is the first extraction with a measurable reduction (−152, 1.25% of the file).
+- lrx.1 is the first extraction with a measurable reduction (−152, 1.25% of the file); cumulative reduction across lrx.1+8e5.6+el3.3 is −908 lines (−7.5% from the 12,158 baseline).
 - Remaining large extractions (in dependency order): 8e5.6 (resume-policy, ~460 lines), el3.3 (candidate orchestration, ~900 lines), 8af.5 (research cluster ~2,500 lines), 161.1 (slash-commands/widget), 161.2 (findings/measurement tool adapters).
 - To reach ≤6k, several of the large extractions MUST land — bugfix-only waves cannot get there.
 
