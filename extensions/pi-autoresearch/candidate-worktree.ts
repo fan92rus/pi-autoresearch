@@ -7,9 +7,9 @@
  *   - createCandidateWorktree: create a system-owned, DETACHED worktree of the
  *     campaign repository from a given FULL commit sha. The source worktree is
  *     never deleted, never reset, never cleaned, never checked out; nothing is
- *     written into it (no .gitignore edits — unlike parallel/worktree.ts,
- *     whose provisionWorktree rm's the target dir and writes .gitignore and is
- *     therefore unusable here).
+ *     written into it (no .gitignore edits — unlike the removed legacy
+ *     parallel/worktree.ts, whose provisionWorktree rm'd the target dir and
+ *     wrote .gitignore and was therefore unusable here).
  *   - checkpointCandidateWorktree: commit EXACTLY the explicitly allowed files
  *     inside the candidate worktree and point a candidate-scoped ref
  *     (refs/pi-autoresearch/candidates/<candidateId>) at the checkpoint
@@ -38,15 +38,24 @@
  * except where explicitly documented (see the staged-state note inside
  * checkpointCandidateWorktree for the tiny status→add race window).
  *
- * All git access goes through the injected ExecFn (same shape as
- * parallel/worktree.ts, imported type-only — no runtime dependency). The
+ * All git access goes through the injected ExecFn (argv-only, no shell;
+ * type-local — no runtime dependency on any legacy namespace). The
  * module never spawns processes itself and never runs a shell.
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import type { ExecFn } from "./parallel/worktree.ts";
+/**
+ * Injected exec function (argv-only, no shell). Type-local since bd
+ * pi-autoresearch-el3.4 removed the legacy parallel/worktree.ts namespace
+ * (same shape as the old shared ExecFn).
+ */
+export type ExecFn = (
+  cmd: string,
+  args: string[],
+  opts?: { cwd?: string; timeout?: number },
+) => Promise<{ stdout: string; stderr: string; code: number }>;
 
 // ─── Exec helper ─────────────────────────────────────────────────────────────
 
@@ -418,7 +427,8 @@ export type CreateWorktreeResult =
  *     it, never edits .gitignore, never deletes anything.
  *
  * Parent directories of the target are created (mkdir -p of the parent only,
- * mirroring parallel/worktree.ts; no file inside the user's tree is touched).
+ * mirroring the removed legacy parallel/worktree.ts behavior; no file inside
+ * the user's tree is touched).
  */
 export async function createCandidateWorktree(
   exec: ExecFn,

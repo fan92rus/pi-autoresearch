@@ -173,22 +173,19 @@ pnpm typecheck 2>&1 | grep -i error || true
 
 **NEVER STOP.** The user may be away for hours. Keep going until interrupted.
 
-## When to go parallel
+## Parallel modes — removed
 
-A sequential `edit → measure → keep/revert` loop is the default. Switch to parallel modes when you hit these triggers:
+The legacy parallel modes (Best-of-N fan-out, orthogonal stacking, space search,
+phases/valleyProbe) were **removed** from pi-autoresearch (dead-code cut dd43c7f;
+skill deleted in bd pi-autoresearch-el3.4, 2026-11-16). Multi-variant exploration
+now runs through `candidate_branch` (isolated candidate worktrees with
+checkpoints) — for diverse ideas use candidate campaigns instead of the removed
+parallel fan-out. "Best-of-N" thinking remains useful: try candidate branches
+sequentially or via `agile_run`/`subagent` fan-out outside the extension.
 
-| Trigger | Mode | Why |
-|---------|------|-----|
-| **2+ distinct hypotheses** to try | Best-of-N | Test all at once instead of sequentially |
-| **Stuck** — 5+ discards in a row, same approach | Best-of-N | Break out of the local optimum with diverse ideas |
-| **Must get worse before better** (refactor, algorithm swap) | Phases | Disable auto-revert; validate only the final metric |
-| **Phase stuck in a valley** (maxSteps hit) | valleyProbe | Spawn diverse continuations from best checkpoint |
-| **Multimodal landscape** — many local optima | SpaceSearch | Beam search maintains K diverse states |
-| **Independent file-scoped optimizations** | CheckOrthogonal | Stack patches that don't overlap |
-
-See `skill://autoresearch-parallel` for detailed flows and tool usage.
-
-**Rule of thumb**: if you're about to try 3+ variations of the same idea, use Best-of-N instead of sequential runs. It's cheaper (flash-model workers) and faster (parallel worktrees).
+**Rule of thumb**: if you're about to try 3+ variations of the same idea, run
+them as candidate_branch campaigns (measured, revertible) instead of sequential
+single edits.
 
 ## Research map (observations, analysis, direction review)
 

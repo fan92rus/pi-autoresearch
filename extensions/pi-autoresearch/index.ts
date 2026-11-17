@@ -203,7 +203,6 @@ import * as candidateWorktree from "./candidate-worktree.ts";
 import * as candidateMeasure from "./candidate-measure.ts";
 import * as researchState from "./research-state.ts";
 import { interactiveParallelConfig, filterSubcommands, applyExperimentLimitArg, configureExperimentLimit } from "./parallel/config-ui.ts";
-import { resolveRepoRoot, cleanupAllWorktrees } from "./parallel/worktree.ts";
 import {
   treeExists,
   loadTree,
@@ -520,13 +519,13 @@ const RunParams = Type.Object({
   budget_seconds: Type.Optional(
     Type.Number({
       description:
-        "Soft time budget in seconds. If the command runs longer, it is killed and the result is flagged budget_exceeded (a steer tells you to speed up measure.sh). Must be <= timeout_seconds. Used by parallel modes so each worker stays bounded. Default: unset (only the hard timeout_seconds applies).",
+        "Soft time budget in seconds. If the command runs longer, it is killed and the result is flagged budget_exceeded (a steer tells you to speed up measure.sh). Must be <= timeout_seconds. Default: unset (only the hard timeout_seconds applies).",
     })
   ),
   bench_mode: Type.Optional(
     Type.String({
       description:
-        'Sets the BENCH_MODE env var for the command (e.g. "quick", "full", "smoke"). measure.sh convention: parallel workers measure with BENCH_MODE=quick (a fast subset), the parent re-measures the winner with BENCH_MODE=full. Default: unset.',
+        'Sets the BENCH_MODE env var for the command (e.g. "quick", "full", "smoke"). measure.sh convention: measure with BENCH_MODE=quick (a fast subset) during the loop; re-measure the kept result with BENCH_MODE=full. Default: unset.',
     })
   ),
   hypothesis: Type.Optional(
@@ -11691,28 +11690,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return;
       }
 
-      // ===== parallel subcommands: activate mode + inject the parallel skill =====
-      const parallelMatch = command.match(/^parallel-(best-of-n|stack|search)\b/);
-      if (parallelMatch) {
-        if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd), ctx)) {
-          ctx.ui.notify("Research campaign active — the legacy parallel flow is not started; use research_questions(action=status).", "info");
-          return;
-        }
-        if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) {
-          ctx.ui.notify("Candidate campaign active — use candidate_branch; the legacy parallel flow is not started.", "info");
-          return;
-        }
-        const workDir = resolveWorkDir(ctx.cwd);
-        // clean any stale worktrees from a previous crashed round
-        await cleanupAllWorktrees(async (cmd: string, args: string[], o?: { cwd?: string; timeout?: number }) => {
-          const r = await pi.exec(cmd, args, o); return { stdout: r.stdout, stderr: r.stderr, code: r.code };
-        }, resolveRepoRoot(workDir)).catch(() => {});
-        recordAutoresearchActivation(workDir, true);
-        setAutoresearchMode(ctx, true);
-        runtime.autoResumeTurns = 0;
-        const kickoff = `/skill:autoresearch-parallel ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`.replace(/\s+/g, " ").trim();
-        ctx.ui.notify(`Parallel mode ON (${parallelMatch[1]}) — loaded autoresearch-parallel skill`, "info");
-        sendWhenReady(ctx, kickoff);
+      // ===== parallel-* subcommands removed (bd pi-autoresearch-el3.4):
+      // the legacy parallel flow is dead (tools cut in dd43c7f, decision
+      // 2026-11-16) — an explicit command is rejected below instead of being
+      // treated as a free-text goal.
+      if (/^parallel-(best-of-n|stack|search)\b/.test(command)) {
+        ctx.ui.notify("parallel-* commands were removed — run diverse variants as candidate_branch campaigns instead.", "warning");
         return;
       }
 

@@ -1,8 +1,9 @@
 /**
- * Parallel-mode configuration: model tiers, complexity map, cascade.
+ * Parallel-policy configuration: model tiers, complexity map, cascade.
  *
- * Loaded from .auto/config.json under the "parallel" key. All fields optional;
- * defaults keep parallel exploration cheap (fast tier, cascade on).
+ * Loaded from .auto/config.json under the "parallel" key (legacy namespace
+ * kept as campaign-policy storage; the parallel fan-out machinery was removed
+ * — bd pi-autoresearch-el3.4). All fields optional.
  */
 
 import type { Complexity, Tier } from "./types.ts";
@@ -21,13 +22,14 @@ export interface ParallelConfig {
   cascade: boolean;
   defaultTier: Tier;
   defaultComplexity: Complexity;
-  /** Parallelism cap. Default min(CPU-1, 4). */
+  /** Campaign-policy concurrency cap (legacy parallel field; currently only
+   *  surfaced by the /autoresearch config dialog). */
   concurrency?: number;
-  /** Per-run_experiment measure budget in seconds (workers + re-measure). */
+  /** Per-run_experiment measure budget in seconds. */
   budgetSeconds: number;
-  /** BENCH_MODE for worker measurements. */
+  /** BENCH_MODE for ordinary measurements (legacy parallel field). */
   workerBenchMode: "quick";
-  /** BENCH_MODE for the parent's winner re-measure. */
+  /** BENCH_MODE for the winner re-measure (legacy parallel field). */
   finalBenchMode: "full";
 }
 
@@ -83,25 +85,3 @@ export function resolveConfig(raw: unknown): ParallelConfig {
   };
 }
 
-/**
- * Resolve the tier model + budget + repeats for a given complexity (or the default).
- * Used to choose how to spawn each worker.
- */
-export function resolveTier(cfg: ParallelConfig, complexity: Complexity | undefined): {
-  model: string;
-  tier: Tier;
-  workerTimeoutMs: number;
-  repeats: number;
-} {
-  const c = complexity ?? cfg.defaultComplexity;
-  const cc = cfg.complexityMap[c] ?? cfg.complexityMap[cfg.defaultComplexity];
-  const model = cfg.tiers[cc.tier] ?? cfg.tiers[cfg.defaultTier];
-  return { model, tier: cc.tier, workerTimeoutMs: cc.workerTimeoutMs, repeats: cc.repeats };
-}
-
-/** Default concurrency: min(CPU-1, 4), floored at 1. */
-export function defaultConcurrency(): number {
-  const cpus = (typeof globalThis !== "undefined" && (globalThis as { navigator?: { hardwareConcurrency?: number } }).navigator?.hardwareConcurrency)
-    ?? 4;
-  return Math.max(1, Math.min((cpus ?? 4) - 1, 4));
-}

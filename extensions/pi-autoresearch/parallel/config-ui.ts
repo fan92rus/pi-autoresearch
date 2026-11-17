@@ -12,7 +12,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 
-import { DEFAULT_CONFIG, resolveConfig, type ParallelConfig, type Tier } from "./config.ts";
+import { resolveConfig, type ParallelConfig, type Tier } from "./config.ts";
 import { DEFAULT_PARTICIPANTS, DEFAULT_CHAIR_MODEL } from "../council.ts";
 
 // ─── Types (duck-typed from ExtensionCommandContext) ─────────────────────────
@@ -51,9 +51,10 @@ export const AUTORESEARCH_SUBCOMMANDS: AutocompleteEntry[] = [
   { value: "dashboard", label: "dashboard", description: "Open the fullscreen scrollable dashboard overlay in the terminal" },
   { value: "council", label: "council", description: "Convene a stagnation council (multi-model hypothesis review)" },
   { value: "help", label: "help", description: "Show /autoresearch usage help" },
-  { value: "parallel-best-of-n", label: "parallel-best-of-n", description: "Campaign config (models, concurrency, budget) — parallel tools removed (scope split)" },
-  { value: "parallel-stack", label: "parallel-stack", description: "Campaign config (models, concurrency, budget) — parallel tools removed (scope split)" },
-  { value: "parallel-search", label: "parallel-search", description: "Campaign config (models, concurrency, budget) — parallel tools removed (scope split)" },
+  // parallel-best-of-n / parallel-stack / parallel-search removed (bd
+  // pi-autoresearch-el3.4): the legacy parallel flow is dead (tools cut in
+  // dd43c7f, owner decision 2026-11-16). Campaign config lives under
+  // /autoresearch config.
 ];
 
 export function filterSubcommands(prefix: string): AutocompleteEntry[] {
@@ -184,6 +185,10 @@ function formatCurrent(cfg: ParallelConfig, expLimit: number | null = null): str
     "  strong: " + cfg.tiers.strong,
     "  " + (RU ? "конкурентность" : "concurrency") + ": " + conc,
     "  " + (RU ? "бюджет (parallel)" : "budget (parallel)") + ": " + cfg.budgetSeconds + "s",
+
+// NOTE (bd pi-autoresearch-el3.4): "parallel" here is the legacy config
+// namespace (.auto/config.json "parallel" key) kept as campaign policy
+// storage — no parallel fan-out machinery exists anymore.
   ].join("\n");
 }
 
@@ -241,11 +246,11 @@ async function configureConcurrency(ctx: ConfigCtx, workDir: string): Promise<bo
     (RU ? "Конкурентность (текущая: " : "Concurrency (current: ") + current + ")",
     "",
     RU ? "Количество воркер-субагентов, работающих параллельно" : "Number of worker subagents running in parallel",
-    RU ? "в будущих параллельных режимах кампании (сейчас инструменты" : "in future campaign parallel modes (the parallel tools are",
-    RU ? "удалены — скоуп-сплит; настройка сохраняется для политики)." : "removed — scope split; the setting is kept as campaign policy).",
+    RU ? "в кампаниях (инструменты параллельных режимов удалены —" : "in campaigns (the parallel-mode tools are removed —",
+    RU ? "скоуп-сплит; настройка — часть политики кампании)." : "scope split; the setting is kept as campaign policy).",
     "",
-    RU ? "Каждый воркер клонирует git worktree и независимо" : "Each worker clones a git worktree and runs measure.sh",
-    RU ? "запускает measure.sh. Больше = быстрее, но больше нагрузка на CPU." : "independently. Higher = faster exploration, but more CPU load.",
+    RU ? "Значение сохраняется как политика кампании (.auto/config.json) —" : "The value is stored as campaign policy (.auto/config.json) —",
+    RU ? "Значение сохраняется как политика кампании (.auto/config.json)." : "The value is stored as campaign policy (.auto/config.json).",
     "",
     RU ? "Рекомендуемые значения:" : "Recommended values:",
     "  auto   = min(CPU-1, 4) = " + autoVal + " (" + (RU ? "ваши ядра" : "your cores") + ": " + cpuCount + ")",
@@ -286,11 +291,10 @@ async function configureBudget(ctx: ConfigCtx, workDir: string): Promise<boolean
     RU ? "Максимальное время выполнения одного measure.sh." : "Maximum wall-clock time for a single measure.sh execution.",
     RU ? "При превышении запуск убивается (budget_exceeded)." : "If exceeded, the run is killed and logged as budget_exceeded.",
     "",
-    RU ? "Бюджет применяется к обоим путям:" : "This budget applies to BOTH paths:",
-    "  Worker (BENCH_MODE=quick) — " + (RU ? "быстрый subset" : "fast subset"),
-    "  Parent (BENCH_MODE=full) — " + (RU ? "полный benchmark" : "complete benchmark"),
+    RU ? "Бюджет применяется к полному прогону measure.sh при re-measure:" : "This budget applies to the full measure.sh run at re-measure:",
+    "  " + (RU ? "обычный прогон" : "ordinary run") + " — " + (RU ? "полный benchmark" : "complete benchmark"),
     "",
-    RU ? "Если baseline превышает бюджет — параллельные раунды не стартуют." : "If the baseline itself exceeds this, parallel rounds will refuse to start.",
+    RU ? "Если baseline превышает бюджет — прогон падает с budget_exceeded." : "If the baseline itself exceeds this, the run fails with budget_exceeded.",
     RU ? "Лучше ускорить measure.sh (добавить BENCH_MODE=quick subset)." : "Fix measure.sh (add BENCH_MODE=quick subset) rather than raising the budget.",
     "",
     RU ? "Типичные значения:" : "Typical values:",
