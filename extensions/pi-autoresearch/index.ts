@@ -214,6 +214,7 @@ export { buildExpeditionWidgetLines, epochTreeView, renderDashboardLines } from 
 export type { EpochTreeView } from "./widget.ts";
 import { listResearchCampaignIds } from "./research-scan.ts";
 import { createResearchPolicy, executeResearchAction } from "./research-dispatch.ts";
+import { createTestHooks, type AutoresearchTestHooks, type BoundTestHooks } from "./test-hooks.ts";
 import { interactiveParallelConfig, filterSubcommands, applyExperimentLimitArg, configureExperimentLimit } from "./parallel/config-ui.ts";
 import {
   treeExists,
@@ -319,23 +320,26 @@ export function computeConfidence(
 export const AUTORESUME_TURN_LIMIT = 200;
 export const CONSECUTIVE_FAILURE_OVERRIDE_LIMIT = 20;
 
+/** Compatibility aliases for the canonical hooks object (bd pi-autoresearch-161.3).
+ *  The extension binds all of them from one `BoundTestHooks` instance at init;
+ *  tests keep importing these names unchanged. */
 /** Test hook for the internal stale-close operation. Set by the extension instance. */
-export let closeStaleCampaign: ((dir: string) => Promise<researchState.Result<{ state: researchState.CampaignState }>>) | null = null;
+export let closeStaleCampaign: AutoresearchTestHooks["closeStaleCampaign"] = null;
 /** Test hook for send-time pending-resume policy. */
-export let sendPendingResumeIfReadyForTest: ((ctx: ExtensionContext, runtime: AutoresearchRuntime) => Promise<void>) | null = null;
+export let sendPendingResumeIfReadyForTest: AutoresearchTestHooks["sendPendingResumeIfReady"] = null;
 /** Test hook: direct access to the session runtime (pin/recovery tests). */
-export let runtimeForTest: ((ctx: ExtensionContext) => AutoresearchRuntime) | null = null;
+export let runtimeForTest: AutoresearchTestHooks["getRuntime"] = null;
 /** Test hook for the async auto-resume limit notification. */
-export let notifyAutoResumeLimitReachedAsyncForTest: ((ctx: ExtensionContext, reason?: string | null) => Promise<void>) | null = null;
+export let notifyAutoResumeLimitReachedAsyncForTest: AutoresearchTestHooks["notifyAutoResumeLimitReachedAsync"] = null;
 /** Test hook for expedition restart restore (bd pi-autoresearch-es1.3). */
-export let restoreExpeditionForTest: ((ctx: ExtensionContext) => Promise<void>) | null = null;
+export let restoreExpeditionForTest: AutoresearchTestHooks["restoreExpeditionFromDisk"] = null;
 /** Test/CLI hook for the expedition web payload (expedition-tui group 4): the
  *  shared builder behind GET /expedition and the initial page. Bound when the
  *  extension initializes; typed as a const export so tests can call it. */
-export let resolveExpeditionPayload: ((workDir: string) => (ExpeditionView & { schema_version: number; campaigns: ExpeditionWebCampaign[]; chainStatus: string | null }) | null) | null = null;
+export let resolveExpeditionPayload: AutoresearchTestHooks["resolveExpeditionPayload"] = null;
 /** Test hook: stops the dashboard static server so tests that started it can
  *  release the listen socket and let the process exit. */
-export let stopDashboardServerForTest: (() => void) | null = null;
+export let stopDashboardServerForTest: AutoresearchTestHooks["stopDashboardServer"] = null;
 
 type AutoResumeGuardState = Pick<ExperimentState, "results" | "currentSegment">;
 type AutoResumeGuardRuntime = {
@@ -402,7 +406,7 @@ interface LogDetails {
   metricProvenance?: string;
 }
 
-interface AutoresearchRuntime {
+export interface AutoresearchRuntime {
   autoresearchMode: boolean;
   /** Campaign id pinned by '/autoresearch research <id>'; research tools refuse other ids while set. */
   researchCampaignId: string | null;
@@ -1777,8 +1781,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const cancelPendingResume = (runtime: AutoresearchRuntime): void => resumePolicy.cancelPendingResume(runtime);
   const sendPendingResumeIfReady = (ctx: ExtensionContext, runtime: AutoresearchRuntime): Promise<void> =>
     resumePolicy.sendPendingResumeIfReady(ctx, runtime);
-  sendPendingResumeIfReadyForTest = sendPendingResumeIfReady;
-  runtimeForTest = (ctx: ExtensionContext) => getRuntime(ctx);
   const schedulePendingResume = (
     ctx: ExtensionContext,
     runtime: AutoresearchRuntime,
@@ -1812,7 +1814,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       : null;
     notifyAutoResumeLimitReached(ctx, detail ? `${reason ?? "Autoresearch auto-resume limit reached"}; ${detail}` : reason);
   };
-  notifyAutoResumeLimitReachedAsyncForTest = notifyAutoResumeLimitReachedAsync;
 
   // ── Research-vectors campaign (openspec/changes/research-vectors, design §8) ──
   const RESEARCH_BLOCK_TEXT = "Research campaign active; use research_questions(action=status) or the operator resolve; the ordinary loop is blocked";
@@ -2636,13 +2637,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     ].join("\n");
     sendWhenReady(ctx, message, { steerIfBusy: true });
   };
-  restoreExpeditionForTest = (ctx: ExtensionContext) => restoreExpeditionFromDisk(ctx);
-
-  // Web payload hook (expedition-tui group 4): bind the shared builder once
-  // the extension initializes so tests and future callers resolve the same
-  // payload the /expedition route serves.
-  resolveExpeditionPayload = (workDir: string) => buildExpeditionPayload(workDir);
-  stopDashboardServerForTest = () => stopDashboardServer();
+  // Web payload hook (expedition-tui group 4): the shared builder behind
+  // GET /expedition is bound with the other hooks at the single init point below.
 
   pi.on("session_start", async (_e, ctx) => {
     reconstructState(ctx);
@@ -7471,7 +7467,25 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       await fs.promises.writeFile(path.join(dir, "report.md"), staleReportText(dir, snap, draftBytes) + "\n", "utf8");
     });
   };
-  closeStaleCampaign = closeStaleCampaignInternal;
+  // bd pi-autoresearch-161.3 (F-20): one explicit initialization point for all
+  // test hooks. The bound object is passed to extracted adapters as deps; the
+  // exported lets are thin aliases so existing tests keep importing the same names.
+  const testHooks: BoundTestHooks = createTestHooks({
+    closeStaleCampaign: closeStaleCampaignInternal,
+    sendPendingResumeIfReady,
+    getRuntime: (ctx: ExtensionContext) => getRuntime(ctx),
+    notifyAutoResumeLimitReachedAsync,
+    restoreExpeditionFromDisk: (ctx: ExtensionContext) => restoreExpeditionFromDisk(ctx),
+    resolveExpeditionPayload: (workDir: string) => buildExpeditionPayload(workDir),
+    stopDashboardServer: () => stopDashboardServer(),
+  });
+  closeStaleCampaign = testHooks.closeStaleCampaign;
+  sendPendingResumeIfReadyForTest = testHooks.sendPendingResumeIfReady;
+  runtimeForTest = testHooks.getRuntime;
+  notifyAutoResumeLimitReachedAsyncForTest = testHooks.notifyAutoResumeLimitReachedAsync;
+  restoreExpeditionForTest = testHooks.restoreExpeditionFromDisk;
+  resolveExpeditionPayload = testHooks.resolveExpeditionPayload;
+  stopDashboardServerForTest = testHooks.stopDashboardServer;
 
   /** Base the campaign state lives under: the pinned --state-root (resolved
    *  absolute) or the work directory itself. Byte-identical to the previous
@@ -8592,8 +8606,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       const dispatched = await executeResearchAction(params, ctx, workDir, {
-        activeChain, getRuntime, collectChainJournals, effectiveResearchBase, researchSnapshot,
-        expeditionCloseNudge, sendWhenReady, refusalText,
+        activeChain, collectChainJournals, effectiveResearchBase, researchSnapshot,
+        expeditionCloseNudge, sendWhenReady, refusalText, hooks: testHooks,
       });
       if (dispatched !== undefined) return dispatched;
 
@@ -9996,7 +10010,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               }
               if (fs.existsSync(path.join(dir, "pending-op.json"))) { refusals.push(`${name} (pending op)`); continue; }
               if (chainIds.includes(id)) { refusals.push(`${name} (active chain)`); continue; }
-              const closed = closeStaleCampaign ? await closeStaleCampaign(dir) : null;
+              const closed = testHooks.closeStaleCampaign ? await testHooks.closeStaleCampaign(dir) : null;
               if (!closed?.ok) refusals.push(`${name} (${closed?.message ?? "could not close as stale"})`);
             }
           }

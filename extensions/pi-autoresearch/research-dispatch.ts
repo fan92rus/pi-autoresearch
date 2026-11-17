@@ -19,7 +19,10 @@ export function createResearchPolicy(): Map<string, string[]> {
 
 /** Executes the expedition action; collaborators are injected by the extension adapter. */
 export async function executeResearchAction(params: any, ctx: any, workDir: string, deps: Record<string, any>) {
-  const { activeChain, getRuntime, collectChainJournals, effectiveResearchBase, researchSnapshot, expeditionCloseNudge, sendWhenReady } = deps;
+  // bd pi-autoresearch-161.3: runtime access arrives through the canonical
+  // hooks object (`deps.hooks`), with the old direct deps key kept as fallback
+  // for callers that have not adopted the deps object yet.
+  const { activeChain, getRuntime = deps.hooks?.getRuntime, collectChainJournals, effectiveResearchBase, researchSnapshot, expeditionCloseNudge, sendWhenReady } = deps;
   const action = params?.action;
   const reply = (text: string) => ({ content: [{ type: "text", text }], details: { action } });
   const fail = (reason: string, message: string) => ({
