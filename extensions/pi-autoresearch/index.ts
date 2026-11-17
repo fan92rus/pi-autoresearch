@@ -2548,35 +2548,63 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     runtime.autoResumeTurns++;
   };
 
+  /**
+   * bd 8e5.3 (F10): the ONE documented gate order for all three resume
+   * delivery paths (agent_end drift, deferred-drift delivery, send-time):
+   *   1. mode off        → cancel (Decision 6 reset points handle most of these,
+   *                        this is the send-time backstop)
+   *   2. manual-check    → cancel (pending-op / halted, state-root aware —
+   *                        design §5: unclear state stops, the operator decides)
+   *   3. stop-reason     → cancel + notify (drift/turn/failure limits)
+   *   4. agent unsettled → retry (re-arm; bd 8e5.3/F11: never park the message)
+   *   5. deliver
+   * Side effects (cancel/notify) are applied by the CALLER — the helper only
+   * decides. `workDir`/`researchBlocks` are returned so the caller does not
+   * re-scan (the scans are sync but not free).
+   */
+  const evaluateResumeGates = async (
+    ctx: ExtensionContext,
+    runtime: AutoresearchRuntime,
+  ): Promise<
+    | { verdict: "cancel"; notify?: string | null }
+    | { verdict: "retry" }
+    | { verdict: "deliver"; workDir: string; researchBlocks: boolean }
+  > => {
+    if (!runtime.autoresearchMode) return { verdict: "cancel" };
+    const workDir = resolveWorkDir(ctx.cwd);
+    if (await campaignNeedsManualCheck(workDir, ctx)) return { verdict: "cancel" };
+    const stopReason = autoResumeStopReasonFor(runtime);
+    if (stopReason !== null) return { verdict: "cancel", notify: stopReason };
+    if (!isAgentSettled(ctx)) return { verdict: "retry" };
+    return { verdict: "deliver", workDir, researchBlocks: researchScanSync(workDir).blocks };
+  };
+
   const sendPendingResumeIfReady = async (ctx: ExtensionContext, runtime: AutoresearchRuntime): Promise<void> => {
     const message = runtime.pendingResumeMessage;
 
     if (!message) return;
-    if (!runtime.autoresearchMode) {
+    // bd 8e5.3 (F10): one documented gate order for all three delivery paths
+    // (agent_end / deliverDeferredDriftNudge / send-time): mode → manual-check
+    // → stop-reason → settled. evaluateResumeGates returns "deliver" | "cancel"
+    // | "retry"; cancel/notify side effects are decided HERE, only the
+    // ordering lives in the shared helper.
+    const gates = await evaluateResumeGates(ctx, runtime);
+    if (gates.verdict === "cancel") {
       cancelPendingResume(runtime);
+      if (gates.notify) notifyAutoResumeLimitReached(ctx, gates.notify);
       return;
     }
-    // Re-check the campaign at SEND time: a message scheduled before an operation
-    // became pending, or before a campaign started, must not be delivered now.
-    // (design §5: unclear state -> stop; active campaign -> candidate wording only.)
-    const workDirNow = resolveWorkDir(ctx.cwd);
-    const researchNow = researchScanSync(workDirNow);
-    const researchStateRootNow = getRuntime(ctx).researchStateRoot;
-    const stateRootHalted = researchStateRootNow !== null && researchStateRootNow !== workDirNow && researchScanSync(researchStateRootNow).halted;
-    if (campaignPendingOpSync(workDirNow) || researchNow.halted || stateRootHalted) {
-      cancelPendingResume(runtime);
+    if (gates.verdict === "retry") {
+      // bd 8e5.3 (F11): the agent is still busy — re-arm instead of parking the
+      // message forever. The timer was already consumed by this fire, so a bare
+      // return would leave pendingResumeTimer === null with nobody left to
+      // reschedule; retry keeps the nudge alive until the agent settles.
+      reschedulePendingResume(ctx, runtime);
       return;
     }
     // Stored campaign wording is stale once the campaign is disabled or gone.
-    if (!campaignActiveSync(workDirNow) && /candidate_branch/.test(message)) {
+    if (!campaignActiveSync(gates.workDir) && /candidate_branch/.test(message)) {
       cancelPendingResume(runtime);
-      return;
-    }
-    if (!isAgentSettled(ctx)) return;
-    const stopReason = autoResumeStopReasonFor(runtime);
-    if (stopReason !== null) {
-      cancelPendingResume(runtime);
-      notifyAutoResumeLimitReached(ctx, stopReason);
       return;
     }
 
@@ -2593,9 +2621,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // A legacy-cycle message stored before a campaign started is replaced by the
     // campaign wording at send time (design §5: no ordinary run/log prescription).
     const isLegacyCycle = /run_experiment|log_experiment/.test(message);
-    const sendText = researchNow.blocks && isLegacyCycle
+    const sendText = gates.researchBlocks && isLegacyCycle
       ? RESEARCH_RESUME_TEXT
-      : !researchNow.blocks && campaignActiveSync(workDirNow) && !/candidate_branch/.test(message) && isLegacyCycle
+      : !gates.researchBlocks && campaignActiveSync(gates.workDir) && !/candidate_branch/.test(message) && isLegacyCycle
         ? await composeCampaignResumeMessage(ctx)
         : message;
     pi.sendUserMessage(sendText);
@@ -2952,15 +2980,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       );
       return;
     }
-    if (await campaignNeedsManualCheck(resolveWorkDir(ctx.cwd), ctx)) return;
-    const stopReason = autoResumeStopReasonFor(runtime);
-    if (stopReason !== null) {
-      await notifyAutoResumeLimitReachedAsync(ctx, stopReason);
+    // bd 8e5.3 (F10): shared gate order (mode → manual-check → stop-reason →
+    // settled) via evaluateResumeGates. "retry" (agent unsettled) proceeds to
+    // schedule: the send-time path re-evaluates the gates and retries anyway.
+    const gates = await evaluateResumeGates(ctx, runtime);
+    if (gates.verdict === "cancel") {
+      if (gates.notify) await notifyAutoResumeLimitReachedAsync(ctx, gates.notify);
       return;
     }
     // bd 8e5.1: drift counters move to DELIVERY (sendPendingResumeIfReady) —
     // the deferral path now matches the ordinary path, both under Decision 3.
-    schedulePendingResume(ctx, runtime, await composeDriftResumeMessage(resolveWorkDir(ctx.cwd), ctx), { drift: true });
+    schedulePendingResume(ctx, runtime, await composeDriftResumeMessage(gates.verdict === "deliver" ? gates.workDir : resolveWorkDir(ctx.cwd), ctx), { drift: true });
   };
 
   /** Re-probe a deferral: deliver when zero active (or fail-open unknown), else re-arm the re-check timer (or fire the fuse). */
@@ -3664,20 +3694,25 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return;
       }
       if (runtime.consecutiveDriftResumes < MAX_CONSECUTIVE_DRIFT_RESUMES) {
-        // Unclear campaign state (pending operation): stop, do not auto-resume (design §5).
-        if (await campaignNeedsManualCheck(resolveWorkDir(ctx.cwd), ctx)) return;
+        // bd 8e5.3 (F10): shared gate order via evaluateResumeGates (mode →
+        // manual-check → stop-reason → settled); stopReason was pre-checked above.
         // Subagent-wait guard (subagent-wait-guard): async subagents alive →
         // defer; counters move to delivery (design Decision 3). Guard disarmed
         // or zero/unknown active → fall through to the ordinary nudge.
         if (await maybeDeferDriftForSubagents(ctx, runtime)) return;
+        const gates = await evaluateResumeGates(ctx, runtime);
+        if (gates.verdict === "cancel") {
+          if (gates.notify) await notifyAutoResumeLimitReachedAsync(ctx, gates.notify);
+          return;
+        }
         // bd 8e5.1: NO counter increment here — drift accounting moved to
         // DELIVERY (sendPendingResumeIfReady, design Decision 3). A nudge
         // cancelled at send time must not spend the drift/turn budget.
         // composeDriftResumeMessage branches by campaign mode: under an active
         // candidate campaign it emits candidate-campaign wording only (design §5).
-        // resolveWorkDir: the campaign may live under a configured workingDir,
+        // gates.workDir: the campaign may live under a configured workingDir,
         // so the campaign check must not use the raw session cwd.
-        schedulePendingResume(ctx, runtime, await composeDriftResumeMessage(resolveWorkDir(ctx.cwd), ctx), { drift: true });
+        schedulePendingResume(ctx, runtime, await composeDriftResumeMessage(gates.verdict === "deliver" ? gates.workDir : resolveWorkDir(ctx.cwd), ctx), { drift: true });
         return;
       }
       // Under an active candidate campaign the notice must not prescribe the
