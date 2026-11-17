@@ -28,7 +28,7 @@ E6 exit criterion: **≤ ~6,000 lines**, with no tool/hook lost (full suite gree
 | 048a134 | 10,188 | −337 | E6 findings/measurement adapters (161.2) |
 | 6f0c189 | 10,202 | +14 | F-20 typed test-hooks object (161.3, DI enabler; net +14) |
 | d937f07 | 10,205 | +3 | unified refusal renderer (161.4, net +3) |
-| (pending) | **10,339** | **+134** | es1.7/es1.8 explicit uiMode + mode-switch finalize (behavior fix, net +134) |
+| ed6b3ba | **10,339** | **+134** | es1.7/es1.8 explicit uiMode + mode-switch finalize (behavior fix, net +134) |
 
 ## Observations
 
