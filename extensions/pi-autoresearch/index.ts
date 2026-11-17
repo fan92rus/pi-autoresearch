@@ -468,6 +468,8 @@ interface AutoresearchRuntime {
   treeViewMode: boolean;
   /** True when the current turn used a loop tool (run_experiment/log_experiment/propose_hypothesis). Reset in before_agent_start; read by agent_end drift policy. */
   lastTurnUsedExperimentTools: boolean;
+  /** bd el3.2: ephemeral confirm worktrees whose removal failed. Never silent — surfaced by candidate_branch status until cleared by a successful removal. */
+  candidateLeftovers: string[] | null;
   /** Consecutive settled turns that did no loop work and were nudged. After MAX_CONSECUTIVE_DRIFT_RESUMES the loop stops instead of nudging again (anti chat-loop bound, goal-x pattern). Reset whenever a loop tool fires. */
   consecutiveDriftResumes: number;
   /** Subagent-wait guard (subagent-wait-guard): deferral state for the drift branch while async subagents run. */
@@ -1939,6 +1941,7 @@ function createSessionRuntime(): AutoresearchRuntime {
     pendingResumeMessage: null,
     treeViewMode: false,
     lastTurnUsedExperimentTools: false,
+    candidateLeftovers: null,
     consecutiveDriftResumes: 0,
     subagentDeferral: null,
     lastLogFlag: null,
@@ -8392,6 +8395,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   /** Side measurement in an ephemeral worktree for one side of a confirm. */
   const measureSideInEphemeral = async (
+    ctx: ExtensionContext,
     workDir: string,
     label: string,
     sideSha: string,
@@ -8421,22 +8425,47 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // B-A fix: the worktree WAS created by this call — remove it before
       // returning the failure, so a failed side leaves no tmp-confirm-* entry
       // registered in git or on disk.
-      await removeEphemeralWorktree(workDir, wtPath);
+      await removeEphemeralWorktree(ctx, workDir, wtPath);
       return { ok: false, reason: measured.reason, message: measured.message };
     }
     return { ok: true, average: measured.average, wtPath };
   };
 
-  const removeEphemeralWorktree = async (workDir: string, wtPath: string): Promise<void> => {
+  /**
+   * Remove an ephemeral confirm worktree and report the outcome (bd el3.2:
+   * cleanup must not silently claim success). A failed removal is remembered
+   * in runtime.candidateLeftovers so `candidate_branch status` surfaces it —
+   * the confirm itself still succeeds (cleanup must not fail a passed
+   * measurement), but the leftover is never silent.
+   */
+  const removeEphemeralWorktree = async (ctx: ExtensionContext, workDir: string, wtPath: string): Promise<{ removed: boolean; message?: string }> => {
+    const runtime = getRuntime(ctx);
     // Plain remove first; --force ONLY for the paths this confirm created.
-    let r = await candidateGitExec("git", ["worktree", "remove", wtPath], { cwd: workDir, timeout: 15000 });
-    if (r.code !== 0) {
-      r = await candidateGitExec("git", ["worktree", "remove", "--force", wtPath], { cwd: workDir, timeout: 15000 });
+    // Windows: a just-finished benchmark process / AV scan can hold the
+    // directory for a moment, so retry a few times before declaring a leftover.
+    // The per-attempt git timeout is short (3s): cleanup must not delay the
+    // tool reply by minutes when git itself is wedged — a leftover is the
+    // safer outcome, it is surfaced in the reply and by candidate_branch status.
+    let r = { code: 1, stdout: "", stderr: "" };
+    for (let attempt = 0; attempt < 4; attempt++) {
+      r = await candidateGitExec("git", ["worktree", "remove", wtPath], { cwd: workDir, timeout: 3000 });
+      if (r.code === 0) break;
+      r = await candidateGitExec("git", ["worktree", "remove", "--force", wtPath], { cwd: workDir, timeout: 3000 });
+      if (r.code === 0) break;
+      await new Promise((res) => setTimeout(res, 250));
     }
     if (r.code !== 0) {
-      // Never fail the confirm for cleanup; leftover is reported via status
-      // (the operator can remove it by hand — MVP has no auto-delete promises).
+      // Never fail the confirm for cleanup; remember the leftover for status.
+      const message = `git worktree remove failed (code ${r.code}): ${(r.stderr || r.stdout || "").trim().split("\n")[0] || "no output"}`;
+      runtime.candidateLeftovers = runtime.candidateLeftovers ?? [];
+      if (!runtime.candidateLeftovers.includes(wtPath)) runtime.candidateLeftovers.push(wtPath);
+      return { removed: false, message };
     }
+    // Success clears any stale memory of this path.
+    if (runtime.candidateLeftovers) {
+      runtime.candidateLeftovers = runtime.candidateLeftovers.filter((p) => p !== wtPath);
+    }
+    return { removed: true };
   };
 
   registerGatedTool({
@@ -8514,6 +8543,38 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 `;
         } catch { /* no measurement yet */ }
         if (insp.lockPresent) text += "Lock file present — if no process is running, resolve (operator action, dialog-confirmed)\n";
+        // bd el3.2: surface ephemeral worktree leftovers — both remembered
+        // failures and a LIVE porcelain scan (a leftover from a previous
+        // session is not in runtime memory but still clutters the repo).
+        const rt = getRuntime(ctx);
+        try {
+          const lst = await candidateGitExec("git", ["worktree", "list", "--porcelain"], { cwd: workDir, timeout: 15000 });
+          if (lst.code === 0) {
+            // Windows path case/separators vary between git invocations;
+            // normalize ONLY for comparison, keep originals for display.
+            const norm = (p: string) => p.replace(/\\/g, "/").toLowerCase();
+            const entries = lst.stdout.split("\n")
+              .filter((l) => l.startsWith("worktree "))
+              .map((l) => l.slice("worktree ".length).trim());
+            const registered = new Set(entries.map(norm));
+            const orphans = entries.filter((p) => norm(p).includes("/tmp-confirm-"));
+            for (const o of orphans) {
+              if (!rt.candidateLeftovers?.some((p) => norm(p) === norm(o))) {
+                rt.candidateLeftovers = rt.candidateLeftovers ?? [];
+                rt.candidateLeftovers.push(o);
+              }
+            }
+            // bd el3.2: a remembered leftover whose path is no longer registered
+            // (the operator removed it by hand) is cleared — status must not
+            // haunt the user with already-fixed problems.
+            if (rt.candidateLeftovers?.length) {
+              rt.candidateLeftovers = rt.candidateLeftovers.filter((p) => registered.has(norm(p)));
+            }
+          }
+        } catch { /* git unavailable — memory-only leftovers below still show */ }
+        if (rt.candidateLeftovers?.length) {
+          text += "⚠ Ephemeral worktree leftovers (cleanup failed; remove by hand):\n" + rt.candidateLeftovers.map((p) => `  ${p}`).join("\n") + "\n";
+        }
         return { content: [{ type: "text", text }], details: { inspection: insp as any, leader: leaderSha } };
       }
 
@@ -8927,14 +8988,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         let leaderSideCleanup: { ok: true; wtPath: string } | null = null;
         let candSideCleanup: { ok: true; wtPath: string } | null = null;
         const opRes = await candidateState.beginOperation(campDir, `confirm ${active.id}`, async () => {
-          const leaderSide = await measureSideInEphemeral(workDir, "leader", expectedLeader, policy);
+          const leaderSide = await measureSideInEphemeral(ctx, workDir, "leader", expectedLeader, policy);
           if (!leaderSide.ok) {
             // Round-3 B1 (parent decision): a KNOWN side refusal means no
             // promotion and no uncertainty — clean refusal clears the marker.
             throw new candidateState.CleanRefusal(leaderSide.reason as any, leaderSide.message);
           }
           leaderSideCleanup = { ok: true, wtPath: leaderSide.wtPath };
-          const candSide = await measureSideInEphemeral(workDir, "cand", cpSha, policy);
+          const candSide = await measureSideInEphemeral(ctx, workDir, "cand", cpSha, policy);
           if (!candSide.ok) {
             throw new candidateState.CleanRefusal(candSide.reason as any, candSide.message);
           }
@@ -8982,16 +9043,21 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // path — a live candidate worktree could be sitting there). B-A fix:
         // null checks (not .ok deref) — a side refused BEFORE creation leaves
         // the variable null, and a side that failed AFTER creation already
-        // cleaned itself up inside measureSideInEphemeral.
-        if (leaderSideCleanup !== null) await removeEphemeralWorktree(workDir, leaderSideCleanup.wtPath);
-        if (candSideCleanup !== null) await removeEphemeralWorktree(workDir, candSideCleanup.wtPath);
+        // cleaned itself up inside measureSideInEphemeral. bd el3.2: a failed
+        // removal surfaces ⚠ in the reply AND is remembered for status.
+        let leftoverWarn = "";
+        for (const side of [leaderSideCleanup, candSideCleanup]) {
+          if (side === null) continue;
+          const rm = await removeEphemeralWorktree(ctx, workDir, side.wtPath);
+          if (!rm.removed) leftoverWarn += `\n⚠ Ephemeral worktree cleanup failed (${rm.message ?? "unknown"}) — ${side.wtPath} is left in place; it is now listed by candidate_branch status.`;
+        }
         if (!opRes.ok) {
-          return fail(opRes.reason, opRes.message);
+          return fail(opRes.reason, opRes.message + leftoverWarn);
         }
         if (outcome === null) {
-          return fail("internal", "confirm finished without a verdict; inspect the campaign state");
+          return fail("internal", "confirm finished without a verdict; inspect the campaign state" + leftoverWarn);
         }
-        return { content: [{ type: "text", text: outcome.text }], details: outcome.details };
+        return { content: [{ type: "text", text: outcome.text + leftoverWarn }], details: outcome.details };
       }
 
       // ---- resolve: OPERATOR manual resolution of an unresolved state ----

@@ -1214,3 +1214,45 @@ test("bd 51n.11: disable refuses with worktree_unreadable too (no candidate ops 
   assert.match(textOf(dirty), /unsaved_changes/, `dirty disable must refuse: ${textOf(dirty)}`);
   fs.rmSync(path.join(wt, "STRAY.txt"), { force: true });
 }, { timeout: 60000 });
+
+// ─── bd el3.2: ephemeral cleanup is never silent ─────────────────────────────
+
+test("bd el3.2: confirm removes its ephemeral worktrees (no leftovers after a clean confirm)", async () => {
+  const { h, dir } = await campaignWithCandidate("cleanup-clean");
+  const confirm = await callTool(h, "confirm", { candidate_bench_value: "105", leader_bench_value: "100" });
+  assert.ok(textOf(confirm).length > 0, "confirm must reply");
+  // The ephemeral root for this campaign must not contain tmp-confirm-* entries.
+  const os = await import("node:os");
+  const { createHash } = await import("node:crypto");
+  const key = createHash("sha256").update(path.resolve(dir)).digest("hex").slice(0, 16);
+  const root = path.join(os.tmpdir(), "pi-ar-candidate", key);
+  const leftover = fs.existsSync(root) ? fs.readdirSync(root).filter((n) => n.startsWith("tmp-confirm-")) : [];
+  assert.deepEqual(leftover, [], "clean confirm must leave no tmp-confirm-* worktrees");
+  const st = await callTool(h, "status", {});
+  assert.doesNotMatch(textOf(st), /Ephemeral worktree leftovers/, `status must not report leftovers after a clean confirm: ${textOf(st)}`);
+}, { timeout: 120000 });
+
+test("bd el3.2: status surfaces a tmp-confirm-* worktree registered by a previous session (porcelain scan)", async () => {
+  const { h, dir } = await campaignWithCandidate("cleanup-orphan");
+  // Simulate a leftover from a crashed confirm: register an ephemeral worktree
+  // directly (the same naming scheme the confirm uses).
+  const os = await import("node:os");
+  const { createHash } = await import("node:crypto");
+  const key = createHash("sha256").update(path.resolve(dir)).digest("hex").slice(0, 16);
+  const root = path.join(os.tmpdir(), "pi-ar-candidate", key);
+  fs.mkdirSync(root, { recursive: true });
+  const orphanPath = path.join(root, "tmp-confirm-leader-orphansim123");
+  git(["worktree", "add", orphanPath, "HEAD"], dir);
+  try {
+    const st = await callTool(h, "status", {});
+    const t = textOf(st);
+    assert.match(t, /Ephemeral worktree leftovers/, `status must surface the registered orphan: ${t}`);
+    assert.match(t, /tmp-confirm-leader-orphansim123/, "status must name the orphan path");
+    assert.match(t, /remove by hand/, "status must tell the operator how to fix it");
+  } finally {
+    git(["worktree", "remove", "--force", orphanPath], dir);
+  }
+  // After manual removal the status is clean again.
+  const st2 = await callTool(h, "status", {});
+  assert.doesNotMatch(textOf(st2), /tmp-confirm-leader-orphansim123/, "removed orphan must disappear from status");
+}, { timeout: 120000 });
