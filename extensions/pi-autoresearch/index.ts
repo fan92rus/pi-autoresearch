@@ -462,10 +462,10 @@ interface AutoresearchRuntime {
   state: ExperimentState;
   /** Pending auto-resume timer; cancelled when the agent starts a new run or compacts. */
   pendingResumeTimer: ReturnType<typeof setTimeout> | null;
-  /** Resume message to send when the pending timer fires. */
-  pendingResumeMessage: string | null;
-  /** bd 8e5.1 (design Decision 3, delivery-time accounting): true when the pending message is a drift nudge — its drift counter + autoResumeTurns increment happens at DELIVERY (sendPendingResumeIfReady), never at schedule time. */
-  pendingResumeDrift: boolean;
+  /** Resume message to send when the pending timer fires, tagged with the loop mode it prescribes (bd 8e5.2/F4: send-time refresh reads the tag instead of regex-sniffing the text). Empty-string "" is the transient mutex claim of ensurePendingResume. */
+  pendingResumeMessage: { mode: "legacy" | "research" | "candidate"; text: string } | "" | null;
+  /** bd 8e5.1: drift-mode accounting flag kept on the runtime (delivery-time increment is decided by the pending message’s mode tag + drift kind; see pendingResumeMessage). */
+  pendingResumeIsDrift: boolean;
   /** TUI view mode: 'list' (dashboard table) or 'tree' (experiment tree). Toggle with Tab. */
   treeViewMode: boolean;
   /** True when the current turn used a loop tool (run_experiment/log_experiment/propose_hypothesis). Reset in before_agent_start; read by agent_end drift policy. */
@@ -1941,7 +1941,7 @@ function createSessionRuntime(): AutoresearchRuntime {
     state: createExperimentState(),
     pendingResumeTimer: null,
     pendingResumeMessage: null,
-    pendingResumeDrift: false,
+    pendingResumeIsDrift: false,
     treeViewMode: false,
     lastTurnUsedExperimentTools: false,
     candidateLeftovers: null,
@@ -2541,7 +2541,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const cancelPendingResume = (runtime: AutoresearchRuntime): void => {
     pausePendingResume(runtime);
     runtime.pendingResumeMessage = null;
-    runtime.pendingResumeDrift = false;
+    runtime.pendingResumeIsDrift = false;
   };
 
   const markAutoResumeSent = (runtime: AutoresearchRuntime): void => {
@@ -2580,9 +2580,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   };
 
   const sendPendingResumeIfReady = async (ctx: ExtensionContext, runtime: AutoresearchRuntime): Promise<void> => {
-    const message = runtime.pendingResumeMessage;
+    const pending = runtime.pendingResumeMessage;
 
-    if (!message) return;
+    if (!pending || pending === "") return;
+    const message = pending.text;
     // bd 8e5.3 (F10): one documented gate order for all three delivery paths
     // (agent_end / deliverDeferredDriftNudge / send-time): mode → manual-check
     // → stop-reason → settled. evaluateResumeGates returns "deliver" | "cancel"
@@ -2602,8 +2603,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       reschedulePendingResume(ctx, runtime);
       return;
     }
-    // Stored campaign wording is stale once the campaign is disabled or gone.
-    if (!campaignActiveSync(gates.workDir) && /candidate_branch/.test(message)) {
+    // bd 8e5.2 (F4): staleness is decided by the MODE TAG, not regex sniffing.
+    // A candidate-mode message is stale once the campaign is disabled or gone.
+    if (pending.mode === "candidate" && !campaignActiveSync(gates.workDir)) {
       cancelPendingResume(runtime);
       return;
     }
@@ -2611,30 +2613,40 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // bd 8e5.1 (design Decision 3, both paths): drift accounting happens at
     // DELIVERY — a scheduled-then-cancelled drift nudge (mode off, halted,
     // stale) must not spend the drift/turn budget for a message never sent.
-    // Read the flag BEFORE cancelPendingResume clears it.
-    const wasDrift = runtime.pendingResumeDrift;
+    // The drift kind is the pending message’s runtime drift flag; read it
+    // BEFORE cancelPendingResume clears it.
+    const wasDrift = runtime.pendingResumeIsDrift;
     cancelPendingResume(runtime);
     if (wasDrift) {
       runtime.consecutiveDriftResumes++;
     }
     markAutoResumeSent(runtime);
-    // A legacy-cycle message stored before a campaign started is replaced by the
-    // campaign wording at send time (design §5: no ordinary run/log prescription).
-    const isLegacyCycle = /run_experiment|log_experiment/.test(message);
-    const sendText = gates.researchBlocks && isLegacyCycle
-      ? RESEARCH_RESUME_TEXT
-      : !gates.researchBlocks && campaignActiveSync(gates.workDir) && !/candidate_branch/.test(message) && isLegacyCycle
-        ? await composeCampaignResumeMessage(ctx)
-        : message;
+    // bd 8e5.2 (F4): send-time mode refresh WITHOUT regex sniffing — the live
+    // resolver replaces a stored wording that no longer matches reality
+    // (design §5: a legacy-cycle message stored before a campaign started is
+    // replaced by the campaign wording at send time).
+    const liveMode = await resolveLoopMode(gates.workDir, ctx);
+    let sendText = message;
+    if (liveMode.mode === "research" && pending.mode === "legacy") {
+      sendText = gates.researchBlocks ? RESEARCH_RESUME_TEXT : await composeCampaignResumeMessage(ctx);
+    } else if (liveMode.mode === "candidate" && pending.mode !== "candidate") {
+      sendText = await composeCampaignResumeMessage(ctx);
+    }
     pi.sendUserMessage(sendText);
   };
   sendPendingResumeIfReadyForTest = sendPendingResumeIfReady;
   runtimeForTest = (ctx: ExtensionContext) => getRuntime(ctx);
 
-  const schedulePendingResume = (ctx: ExtensionContext, runtime: AutoresearchRuntime, message: string, opts?: { drift?: boolean }): void => {
+  const schedulePendingResume = (
+    ctx: ExtensionContext,
+    runtime: AutoresearchRuntime,
+    message: string,
+    opts?: { mode?: "legacy" | "research" | "candidate" },
+  ): void => {
     pausePendingResume(runtime);
-    runtime.pendingResumeMessage = message;
-    runtime.pendingResumeDrift = opts?.drift === true;
+    // bd 8e5.2 (F4): the message carries its mode tag; send-time refresh and
+    // drift accounting read the tag instead of regex-sniffing the text.
+    runtime.pendingResumeMessage = { mode: opts?.mode ?? "legacy", text: message };
     runtime.pendingResumeTimer = setTimeout(
       () => sendPendingResumeIfReady(ctx, runtime),
       SETTLED_WINDOW_MS,
@@ -2643,7 +2655,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const reschedulePendingResume = (ctx: ExtensionContext, runtime: AutoresearchRuntime): void => {
     if (!hasPendingResume(runtime)) return;
-    schedulePendingResume(ctx, runtime, runtime.pendingResumeMessage!, { drift: runtime.pendingResumeDrift });
+    const pending = runtime.pendingResumeMessage;
+    if (typeof pending === "string" || pending === null) return;
+    schedulePendingResume(ctx, runtime, pending.text, { mode: pending.mode });
   };
 
   const hasRunExperimentsThisSession = (runtime: AutoresearchRuntime): boolean =>
@@ -2810,6 +2824,30 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const researchCompletionText = "Continue the research campaign: all brief questions are closed — pick a stop rule and call research_questions(action=stop, rule_id=<rule_id>, reason=<why the stop condition is met>), then research_questions(action=report); STOP on manual_check_required.";
 
+  /** bd 8e5.2 (F4): the ONE loop-mode resolver. "Which campaign owns the loop
+   *  right now" is decided here — session-aware (state-root pinned research
+   *  counts, review B2), never by regex-sniffing message text. Order matters:
+   *  research first (it blocks the candidate scan being meaningful), then
+   *  candidate, then legacy. `researchCompletion` distinguishes the two
+   *  research wordings (all questions closed → stop-rule push).
+   */
+  const resolveLoopMode = async (workDir: string, ctx?: ExtensionContext): Promise<{
+    mode: "legacy" | "research" | "candidate";
+    researchCompletion: boolean;
+  }> => {
+    if (await researchBlocksOrdinaryLoop(workDir, ctx)) {
+      const snapshot = await researchCompletionSnapshot(ctx);
+      const completion = snapshot.readable && snapshot.allClosed && !snapshot.stopTriggered && snapshot.phase === "research";
+      return { mode: "research", researchCompletion: completion };
+    }
+    if (await campaignBlocksOrdinaryLoop(workDir)) return { mode: "candidate", researchCompletion: false };
+    return { mode: "legacy", researchCompletion: false };
+  };
+
+  /** bd 8e5.2 (F4): the snapshot condition spelled out 3× before — now once. */
+  const researchNextStepText = (researchCompletion: boolean): string =>
+    researchCompletion ? researchCompletionText : RESEARCH_RESUME_TEXT;
+
   /** Expedition-aware drift branch (review blocker 2026-11-12: the legacy
    *  'pick a stop rule' push fired in an expedition with an active direction
    *  still on the map). Returns the continuation text for an expedition
@@ -2848,10 +2886,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (expeditionBranch !== null) {
       return ["⚠ Last turn did no research-campaign work.", expeditionBranch, "Questions and decision rules come only from the approved brief."].join(" ");
     }
-    const snapshot = await researchCompletionSnapshot(ctx);
-    const next = snapshot.readable && snapshot.allClosed && !snapshot.stopTriggered && snapshot.phase === "research"
-      ? researchCompletionText
-      : RESEARCH_RESUME_TEXT;
+    // bd 8e5.2 (F4): the snapshot condition lives in resolveLoopMode — this
+    // composer just renders the research wording.
+    const driftMode = await resolveLoopMode(resolveWorkDir(ctx.cwd), ctx);
+    const next = researchNextStepText(driftMode.researchCompletion);
     return [
       "⚠ Last turn did no research-campaign work.",
       next,
@@ -2890,18 +2928,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
    *  composer is given: never mentions the blocked legacy tools. Session-aware
    *  sync variant: also consults the pinned --state-root base. */
   const composeCampaignResumeMessage = async (ctx: ExtensionContext): Promise<string> => {
-    const workDir = resolveWorkDir(ctx.cwd);
-    const stateRoot = getRuntime(ctx).researchStateRoot;
-    const research =
-      researchScanSync(workDir).blocks ||
-      (stateRoot !== null && stateRoot !== workDir && researchScanSync(stateRoot).blocks);
-    if (research) {
+    // bd 8e5.2 (F4): mode decided by the one resolver (session-aware:
+    // resolveLoopMode covers the pinned state-root via researchBlocksOrdinaryLoop).
+    const mode = await resolveLoopMode(resolveWorkDir(ctx.cwd), ctx);
+    if (mode.mode === "research") {
       const expeditionBranch = await expeditionDriftBranchText(ctx);
       if (expeditionBranch !== null) return expeditionBranch;
-      const snapshot = await researchCompletionSnapshot(ctx);
-      return snapshot.readable && snapshot.allClosed && !snapshot.stopTriggered && snapshot.phase === "research"
-        ? researchCompletionText
-        : RESEARCH_RESUME_TEXT;
+      return researchNextStepText(mode.researchCompletion);
     }
     return [
           "Continue the candidate campaign now: candidate_branch status, then run/checkpoint on the active candidate.",
@@ -2911,39 +2944,40 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   };
 
   /** Corrective resume for a settled turn that did no loop work (bounded — see MAX_CONSECUTIVE_DRIFT_RESUMES). */
-  const composeDriftResumeMessage = async (cwd: string, ctx: ExtensionContext): Promise<string> => {
-    // Research campaign active (design §8): resume the research campaign only.
-    // Session-aware: the pinned --state-root campaign counts in THIS session
-    // (review B2), so a state-root campaign gets research wording too.
-    if ((await researchBlocksOrdinaryLoop(resolveWorkDir(cwd), ctx))) return composeResearchDriftMessage(ctx);
-    // Candidate-branch campaign active (design §5): do NOT prescribe the legacy
-    // cycle; the campaign has its own loop and its own stop rules. resolveWorkDir
-    // (not the raw cwd): the campaign may live under a configured workingDir.
-    if (await campaignBlocksOrdinaryLoop(resolveWorkDir(cwd))) {
-      return [
+  /** bd 8e5.2 (F4): drift composers return {mode, text} so the pending message
+   *  carries its true mode tag — send-time refresh must not replace an
+   *  expedition drift nudge (mode "research") just because its text lacks the
+   *  legacy-tool words the old regex sniffed. */
+  const composeDriftResumeMessage = async (cwd: string, ctx: ExtensionContext): Promise<{ mode: "legacy" | "research" | "candidate"; text: string }> => {
+    // bd 8e5.2 (F4): the mode decision lives in resolveLoopMode (session-aware,
+    // design §8/§5); this composer only renders per-mode wording.
+    const mode = await resolveLoopMode(resolveWorkDir(cwd), ctx);
+    if (mode.mode === "research") return { mode: "research", text: await composeResearchDriftMessage(ctx) };
+    if (mode.mode === "candidate") {
+      return { mode: "candidate", text: [
         "⚠ Last turn did no candidate-campaign work.",
         "Resume the campaign now: candidate_branch status, then run/checkpoint on the active candidate.",
         "If status reports manual_check_required: STOP — report the pending operation and wait for the operator (resolve).",
-      ].join(" ");
+      ].join(" ") };
     }
     // No campaign is active. Prescribe the legacy cycle ONLY when the loop was
     // actually initialized: without a ledger (.auto/log.jsonl) nagging a chat
     // turn with run_experiment/log_experiment is noise (observed live in a
     // chat-only project, bd drift-nudge fix). Name the start commands instead.
     if (!fs.existsSync(autoresearchJsonlPath(resolveWorkDir(cwd)))) {
-      return [
+      return { mode: "legacy", text: [
         "⚠ Last turn did no experiment work and no campaign is active.",
         "The experiment loop is not initialized in this project (no .auto/log.jsonl).",
         "To start a loop run /autoresearch <goal>; to run a research campaign use /autoresearch research <topic>.",
-      ].join(" ");
+      ].join(" ") };
     }
-    return [
+    return { mode: "legacy", text: [
       "⚠ Last turn used no experiment tools (chat/reads don't advance the loop).",
       "Resume the cycle now: propose_hypothesis → run_experiment → log_experiment.",
       MEASUREMENT_GUARDRAIL,
       experimentLimitClause(cwd),
       BENCHMARK_GUARDRAIL,
-    ].join(" ");
+    ].join(" ") };
   };
 
   // ── Subagent-wait guard (task 2.2): defer the drift branch while async subagents run ──
@@ -2990,7 +3024,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
     // bd 8e5.1: drift counters move to DELIVERY (sendPendingResumeIfReady) —
     // the deferral path now matches the ordinary path, both under Decision 3.
-    schedulePendingResume(ctx, runtime, await composeDriftResumeMessage(gates.verdict === "deliver" ? gates.workDir : resolveWorkDir(ctx.cwd), ctx), { drift: true });
+    const driftMsg = await composeDriftResumeMessage(gates.verdict === "deliver" ? gates.workDir : resolveWorkDir(ctx.cwd), ctx);
+    schedulePendingResume(ctx, runtime, driftMsg.text, { mode: driftMsg.mode });
+    runtime.pendingResumeIsDrift = true;
   };
 
   /** Re-probe a deferral: deliver when zero active (or fail-open unknown), else re-arm the re-check timer (or fire the fuse). */
@@ -3065,12 +3101,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   };
 
   const composeCompactionResumeMessage = async (ctx: ExtensionContext): Promise<string> => {
-    if ((await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd), ctx))) return composeResearchCompactionMessage();
-    // Candidate-branch campaign active (design §5): resume the campaign, not
-    // the legacy experiment loop; compaction must not reintroduce run_experiment.
-    // resolveWorkDir (not the raw cwd): the campaign may live under a configured
-    // workingDir.
-    if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) {
+    // bd 8e5.2 (F4): the mode decision lives in resolveLoopMode.
+    const mode = await resolveLoopMode(resolveWorkDir(ctx.cwd), ctx);
+    if (mode.mode === "research") return composeResearchCompactionMessage();
+    if (mode.mode === "candidate") {
       return [
         "Resume the candidate campaign now: candidate_branch status, then run/checkpoint on the active candidate.",
         "If status reports manual_check_required: STOP — report the pending operation and wait for the operator (resolve).",
@@ -3635,22 +3669,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       await notifyAutoResumeLimitReachedAsync(ctx, stopReason);
       return;
     }
-    // Candidate-branch campaign active (design §5): the default resume must not
-    // prescribe the legacy cycle (run_experiment/log_experiment/propose_hypothesis),
-    // which is blocked while the campaign runs. Applied to the DEFAULT composer
-    // here so every ensurePendingResume call site (partial-cycle agent_end,
-    // post-turn plain resume) inherits the campaign branch. Explicit composers
-    // (drift, compaction) branch by campaign mode themselves.
-    let composed: string | Promise<string>;
+    // bd 8e5.2 (F4): the mode decision lives in resolveLoopMode. The default
+    // resume must not prescribe the legacy cycle while a campaign runs (design
+    // §5); explicit composers (drift, compaction) branch by mode themselves.
+    let composed: Promise<{ mode: "legacy" | "research" | "candidate"; text: string }>;
     if (composeMessage) {
-      composed = composeMessage(ctx);
-    } else if (
-      (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd), ctx)) ||
-      (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd)))
-    ) {
-      composed = composeCampaignResumeMessage(ctx);
+      composed = (async () => ({ mode: (await resolveLoopMode(resolveWorkDir(ctx.cwd), ctx)).mode, text: await composeMessage(ctx) }));
     } else {
-      composed = composeResumeMessage(ctx);
+      const mode = await resolveLoopMode(resolveWorkDir(ctx.cwd), ctx);
+      composed = mode.mode === "legacy"
+        ? Promise.resolve({ mode: "legacy" as const, text: composeResumeMessage(ctx) })
+        : Promise.resolve({ mode: mode.mode, text: await composeCampaignResumeMessage(ctx) });
     }
     // Claim the pending slot BEFORE awaiting the composer: two agent_end events
     // settling in the same window would otherwise both pass hasPendingResume and
@@ -3658,7 +3687,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // message overwrites it synchronously after the await; sendPendingResumeIfReady
     // treats an empty message as nothing to send).
     runtime.pendingResumeMessage = "";
-    schedulePendingResume(ctx, runtime, await composed);
+    const resolved = await composed;
+    schedulePendingResume(ctx, runtime, resolved.text, { mode: resolved.mode });
   };
 
   pi.on("session_before_compact", async (event, ctx) => {
@@ -3712,7 +3742,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // candidate campaign it emits candidate-campaign wording only (design §5).
         // gates.workDir: the campaign may live under a configured workingDir,
         // so the campaign check must not use the raw session cwd.
-        schedulePendingResume(ctx, runtime, await composeDriftResumeMessage(gates.verdict === "deliver" ? gates.workDir : resolveWorkDir(ctx.cwd), ctx), { drift: true });
+        const driftMsg = await composeDriftResumeMessage(gates.verdict === "deliver" ? gates.workDir : resolveWorkDir(ctx.cwd), ctx);
+        schedulePendingResume(ctx, runtime, driftMsg.text, { mode: driftMsg.mode });
+        runtime.pendingResumeIsDrift = true;
         return;
       }
       // Under an active candidate campaign the notice must not prescribe the

@@ -85,11 +85,11 @@ test("auto-resume limit notification names a questions-complete campaign needing
 
 test("send-time override replaces legacy message only while research campaign blocks", async () => {
   const h = await fixture();
-  const runtime = { pendingResumeMessage: "Please run_experiment and log_experiment.", pendingResumeTimer: null, autoresearchMode: true, autoResumeTurns: 0, state: { results: [], currentSegment: 0 } };
+  const runtime = { pendingResumeMessage: { mode: "legacy", text: "Please run_experiment and log_experiment." }, pendingResumeIsDrift: false, pendingResumeTimer: null, autoresearchMode: true, autoResumeTurns: 0, state: { results: [], currentSegment: 0 } };
   await h.module.sendPendingResumeIfReadyForTest(h.ctx, runtime);
   assert.equal(h.pi.sentMessages.at(-1)?.text, "Continue the research campaign: call research_questions(action=status), then issue separate research_questions calls with action=open, action=record, or action=close as indicated by the approved brief; STOP on manual_check_required.");
   const stateAware = "Continue the active research campaign with its recorded evidence.";
-  runtime.pendingResumeMessage = stateAware;
+  runtime.pendingResumeMessage = { mode: "research", text: stateAware };
   await h.module.sendPendingResumeIfReadyForTest(h.ctx, runtime);
   assert.equal(h.pi.sentMessages.at(-1)?.text, stateAware);
 }, { timeout: 60000 });

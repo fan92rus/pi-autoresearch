@@ -526,7 +526,7 @@ test("bd 8e5.1: an ordinary-path drift nudge cancelled at send time spends NO dr
   await settleNoWorkTurn(h);
   // Check the scheduled state BEFORE the settle window elapses.
   const rt = (await import(pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")))).runtimeForTest(h.ctx);
-  assert.equal(rt.pendingResumeDrift, true, "the scheduled nudge must be marked as drift");
+  assert.equal(rt.pendingResumeIsDrift, true, "the scheduled nudge must be marked as drift");
   const driftBefore = rt.consecutiveDriftResumes;
   const turnsBefore = rt.autoResumeTurns;
   assert.equal(driftBefore, 0, "bd 8e5.1: schedule time must NOT increment the drift counter");
