@@ -464,6 +464,8 @@ interface AutoresearchRuntime {
   pendingResumeTimer: ReturnType<typeof setTimeout> | null;
   /** Resume message to send when the pending timer fires. */
   pendingResumeMessage: string | null;
+  /** bd 8e5.1 (design Decision 3, delivery-time accounting): true when the pending message is a drift nudge — its drift counter + autoResumeTurns increment happens at DELIVERY (sendPendingResumeIfReady), never at schedule time. */
+  pendingResumeDrift: boolean;
   /** TUI view mode: 'list' (dashboard table) or 'tree' (experiment tree). Toggle with Tab. */
   treeViewMode: boolean;
   /** True when the current turn used a loop tool (run_experiment/log_experiment/propose_hypothesis). Reset in before_agent_start; read by agent_end drift policy. */
@@ -1939,6 +1941,7 @@ function createSessionRuntime(): AutoresearchRuntime {
     state: createExperimentState(),
     pendingResumeTimer: null,
     pendingResumeMessage: null,
+    pendingResumeDrift: false,
     treeViewMode: false,
     lastTurnUsedExperimentTools: false,
     candidateLeftovers: null,
@@ -2538,6 +2541,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const cancelPendingResume = (runtime: AutoresearchRuntime): void => {
     pausePendingResume(runtime);
     runtime.pendingResumeMessage = null;
+    runtime.pendingResumeDrift = false;
   };
 
   const markAutoResumeSent = (runtime: AutoresearchRuntime): void => {
@@ -2576,7 +2580,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       return;
     }
 
+    // bd 8e5.1 (design Decision 3, both paths): drift accounting happens at
+    // DELIVERY — a scheduled-then-cancelled drift nudge (mode off, halted,
+    // stale) must not spend the drift/turn budget for a message never sent.
+    // Read the flag BEFORE cancelPendingResume clears it.
+    const wasDrift = runtime.pendingResumeDrift;
     cancelPendingResume(runtime);
+    if (wasDrift) {
+      runtime.consecutiveDriftResumes++;
+    }
     markAutoResumeSent(runtime);
     // A legacy-cycle message stored before a campaign started is replaced by the
     // campaign wording at send time (design §5: no ordinary run/log prescription).
@@ -2591,9 +2603,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   sendPendingResumeIfReadyForTest = sendPendingResumeIfReady;
   runtimeForTest = (ctx: ExtensionContext) => getRuntime(ctx);
 
-  const schedulePendingResume = (ctx: ExtensionContext, runtime: AutoresearchRuntime, message: string): void => {
+  const schedulePendingResume = (ctx: ExtensionContext, runtime: AutoresearchRuntime, message: string, opts?: { drift?: boolean }): void => {
     pausePendingResume(runtime);
     runtime.pendingResumeMessage = message;
+    runtime.pendingResumeDrift = opts?.drift === true;
     runtime.pendingResumeTimer = setTimeout(
       () => sendPendingResumeIfReady(ctx, runtime),
       SETTLED_WINDOW_MS,
@@ -2602,7 +2615,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const reschedulePendingResume = (ctx: ExtensionContext, runtime: AutoresearchRuntime): void => {
     if (!hasPendingResume(runtime)) return;
-    schedulePendingResume(ctx, runtime, runtime.pendingResumeMessage!);
+    schedulePendingResume(ctx, runtime, runtime.pendingResumeMessage!, { drift: runtime.pendingResumeDrift });
   };
 
   const hasRunExperimentsThisSession = (runtime: AutoresearchRuntime): boolean =>
@@ -2913,11 +2926,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   };
 
   /**
-   * Deliver a deferred drift nudge now: exactly one drift counter increment and
-   * one markAutoResumeSent (moved here from agent_end, design Decision 3), the
-   * drift-branch conditions are re-evaluated at delivery (manual-check, drift
-   * limit, stop-reason, send-time gates). Returns true when delivered/decided,
-   * false when the deferral was cleared for a retry later.
+   * Deliver a deferred drift nudge now: the drift-branch conditions are
+   * re-evaluated at delivery (manual-check, drift limit, stop-reason,
+   * send-time gates); the counter increment itself happens in
+   * sendPendingResumeIfReady (bd 8e5.1: delivery-time accounting on BOTH
+   * paths, design Decision 3). Returns true when delivered/decided, false
+   * when the deferral was cleared for a retry later.
    */
   const deliverDeferredDriftNudge = async (
     ctx: ExtensionContext,
@@ -2944,9 +2958,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       await notifyAutoResumeLimitReachedAsync(ctx, stopReason);
       return;
     }
-    runtime.consecutiveDriftResumes++;
-    markAutoResumeSent(runtime);
-    schedulePendingResume(ctx, runtime, await composeDriftResumeMessage(resolveWorkDir(ctx.cwd), ctx));
+    // bd 8e5.1: drift counters move to DELIVERY (sendPendingResumeIfReady) —
+    // the deferral path now matches the ordinary path, both under Decision 3.
+    schedulePendingResume(ctx, runtime, await composeDriftResumeMessage(resolveWorkDir(ctx.cwd), ctx), { drift: true });
   };
 
   /** Re-probe a deferral: deliver when zero active (or fail-open unknown), else re-arm the re-check timer (or fire the fuse). */
@@ -3656,13 +3670,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // defer; counters move to delivery (design Decision 3). Guard disarmed
         // or zero/unknown active → fall through to the ordinary nudge.
         if (await maybeDeferDriftForSubagents(ctx, runtime)) return;
-        runtime.consecutiveDriftResumes++;
-        markAutoResumeSent(runtime);
+        // bd 8e5.1: NO counter increment here — drift accounting moved to
+        // DELIVERY (sendPendingResumeIfReady, design Decision 3). A nudge
+        // cancelled at send time must not spend the drift/turn budget.
         // composeDriftResumeMessage branches by campaign mode: under an active
         // candidate campaign it emits candidate-campaign wording only (design §5).
         // resolveWorkDir: the campaign may live under a configured workingDir,
         // so the campaign check must not use the raw session cwd.
-        schedulePendingResume(ctx, runtime, await composeDriftResumeMessage(resolveWorkDir(ctx.cwd), ctx));
+        schedulePendingResume(ctx, runtime, await composeDriftResumeMessage(resolveWorkDir(ctx.cwd), ctx), { drift: true });
         return;
       }
       // Under an active candidate campaign the notice must not prescribe the

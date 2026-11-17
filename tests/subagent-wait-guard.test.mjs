@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { createHarness } from "./fake-pi.ts";
 import { approveOptimizeBrief } from "./optimize-approve-helper.mjs";
@@ -513,4 +514,39 @@ test("session_start resets the deferral (review round 4: reset point covered by 
   await settleWindow();
   await advance(SUBAGENT_DEFER_RECHECK_MS + 1500);
   assert.equal(driftNudges(h).length, 0, "session_start reset kills the deferral: no delivery after zero active");
+});
+
+// ─── bd 8e5.1: delivery-time drift accounting on BOTH paths ──────────────────
+
+test("bd 8e5.1: an ordinary-path drift nudge cancelled at send time spends NO drift/turn budget", async () => {
+  const h = await readySession("e51-cancel");
+  // No fleet responder installed at all → probe unknown → fail-open →
+  // the ordinary (non-deferred) path schedules the drift nudge.
+  await fireSessionStart(h);
+  await settleNoWorkTurn(h);
+  // Check the scheduled state BEFORE the settle window elapses.
+  const rt = (await import(pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")))).runtimeForTest(h.ctx);
+  assert.equal(rt.pendingResumeDrift, true, "the scheduled nudge must be marked as drift");
+  const driftBefore = rt.consecutiveDriftResumes;
+  const turnsBefore = rt.autoResumeTurns;
+  assert.equal(driftBefore, 0, "bd 8e5.1: schedule time must NOT increment the drift counter");
+  assert.equal(turnsBefore, 0, "bd 8e5.1: schedule time must NOT increment autoResumeTurns");
+  // Turn the mode OFF before delivery: send-time cancel (was the budget-eater).
+  await h.command("autoresearch").handler("off", h.ctx);
+  await settleWindow();
+  assert.equal(rt.consecutiveDriftResumes, 0, "cancelled drift nudge must not increment the drift counter");
+  assert.equal(rt.autoResumeTurns, 0, "cancelled drift nudge must not increment autoResumeTurns");
+  assert.equal(driftNudges(h).length, 0, "no message sent after mode off");
+});
+
+test("bd 8e5.1: a DELIVERED drift nudge increments the drift counter exactly once at delivery", async () => {
+  const h = await readySession("e51-deliver");
+  await fireSessionStart(h);
+  await settleNoWorkTurn(h);
+  const rt = (await import(pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")))).runtimeForTest(h.ctx);
+  assert.equal(rt.consecutiveDriftResumes, 0, "no increment at schedule time");
+  await settleWindow(); // deliver
+  assert.equal(driftNudges(h).length, 1, "nudge delivered");
+  assert.equal(rt.consecutiveDriftResumes, 1, "delivery increments the drift counter exactly once");
+  assert.equal(rt.autoResumeTurns, 1, "delivery increments autoResumeTurns");
 });
