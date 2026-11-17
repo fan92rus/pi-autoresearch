@@ -232,21 +232,78 @@ import { computeSimhash, hammingDistance, classifyDistance } from "./parallel/si
 import { rankNodes, type RankedNode } from "./parallel/ucb1.ts";
 import { renderTree, renderNodeDetail, findBestNodeId } from "./parallel/treeview.ts";
 import { repeatConfidence, keepStatus } from "./confidence.ts";
+import {
+  currentResults,
+  resultEpoch,
+  segmentEpoch,
+  epochResults,
+  findBaselineMetric,
+  findBaselineSecondary,
+  findBest,
+  findBestMetric,
+  findBestRunNumber,
+  priorEpochBest,
+  isBetter,
+} from "./ledger-metrics.ts";
+import { computeConfidence as ledgerComputeConfidence } from "./ledger-metrics.ts";
+// bd lrx.1: pure extraction — re-export so existing consumers of index.ts keep working.
+export { priorEpochBest, findBaselineMetric, findBestMetric } from "./ledger-metrics.ts";
 
-// ---------------------------------------------------------------------------
-// Experiment output limits (sent to LLM — keep small to save context)
-// ---------------------------------------------------------------------------
+/**
+ * Check if a command's primary purpose is running the benchmark script.
+ *
+ * Strategy: strip common harmless prefixes (env vars, env/time/nice wrappers)
+ * then check that the core command is the benchmark script invoked via a known
+ * pattern. Rejects chaining tricks like "evil.py; measure.sh" because we require
+ * the benchmark script to be the *first* real command.
+ */
+function isAutoresearchShCommand(command: string): boolean {
+  let cmd = command.trim();
+
+  // Strip leading env variable assignments: FOO=bar BAZ="qux" ...
+  cmd = cmd.replace(/^(?:\w+=\S*\s+)+/, "");
+
+  // Strip known harmless command wrappers (env, time, nice, nohup) repeatedly
+  // Allows flags and their numeric values: e.g. "nice -n 10 time env ..."
+  let prev: string;
+  do {
+    prev = cmd;
+    cmd = cmd.replace(/^(?:env|time|nice|nohup)(?:\s+-\S+(?:\s+\d+)?)*\s+/, "");
+  } while (cmd !== prev);
+
+  // Now the core command must be the benchmark script via a known invocation.
+  // `sessionFilePath("measure")` resolves to `.auto/measure.sh` in the current
+  // layout and to the legacy flat `autoresearch.sh` in pre-.auto projects, so
+  // both spellings stay valid here (paths.ts SESSION_FILE_NAMES.measure.legacy).
+  // An optional path prefix allows
+  //   ./.auto/measure.sh, /abs/path/.auto/measure.sh, bash [-flags] autoresearch.sh, etc.
+  return /^(?:(?:bash|sh|source)\s+(?:-\w+\s+)*)?(?:\/|\.{1,2}\/|[\w.-]+\/)*(?:autoresearch\.sh|\.auto\/measure\.sh)(?:\s|$)/.test(cmd);
+}
+
+
+/**
+ * Compute confidence score for the best improvement vs. session noise floor.
+ *
+ * Noise is the sample standard deviation of repeats of the best keep's own
+ * hypothesis (experiment-rigor 3.2). Returns `|best_delta| / sd`, where
+ * best_delta is the improvement of the best kept metric over baseline.
+ *
+ * Returns null when there is no keep better than baseline, the hypothesis has
+ * fewer than two runs, or the spread is 0. The segment MAD is a diagnostic only.
+ */
+// bd lrx.1: output caps for captured experiment output (kept small to save context).
 const EXPERIMENT_MAX_LINES = 10;
 const EXPERIMENT_MAX_BYTES = 4 * 1024; // 4KB
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
+export function computeConfidence(
+  results: ExperimentResult[],
+  segment: number,
+  direction: "lower" | "higher",
+  epoch: number = segmentEpoch(results, segment),
+): number | null {
+  return ledgerComputeConfidence(results, segment, direction, repeatConfidence, epoch);
+}
 
-/**
- * Actionable Side Information (ASI) — free-form diagnostics per experiment run.
- * The agent decides what to record. Any key/value pair is valid.
- */
 interface ASI {
   [key: string]: unknown;
 }
@@ -804,130 +861,12 @@ async function execBashScript(
   });
 }
 
-/**
- * Check if a command's primary purpose is running the benchmark script.
- *
- * Strategy: strip common harmless prefixes (env vars, env/time/nice wrappers)
- * then check that the core command is the benchmark script invoked via a known
- * pattern. Rejects chaining tricks like "evil.py; measure.sh" because we require
- * the benchmark script to be the *first* real command.
- */
-function isAutoresearchShCommand(command: string): boolean {
-  let cmd = command.trim();
 
-  // Strip leading env variable assignments: FOO=bar BAZ="qux" ...
-  cmd = cmd.replace(/^(?:\w+=\S*\s+)+/, "");
 
-  // Strip known harmless command wrappers (env, time, nice, nohup) repeatedly
-  // Allows flags and their numeric values: e.g. "nice -n 10 time env ..."
-  let prev: string;
-  do {
-    prev = cmd;
-    cmd = cmd.replace(/^(?:env|time|nice|nohup)(?:\s+-\S+(?:\s+\d+)?)*\s+/, "");
-  } while (cmd !== prev);
 
-  // Now the core command must be the benchmark script via a known invocation.
-  // `sessionFilePath("measure")` resolves to `.auto/measure.sh` in the current
-  // layout and to the legacy flat `autoresearch.sh` in pre-.auto projects, so
-  // both spellings stay valid here (paths.ts SESSION_FILE_NAMES.measure.legacy).
-  // An optional path prefix allows
-  //   ./.auto/measure.sh, /abs/path/.auto/measure.sh, bash [-flags] autoresearch.sh, etc.
-  return /^(?:(?:bash|sh|source)\s+(?:-\w+\s+)*)?(?:\/|\.{1,2}\/|[\w.-]+\/)*(?:autoresearch\.sh|\.auto\/measure\.sh)(?:\s|$)/.test(cmd);
-}
 
-function isBetter(
-  current: number,
-  best: number,
-  direction: "lower" | "higher"
-): boolean {
-  return direction === "lower" ? current < best : current > best;
-}
 
-/**
- * Compute confidence score for the best improvement vs. session noise floor.
- *
- * Noise is the sample standard deviation of repeats of the best keep's own
- * hypothesis (experiment-rigor 3.2). Returns `|best_delta| / sd`, where
- * best_delta is the improvement of the best kept metric over baseline.
- *
- * Returns null when there is no keep better than baseline, the hypothesis has
- * fewer than two runs, or the spread is 0. The segment MAD is a diagnostic only.
- */
-export function computeConfidence(
-  results: ExperimentResult[],
-  segment: number,
-  direction: "lower" | "higher",
-  epoch: number = segmentEpoch(results, segment),
-): number | null {
-  // Within one epoch only (task 2.3): the noise and baseline of another scale
-  // would make the noise-floor multiple meaningless. Noise = repeats of the best
-  // keep's own hypothesis (experiment-rigor 3.2, shared rule in confidence.ts).
-  const cur = epochResults(results, segment, epoch).filter((r) => r.metric > 0);
-  const baseline = findBaselineMetric(results, segment, epoch);
-  if (baseline === null) return null;
-  const rc = repeatConfidence(cur, baseline, direction);
-  return rc === null ? null : rc.value;
-}
 
-/** Get results in the current segment only */
-function currentResults(results: ExperimentResult[], segment: number): ExperimentResult[] {
-  return results.filter((r) => r.segment === segment);
-}
-
-/**
- * Measurement epoch of a run (task 2.3). Records without a valid `epoch` belong
- * to epoch 1 — the same contract as jsonl.ts reconstruct, so a broken epoch on a
- * run joins epoch 1 and is never compared with a later epoch's best.
- */
-function resultEpoch(result: { epoch?: number }): number {
-  const epoch = result.epoch;
-  return typeof epoch === "number" && Number.isSafeInteger(epoch) && epoch >= 1 ? epoch : 1;
-}
-
-/** Highest epoch among the segment's runs (1 when the segment has none). */
-function segmentEpoch(results: ExperimentResult[], segment: number): number {
-  let epoch = 1;
-  for (const r of currentResults(results, segment)) epoch = Math.max(epoch, resultEpoch(r));
-  return epoch;
-}
-
-/**
- * Runs of one segment that belong to `epoch` (default: the segment's current
- * epoch). Best, baseline and confidence are computed ONLY over one epoch — a
- * delta across epochs would compare two different scales (spec measurement-track,
- * «Эпохи шкалы и блокировка поперечных сравнений»).
- */
-function epochResults(
-  results: ExperimentResult[],
-  segment: number,
-  epoch: number = segmentEpoch(results, segment),
-): ExperimentResult[] {
-  return currentResults(results, segment).filter((r) => resultEpoch(r) === epoch);
-}
-
-/**
- * Best keep of the nearest EARLIER epoch of the segment. It is a cross-epoch
- * reference only: both values are shown, the delta is never computed. null when
- * no earlier epoch has a keep run.
- */
-export function priorEpochBest(
-  results: ExperimentResult[],
-  segment: number,
-  epoch: number,
-  direction: "lower" | "higher",
-): { epoch: number; metric: number; runNumber: number } | null {
-  let best: { epoch: number; metric: number; runNumber: number } | null = null;
-  const seg = currentResults(results, segment);
-  for (let i = 0; i < seg.length; i++) {
-    const r = seg[i];
-    const e = resultEpoch(r);
-    if (e >= epoch || r.status !== "keep" || r.metric <= 0) continue;
-    if (best === null || e > best.epoch || (e === best.epoch && isBetter(r.metric, best.metric, direction))) {
-      best = { epoch: e, metric: r.metric, runNumber: i + 1 };
-    }
-  }
-  return best;
-}
 
 /**
  * Epoch of each tree node (task 2.3): the epoch of its run in the ledger (runRef).
@@ -1360,67 +1299,9 @@ function validateWorkDir(ctxCwd: string): string | null {
   return null;
 }
 
-/** Baseline = first experiment of the current epoch in the current segment */
-export function findBaselineMetric(
-  results: ExperimentResult[],
-  segment: number,
-  epoch: number = segmentEpoch(results, segment),
-): number | null {
-  const cur = epochResults(results, segment, epoch);
-  return cur.length > 0 ? cur[0].metric : null;
-}
 
-/**
- * One best-scan for both findBestMetric and findBestRunNumber (bd lrx.4):
- * the two pre-unification implementations were NOT identical — findBestMetric
- * did not filter keep metric===0 (would return 0 as "best"); the unified scan
- * applies the metric!==0 invariant everywhere, matching the rest of the
- * codebase. The linear fold also replaces Math.min(...kept)/Math.max(...)
- * spread, which throws RangeError on very large segments (~>100k entries). The linear fold also replaces Math.min(...kept)/Math.max(...)
- * spread, which throws RangeError on very large segments (~>100k entries).
- * Returns null when no keep exists in the epoch.
- */
-function findBest(
-  results: ExperimentResult[],
-  segment: number,
-  direction: "lower" | "higher",
-  epoch: number,
-): { metric: number; position: number } | null {
-  const seg = currentResults(results, segment);
-  let best: { metric: number; position: number } | null = null;
-  for (let i = 0; i < seg.length; i++) {
-    const r = seg[i];
-    if (resultEpoch(r) !== epoch) continue;
-    if (r.status !== "keep" || r.metric === 0) continue;
-    if (best === null || (direction === "lower" ? r.metric < best.metric : r.metric > best.metric)) {
-      best = { metric: r.metric, position: i };
-    }
-  }
-  return best;
-}
 
-/** Best = optimal metric across kept experiments of the current epoch (min for lower, max for higher) */
-export function findBestMetric(
-  results: ExperimentResult[],
-  segment: number,
-  direction: "lower" | "higher",
-  epoch: number = segmentEpoch(results, segment),
-): number | null {
-  return findBest(results, segment, direction, epoch)?.metric ?? null;
-}
 
-/** T5: Find the run number (1-based) where the current best metric was set. */
-function findBestRunNumber(
-  results: ExperimentResult[],
-  segment: number,
-  direction: "lower" | "higher",
-  epoch: number = segmentEpoch(results, segment),
-): number {
-  const seg = currentResults(results, segment);
-  const best = findBest(results, segment, direction, epoch);
-  // results are stored per-segment; run numbers are global (1-based within segment)
-  return best ? best.position + 1 : seg.length;
-}
 
 // -----------------------------------------------------------------------
 // Session file paths (single source of truth for autoresearch.* filenames)
@@ -1815,39 +1696,6 @@ function findBaselineRunNumber(
   return index >= 0 ? index + 1 : null;
 }
 
-/**
- * Find secondary metric baselines from the first experiment in current segment.
- * For metrics that didn't exist at baseline time, falls back to the first
- * occurrence of that metric in the current segment.
- */
-function findBaselineSecondary(
-  results: ExperimentResult[],
-  segment: number,
-  knownMetrics?: MetricDef[],
-  epoch: number = segmentEpoch(results, segment),
-): Record<string, number> {
-  const cur = epochResults(results, segment, epoch);
-  const base: Record<string, number> = cur.length > 0
-    ? { ...(cur[0].metrics ?? {}) }
-    : {};
-
-  // Fill in any known metrics missing from baseline with their first occurrence
-  if (knownMetrics) {
-    for (const sm of knownMetrics) {
-      if (base[sm.name] === undefined) {
-        for (const r of cur) {
-          const val = (r.metrics ?? {})[sm.name];
-          if (val !== undefined) {
-            base[sm.name] = val;
-            break;
-          }
-        }
-      }
-    }
-  }
-
-  return base;
-}
 
 function cloneExperimentState(state: ExperimentState): ExperimentState {
   return {

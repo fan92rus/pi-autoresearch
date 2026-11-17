@@ -1,5 +1,7 @@
 export type JsonlEntry = Record<string, unknown>;
 
+import { advanceSegment } from "./ledger-metrics.ts";
+
 export interface AutoresearchConfigEntry extends JsonlEntry {
   type: "config";
   name?: string;
@@ -130,7 +132,7 @@ function updateConfig(state: ReconstructedJsonlState, entry: AutoresearchConfigE
 function nextSegment(state: ReconstructedJsonlState, segment: number): number {
   if (state.results.length === 0) return segment;
   state.secondaryMetrics = [];
-  return segment + 1;
+  return advanceSegment(segment, state.results.length > 0);
 }
 
 function observeEpoch(state: ReconstructedJsonlState, entry: JsonlEntry): void {

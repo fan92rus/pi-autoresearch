@@ -35,6 +35,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { parseJsonlEntry } from "./jsonl.ts";
+import { advanceSegment } from "./ledger-metrics.ts";
 import { journalTarget } from "./research-journal.ts";
 import {
   classifyRunLink,
@@ -542,7 +543,6 @@ interface LogRowContext {
 function scanLogContexts(text: string): Map<number, LogRowContext> {
   const contexts = new Map<number, LogRowContext>();
   let segment = 0;
-  let headers = 0;
   let runsSeen = 0;
   let metricName: string | null = null;
   let bestDirection: "lower" | "higher" | null = null;
@@ -552,8 +552,9 @@ function scanLogContexts(text: string): Map<number, LogRowContext> {
       const entry = parseJsonlEntry(line);
       if (entry !== null) {
         if (entry.type === "config") {
-          if (headers > 0 && runsSeen > 0) segment++;
-          headers++;
+          // bd lrx.1: shared rule with reconstructJsonlState — only a header
+          // after runs in THIS segment starts a new segment.
+          segment = advanceSegment(segment, runsSeen > 0);
           metricName = typeof entry.metricName === "string" && entry.metricName !== "" ? entry.metricName : null;
           bestDirection = entry.bestDirection === "higher" || entry.bestDirection === "lower" ? entry.bestDirection : null;
         } else if (typeof entry.run === "number") {
