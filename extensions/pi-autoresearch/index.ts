@@ -409,6 +409,10 @@ interface LogDetails {
 
 export interface AutoresearchRuntime {
   autoresearchMode: boolean;
+  /** es1.7/es1.8: the view the TUI shows while the mode is ON. Explicit on
+   *  purpose: a chain may not exist yet during the expedition design phase,
+   *  and a research campaign is NOT an expedition. */
+  uiMode: "optimization" | "expedition";
   /** Campaign id pinned by '/autoresearch research <id>'; research tools refuse other ids while set. */
   researchCampaignId: string | null;
   /**
@@ -1537,6 +1541,7 @@ function createExperimentState(): ExperimentState {
 function createSessionRuntime(): AutoresearchRuntime {
   return {
     autoresearchMode: false,
+    uiMode: "optimization",
     researchCampaignId: null,
     researchStateRoot: null,
     experimentsThisSession: 0,
@@ -2448,6 +2453,37 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       return;
     }
 
+    // es1.7/es1.8: the design phase has no chain journal yet, so the explicit
+    // uiMode is the only honest signal. The legacy chain predicate below stays
+    // verbatim (source-level regression test).
+    if (runtime.uiMode === "expedition" && !(runtime.researchChain && (runtime.researchChain as typeof runtime.researchChain & { expedition?: boolean }).expedition === true)) {
+      ctx.ui.setWidget("autoresearch", (tui, theme) => ({
+        render(width: number): string[] {
+          const safeWidth = Math.max(1, width || getTuiSize(tui).width);
+          let goal = "";
+          try {
+            const draft = expedition.findLatestDraft(runtime.researchStateRoot ?? path.join(resolveWorkDir(ctx.cwd), ".auto"));
+            if (draft) {
+              const parsed: unknown = JSON.parse(fs.readFileSync(draft, "utf8"));
+              const rawGoal = parsed && typeof parsed === "object" ? (parsed as { goal?: unknown }).goal : null;
+              if (typeof rawGoal === "string") goal = rawGoal.replace(/\s+/g, " ").slice(0, 80);
+            }
+          } catch { /* the draft is optional and may be damaged */ }
+          return [joinPartsToWidth(
+            [
+              theme.fg("accent", "🧭"),
+              theme.fg("dim", " │ expedition design phase"),
+              theme.fg("dim", goal ? ` │ goal: ${goal}` : " │ goal pending"),
+              theme.fg("dim", " │ expedition_brief draft → propose"),
+            ],
+            safeWidth
+          )];
+        },
+        invalidate(): void { try { tui.requestRender(); } catch { /* headless */ } },
+      }));
+      return;
+    }
+
     if (runtime.researchChain && (runtime.researchChain as typeof runtime.researchChain & { expedition?: boolean }).expedition === true) {
       const chain = runtime.researchChain;
       const chainDir = path.join(chain.workDir, ".auto", "research-chain", chain.chainId);
@@ -2622,6 +2658,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const campaignId: string | null = fresh.campaignId ?? null;
     runtime.researchCampaignId = campaignId;
     runtime.researchChain = { chainId: fresh.chainId, workDir, charterPath: fresh.docPath, charterSha256: fresh.docSha256, charter: fresh.charter, expedition: true, docSha256: fresh.docSha256 };
+    runtime.uiMode = "expedition";
     if (!runtime.autoresearchMode) { recordAutoresearchActivation(workDir, true); setAutoresearchMode(ctx, true); }
     runtime.autoResumeTurns = 0;
     runtime.consecutiveDriftResumes = 0;
@@ -3227,6 +3264,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const wasInactive = !runtime.autoresearchMode;
       recordAutoresearchActivation(workDir, true);
       setAutoresearchMode(ctx, true);
+      runtime.uiMode = "optimization";
       updateWidget(ctx);
 
       if (wasInactive) {
@@ -8066,9 +8104,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (!started.ok) return reply(`${started.reason}: ${started.message}`, started.reason);
       const status = await chainJournal.setChainStatus(workDir, chainId, "active");
       if (!status.ok) return reply(`${status.reason}: ${status.message}`, status.reason);
-      if (!runtime.autoresearchMode) { recordAutoresearchActivation(workDir,true); setAutoresearchMode(ctx,true); updateWidget(ctx); }
+      // es1.8: every creation path pins the expedition view and refreshes the
+      // widget — including a session where the mode was already ON.
+      if (!runtime.autoresearchMode) { recordAutoresearchActivation(workDir,true); setAutoresearchMode(ctx,true); }
+      runtime.uiMode = "expedition";
       runtime.researchCampaignId = id;
       runtime.researchChain = {chainId,workDir,charterPath:docPath,charterSha256:current.sha256,charter:current.doc.charter,expedition:true,docSha256:current.sha256};
+      updateWidget(ctx);
       // Restart marker (bd pi-autoresearch-es1.3): lets a fresh session restore
       // the binding from disk. Chain creation is already durable at this point,
       // so a marker failure degrades to a warning, not a rollback.
@@ -9161,6 +9203,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     setAutoresearchMode(ctx, false);
     runtime.researchCampaignId = null;
     runtime.researchStateRoot = null;
+    runtime.uiMode = "optimization";
     runtime.autoResumeTurns = 0;
     runtime.experimentsThisSession = 0;
     runtime.lastRunChecks = null;
@@ -9182,6 +9225,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const runtime = getRuntime(ctx);
     recordAutoresearchActivation(resolveWorkDir(ctx.cwd), false);
     setAutoresearchMode(ctx, false);
+    runtime.uiMode = "optimization";
     runtime.researchCampaignId = null;
     // Review R1A: re-arm the continuation flag at the chain boundary — a NEW
     // chain bound in the same session must be able to send its first
@@ -9502,6 +9546,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     let slice = "";
     const chain = activeChain(ctx);
     if (chain?.expedition) {
+      runtime.uiMode = "expedition";
+      updateWidget(ctx);
       const verified = await chainJournal.verifyChain(chain.workDir, chain.chainId);
       if (verified.ok) { const replay = expedition.replayExpeditionMap(verified.entries); if (replay.ok) slice = expedition.mapSliceText(replay.map); }
     }
@@ -9525,6 +9571,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const runtime = getRuntime(ctx);
     recordAutoresearchActivation(resolveWorkDir(ctx.cwd), false);
     setAutoresearchMode(ctx, false);
+    runtime.uiMode = "optimization";
     runtime.researchCampaignId = null;
     runtime.researchChain = null;
     runtime.chainContinuationSent = false;
@@ -9549,6 +9596,80 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
     }
     return ids;
+  };
+
+  /** es1.7/es1.8: a mode switch records the same finalize shape as
+   *  finalize_research (type/reason/evidence/confidence/best_metric/run_count/
+   *  timestamp) and refreshes .auto/report.md. Unlike the tool it never sends
+   *  a steer — the launch path already delivers its own kickoff. */
+  const recordModeSwitchFinalize = (ctx: ExtensionContext, reason: string): void => {
+    const workDir = resolveWorkDir(ctx.cwd);
+    const runtime = getRuntime(ctx);
+    const entry = {
+      type: "finalize",
+      reason,
+      evidence: "",
+      confidence: 1,
+      best_metric: runtime.state.bestMetric,
+      run_count: runtime.state.results.length,
+      timestamp: Date.now(),
+    };
+    try {
+      const jsonlPath = autoresearchJsonlPath(workDir);
+      ensureParentDir(jsonlPath);
+      fs.appendFileSync(jsonlPath, JSON.stringify(entry) + "\n");
+      broadcastDashboardUpdate(workDir);
+    } catch (e) {
+      ctx.ui.notify(`Mode switch finalize entry could not be written: ${e instanceof Error ? e.message : String(e)}`, "error");
+    }
+    try { writeCampaignReport(workDir); }
+    catch (e) { ctx.ui.notify(`Mode switch campaign report could not be written: ${e instanceof Error ? e.message : String(e)}`, "warning"); }
+  };
+
+  /** es1.8: symmetric expedition → ordinary optimization switch. Mirrors the
+   *  finalize_research guards: verify the journal, refuse while any chain
+   *  campaign is in research or unreadable, then journal expedition_stop +
+   *  completed, write the expedition report, unbind and archive. Every refusal
+   *  path returns before any journal or runtime mutation. */
+  const finalizeExpeditionForOptimization = async (ctx: ExtensionContext): Promise<{ ok: boolean; message: string }> => {
+    const runtime = getRuntime(ctx);
+    const chain = runtime.researchChain;
+    if (!chain?.expedition) return { ok: true, message: "" };
+    const workDir = resolveWorkDir(ctx.cwd);
+    const verified = await chainJournal.verifyChain(chain.workDir, chain.chainId);
+    if (!verified.ok) {
+      await chainJournal.markManualCheckRequired(chain.workDir, chain.chainId, verified.message).catch(() => undefined);
+      return { ok: false, message: `Expedition ${chain.chainId} journal is damaged (manual_check_required): ${verified.message}. Fix it before switching to optimization.` };
+    }
+    const status = await chainJournal.statusOf(chain.workDir, chain.chainId);
+    if (status === "manual_check_required") return { ok: false, message: `Expedition ${chain.chainId} requires a manual check; fix it before switching to optimization.` };
+    if (!chainJournal.isFinal(status)) {
+      for (const cid of await chainCampaignIds(ctx)) {
+        const resolved = researchState.resolveCampaignDir(chain.workDir, cid);
+        if (!resolved.ok) return { ok: false, message: `Expedition campaign ${cid} state is unreadable: ${resolved.message}. Finish or repair it before switching to optimization.` };
+        const st = await researchState.readState(resolved.dir);
+        if (!st.ok) return { ok: false, message: `Expedition campaign ${cid} state is unreadable: ${st.message}. Finish or repair it before switching to optimization.` };
+        if (st.state.phase === "research" || st.state.phase === "briefing") {
+          return { ok: false, message: `Expedition campaign ${cid} is still in phase ${st.state.phase}: finish/finalize it first, then switch to optimization.` };
+        }
+      }
+      const chainDirPath = chainJournal.chainDir(chain.workDir, chain.chainId);
+      if (!chainDirPath) return { ok: false, message: `Expedition ${chain.chainId} chain directory is unavailable; switch to optimization refused.` };
+      const stop = await chainJournal.appendEntry(chainDirPath, chain.workDir, chain.chainId, "expedition_stop", { rule: "mode_switch_optimization", basis: "rule" });
+      if (!stop.ok) return { ok: false, message: `Expedition stop could not be recorded (${stop.message}); switch to optimization refused.` };
+      const completed = await chainJournal.setChainStatus(chain.workDir, chain.chainId, "completed");
+      if (!completed.ok) return { ok: false, message: `Completed status could not be recorded (${completed.message}); switch to optimization refused.` };
+      await writeExpeditionFinalReport(chain, "completed", verified.entries);
+    }
+    exitResearchMode(ctx, chain.chainId);
+    try {
+      const archived = await archiveFinishedCampaigns(workDir, effectiveResearchBase(workDir, ctx), ctx);
+      if (archived !== null && archived.length > 0) ctx.ui.notify(`Archived finished campaigns: ${archived.join(", ")}.`, "info");
+    } catch { /* archival is best effort */ }
+    cancelPendingResume(runtime);
+    recordModeSwitchFinalize(ctx, "switch to optimization mode");
+    runtime.uiMode = "optimization";
+    return { ok: true, message: "" };
   };
 
   function turnAutoresearchOff(ctx: ExtensionContext): void {
@@ -9825,6 +9946,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             if (status === "awaiting_child") {
               recordAutoresearchActivation(workDir, true);
               setAutoresearchMode(ctx, true);
+              runtime.uiMode = "expedition";
               runtime.autoResumeTurns = 0;
               runtime.consecutiveDriftResumes = 0;
               updateWidget(ctx);
@@ -9840,6 +9962,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (!ctx.hasUI) { ctx.ui.notify("Expedition needs TUI confirmation; headless use requires the --expedition-doc wrapper.", "error"); return; }
         if (await researchBlocksExpeditionLaunch(workDir, ctx)) { ctx.ui.notify("Cannot launch expedition while a research campaign is active; resume or finish it first.", "error"); return; }
         if (await campaignBlocksOrdinaryLoop(workDir)) { ctx.ui.notify("Candidate campaign active; finish it before starting an expedition.", "error"); return; }
+        // es1.7: an active optimization loop is finalized (ledger + report) but
+        // NOT steered — the design-phase kickoff below is the only message. The
+        // persisted off-marker is untouched: the mode stays ON, only the view
+        // changes. A chain-bound session is not a mode switch.
+        if (runtime.autoresearchMode && runtime.researchChain?.expedition !== true) {
+          recordModeSwitchFinalize(ctx, "switch to expedition mode");
+          cancelPendingResume(runtime);
+          runtime.autoResumeTurns = 0;
+          runtime.consecutiveDriftResumes = 0;
+        }
+        runtime.uiMode = "expedition";
         recordAutoresearchActivation(workDir, true); setAutoresearchMode(ctx, true);
         runtime.autoResumeTurns = 0; runtime.consecutiveDriftResumes = 0; updateWidget(ctx);
         const goal = trimmedArgs.slice("expedition".length).trim();
@@ -10092,6 +10225,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           );
         }
         runtime.researchStateRoot = requestedStateRoot;
+        runtime.uiMode = "optimization"; // a research campaign keeps the legacy dashboard, never the expedition view
         recordAutoresearchActivation(researchWorkDir, true);
         setAutoresearchMode(ctx, true);
         runtime.autoResumeTurns = 0;
@@ -10145,14 +10279,24 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return;
       }
 
+      // es1.8: the symmetric switch back. A bound expedition is finalized
+      // exactly like finalize_research does, but the ordinary launch then
+      // continues instead of being refused as "already active". A session
+      // that was explicitly turned OFF keeps the legacy launch/restore path.
       if (runtime.autoresearchMode) {
-        ctx.ui.notify("Autoresearch already active — use '/autoresearch off' to stop first", "info");
-        return;
+        if (runtime.researchChain?.expedition === true) {
+          const switched = await finalizeExpeditionForOptimization(ctx);
+          if (!switched.ok) { ctx.ui.notify(switched.message, "error"); return; }
+        } else {
+          ctx.ui.notify("Autoresearch already active — use '/autoresearch off' to stop first", "info");
+          return;
+        }
       }
 
       const workDir = resolveWorkDir(ctx.cwd);
       recordAutoresearchActivation(workDir, true);
       setAutoresearchMode(ctx, true);
+      runtime.uiMode = "optimization";
       runtime.autoResumeTurns = 0;
       runtime.consecutiveDriftResumes = 0;
       // Register the widget NOW: the agent may take a while before its first

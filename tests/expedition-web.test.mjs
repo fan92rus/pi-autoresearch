@@ -209,6 +209,8 @@ test('export command stays the ordinary ledger path inside an expedition (no exp
 test('no new broadcast points: broadcastDashboardUpdate call sites unchanged', () => {
   const source = fs.readFileSync(path.join(import.meta.dirname, '..', 'extensions', 'pi-autoresearch', 'index.ts'), 'utf8');
   const callSites = source.match(/broadcastDashboardUpdate\(/g)?.length ?? 0;
-  // 4 existing sites (ledger/config writes) + 1 definition; the expedition branch adds none.
-  assert.equal(callSites, 5);
+  // 4 legacy sites (ledger/config writes) + 1 definition = 5. es1.7/es1.8
+  // adds one intentional broadcast after the mode-switch finalize entry so
+  // an open dashboard sees the new ledger row; the expedition branch adds none.
+  assert.equal(callSites, 6);
 });
