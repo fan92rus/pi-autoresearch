@@ -205,6 +205,8 @@ import * as candidateWorktree from "./candidate-worktree.ts";
 import * as candidateMeasure from "./candidate-measure.ts";
 import { candidateWorktreeRoot, createCandidateExecRunner, executeCandidateBranchAction } from "./candidate-campaign.ts";
 import * as researchState from "./research-state.ts";
+import { listResearchCampaignIds } from "./research-scan.ts";
+import { createResearchPolicy, executeResearchAction } from "./research-dispatch.ts";
 import { interactiveParallelConfig, filterSubcommands, applyExperimentLimitArg, configureExperimentLimit } from "./parallel/config-ui.ts";
 import {
   treeExists,
@@ -8258,18 +8260,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     ["propose", ["action"]],
   ]);
 
-  const RESEARCH_ACTION_KEYS = new Map<string, string[]>([
-    ["start", ["action", "expected_sha256"]],
-    ["open", ["action", "question_id"]],
-    ["record", ["action", "evidence_ref"]],
-    ["close", ["action", "question_id", "rule_id", "verdict", "reason"]],
-    ["stop", ["action", "rule_id", "reason"]],
-    ["status", ["action"]],
-    ["report", ["action"]],
-    ["resolve", ["action"]],
-    ["chain_stop", ["action", "rule_id", "reason"]],
-    ["expedition", ["action", "subaction", "dir", "to", "from", "reason", "why", "refs", "review_ref", "review_sha256"]],
-  ]);
+  const RESEARCH_ACTION_KEYS = createResearchPolicy();
 
   const researchRefusal = (reason: researchState.RefusalReason, message: string): researchState.Refusal => ({
     ok: false,
@@ -8282,25 +8273,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const extra = Object.keys(params).filter((k) => !allowed.includes(k));
     if (extra.length === 0) return null;
     return `unexpected field(s) ${extra.map((k) => JSON.stringify(k)).join(", ")}; this action accepts only ${allowed.join(", ")}. Approval and operator confirmation are never accepted from the model${hint ? `. Hint: ${hint}` : ""}`;
-  };
-
-  const listResearchCampaignIds = (base: string): string[] | null => {
-    const root = researchState.researchRoot(base);
-    if (!fs.existsSync(root)) return [];
-    try {
-      // Live case 2026-11-14: only directories WITH state.json are campaigns.
-      // Service dirs (.auto/research/briefs, .auto/research/evidence) matched
-      // the id regex and poisoned every scan ("several campaigns exist",
-      // "campaigns need attention", blocked git). createCampaign writes
-      // state.json atomically right after mkdir, so every real campaign has it.
-      return fs.readdirSync(root, { withFileTypes: true })
-        .filter((d) => d.isDirectory())
-        .filter((d) => fs.existsSync(path.join(root, d.name, researchState.STATE_FILE)))
-        .map((d) => d.name)
-        .sort();
-    } catch {
-      return null;
-    }
   };
 
   /** Campaign ids under the bases that do NOT count as finished: briefing,
@@ -9585,79 +9557,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return reply("✅ Pending operation resolved by the operator; the marker is cleared. Check the campaign with research_questions(action=status).");
       }
 
-      if (action === "expedition") {
-        const chain = activeChain(ctx);
-        if (!chain?.expedition) return fail("not_an_expedition", "expedition_map is available only on an expedition chain");
-        const verified = await chainJournal.verifyChain(chain.workDir, chain.chainId);
-        if (!verified.ok) {
-          await chainJournal.markManualCheckRequired(chain.workDir, chain.chainId, verified.message).catch(() => undefined);
-          return fail("manual_check_required", verified.message);
-        }
-        const replay = expedition.replayExpeditionMap(verified.entries);
-        if (!replay.ok) return fail(replay.reason, replay.message);
-        const subaction = params.subaction;
-        if (subaction === "status") {
-          return reply(expedition.mapSliceText(replay.map) || "Expedition map is empty.");
-        }
-        const types: Record<string, expedition.MapEventType> = {open:"direction_opened",activate:"direction_activated",resolve:"direction_resolved",reject:"direction_rejected",advisory:"direction_advisory",park:"direction_parked",reopen:"direction_reopened",pivot:"pivot"};
-        if (subaction === "expedition_stop" || !types[subaction]) return fail("invalid_argument", "invalid expedition subaction; expedition_stop is written by the system");
-        const type = types[subaction];
-        const payload: Record<string, unknown> = {dir:params.dir,from:params.from,to:params.to,why:params.why ?? params.reason,reason:params.reason ?? params.why,refs:params.refs,review_ref:params.review_ref,review_sha256:params.review_sha256,...(subaction === "activate" ? {campaign:getRuntime(ctx).researchCampaignId} : {})};
-        const journals = new Map<string, Array<{questionId:string;verdict:string;hasEvidence:boolean}>>();
-        for (const j of await collectChainJournals(workDir, ctx, effectiveResearchBase(workDir, ctx), chain.chainId)) journals.set(j.campaignId, j.closedQuestions);
-        // Exhausted-campaign guard (live lob-collector-data 2026-11-13): the agent
-        // kept activating new directions on ONE campaign whose every question was
-        // already closed, then stalled — there was nothing left to record against.
-        // Activation on an exhausted (all-closed, research-phase) campaign is
-        // refused with the honest next step: brief the next chain campaign first.
-        if (subaction === "activate") {
-          const pinnedId = getRuntime(ctx).researchCampaignId;
-          if (typeof pinnedId === "string" && pinnedId.length > 0) {
-            const pinnedResolved = researchState.resolveCampaignDir(workDir, pinnedId);
-            if (pinnedResolved.ok) {
-              try {
-                const pinnedSnap = await researchSnapshot(pinnedResolved.dir);
-                if (pinnedSnap.ok && pinnedSnap.brief !== null && pinnedSnap.state.phase === "research" && pinnedSnap.brief.questions.length > 0) {
-                  const anyOpen = pinnedSnap.brief.questions.some((q) => pinnedSnap.replay.vectors.get(q.id)?.status !== "closed");
-                  if (!anyOpen) {
-                    return fail(
-                      "campaign_exhausted",
-                      `Campaign ${pinnedId} has every brief question closed (phase research) — activating another direction on it gives the agent nothing to record against. Brief a NEW chain campaign first: research_brief draft (finding_refs cite closed questions of this chain; auto-approved by the charter checks) -> research_questions(action=start, expected_sha256=<approved brief sha256>), then activate the next direction (it will pin the new campaign).`,
-                    );
-                  }
-                }
-              } catch { /* snapshot failure: keep the legacy behavior */ }
-            }
-          }
-        }
-        const transition = expedition.validateMapTransition(replay.map, type, payload, journals);
-        if (!transition.ok) return fail(transition.reason, transition.message);
-        const chainDirPath = chainJournal.chainDir(chain.workDir, chain.chainId);
-        if (!chainDirPath) return fail("manual_check_required", "chain directory is unavailable");
-        const written = await chainJournal.appendEntry(chainDirPath, chain.workDir, chain.chainId, type, payload);
-        if (!written.ok) return fail(written.reason as never, written.message);
-        // Direction nudge (live-stall fix 2026-11-12): after a closing
-        // transition the bare "map recorded" reply left the agent with no
-        // next step and the expedition stalled. Only expedition chains with
-        // the pinned campaign in the research phase get the nudge; every
-        // other reply stays bit-identical (regression-tested).
-        if (["resolve", "reject", "advisory", "park"].includes(subaction)) {
-          const postReplay = expedition.replayExpeditionMap([...verified.entries, written.entry]);
-          if (!postReplay.ok) return reply(`Expedition map recorded: ${subaction} ${params.dir ?? params.from ?? ""}.`);
-          const preActive = replay.map.directions.get(String(payload.dir ?? ""))?.status === "active";
-          const nudge = await expeditionCloseNudge(ctx, chain, postReplay.map, { eventClosedActive: preActive });
-          if (nudge !== null) {
-            // Review blockers B2/B3 resolution: the steer is per closing
-            // EVENT, not per chain — every qualifying close of the last
-            // active direction continues the turn (one send per call by
-            // construction; a repeated event requires a new, distinct tool
-            // call, so duplicates are structurally impossible).
-            if (nudge.steerMessage !== null) sendWhenReady(ctx, nudge.steerMessage, { steerIfBusy: true });
-            return reply(`Expedition map recorded: ${subaction} ${params.dir ?? params.from ?? ""}. ${nudge.replySuffix}`);
-          }
-        }
-        return reply(`Expedition map recorded: ${subaction} ${params.dir ?? params.from ?? ""}.`);
-      }
+      const dispatched = await executeResearchAction(params, ctx, workDir, {
+        activeChain, getRuntime, collectChainJournals, effectiveResearchBase, researchSnapshot,
+        expeditionCloseNudge, sendWhenReady, refusalText,
+      });
+      if (dispatched !== undefined) return dispatched;
 
       if (action === "chain_stop") {
         const chain = activeChain(ctx);
