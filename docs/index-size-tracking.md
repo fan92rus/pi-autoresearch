@@ -28,12 +28,14 @@ E6 exit criterion: **≤ ~6,000 lines**, with no tool/hook lost (full suite gree
 | 048a134 | 10,188 | −337 | E6 findings/measurement adapters (161.2) |
 | 6f0c189 | 10,202 | +14 | F-20 typed test-hooks object (161.3, DI enabler; net +14) |
 | d937f07 | 10,203 | +1 | unified refusal renderer (161.4, net +1, remeasured) |
-| ed6b3ba | **10,347** | **+144** | es1.7/es1.8 explicit uiMode + mode-switch finalize (behavior fix, net +144, remeasured) |
+| ed6b3ba | 10,347 | +144 | es1.7/es1.8 explicit uiMode + mode-switch finalize (behavior fix, net +144, remeasured) |
+| 02e5ede | 10,342 | −5 | RESEARCH_PHASE_POLICY migration (8af.2, net −5) |
+| eec6cd6 | **9,739** | **−603** | hidden research dispatcher extraction (8af.5 continuation) |
 
 ## Observations
 
 - Bugfix waves typically ADD lines (+15…+66); only true extractions reduce the file.
-- lrx.1 is the first extraction with a measurable reduction (−152, 1.25% of the file); cumulative reduction at HEAD (5260053, remeasured by `git show <sha>:index.ts | wc -l`) is −1,811 lines (−14.9% from the 12,158 baseline).
+- lrx.1 is the first extraction with a measurable reduction (−152, 1.25% of the file); cumulative reduction at HEAD (eec6cd6, remeasured by `git show <sha>:index.ts | wc -l`) is −2,419 lines (−19.9% from the 12,158 baseline).
 - Large extractions already landed: lrx.1 ledger-metrics, 8e5.6 resume-policy, el3.3 candidate dispatcher, 161.1 widget renderers, 161.2 findings/measurement adapters; 8af.5 remains PARTIAL (~2,400 lines of research launch/handlers still inline), which is why the E6 ≥6k carve-out target is not met.
 - To reach ≤6k, several of the large extractions MUST land — bugfix-only waves cannot get there.
 
