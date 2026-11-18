@@ -21,12 +21,18 @@ No runtime import cycles were confirmed; extracted tool modules contain no modul
 
 ## Grouped follow-up tasks
 
-All issues are children of epic `pi-autoresearch-tj0`.
+Top-level epic: `pi-autoresearch-tj0`. Tasks are attached to stage epics:
+
+- `pi-autoresearch-tj0.14` — E9.1, critical correctness and data-loss fixes: `tj0.1`–`tj0.7`
+- `pi-autoresearch-tj0.15` — E9.2, shared contracts, DI and test-harness hardening: `tj0.8`–`tj0.12`
+- `pi-autoresearch-tj0.16` — E9.3, further index.ts size reduction: `tj0.13`
 
 - **P1 (7):** `tj0.1` resume/off race, `tj0.2` mode transitions, `tj0.3` research policy fail-open, `tj0.4` expedition replay data loss, `tj0.5` draft/chain publication, `tj0.6` candidate worktree leak, `tj0.7` confirm TOCTOU.
 - **P2 (5):** `tj0.8` one inspection/refusal vocabulary, `tj0.9` ledger segment counter and council cap, `tj0.10` getter-only DI and instance-scoped state, `tj0.11` dead parallel config/docs, `tj0.12` behavioral tests instead of source-text/timing pins.
 - **P3 (1):** `tj0.13` extract remaining dashboard/HTTP block from `index.ts`.
 
 Cross-aspect duplicates were merged into single tasks: `inspectCampaign`/`refusal_reason` appears in aspects 3/5/7/8 and is tracked in `tj0.8`; mode/TUI test gaps are tracked in `tj0.12`; source-text pins are tracked in `tj0.12`.
+
+Each stage epic has a verifiable close condition in its acceptance criteria.
 
 No code was changed as part of this review round.
