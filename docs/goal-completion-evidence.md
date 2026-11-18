@@ -19,6 +19,7 @@ Command: `env -u PI_SUBAGENT_CHILD -u PI_SUBAGENT_PARENT_SESSION npm test` (880 
 - First run: 1959 tests, 1948 pass, 7 fail, 4 skipped (the seventh was load-only `.cmd` shim timing, passing solo).
 - Confirming rerun on code HEAD `94fcd9e`: `D:/tmp/final-goal-full-confirm.log`, **1959 tests, 1949 pass, exactly 6 fail, 4 skipped**.
 - Final rerun on documentation HEAD `1272ce4`: `D:/tmp/final-goal-1272ce4-full.log`, **1959 tests, 1949 pass, exactly 6 fail, 4 skipped** (871, 1368, 1398, 1482, 1578, 1655 — all known baseline/load families; 1398/1482 pass solo).
+- Final rerun on archived-review HEAD `25747de`: `D:/tmp/final-goal-25747de-full.log`, 1959 tests / 1947 pass / 8 fail / 4 skipped; the two additional family members 1366 and 1763 both pass solo (`D:/tmp/final-goal-{1366,1763}-solo.log`, 1/1 each). The suite has a variable number of known load/timing failures under parallel execution; two independent runs at final code HEAD `94fcd9e` and one at `1272ce4` reproduced exactly six.
 - Failures:
   - 871 prompt-size budget — deterministic at pristine baseline;
   - 1199/1200 hung child timing — both pass solo (2/2, `D:/tmp/final-e6-solo-hung.log`);
