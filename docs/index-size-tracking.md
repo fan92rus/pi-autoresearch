@@ -36,13 +36,14 @@ E6 exit criterion: **≤ ~6,000 lines**, with no tool/hook lost (full suite gree
 | fdf2d96 | 7,641 | −743 | run_experiment tool extraction (161/E6) |
 | ecd29b2 | 7,402 | −239 | candidate_branch registration wrapper extraction (161/E6) |
 | cc96d25 | 7,291 | −111 | finalize_research tool extraction (161/E6) |
-| 522fee1 | **6,978** | **−313** | research_brief tool extraction (161/E6) |
+| 522fee1 | 6,978 | −313 | research_brief tool extraction (161/E6) |
+| <pending> | **6,646** | **−332** | tree_status + council_convene extraction (161/E6) |
 
 ## Observations
 
 - Bugfix waves typically ADD lines (+15…+66); only true extractions reduce the file.
-- lrx.1 is the first extraction with a measurable reduction (−152, 1.25% of the file); cumulative reduction at HEAD (522fee1, remeasured by `git show <sha>:index.ts | wc -l`) is −5,180 lines (−42.6% from the 12,158 baseline).
-- Large extractions already landed: lrx.1 ledger-metrics, 8e5.6 resume-policy, el3.3 candidate dispatcher, 161.1 widget renderers, 161.2 findings/measurement adapters, 8af.5 dispatcher/research-tool, direction-review tool , log_experiment tool, run_experiment tool, candidate_branch wrapper , finalize_research tool and research_brief tool; E6 target ≤6k still needs ~978 more lines extracted.
+- lrx.1 is the first extraction with a measurable reduction (−152, 1.25% of the file); cumulative reduction at HEAD (pending tree/council commit, remeasured by `git show <sha>:index.ts | wc -l`) is −5,512 lines (−45.3% from the 12,158 baseline).
+- Large extractions already landed: lrx.1 ledger-metrics, 8e5.6 resume-policy, el3.3 candidate dispatcher, 161.1 widget renderers, 161.2 findings/measurement adapters, 8af.5 dispatcher/research-tool, direction-review tool , log_experiment tool, run_experiment tool, candidate_branch wrapper , finalize_research tool and research_brief tool; E6 target ≤6k still needs ~646 more lines extracted.
 - To reach ≤6k, several of the large extractions MUST land — bugfix-only waves cannot get there.
 
 ## Verification contract
