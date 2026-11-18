@@ -1,0 +1,18 @@
+HAS TECH DEBT
+
+## Review
+
+- [bug] [major] `extensions/pi-autoresearch/candidate-branch-tool.ts:170-185` — an exception between ephemeral worktree creation and measurement return bypasses `removeEphemeralWorktree`; `candidate-campaign.ts:483-497` tracks only successfully returned sides, so the path is untracked and leaks. Fix: wrap measurement in `try/finally`, return `wtPath` on every failure, register the path before starting measurement. Confidence: medium-high.
+- [bug] [major] `extensions/pi-autoresearch/candidate-branch-tool.ts:178-183` — cleanup failure after a failed measurement is discarded (`removeEphemeralWorktree` result ignored); the confirmation reply has no warning and runtime memory does not survive restart. Fix: include cleanup outcome/path in the side result and surface it through `candidate-campaign.ts:549-555`. Confidence: high.
+- [bug] [major] `extensions/pi-autoresearch/candidate-campaign.ts:471-485` — leader SHA, epoch and methodology hashes are captured before `beginOperation`; concurrent promotion or measurement-scale change is not re-checked under the marker. CAS protects only the leader ref, not epoch/methodology comparability. Fix: re-read preconditions inside the locked callback or abort if they changed. Confidence: medium.
+- [bug] [major] `extensions/pi-autoresearch/candidate-campaign.ts:246-247` — `run` checks only `fs.existsSync(wtPath)`; a worktree with broken `.git` can still execute the benchmark, consume budget and report a measurement, unlike pause/create/resume/disable, which refuse `worktree_unreadable`. Fix: require `collectWorktreeChanges(...).ok` before measurement. Confidence: medium-high.
+- [tech_debt] [minor] `extensions/pi-autoresearch/candidate-campaign.ts:16-19,189-190,241-242,300-301,463-464` — `inspectCampaign` is repeated per action, and `fail()` emits only `{action, reason}`; there is no canonical `refusal_reason` or inspection/refusal adapter. Fix: centralize the guard and include `refusal_reason` in details. Confidence: high.
+- [bug] [minor] `extensions/pi-autoresearch/candidate-branch-tool.ts:195-222` vs `candidate-campaign.ts:50-67` — cleanup uses exact string equality; status normalizes separators/case. A remembered path can be duplicated or fail to clear after successful removal, producing a stale warning. Fix: use one shared canonical path helper in both. Confidence: high.
+- [bug] [minor] `extensions/pi-autoresearch/candidate-campaign.ts:69` — `git worktree list --porcelain` failure is swallowed; “no leftovers” and “cannot scan” are indistinguishable in status. Fix: add an explicit scan-unavailable warning while still showing memory-only leftovers. Confidence: high.
+- [bug] [minor] `extensions/pi-autoresearch/index.ts:4477-4531` — ordinary-loop gates use shallow `schema_version`/`candidates` validation while `candidate-state.ts:819-849` validates the full state; a disabled but otherwise invalid state can unblock the loop while candidate tools refuse. Fix: call one shared full validator from both paths. Confidence: high.
+- [growth] [minor] `tests/candidate-branch-wiring.test.mjs:770-806,1220-1258` — cleanup tests cover known failure, clean confirm and orphan display only; no injected throw, cleanup failure, race or normalized-path case. Fix: add deterministic failure-injection tests. Confidence: high.
+
+### Development points
+1. Failure-injection suite for confirm: thrown measurement, failed `git worktree remove`, restart with registered orphan.
+2. One campaign inspection/refusal contract shared by the tool and loop gates, including `refusal_reason`.
+3. Precondition capture under the confirm lock plus canonical worktree-path registry with `try/finally` cleanup.
