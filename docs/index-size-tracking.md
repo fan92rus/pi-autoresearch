@@ -34,12 +34,12 @@ E6 exit criterion: **≤ ~6,000 lines**, with no tool/hook lost (full suite gree
 | 84e1d55 | 9,382 | −357 | direction-review tool extraction (161) |
 | 7692a6b | 8,384 | −998 | log_experiment tool extraction (161/E6) |
 | fdf2d96 | 7,641 | −743 | run_experiment tool extraction (161/E6) |
-| <pending> | **7,402** | **−239** | candidate_branch registration wrapper extraction (161/E6) |
+| ecd29b2 | **7,402** | **−239** | candidate_branch registration wrapper extraction (161/E6) |
 
 ## Observations
 
 - Bugfix waves typically ADD lines (+15…+66); only true extractions reduce the file.
-- lrx.1 is the first extraction with a measurable reduction (−152, 1.25% of the file); cumulative reduction at HEAD (pending candidate-branch commit, remeasured by `git show <sha>:index.ts | wc -l`) is −4,756 lines (−39.1% from the 12,158 baseline).
+- lrx.1 is the first extraction with a measurable reduction (−152, 1.25% of the file); cumulative reduction at HEAD (ecd29b2, remeasured by `git show <sha>:index.ts | wc -l`) is −4,756 lines (−39.1% from the 12,158 baseline).
 - Large extractions already landed: lrx.1 ledger-metrics, 8e5.6 resume-policy, el3.3 candidate dispatcher, 161.1 widget renderers, 161.2 findings/measurement adapters, 8af.5 dispatcher/research-tool, direction-review tool , log_experiment tool, run_experiment tool and candidate_branch wrapper; E6 target ≤6k still needs ~1.4k more lines extracted.
 - To reach ≤6k, several of the large extractions MUST land — bugfix-only waves cannot get there.
 
