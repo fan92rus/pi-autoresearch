@@ -15,6 +15,7 @@ const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const configUiPath = path.join(repoRoot, "extensions", "pi-autoresearch", "parallel", "config-ui.ts");
 const configTsPath = path.join(repoRoot, "extensions", "pi-autoresearch", "parallel", "config.ts");
 const indexTsPath = path.join(repoRoot, "extensions", "pi-autoresearch", "index.ts");
+const commandTsPath = path.join(repoRoot, "extensions", "pi-autoresearch", "autoresearch-command.ts");
 const skillPath = path.join(repoRoot, "skills", "autoresearch-parallel");
 const worktreePath = path.join(repoRoot, "extensions", "pi-autoresearch", "parallel", "worktree.ts");
 
@@ -54,7 +55,9 @@ test("config-ui.ts user-facing strings name no removed tool", () => {
 
 test("the legacy parallel skill is deleted and index.ts has no parallel-* dispatch", () => {
   assert.ok(!fs.existsSync(skillPath), "skills/autoresearch-parallel must not exist");
-  const indexSrc = fs.readFileSync(indexTsPath, "utf-8");
+  // The command body lives in autoresearch-command.ts (extracted from index.ts);
+  // scan both sources so the rejection guard is checked where it now lives.
+  const indexSrc = fs.readFileSync(indexTsPath, "utf-8") + fs.readFileSync(commandTsPath, "utf-8");
   // The only allowed parallel-* reference is the explicit rejection guard:
   // it must notify "removed" and return — never dispatch or activate a mode.
   const guardAnchor = 'if (/^parallel-(best-of-n|stack|search)\\b/.test(command)) {';
