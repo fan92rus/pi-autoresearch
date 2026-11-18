@@ -1859,10 +1859,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     let blocks = false;
     let halted = false;
     for (const c of scan.campaigns) {
-      if (c.pendingOp) { blocks = true; halted = true; continue; }
-      if (c.state === null) { blocks = true; halted = true; continue; } // corrupt = fail closed
-      if (c.state.phase === "research") { blocks = true; }
-      else if (c.state.phase === "stopped") { blocks = true; halted = true; }
+      if (researchState.researchPolicyBlocks(c, "ordinaryLoop")) blocks = true;
+      if (researchState.researchPolicyBlocks(c, "halt")) halted = true;
     }
     return { blocks, halted };
   };
@@ -1891,9 +1889,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const scan = researchState.scanCampaignsSync(workDir);
     if (!scan.ok) return true;
     for (const c of scan.campaigns) {
-      if (c.pendingOp) return true;
-      if (c.state === null) return true; // unreadable/invalid = fail closed
-      if (c.state.phase === "research") return true;
+      if (researchState.researchPolicyBlocks(c, "git")) return true;
       // briefing and stopped do not block the shell Git ban
     }
     return false;
@@ -1924,9 +1920,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const scan = researchState.scanCampaignsSync(workDir);
     if (!scan.ok) return true;
     for (const c of scan.campaigns) {
-      if (c.pendingOp) return true;
-      if (c.state === null) return true; // unreadable/invalid = fail closed
-      if (c.state.phase !== "stopped") return true; // briefing and research block a launch
+      if (researchState.researchPolicyBlocks(c, "launch")) return true;
+      // briefing and research block a launch
     }
     return false;
   };

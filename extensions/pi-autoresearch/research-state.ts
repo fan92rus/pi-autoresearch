@@ -684,6 +684,40 @@ export function scanCampaignsSync(base: string): CampaignScan {
   }
   return { ok: true, campaigns };
 }
+
+/**
+ * bd 8af.2: the phase-blocking rules of every scanner, in ONE table.
+ * Cells are literal booleans copied from the pre-refactor inline predicates;
+ * no gate may widen or narrow them here. `pending_op` and `unreadable`
+ * fail closed for all four rows, as they did before. `unreadable` covers a
+ * missing/invalid state.json; a scan-wide failure is handled by the callers
+ * (all four scanners blocked on it before, and still do).
+ *
+ * ordinaryLoop — the legacy loop refuses research/stopped campaigns;
+ * halt — auto-continuation additionally refuses stopped campaigns;
+ * git — the shell ban tracks active work only (briefing/stopped are free);
+ * launch — a new expedition refuses briefing/research but not stopped.
+ */
+export const RESEARCH_PHASE_POLICY = {
+  ordinaryLoop: { briefing: false, research: true, stopped: true, pending_op: true, unreadable: true },
+  halt: { briefing: false, research: false, stopped: true, pending_op: true, unreadable: true },
+  git: { briefing: false, research: true, stopped: false, pending_op: true, unreadable: true },
+  launch: { briefing: true, research: true, stopped: false, pending_op: true, unreadable: true },
+} as const;
+
+export type ResearchPhasePolicyRow = keyof typeof RESEARCH_PHASE_POLICY;
+
+/** Apply one table row to a single scanned campaign (one fact per campaign). */
+export function researchPolicyBlocks(
+  campaign: Pick<ScannedCampaign, "pendingOp" | "state">,
+  row: ResearchPhasePolicyRow,
+): boolean {
+  const policy = RESEARCH_PHASE_POLICY[row];
+  if (campaign.pendingOp) return policy.pending_op;
+  if (campaign.state === null) return policy.unreadable;
+  return policy[campaign.state.phase];
+}
+
 /**
  * One locked state update. Order: lock, pending-operation check, state read
  * (fail-closed), approved-brief check, decision, marker, optional work, state
