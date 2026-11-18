@@ -1,0 +1,18 @@
+## Review
+
+**Verdict: APPROVED (task label ГОДЕН)** — no blockers found. Review-only: no files edited, nothing committed.
+
+- **Correct**
+  - `git diff`: only the intended extraction in `index.ts` (`+35/−332`, net **−297**; 6,978 → 6,681 lines) plus two new modules (`brief-tools.ts` **292** lines, `research-alias-tools.ts` **124** lines). `git diff --check` exit 0; worktree still shows the same 3 intended paths (1 modified, 2 untracked), no staged files.
+  - **Byte-equality verified by script** (HEAD `index.ts` vs new modules, after replacing `deps.` prefix only): all four registered tool object literals are byte-identical — `optimize_brief` 5,002 B, `expedition_brief` 9,150 B, `research_questions` 3,622 B, `expedition_map` 3,576 B (0 diff lines each). This covers descriptions, promptSnippets/promptGuidelines, parameter schemas/allowlists, `renderCall`, refusal strings and `execute`.
+  - Gates/helpers also equivalent: `optimizeRefusal`, `lastConfigHeader`, `optimizeStartGate`, `optimizeNotStartedGate` identical after `deps.` normalization; `optimizeBriefTranscriptText`, `aliasRefusal`, `makeAliasRenderer` canonical-identical after removing indentation and the added deps parameter.
+  - **Late bindings / TDZ / cycles**: every injected identifier (`assertModeActive`, `campaignBlocks*`, `researchBlocks*`, `resolveWorkDir`, `unexpectedArgKeys`, `getRuntime`, `recordAutoresearchActivation`, `setAutoresearchMode`, `updateWidget`, `sendWhenReady`, `refusalText`) is declared in `index.ts` before the deps objects (lines 995–4909 vs 5442/5522). `optimizeBriefDir` is a live getter/setter over the `let` at `index.ts:5435`; the other write site `index.ts:2686` still targets the same binding (unchanged from HEAD at 2684/5433). `researchExecutor`/`researchRenderer` are captured from `researchTool` at the same point as HEAD. No direct or transitive import of `index.ts` from the new modules or their new dependencies.
+  - **Logs**: targeted `106/106 pass`; full `1950 pass / 5 fail / 4 skipped / 1959 total, FULL_EXIT=1`. I did not run full. All 5 failures are accounted for and unrelated to the extraction: #871 prompt-size `7618 > 7500` is byte-identical in `e6-briefs-baseline-prompt.log`; #1368/#1578/#1655 are `lock_busy` cross-process flakes in `research-analysis.ts`/`research-journal.ts`/`research-observations.ts` (untouched; same class of failure in `solo2.log`); #1763 B2 contrast passes in isolation here (`21/21`).
+  - Fresh verification against the current file state (index.ts mtime postdates the worker logs): 77 relevant tests pass (`77/77`) and `research-tool-aliases.test.mjs` alone passes `11/11` once `PI_SUBAGENT_CHILD`/`PI_SUBAGENT_PARENT_SESSION` are unset.
+
+- **Minor / notes**
+  - Full suite is **not green** (exit 1); worker's "1950/5" is accurate but should not be reported as an all-pass run.
+  - Environment gotcha: `PI_SUBAGENT_CHILD=1` in this child shell intentionally suppresses the restore message (`index.ts:2633`), making test "restart restore message uses the map and question aliases" fail unless those env vars are unset. This is a harness/environment artifact, not a refactor regression (the test passed in both worker logs and in my clean-env rerun).
+  - `deps.unexpectedArgKeys` and `deps.getRuntime` are passed as plain function values, not getters; they are immutable `const` closures in `index.ts`, so this is safe, but it is the only injector that is not getter-backed.
+
+- **Nit**: the new modules repeat the "byte-identical modulo deps" claim in header comments; accurate, but the claim is now independently verified by the script above.

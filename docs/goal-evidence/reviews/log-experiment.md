@@ -1,0 +1,8 @@
+## Review — ГОДЕН
+
+- **Correct:** `index.ts` replaces the inline `log_experiment` registration with `registerGatedTool(createLogExperimentTool({...}))`; the extracted module contains the tool definition, execution logic, renderers, and research-map helpers. The moved helper bodies and tool logic appear semantically unchanged; the visible tool-boundary changes are dependency injection and returning the tool object. I found no missing helper imports at remaining `index.ts` call sites.
+- **Correct:** The module has 26 declared dependencies, all supplied by `index.ts`. Mutable or late-declared collaborators (`broadcastDashboardUpdate`, campaign guards/responses, `optimizeNotStartedGate`, and `overlayTui`) are passed as getters. No module-level mutable state or import cycle was apparent.
+- **Correct:** The requested eight-file targeted run passed: **83 passed, 1 skipped, 0 failed**. The isolated test 1702 also passed.
+- **Blocker:** None found.
+- **Minor:** The provided full-suite log reports **1,949 passed, 6 failed, 4 skipped**. Failures: “autoresearch section stays within the prompt size budget”; “hung search child…”; two “cross-process… appending…” tests; “separate processes appending to one journal…”; and “deleting the brief while the dialog is pending fails closed.” The last one passed when rerun alone. These failures do not establish a regression from this extraction.
+- **Nits:** None. No files were edited or committed.

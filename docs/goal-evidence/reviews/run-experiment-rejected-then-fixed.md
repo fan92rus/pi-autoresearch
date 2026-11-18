@@ -1,0 +1,8 @@
+## Review — REJECTED
+
+- **Correct:** The extracted tool body matches `HEAD` byte-for-byte after removing the DI destructure and wrappers: 771 lines, SHA-256 `b00d0bc396e7b4a5b5c3cafd1e53fec6a283e09c983abd708430bbcbda9e616a` on both sides. All 27 declared dependencies are passed; late-declared helpers use getters. The registration remains gated, with no re-export removed in the diff.
+- **Blocker:** `createRunExperimentTool` captures the mutable `overlayTui` getter once at execution start (`run-experiment-tool.ts:103–113`). Its render calls (`:397`, `:553`) therefore use that snapshot, whereas the original read the live variable. Opening or closing the dashboard during a run changes which overlay receives render requests. **Fix in `createRunExperimentTool`:** read `deps.overlayTui` at both render sites; verify that an overlay opened mid-run receives updates and one closed mid-run receives none.
+- **Minor:** The full-suite log reports **1949 passed, 6 failed, 4 skipped**. Solo reruns of failures 521 and 1482 passed; three failures report journal-lock contention. Failure 871 reports a prompt section of 7618 characters against a 7500-character limit. These failures are not established as caused by this extraction.
+- **Nit:** `RunDetails` remains unused in `index.ts:384`; the extracted-only `truncateTail`/limit imports remain at `index.ts:29`.
+
+The targeted log reports **223 passed, 0 failed**. No tests were rerun, no files were changed or staged, and no commit was made.

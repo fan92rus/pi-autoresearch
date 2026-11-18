@@ -1,0 +1,13 @@
+## Review
+
+**Verdict: ГОДЕН / APPROVED** (review-only; no edits, no commit, no full suite run).
+
+- **Correct**
+  - Mechanical comparison: HEAD registration body (`index.ts:5673–6002`, 330 lines) and the new module body (`research-brief-tool.ts:47–376`, 330 lines) are **identical** after the sole normalization `deps.<name> → <name>` (`diff` exit 0, zero output; independently confirmed by a Python `difflib` run: 330/330 lines, 0 diff lines). No refusal, render, validation, approval, or reply strings changed.
+  - Surface: `index.ts` 7,291 → 6,978 lines (−313; diff +21/−334); new module 378 lines; only `index.ts` modified and `research-brief-tool.ts` added. `createResearchTool` block and tool aliases are untouched.
+  - DI/bindings: all 16 interface fields are supplied at `index.ts:5672–5690` — 11 `const`/module-level functions, 5 getters, and 1 setter for `briefPreviewDir`. Every use in the new module is a point-of-use `deps.foo` read (33 occurrences on 31 lines): `briefPreviewDir` is read in `renderCall` (`research-brief-tool.ts:52`) and written at lines 225/307; campaign id/runtime flags go through `deps.getRuntime(ctx)` at lines 135/146/223/224/248/268; late helpers (`activeChain`, `chainCampaignIds`, `charterFileIntact`, `collectChainJournals`) are getter-backed, so no TDZ snapshot. `askConsent`/`briefConsentSummary`/`briefTranscriptText` are stateless direct imports from the same modules as before. No module-level `let`/`var`, no `./index.ts` import, no cycle (only `test-hooks.ts` type-imports `index.ts`). `registerGatedTool` merely adds `tool.name` and calls `pi.registerTool` (`index.ts:1701–1704`), and getter access occurs only in tool handlers.
+  - Logs (recomputed from files): targeted `172 tests / 172 pass / 0 fail`; full `1959 tests / 1946 pass / 9 fail / 4 skipped`; `solo-a` `2/2`, `solo-b` `1/1`. The 9 full-run failures are 850, 871, 1199, 1368, 1578, 1655 (unrelated to the extraction: manifest, prompt-size budget, hung child, journal lock) plus 1702/1710/1763. Tests 871 and 1578 fail on a pristine HEAD copy (`baseline-solo.log` 0/2); `solo.log` shows 7/9 passing in isolation, including the three timed-out RPC/state-root cases. Error shapes (`0!==1`, `2!==0`, `0!==1` with `test.timeout`) are consistent with load flakes, and all three pass when rerun solo. Full suite was **not** re-run.
+
+- **Fixed**: none — review-only task.
+- **Blocker**: none.
+- **Note**: residual full-suite noise is pre-existing/load-dependent; targeted 172/0 covers propose consent, hash, approval, chain flows and transcript rendering (including tests 67–68 for brief preview across sessions). No test files needed changes.

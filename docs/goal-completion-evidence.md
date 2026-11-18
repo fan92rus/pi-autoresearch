@@ -1,6 +1,6 @@
 # Goal completion evidence — `mwjevkjr-o5sbon`
 
-Final HEAD: `94fcd9e` (pushed, `origin/master` in sync).
+Final HEAD: `1272ce4` (pushed, `origin/master` in sync).
 
 ## Scope and bd closure
 
@@ -17,7 +17,8 @@ Final HEAD: `94fcd9e` (pushed, `origin/master` in sync).
 Command: `env -u PI_SUBAGENT_CHILD -u PI_SUBAGENT_PARENT_SESSION npm test` (880 s timeout), log `D:/tmp/final-e6-full.log` at HEAD `94fcd9e`.
 
 - First run: 1959 tests, 1948 pass, 7 fail, 4 skipped (the seventh was load-only `.cmd` shim timing, passing solo).
-- Confirming rerun on final HEAD: `D:/tmp/final-goal-full-confirm.log`, **1959 tests, 1949 pass, exactly 6 fail, 4 skipped**.
+- Confirming rerun on code HEAD `94fcd9e`: `D:/tmp/final-goal-full-confirm.log`, **1959 tests, 1949 pass, exactly 6 fail, 4 skipped**.
+- Final rerun on documentation HEAD `1272ce4`: `D:/tmp/final-goal-1272ce4-full.log`, **1959 tests, 1949 pass, exactly 6 fail, 4 skipped** (871, 1368, 1398, 1482, 1578, 1655 — all known baseline/load families; 1398/1482 pass solo).
 - Failures:
   - 871 prompt-size budget — deterministic at pristine baseline;
   - 1199/1200 hung child timing — both pass solo (2/2, `D:/tmp/final-e6-solo-hung.log`);
@@ -31,7 +32,7 @@ Pristine baseline comparison: worktree at `b27a253`, same clean-env command, log
 
 ## Worker → fresh reviewer chain
 
-Every committed wave had a fresh refuting reviewer with ГОДЕН and no blockers before commit. Representative final extractions:
+Every committed wave had a fresh refuting reviewer with ГОДЕН and no blockers before commit. Original reviewer reports are preserved in `docs/goal-evidence/reviews/` (including the rejected first `run_experiment` review and its subsequent fix review, documenting refutation rather than self-confirmation). Representative final extractions:
 
 - `log_experiment`: `7692a6b`, 83/83 targeted, 0 blockers.
 - `run_experiment`: `fdf2d96`; first review found a live-binding blocker (`overlayTui` snapshot), fixed at both render sites and re-reviewed ГОДЕН; 223/223 targeted.
