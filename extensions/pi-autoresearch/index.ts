@@ -192,6 +192,8 @@ import { listResearchCampaignIds } from "./research-scan.ts";
 import { createResearchPolicy, executeResearchAction } from "./research-dispatch.ts";
 import { createResearchTool } from "./research-tool.ts";
 import { createResearchBriefTool } from "./research-brief-tool.ts";
+import { createOptimizeBriefTool, createExpeditionBriefTool, createOptimizeGates, type BriefToolsDeps } from "./brief-tools.ts";
+import { createResearchQuestionsTool, createExpeditionMapTool, type ResearchAliasToolDeps } from "./research-alias-tools.ts";
 import { createDirectionReviewTool } from "./direction-review-tool.ts";
 import {
   createLogExperimentTool, formatExhaustionHintLine, K_SER_RUNS, K_STAG_RUNS,
@@ -5099,243 +5101,32 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // The brief view and the consent dialog follow the research_brief pattern; the
   // dialog body comes from the shared brief-consent.ts.
   let optimizeBriefDir: string | null = null;
-  const optimizeRefusal = (text: string) => ({ content: [{ type: "text" as const, text }], details: {} });
-  const lastConfigHeader = (jsonlPath: string): Record<string, unknown> | undefined => {
-    try {
-      if (!fs.existsSync(jsonlPath)) return undefined;
-      const lines = fs.readFileSync(jsonlPath, "utf-8").split("\n").filter(Boolean);
-      for (let i = lines.length - 1; i >= 0; i--) {
-        try {
-          const entry = JSON.parse(lines[i]) as Record<string, unknown>;
-          if (entry && entry.type === "config") return entry;
-        } catch { continue; }
-      }
-    } catch { /* unreadable ledger: treated as not started */ }
-    return undefined;
-  };
-  // init_experiment: a resume of the same config needs no brief (D1); anything else needs the approved brief and the same arguments.
-  const optimizeStartGate = (
-    ctx: ExtensionContext,
-    params: { name: string; metric_name: string; metric_unit?: string; direction?: string; cwd?: string },
-  ) => {
-    // An empty cwd would be read as the process directory by the gate but as absent by init: refuse it before any comparison.
-    if (params.cwd !== undefined && optimizeBrief.isBlankPath(params.cwd)) {
-      return optimizeRefusal("❌ init_experiment refused: cwd must be a non-empty path");
-    }
-    const workDir = resolveWorkDir(ctx.cwd);
-    const header = lastConfigHeader(autoresearchJsonlPath(workDir));
-    // D1 covers only this session's own ledger: a cwd that points elsewhere is another ledger and needs the brief.
-    const sameDir = params.cwd === undefined || path.resolve(params.cwd) === path.resolve(workDir);
-    if (
-      sameDir &&
-      header &&
-      header.name === params.name &&
-      header.metricName === params.metric_name &&
-      (header.metricUnit ?? "") === (params.metric_unit ?? "") &&
-      header.bestDirection === (params.direction ?? "lower")
-    ) {
-      return undefined;
-    }
-    const approved = optimizeBrief.approvedBriefFor(optimizeBrief.optimizeDirOf(ctx.cwd));
-    if (!approved.ok) {
-      const detail = "detail" in approved && approved.detail ? ` (${approved.detail})` : "";
-      return optimizeRefusal(`❌ init_experiment refused (${approved.reason}): ${approved.message}${detail}. Order: optimize_brief draft → propose → init_experiment.`);
-    }
-    // A pinned session (init with cwd earlier) writes to workDir even without cwd: compare what is actually written.
-    const effectiveCwd = params.cwd === undefined && workDir !== path.resolve(ctx.cwd) ? workDir : params.cwd;
-    const diffs = optimizeBrief.initArgsMismatch(approved.brief, { ...params, cwd: effectiveCwd });
-    if (diffs.length > 0) {
-      return optimizeRefusal(`❌ init_experiment does not match the approved brief:\n- ${diffs.join("\n- ")}\nDraft the new values with optimize_brief draft and propose them again.`);
-    }
-    // The session runs with the approved direction, not with a direction inherited from an earlier segment.
-    return { approvedDirection: optimizeBrief.effectiveDirection(approved.brief) };
-  };
-  // run_experiment / log_experiment: no measurement before a started session.
-  const optimizeNotStartedGate = (ctx: ExtensionContext) => {
-    if (lastConfigHeader(autoresearchJsonlPath(resolveWorkDir(ctx.cwd))) !== undefined) return undefined;
-    const approved = optimizeBrief.approvedBriefFor(optimizeBrief.optimizeDirOf(ctx.cwd));
-    const step = approved.ok
-      ? "init_experiment"
-      : approved.reason === "brief_missing" || approved.reason === "brief_invalid"
-        ? "optimize_brief draft"
-        : "optimize_brief propose";
-    return optimizeRefusal(`❌ The optimization session is not started: next step is ${step}. Order: optimize_brief draft → propose → init_experiment.`);
-  };
-  const optimizeBriefTranscriptText = (dir: string | null): string => {
-    if (dir === null) return "Бриф для показа не найден: в этой сессии не было optimize_brief draft.";
-    const read = optimizeBrief.readOptimizeBrief(dir);
-    return read.ok ? optimizeBrief.optimizeBriefMarkdown(read.brief, read.sha256) : `Бриф для показа не найден: ${read.message}.`;
-  };
-  registerGatedTool({
-    name: "optimize_brief",
-    label: "Optimize brief (phase 1)",
-    // The full brief is drawn as this tool call's row: shown before execute and before the owner dialog.
-    renderCall(args: any, _theme: any, _context: any) {
-      if (args?.action !== "propose") return new Text(`optimize_brief ${String(args?.action ?? "")}`, 0, 0);
-      return new Text(optimizeBriefTranscriptText(optimizeBriefDir), 0, 0);
-    },
-    description:
-      "Ordinary optimization loop, phase 1: draft the session brief (name, metric_name, metric_unit, direction, cwd), then ask the OWNER " +
-      "to approve it with propose. init_experiment starts the session only with that approval and the same arguments. The model cannot approve.",
-    promptSnippet: "Optimization brief: draft the session brief, then the owner approves it (propose); init_experiment starts only after that",
-    promptGuidelines: [
-      "Before init_experiment, call optimize_brief draft with name, metric_name, metric_unit, direction, cwd; then optimize_brief propose for the owner's approval.",
-      "Use the same name, metric_name, metric_unit, direction and cwd in init_experiment as in the approved brief.",
-    ],
-    parameters: {
-      type: "object",
-      properties: {
-        action: { type: "string", enum: ["draft", "propose"], description: "Brief action to perform." },
-        brief: {
-          type: "object",
-          description: "draft only: {name, metric_name, metric_unit?, direction? (lower|higher), cwd?}. Unknown fields are refused.",
-        },
-      },
-      required: ["action"],
-    } as any,
-
-    async execute(_toolCallId: string, params: any, _signal, _onUpdate, ctx: ExtensionContext) {
-      const modeGate = assertModeActive(ctx);
-      if (modeGate) return modeGate;
-      if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return campaignBlockedResponse();
-      if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd), ctx)) return researchBlockedResponse();
-      const action = params?.action;
-      if (action !== "draft" && action !== "propose") {
-        return optimizeRefusal(`❌ unknown action ${JSON.stringify(String(action))}; allowed: draft propose`);
-      }
-      if (action === "propose" && params.brief !== undefined) {
-        return optimizeRefusal("❌ propose takes no brief: the approved text is brief.json; draft a new brief first");
-      }
-      const extra = Object.keys(params ?? {}).filter((k) => k !== "action" && k !== "brief");
-      if (extra.length > 0) {
-        return optimizeRefusal(`❌ unexpected field(s): ${extra.join(", ")}; approval and confirmation fields are not model arguments`);
-      }
-      const dir = optimizeBrief.optimizeDirOf(ctx.cwd);
-      if (action === "draft") {
-        if (params.brief === undefined) return optimizeRefusal("❌ draft requires the brief object");
-        const written = optimizeBrief.writeOptimizeBriefDraft(dir, params.brief);
-        if (!written.ok) return optimizeRefusal(`❌ brief rejected: ${written.errors.join("; ")}`);
-        optimizeBriefDir = dir;
-        return {
-          content: [{ type: "text", text: `✅ Brief draft saved (sha256 ${written.sha256}). It is NOT approved yet: the owner confirms it with optimize_brief propose.` }],
-          details: { action },
-        };
-      }
-      // propose: owner dialog. No UI or no explicit confirm === true means no approval.
-      const read = optimizeBrief.readOptimizeBrief(dir);
-      if (!read.ok) return optimizeRefusal(`❌ ${read.message}`);
-      optimizeBriefDir = dir;
-      const existing = optimizeBrief.readOptimizeApproval(dir);
-      if (existing.ok && existing.approval.confirmed === true && existing.approval.brief_sha256 === read.sha256) {
-        return { content: [{ type: "text", text: `✅ Brief already approved (sha256 ${read.sha256}). Call init_experiment with the same arguments.` }], details: { action } };
-      }
-      const outcome = await askConsent<{ ok: boolean; message: string }>({
-        hasUi: !!(ctx.hasUI && ctx.ui && typeof ctx.ui.confirm === "function"),
-        title: "Optimization session: approve brief",
-        body: optimizeBrief.optimizeConsentSummary(read.brief, read.sha256),
-        confirm: (title, body) => ctx.ui.confirm(title, body),
-        record: async (confirmed) => optimizeBrief.writeOptimizeApproval(dir, confirmed, read.sha256),
-      });
-      if (outcome.status === "no_ui") return optimizeRefusal("❌ brief approval is an owner action and needs an interactive dialog; the brief stays unapproved");
-      if (outcome.status === "refused") return optimizeRefusal("❌ the owner did not confirm the brief; nothing was approved");
-      if (outcome.status === "write_failed") return optimizeRefusal(`❌ ${outcome.failure.message}; nothing was approved`);
-      return {
-        content: [{ type: "text", text: `✅ Brief approved (sha256 ${read.sha256}). Call init_experiment with the same name, metric_name, metric_unit, direction and cwd.` }],
-        details: { action },
-      };
-    },
+  const { optimizeRefusal, optimizeStartGate, optimizeNotStartedGate } = createOptimizeGates({
+    resolveWorkDir,
+    autoresearchJsonlPath,
   });
+  // Both brief tools receive getter-backed collaborators; optimizeBriefDir is a
+  // mutable binding also assigned by the command section above.
+  const briefToolDeps: BriefToolsDeps = {
+    assertModeActive,
+    campaignBlocksOrdinaryLoop,
+    campaignBlockedResponse,
+    researchBlocksOrdinaryLoop,
+    researchBlockedResponse,
+    resolveWorkDir,
+    optimizeRefusal,
+    unexpectedArgKeys,
+    getRuntime,
+    recordAutoresearchActivation,
+    setAutoresearchMode,
+    updateWidget,
+    sendWhenReady,
+    get optimizeBriefDir() { return optimizeBriefDir; },
+    set optimizeBriefDir(dir: string | null) { optimizeBriefDir = dir; },
+  };
+  registerGatedTool(createOptimizeBriefTool(briefToolDeps));
 
-  registerGatedTool({
-    name: "expedition_brief",
-    label: "Expedition document",
-    renderCall(args: any) {
-      if (args?.action !== "propose") return new Text(`expedition_brief ${String(args?.action ?? "")}`, 0, 0);
-      const doc = typeof args?.doc === "object" && args?.doc !== null ? args.doc : null;
-      if (!doc) return new Text("Expedition proposal", 0, 0);
-      const goal = typeof doc.goal === "string" ? doc.goal : "";
-      const dirs = Array.isArray(doc.directions)
-        ? doc.directions.filter((d: any) => typeof d?.name === "string").map((d: any) => `- ${d.name}`).join("\\n")
-        : "";
-      return new Text(`Expedition proposal: ${goal}${dirs ? `\\n${dirs}` : ""}`, 0, 0);
-    },
-    description: "Draft and obtain owner confirmation for an expedition document, then create campaign 0.",
-    promptSnippet: "Expedition: ask missing design questions as one packet, draft expedition_brief, then propose",
-    promptGuidelines: ["Ask the owner all missing questions in one message before drafting.", "Use expedition_brief draft, then propose. Never pass approval or hash fields."],
-    parameters: { type: "object", properties: { action: { type: "string", enum: ["draft", "propose"] }, doc: { type: "object" }, doc_path: { type: "string" } }, required: ["action"] } as any,
-    async execute(_id: string, params: any, _signal: any, _update: any, ctx: ExtensionContext) {
-      const action = params?.action;
-      const reply = (text: string, reason?: string) => ({content:[{type:"text" as const,text}],details:{action,...(reason?{reason}:{})}});
-      const allowed = action === "draft" ? ["action","doc"] : action === "propose" ? ["action","doc_path"] : null;
-      if (!allowed) return reply("invalid_argument: action must be draft or propose", "invalid_argument");
-      const extra = unexpectedArgKeys(params ?? {}, allowed);
-      if (extra) return reply(`invalid_argument: ${extra}`, "invalid_argument");
-      if (!ctx.hasUI && action === "propose") return reply("no_ui: expedition confirmation requires TUI", "no_ui");
-      const workDir = resolveWorkDir(ctx.cwd), runtime = getRuntime(ctx);
-      const stateRoot = runtime.researchStateRoot ?? path.join(workDir, ".auto");
-      if (action === "draft") {
-        const checked = expedition.validateExpeditionDoc(params.doc);
-        if (!checked.ok) return reply(`${checked.reason}: ${checked.message}`, checked.reason);
-        const saved = expedition.saveExpeditionDraft(stateRoot, checked.doc);
-        return saved.ok ? reply(`Expedition draft saved: ${saved.path}. Next: expedition_brief propose.`) : reply(`${saved.reason}: ${saved.message}`, saved.reason);
-      }
-      let docPath: string;
-      if (typeof params.doc_path === "string") docPath = path.resolve(workDir, params.doc_path);
-      else {
-        const latest = expedition.findLatestDraft(stateRoot);
-        if (!latest) return reply("expedition_draft_missing: no draft found", "expedition_draft_missing");
-        docPath = path.join(path.dirname(workDir), `expedition-${Date.now()}.json`);
-        try { fs.writeFileSync(docPath, fs.readFileSync(latest)); fs.unlinkSync(latest); } catch (e) { return reply(`io_failed: ${String(e)}`, "io_failed"); }
-      }
-      try {
-        const real = fs.realpathSync(docPath), realWork = fs.realpathSync(workDir), rel = path.relative(realWork, real);
-        if (rel === "" || (!path.isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${path.sep}`))) return reply("path_inside_workdir: document must be outside the work directory", "path_inside_workdir");
-      } catch (e) { return reply(`expedition_doc_unreadable: ${String(e)}`, "expedition_doc_unreadable"); }
-      const initial = expedition.readExpeditionDoc(docPath);
-      if (!initial.ok) return reply(`${initial.reason}: ${initial.message}`, initial.reason);
-      const dialog = expedition.expeditionDialogText(initial.doc, initial.sha256);
-      const confirmed = await ctx.ui.confirm("Confirm expedition document", dialog);
-      const current = expedition.readExpeditionDoc(docPath);
-      if (!current.ok || current.sha256 !== initial.sha256) return reply("expedition_changed: document changed during confirmation", "expedition_changed");
-      if (confirmed !== true) return reply("owner_declined: expedition was not created", "owner_declined");
-      const id = `exp-${Date.now()}`, chainId = `${id}-chain`;
-      const createdChain = await chainJournal.createChain(workDir, chainId, id);
-      if (!createdChain.ok) return reply(`${createdChain.reason}: ${createdChain.message}`, createdChain.reason);
-      const chainDir = chainJournal.chainDir(workDir, chainId)!;
-      const add = async (type: string, payload: Record<string, unknown>) => chainJournal.appendEntry(chainDir, workDir, chainId, type, payload);
-      let r = await add("expedition_created", {goal: current.doc.goal, doc_sha256: current.sha256});
-      if (!r.ok) return reply(`${r.reason}: ${r.message}`, r.reason);
-      for (const d of current.doc.directions) { r = await add("direction_opened", {dir:d.name,why:d.why}); if (!r.ok) return reply(`${r.reason}: ${r.message}`, r.reason); }
-      const campaign = await researchState.createCampaign(workDir, id);
-      if (!campaign.ok) return reply(`${campaign.reason}: ${campaign.message}`, campaign.reason);
-      const brief = await researchState.writeBriefDraft(campaign.dir, current.doc.campaign0);
-      if (!brief.ok) return reply(`${brief.reason}: ${brief.message}`, brief.reason);
-      const approval = await researchState.writeApproval(campaign.dir, brief.sha256);
-      if (!approval.ok) return reply(`${approval.reason}: ${approval.message}`, approval.reason);
-      r = await add("brief_approved", {campaign_id:id,brief_sha256:brief.sha256,source:"expedition"});
-      if (!r.ok) return reply(`${r.reason}: ${r.message}`, r.reason);
-      r = await add("campaign_added", {campaign_id:id});
-      if (!r.ok) return reply(`${r.reason}: ${r.message}`, r.reason);
-      const started = await researchState.transitionPhase(campaign.dir, "start expedition campaign", "briefing", "research");
-      if (!started.ok) return reply(`${started.reason}: ${started.message}`, started.reason);
-      const status = await chainJournal.setChainStatus(workDir, chainId, "active");
-      if (!status.ok) return reply(`${status.reason}: ${status.message}`, status.reason);
-      // es1.8: every creation path pins the expedition view and refreshes the
-      // widget — including a session where the mode was already ON.
-      if (!runtime.autoresearchMode) { recordAutoresearchActivation(workDir,true); setAutoresearchMode(ctx,true); }
-      runtime.uiMode = "expedition";
-      runtime.researchCampaignId = id;
-      runtime.researchChain = {chainId,workDir,charterPath:docPath,charterSha256:current.sha256,charter:current.doc.charter,expedition:true,docSha256:current.sha256};
-      updateWidget(ctx);
-      // Restart marker (bd pi-autoresearch-es1.3): lets a fresh session restore
-      // the binding from disk. Chain creation is already durable at this point,
-      // so a marker failure degrades to a warning, not a rollback.
-      const marker = expedition.writeExpeditionMarker(chainDir, {goal: current.doc.goal, docPath, docSha256: current.sha256, campaignId: id, charter: current.doc.charter});
-      const markerNote = marker.ok ? "" : `\nwarning: expedition restart marker not written (${marker.reason}: ${marker.message}); the expedition will not survive a pi restart.`;
-      sendWhenReady(ctx, `Expedition ${id} created. Campaign 0 is running; the campaign brief is approved by the expedition confirmation. Before question work: pick a direction and activate it with expedition_map(subaction="activate", dir=<name>, why=<rationale>) — questions of campaign 0 belong to that direction. Use separate research_questions calls with action="open", action="record", or action="close" for campaign questions. When the direction is closed, close its campaign questions first, then call expedition_map(subaction="resolve", dir=<name>, refs=[{campaign,question}]) or make a separate call to expedition_map(subaction="reject", dir=<name>, refs=[{campaign,question}]), expedition_map(subaction="advisory", dir=<name>, review_ref=<path>, review_sha256=<sha256>), or expedition_map(subaction="park", dir=<name>, reason=<why>); activate the next direction with expedition_map(subaction="activate", dir=<name>, why=<rationale>) before drafting the next campaign. Question close is not map direction resolve.`, { steerIfBusy: true });
-      return reply(`✅ Expedition ${chainId} created; campaign ${id} started (document sha256 ${current.sha256}). Next: expedition_map(subaction="activate", dir=<name>, why=<rationale>) before question work; use separate research_questions calls with action="open", action="record", or action="close" for questions. After closing a direction with expedition_map(subaction="resolve", dir=<name>, refs=...) or a separate call with expedition_map(subaction="reject", dir=<name>, refs=...), activate the next direction with expedition_map(subaction="activate", dir=<name>, why=<rationale>) before drafting the next campaign.${markerNote}`);
-    },
-  });
+  registerGatedTool(createExpeditionBriefTool(briefToolDeps));
 
   registerGatedTool(createResearchBriefTool({
     assertModeActive,
@@ -5394,104 +5185,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // only model-callable research/map tools; existing wiring tests can still call it.
   pi.registerTool(researchTool);
 
-  const researchExecutor = researchTool.execute as (...args: any[]) => Promise<any>;
-  const researchRenderer = researchTool.renderCall as ((...args: any[]) => any) | undefined;
-  const aliasRefusal = (toolName: string, message: string) => ({
-    content: [{ type: "text" as const, text: refusalText({ reason: "invalid_argument", message }) }],
-    details: { action: toolName, reason: "invalid_argument" },
-  });
-  const makeAliasRenderer = (toolName: string, mapAlias: boolean) => (args: any, theme: any, context: any) => {
-    try {
-      const normalized = mapAlias ? { ...(args ?? {}), action: "expedition" } : args;
-      return researchRenderer?.(normalized, theme, context) ?? new Text(theme ? theme.fg("toolTitle", theme.bold(`${toolName} `)) : `${toolName} `, 0, 0);
-    } catch {
-      return new Text(`${toolName} `, 0, 0);
-    }
+  // Alias deps read late: the hidden dispatcher is created above, the mutable
+  // extension state stays getter-backed in index.ts.
+  const aliasToolDeps: ResearchAliasToolDeps = {
+    assertModeActive,
+    refusalText,
+    researchExecutor: researchTool.execute as (...args: any[]) => Promise<any>,
+    researchRenderer: researchTool.renderCall as ((...args: any[]) => any) | undefined,
   };
-  const campaignAliasKeys = new Set(["action", "expected_sha256", "question_id", "evidence_ref", "rule_id", "verdict", "reason"]);
-  const campaignAliasActions = new Set(["start", "open", "record", "close", "stop", "status", "report", "resolve", "chain_stop"]);
-  const mapAliasKeys = new Set(["subaction", "dir", "from", "to", "reason", "why", "refs", "review_ref", "review_sha256"]);
-  const mapAliasActions = new Set(["open", "activate", "resolve", "reject", "advisory", "park", "reopen", "pivot", "status"]);
-
-  registerGatedTool({
-    name: "research_questions",
-    label: "Research campaign questions",
-    description: "Campaign lifecycle and approved-brief question tool. Actions: start, open, record, close, stop, status, report, resolve, chain_stop. `close` resolves a CAMPAIGN QUESTION using question_id + rule_id + verdict + evidence. `resolve` is OPERATOR-only pending-operation cleanup requiring owner dialog confirmation. For EXPEDITION MAP direction operations use expedition_map, not this tool.",
-    promptSnippet: "Campaign questions: open, record evidence, close questions under the approved brief; expedition map is a separate tool",
-    promptGuidelines: [
-      "Use research_questions(action=close) to close a campaign question: provide question_id, rule_id from that question, verdict, and recorded evidence.",
-      "Workflow per question: action=open(question_id) -> action=record(evidence_ref) -> action=close(question_id, rule_id, verdict). record takes ONLY evidence_ref (a file:lines or file#anchor INSIDE the work directory) and binds to the currently open question — never pass question_id to record. If the evidence file lives outside the work directory, copy it in first (e.g. under .auto/research/evidence/) and cite the relative path.",
-      "This tool's resolve is only an operator-confirmed pending-op cleanup; it does not resolve map directions.",
-      "Do not pass map refs/review_ref/from/to here; use expedition_map for map operations.",
-    ],
-    renderCall: makeAliasRenderer("research_questions", false),
-    parameters: {
-      type: "object",
-      properties: {
-        action: { type: "string", enum: ["start", "open", "record", "close", "stop", "status", "report", "resolve", "chain_stop"], description: "Campaign/question action." },
-        expected_sha256: { type: "string", description: "start only: approved brief SHA-256." },
-        question_id: { type: "string", description: "open/close: question id from the approved brief." },
-        evidence_ref: { type: "string", description: "record only: path:lines or path#anchor pointing INSIDE the work directory (copy external evidence in first); binds to the currently open question — question_id is not taken." },
-        rule_id: { type: "string", description: "close: decision rule for that question; stop: stop rule of the approved brief; chain_stop: charter stop rule." },
-        verdict: { type: "string", description: "close only: verdict declared by the approved brief." },
-        reason: { type: "string", description: "stop: required; close: required for inconclusive/waiting_for_data verdicts." },
-      },
-      required: ["action"],
-      additionalProperties: false,
-    } as any,
-    async execute(toolCallId: string, params: any, signal: any, onUpdate: any, ctx: ExtensionContext) {
-      const modeGate = assertModeActive(ctx);
-      if (modeGate) return modeGate;
-      const extra = Object.keys(params ?? {}).filter((key) => !campaignAliasKeys.has(key));
-      if (extra.length) {
-        const mapOnly = extra.some((key) => ["refs", "review_ref", "review_sha256", "from", "to"].includes(key));
-        return aliasRefusal("research_questions", `unexpected field(s) ${extra.map((key) => JSON.stringify(key)).join(", ")}; ${mapOnly ? "use expedition_map(subaction=..., refs=...) for map direction operations" : "only campaign/question fields are accepted"}`);
-      }
-      if (!campaignAliasActions.has(params?.action)) return aliasRefusal("research_questions", `unknown campaign/question action ${JSON.stringify(String(params?.action))}`);
-      return researchExecutor(toolCallId, params, signal, onUpdate, ctx);
-    },
-  });
-
-  registerGatedTool({
-    name: "expedition_map",
-    label: "Expedition direction map",
-    description: "Expedition MAP ONLY: open/activate/resolve/reject/advisory/park/reopen/pivot/status directions. `resolve`/`reject` close a MAP DIRECTION using refs to already-closed campaign questions; they do NOT close a question and never accept rule_id/verdict. For questions use research_questions(action=close, question_id, rule_id, verdict).",
-    promptSnippet: "Expedition map only: activate/resolve/reject directions using refs; campaign questions use research_questions",
-    promptGuidelines: [
-      "Use expedition_map(subaction=activate, dir=<name>, why=<rationale>) to activate the current direction.",
-      "Use expedition_map(subaction=resolve, dir=<name>, refs=[{campaign,question}]) or expedition_map(subaction=reject, dir=<name>, refs=[{campaign,question}]) to close a MAP DIRECTION after referenced questions are closed; reason is optional for both.",
-      "This tool never accepts rule_id or verdict. Use research_questions(action=close, question_id, rule_id, verdict) to close a campaign question.",
-      "Do not confuse research_questions(action=resolve), which is operator-only pending-op cleanup, with map resolve.",
-    ],
-    renderCall: makeAliasRenderer("expedition_map", true),
-    parameters: {
-      type: "object",
-      properties: {
-        subaction: { type: "string", enum: ["open", "activate", "resolve", "reject", "advisory", "park", "reopen", "pivot", "status"], description: "Map transition or status." },
-        dir: { type: "string", description: "Direction name for open/activate/resolve/reject/advisory/park/reopen." },
-        from: { type: "string", description: "pivot only: currently active direction." },
-        to: { type: "string", description: "pivot only: open target direction." },
-        reason: { type: "string", description: "Transition rationale; required for park/reopen/pivot." },
-        why: { type: "string", description: "open/activate rationale." },
-        refs: { type: "array", items: { type: "object", properties: { campaign: { type: "string" }, question: { type: "string" } }, required: ["campaign", "question"], additionalProperties: false }, description: "resolve/reject only: closed question refs proving direction outcome." },
-        review_ref: { type: "string", description: "advisory only: review file path." },
-        review_sha256: { type: "string", description: "advisory only: SHA-256 of the review file." },
-      },
-      required: ["subaction"],
-      additionalProperties: false,
-    } as any,
-    async execute(toolCallId: string, params: any, signal: any, onUpdate: any, ctx: ExtensionContext) {
-      const modeGate = assertModeActive(ctx);
-      if (modeGate) return modeGate;
-      const extra = Object.keys(params ?? {}).filter((key) => !mapAliasKeys.has(key));
-      if (extra.length) {
-        const questionOnly = extra.some((key) => ["rule_id", "verdict", "question_id", "expected_sha256", "evidence_ref"].includes(key));
-        return aliasRefusal("expedition_map", `unexpected field(s) ${extra.map((key) => JSON.stringify(key)).join(", ")}; ${questionOnly ? "use research_questions(action=close, question_id, rule_id, verdict) to close a campaign question" : "only expedition map fields are accepted"}`);
-      }
-      if (!mapAliasActions.has(params?.subaction)) return aliasRefusal("expedition_map", `unknown expedition-map subaction ${JSON.stringify(String(params?.subaction))}`);
-      return researchExecutor(toolCallId, { ...params, action: "expedition" }, signal, onUpdate, ctx);
-    },
-  });
+  registerGatedTool(createResearchQuestionsTool(aliasToolDeps));
+  registerGatedTool(createExpeditionMapTool(aliasToolDeps));
 
   // /autoresearch command — enter autoresearch mode
   // -----------------------------------------------------------------------
