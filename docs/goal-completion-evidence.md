@@ -16,7 +16,8 @@ Final HEAD: `94fcd9e` (pushed, `origin/master` in sync).
 
 Command: `env -u PI_SUBAGENT_CHILD -u PI_SUBAGENT_PARENT_SESSION npm test` (880 s timeout), log `D:/tmp/final-e6-full.log` at HEAD `94fcd9e`.
 
-- 1959 tests, 1948 pass, 7 fail, 4 skipped.
+- First run: 1959 tests, 1948 pass, 7 fail, 4 skipped (the seventh was load-only `.cmd` shim timing, passing solo).
+- Confirming rerun on final HEAD: `D:/tmp/final-goal-full-confirm.log`, **1959 tests, 1949 pass, exactly 6 fail, 4 skipped**.
 - Failures:
   - 871 prompt-size budget — deterministic at pristine baseline;
   - 1199/1200 hung child timing — both pass solo (2/2, `D:/tmp/final-e6-solo-hung.log`);
