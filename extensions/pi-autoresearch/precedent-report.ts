@@ -194,6 +194,8 @@ export interface PrecedentReportOptions {
   deadlineMs?: number;
   /** Monotonic clock in ms behind the shared deadline; a seam for tests. */
   clock?: () => number;
+  /** Cap for the memory adapter call; defaults to MEMORY_DEADLINE_MS. Test seam for slow worker startup under load. */
+  memoryDeadlineMs?: number;
   versions?: Omit<VersionChildOptions, "deadlineMs" | "deadlineAt" | "clock" | "budget">;
   search?: Omit<PrecedentSearchOptions, "deadlineMs" | "maxOutputBytes" | "args">;
   /** Host memory adapter (task 2.3). Absent: memory is `unavailable`. */
@@ -805,7 +807,7 @@ export async function searchPrecedentReport(
     adapter === undefined
       ? null
       : await runMemorySearch(adapter, queryText(input), {
-          deadlineMs: Math.min(remainingMs(), MEMORY_DEADLINE_MS),
+          deadlineMs: Math.min(remainingMs(), options.memoryDeadlineMs ?? MEMORY_DEADLINE_MS),
           maxBytes: SEARCH_MAX_BYTES - versionSpent.bytes,
           maxItems: SEARCH_MAX_ITEMS - versionSpent.items,
         });

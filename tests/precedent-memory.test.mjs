@@ -61,6 +61,8 @@ function adapterModule(t, body) {
 }
 
 /** Adapter answering every call with the same JSON-serialisable `response`. */
+const MEMORY_TEST_DEADLINE_MS = 9_000;
+
 function answering(t, response) {
   return adapterModule(t, `  return ${JSON.stringify(response)};`);
 }
@@ -180,6 +182,17 @@ test("configured adapter: the call gets the query, the result limit, a bounded d
   assert.ok(received.limits.maxItems > 0 && received.limits.maxItems <= SEARCH_MAX_ITEMS);
 });
 
+test("configured adapter: memoryDeadlineMs is forwarded to the adapter", async (t) => {
+  const root = makeDir(t, "precedent-memory-deadline-seam-");
+  writeRel(root, ".auto/log.jsonl", matchingLedger());
+  const { report } = await searchPrecedentReport(root, input("парсер"), {
+    memory: await echoing(t),
+    memoryDeadlineMs: MEMORY_TEST_DEADLINE_MS,
+  });
+  const received = JSON.parse(report.search.memory.entries[0].untrusted_content.ref);
+  assert.equal(received.limits.deadlineMs, MEMORY_TEST_DEADLINE_MS);
+});
+
 test("configured adapter: a completed search with zero results is no-matches and complete", async (t) => {
   const root = makeDir(t, "precedent-memory-zero-");
   writeRel(root, ".auto/log.jsonl", standardLedger({ run: 1, status: "keep", metric: 120, description: "кэш" }));
@@ -219,6 +232,7 @@ test("configured adapter that errored: freshness is unknown even though the loca
 
   const { report } = await searchPrecedentReport(root, input("парсер"), {
     memory: await answering(t, { ok: false, error: "индекс памяти недоступен" }),
+    memoryDeadlineMs: MEMORY_TEST_DEADLINE_MS,
   });
   assert.equal(report.search.memory.status, "error");
   assert.equal(report.search.complete, false);
