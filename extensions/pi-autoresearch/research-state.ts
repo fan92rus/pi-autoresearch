@@ -664,19 +664,14 @@ export function scanCampaignsSync(base: string): CampaignScan {
     const pendingOp = existsSync(join(dir, PENDING_OP_FILE));
     let state: CampaignState | null = null;
     try {
-      const raw = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, unknown>;
-      // The SAME four-field predicate the pre-unification inline scanners
-      // used (review round 1): schema_version, campaign_id === dirname,
-      // known phase. Deliberately NOT stateProblem - that also rejects
-      // unknown/extra fields, which would silently tighten the scanners'
-      // semantics (a hand-extended state.json would flip from passing to
-      // fail-closed blocking).
-      const valid =
-        raw && typeof raw === "object" &&
-        raw.schema_version === RESEARCH_STATE_SCHEMA_VERSION &&
-        raw.campaign_id === entry.name &&
-        (CAMPAIGN_PHASES as readonly string[]).includes(raw.phase as string);
-      if (valid) state = raw as unknown as CampaignState;
+      const raw: unknown = JSON.parse(readFileSync(statePath, "utf8"));
+      // bd tj0.3: use the SAME validator as readState/inspectCampaign. A state
+      // with extra fields (or any other problem) is unreadable here too:
+      // otherwise the scanner saw a finished campaign that every mutator and
+      // the archive refused, and the loop could leave itself running over a
+      // blocked campaign. stateProblem keeps CAMPAIGN_PHASES and the known
+      // phase semantics; it adds exact field-set/schema/id validation.
+      if (stateProblem(raw, entry.name) === null) state = raw as CampaignState;
     } catch {
       state = null; // corrupt = unreadable, the caller decides
     }
@@ -707,15 +702,46 @@ export const RESEARCH_PHASE_POLICY = {
 
 export type ResearchPhasePolicyRow = keyof typeof RESEARCH_PHASE_POLICY;
 
+/** The ordered refusal vocabulary of every research gate. Pending op wins
+ *  over state validity, which wins over phase; null means this row allows
+ *  the campaign. One vocabulary for scanner, launch, archive and exit. */
+export type ResearchPolicyReason = "pending_op" | "unreadable" | CampaignPhase;
+
+/** Typed reason behind one policy row. Never reorders the checks: a stopped
+ *  campaign with a pending marker is pending_op, not a finished phase. */
+export function researchPolicyRefusal(
+  campaign: Pick<ScannedCampaign, "pendingOp" | "state">,
+  row: ResearchPhasePolicyRow,
+): ResearchPolicyReason | null {
+  const policy = RESEARCH_PHASE_POLICY[row];
+  if (campaign.pendingOp) return policy.pending_op ? "pending_op" : null;
+  if (campaign.state === null) return policy.unreadable ? "unreadable" : null;
+  return policy[campaign.state.phase] ? campaign.state.phase : null;
+}
+
+/** Why an archive moved nothing. The policy tokens identify a campaign that
+ *  is still active; unlistable/io are filesystem failures. Typed so a final
+ *  exit can tell "nothing was finished" from "a stopped campaign blocks". */
+export type ResearchArchiveRefusalReason = ResearchPolicyReason | "unlistable" | "io";
+export type ResearchArchiveOutcome =
+  | { ok: true; archived: string[] }
+  | { ok: false; reason: ResearchArchiveRefusalReason };
+
+/** A read-only inspection expressed in the scanner's vocabulary. A pending
+ *  marker is kept even when inspectCampaign also returned a readable state. */
+export function inspectionPolicyInput(insp: CampaignInspection): Pick<ScannedCampaign, "pendingOp" | "state"> {
+  return {
+    pendingOp: insp.pendingOp !== null || insp.status === "manual_check_required",
+    state: insp.status === "ready" ? insp.state : null,
+  };
+}
+
 /** Apply one table row to a single scanned campaign (one fact per campaign). */
 export function researchPolicyBlocks(
   campaign: Pick<ScannedCampaign, "pendingOp" | "state">,
   row: ResearchPhasePolicyRow,
 ): boolean {
-  const policy = RESEARCH_PHASE_POLICY[row];
-  if (campaign.pendingOp) return policy.pending_op;
-  if (campaign.state === null) return policy.unreadable;
-  return policy[campaign.state.phase];
+  return researchPolicyRefusal(campaign, row) !== null;
 }
 
 /**

@@ -471,17 +471,37 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
           const campaignDir = resolveRequestedCampaignDir(requestedId);
           if (campaignDir !== null) {
             const insp = await researchState.inspectCampaign(campaignDir);
-            const phase = insp?.state?.phase ?? null;
-            // research-charter: a stopped campaign is the natural chain root —
-            // the chain resumes on top of it, so it does not block the launch.
-            if (requestedCharterPath !== null && phase === "stopped") {
+            // bd tj0.3: the same ordered gate as every other research path —
+            // pending_op, then state validity, then phase. "launch" refuses
+            // unreadable states and stranded (pending) stopped campaigns; a
+            // pending marker on a readable briefing/research campaign is still
+            // resumable so the operator can run research_questions(action=resolve).
+            const reason = researchState.researchPolicyRefusal(researchState.inspectionPolicyInput(insp), "launch");
+            const phase = insp.state?.phase ?? null;
+            const resumablePhase = phase === "briefing" || phase === "research";
+            // The ONE explicit exception to the terminal-phase refusal:
+            // research-charter resumes on top of a READY, pending-free stopped
+            // chain root.
+            const charterStoppedRoot = requestedCharterPath !== null && insp.status === "ready" &&
+              !insp.pendingOp && phase === "stopped";
+            if (charterStoppedRoot) {
               // allowed: the chain takes this campaign as its root.
+            } else if (reason === "unreadable" || (reason === "pending_op" && !resumablePhase)) {
+              ctx.ui.notify(
+                reason === "pending_op"
+                  ? `Campaign ${requestedId} has an interrupted operation (manual check required); resolve it before resuming`
+                  : `Campaign ${requestedId} is unreadable; cannot resume from here`,
+                "info",
+              );
+              return;
             } else if (phase === "stopped") {
               ctx.ui.notify(`Campaign ${requestedId} is stopped (terminal); it never resumes. Create a new campaign: /autoresearch research <description>`, "info");
               return;
-            } else if (phase !== "briefing" && phase !== "research") {
+            } else if (!resumablePhase) {
               ctx.ui.notify(`Campaign ${requestedId} is in phase ${String(phase)} or unreadable; cannot resume from here`, "info");
               return;
+            } else if (reason === "pending_op") {
+              ctx.ui.notify(`Campaign ${requestedId} has an interrupted operation (manual check required); resolve it with research_questions(action=resolve)`, "info");
             }
           }
         } else if (existingIds.length > 0 || uniqueLaunchBases.some((base) => campaignIdsByBase.get(base) === null)) {
