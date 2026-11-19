@@ -35,4 +35,8 @@ Cross-aspect duplicates were merged into single tasks: `inspectCampaign`/`refusa
 
 Each stage epic has a verifiable close condition in its acceptance criteria.
 
+### tj0.2 upgrade note
+
+`expedition_brief propose` now records `mode_finalized` in the durable publication journal before appending the mode-switch finalize. Partial publications produced by the rejected intermediate code (`1324007`/`9ea6a79`) may be legacy schema-v1 journals without this field; `readPublication` coerces a missing field to `false`. Retrying such an old partial journal from an active optimization can append one extra finalize. New partial publications are exactly-once; historical journals are deliberately not migrated — treat one as a manual-check case if duplicate finalize matters.
+
 No code was changed as part of this review round.

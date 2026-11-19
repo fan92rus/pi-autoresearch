@@ -244,6 +244,14 @@ function readPublication(workDir: string): { state: ExpeditionPublication | null
       !raw.done.every((step) => typeof step === "string") ||
       (raw.mode_finalized !== undefined && typeof raw.mode_finalized !== "boolean")
     ) return { state: null, problem: "expedition_publication_invalid" };
+    // Legacy schema-v1 journals written before bd tj0.2 have no mode_finalized
+    // field and are coerced to false. Such a partial journal may already have a
+    // mode-switch finalize from the older code path; retrying it from an active
+    // optimization can therefore append one extra finalize. Journals written by
+    // this version record mode_finalized before the ledger append, so new
+    // partial publications are exactly-once. No automatic migration is attempted:
+    // treat an old partial journal as a manual-check case if duplicate finalize
+    // matters; do not silently rewrite historical journals.
     return { state: { schema_version: 1, id: raw.id, chain_id: raw.chain_id, doc_path: raw.doc_path, doc_sha256: raw.doc_sha256, step: raw.step, done: raw.done as string[], mode_finalized: raw.mode_finalized === true } };
   } catch {
     return { state: null, problem: "expedition_publication_invalid" };
