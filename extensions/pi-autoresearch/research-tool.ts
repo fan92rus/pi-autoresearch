@@ -35,7 +35,8 @@ export interface ResearchToolDeps {
   locateEvidence: (workDir: string, ref: string) => Promise<any>;
   evidenceStatus: (workDir: string, e: any) => Promise<string>;
   questionLines: (workDir: string, brief: any, replay: any) => Promise<string[]>;
-  archiveFinishedCampaigns: (workDir: string, stateBase: string, ctx?: ExtensionContext) => Promise<string[] | null>;
+  archiveFinishedCampaigns: (workDir: string, stateBase: string, ctx?: ExtensionContext, opts?: { includeChainCampaigns?: boolean }) => Promise<string[] | null>;
+  archiveOutcome: (workDir: string, stateBase: string, ctx?: ExtensionContext, opts?: { includeChainCampaigns?: boolean }) => Promise<researchState.ResearchArchiveOutcome>;
   otherCampaignBusyReason: (workDir: string, ctx: ExtensionContext, selfId: string) => Promise<string | null>;
   sendWhenReady: (ctx: ExtensionContext, message: string, opts?: { steerIfBusy?: boolean }) => void;
   exitResearchMode: (ctx: ExtensionContext, campaignId: string) => void;
@@ -51,6 +52,41 @@ export interface ResearchToolDeps {
 }
 
 export function createResearchTool(deps: ResearchToolDeps): ResearchTool {
+  /** bd tj0.3: archive FIRST, leave the loop only on success. Chain campaigns
+   *  are included because every caller here is a FINAL chain/campaign exit —
+   *  the old "exit first" order only existed to clear the chain pin so the
+   *  archive would see them. A null/throw means a stopped or unreadable
+   *  campaign still blocks: keep the mode ON and name the manual check. */
+  const archiveBeforeExit = async (
+    ctx: ExtensionContext,
+    workDir: string,
+    campaignId: string,
+  ): Promise<{ exited: boolean; note: string }> => {
+    const { archiveOutcome, effectiveResearchBase, exitResearchMode } = deps;
+    let outcome: researchState.ResearchArchiveOutcome = { ok: false, reason: "io" };
+    let detail = "";
+    try {
+      outcome = await archiveOutcome(workDir, effectiveResearchBase(workDir, ctx), ctx, { includeChainCampaigns: true });
+    } catch (err) {
+      detail = err instanceof Error ? err.message : String(err);
+    }
+    // A final chain can be stopped while its campaign is still in briefing/
+    // research (owner chain_stop during work): nothing finished to move, but
+    // the spec still turns the mode OFF. Every other refusal means a campaign
+    // still blocks, so the loop must stay ON with an explicit manual check.
+    const stillBlocking = !outcome.ok && outcome.reason !== "briefing" && outcome.reason !== "research";
+    if (stillBlocking) {
+      const reason = outcome.ok ? "io" : outcome.reason;
+      return {
+        exited: false,
+        note: `\n⛔ Manual check required: finished campaigns could not be archived (${reason}${detail ? `: ${detail}` : ""}). ` +
+          "Research mode stays ON and the ordinary loop stays blocked until the blocking campaign files are checked by hand.",
+      };
+    }
+    exitResearchMode(ctx, campaignId);
+    return { exited: true, note: outcome.ok && outcome.archived.length > 0 ? `\n🗄 Archived finished campaigns: ${outcome.archived.join(", ")}.` : "" };
+  };
+
   const researchTool: ResearchTool = {
     name: "research",
     label: "Internal research dispatcher (not exposed)",
@@ -443,15 +479,9 @@ export function createResearchTool(deps: ResearchToolDeps): ResearchTool {
           // Exception (spec): the final report of the active campaign of a chain
           // STOPPED during work turns the mode OFF regardless of the campaign phase.
           if (chainJournal.isFinal(chainStatusNow)) {
-            // bd 8af.6 (owner decision): exit FIRST (clears the chain pin so the
-            // reported campaign is not skipped as chain-protected), THEN archive.
-            exitResearchMode(ctx, id);
-            let archiveNote1 = "";
-            try {
-            const archived = await archiveFinishedCampaigns(workDir, effectiveResearchBase(workDir, ctx), ctx);
-            if (archived !== null && archived.length > 0) archiveNote1 = `
-🗄 Archived finished campaigns: ${archived.join(", ")}.`;
-            } catch { /* archival is best effort */ }
+            const finish = await archiveBeforeExit(ctx, workDir, id);
+            if (!finish.exited) return reply(reportText + "\n\n" + savedNote + finish.note);
+            const archiveNote1 = finish.note;
             const expeditionNote = chain.expedition ? await writeExpeditionFinalReport(chain, chainStatusNow, verified.entries) : "";
             return reply(reportText + (archiveNote1 ? archiveNote1 + "\n" : "\n") + "\n\n" + savedNote + (expeditionNote ? `\n${expeditionNote}` : "") + "\n" + "Research mode is OFF. The chain is " + chainStatusNow + "." + (archiveNote1 ? " Note: the finished campaign moved to .auto/research-archive (report.md is inside the archive)." : ""));
           }
@@ -466,13 +496,9 @@ export function createResearchTool(deps: ResearchToolDeps): ResearchTool {
             // Review (ef7d8951): a charter change inside the predicate sets
             // manual_check_required; it must not be overwritten by limit_reached.
             if ((await chainJournal.statusOf(chain.workDir, chain.chainId)) === "manual_check_required") {
-              exitResearchMode(ctx, id);
-              // bd 8af.6 (owner decision): exit FIRST, THEN archive.
-              let archiveNote3 = "";
-              try {
-                const archived = await archiveFinishedCampaigns(workDir, effectiveResearchBase(workDir, ctx), ctx);
-                if (archived !== null && archived.length > 0) archiveNote3 = `\n🗄 Archived finished campaigns: ${archived.join(", ")}.`;
-              } catch { /* archival is best effort */ }
+              const finish = await archiveBeforeExit(ctx, workDir, id);
+              if (!finish.exited) return reply(reportText + "\n\n" + savedNote + finish.note);
+              const archiveNote3 = finish.note;
               return reply(reportText + (archiveNote3 ? archiveNote3 + "\n" : "\n") + "\n\n" + savedNote + "\nThe charter file changed since the owner confirmed it: chain status manual_check_required. Research mode is OFF (spec: the predicate is false after the report)." + (archiveNote3 ? " Note: the finished campaign moved to .auto/research-archive." : ""));
             }
             const limitWrite = await chainJournal.setChainStatus(chain.workDir, chain.chainId, "limit_reached");
@@ -485,13 +511,9 @@ export function createResearchTool(deps: ResearchToolDeps): ResearchTool {
               try { freshStatus = await chainJournal.statusOf(chain.workDir, chain.chainId); } catch { /* best effort */ }
               return reply(reportText + "\n\n" + savedNote + `\nwarning: limit_reached could not be recorded (${limitWrite.message}); the chain stays ${freshStatus}; research mode stays ON; fix the journal and report again.`);
             }
-            exitResearchMode(ctx, id);
-            // bd 8af.6 (owner decision): exit FIRST, THEN archive.
-            let archiveNote4 = "";
-            try {
-              const archived = await archiveFinishedCampaigns(workDir, effectiveResearchBase(workDir, ctx), ctx);
-              if (archived !== null && archived.length > 0) archiveNote4 = `\n🗄 Archived finished campaigns: ${archived.join(", ")}.`;
-            } catch { /* archival is best effort */ }
+            const finish = await archiveBeforeExit(ctx, workDir, id);
+            if (!finish.exited) return reply(reportText + "\n\n" + savedNote + finish.note);
+            const archiveNote4 = finish.note;
             return reply(reportText + (archiveNote4 ? archiveNote4 + "\n" : "\n") + "\n\n" + savedNote + "\nResearch mode is OFF: the charter limit is reached (chain limit_reached). No further chain campaigns are created." + (archiveNote4 ? " Note: the finished campaign moved to .auto/research-archive." : ""));
           }
           // Owner decision (review M1): the chain advances only on a report of a
@@ -511,14 +533,9 @@ export function createResearchTool(deps: ResearchToolDeps): ResearchTool {
         // A report of a STOPPED campaign is the campaign's last step: leave
         // research mode now (the report is already on disk).
         if (snap.state.phase === "stopped" && saved) {
-          exitResearchMode(ctx, id);
-        // bd 8af.6 (owner decision): exit FIRST (clears the chain pin so the
-        // reported campaign is not skipped as chain-protected), THEN archive.
-        let archiveNote2 = "";
-        try {
-          const archived = await archiveFinishedCampaigns(workDir, effectiveResearchBase(workDir, ctx), ctx);
-          if (archived !== null && archived.length > 0) archiveNote2 = `\n🗄 Archived finished campaigns: ${archived.join(", ")}.`;
-        } catch { /* archival is best effort */ }
+          const finish = await archiveBeforeExit(ctx, workDir, id);
+          if (!finish.exited) return reply(reportText + "\n\n" + savedNote + finish.note);
+          const archiveNote2 = finish.note;
           return reply(reportText + (archiveNote2 ? archiveNote2 + "\n" : "\n") + "\n\n" + savedNote + "\nResearch mode is OFF.");
         }
         if (snap.state.phase === "stopped") {

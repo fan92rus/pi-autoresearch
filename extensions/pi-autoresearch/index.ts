@@ -330,6 +330,10 @@ export let resolveExpeditionPayload: AutoresearchTestHooks["resolveExpeditionPay
 /** Test hook: stops the dashboard static server so tests that started it can
  *  release the listen socket and let the process exit. */
 export let stopDashboardServerForTest: AutoresearchTestHooks["stopDashboardServer"] = null;
+/** bd tj0.3: the two extension-local policy resolvers, bound at init so the
+ *  matrix test can drive them without a tool-level detour. */
+export let blockingCampaignIdsForTest: ((bases: string[]) => Promise<string[]>) | null = null;
+export let archiveFinishedCampaignsForTest: ((workDir: string, stateBase: string, ctx?: ExtensionContext, opts?: { includeChainCampaigns?: boolean }) => Promise<string[] | null>) | null = null;
 
 type AutoResumeGuardState = Pick<ExperimentState, "results" | "currentSegment">;
 type AutoResumeGuardRuntime = {
@@ -4496,6 +4500,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     pi,
     get assertModeActive() { return assertModeActive; },
     get archiveFinishedCampaigns() { return archiveFinishedCampaigns; },
+    get archiveOutcome() { return archiveFinishedCampaignsDetailed; },
     autoresearchJsonlPath,
     get broadcastDashboardUpdate() { return broadcastDashboardUpdate; },
     get campaignBlockedResponse() { return campaignBlockedResponse; },
@@ -4624,6 +4629,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     message,
   });
 
+  /** One ordered gate for an inspected campaign (pending op, then state,
+   *  then phase). The launch row is the shared "terminal is finished" rule;
+   *  callers add only their own explicit exceptions. */
+  const campaignPolicyReason = (insp: researchState.CampaignInspection): researchState.ResearchPolicyReason | null =>
+    researchState.researchPolicyRefusal(researchState.inspectionPolicyInput(insp), "launch");
+
   /** Refuses any field the action does not accept, so approval fields never reach the tools. */
   const unexpectedArgKeys = (params: Record<string, unknown>, allowed: readonly string[], hint?: string): string | null => {
     const extra = Object.keys(params).filter((k) => !allowed.includes(k));
@@ -4632,9 +4643,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   };
 
   /** Campaign ids under the bases that do NOT count as finished: briefing,
-   *  research, or unreadable (also an unlistable base). A finished (stopped)
-   *  campaign never blocks a launch; the draft that starts a new campaign
-   *  archives it. */
+   *  research, pending, unreadable (also an unlistable base). Only a READY
+   *  stopped campaign is finished; the draft that starts a new campaign
+   *  archives it. inspectCampaign reports pending ops and unreadable states
+   *  as refusals, never as a finished phase. */
   const blockingCampaignIds = async (bases: string[]): Promise<string[]> => {
     const out: string[] = [];
     for (const base of bases) {
@@ -4650,39 +4662,50 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           continue;
         }
         const insp = await researchState.inspectCampaign(resolved.dir);
-        if (insp.state?.phase !== "stopped") out.push(id);
+        // Same ordered vocabulary as every other gate: pending_op and
+        // unreadable must never be mistaken for a terminal phase.
+        const finished = insp.status === "ready" && !insp.pendingOp &&
+          insp.state?.phase === "stopped" && campaignPolicyReason(insp) === null;
+        if (!finished) out.push(id);
       }
     }
     return [...new Set(out)].sort();
   };
+  blockingCampaignIdsForTest = blockingCampaignIds;
 
-  /** Moves every FINISHED (phase stopped) campaign of the session's bases into
-   *  <base>/.auto/research-archive/<id>-<stamp>. A move, never a delete. Returns
-   *  the archived names, or null when any campaign is active, unreadable or
-   *  unlistable: then nothing is moved and the caller keeps its refusal. */
-  const archiveFinishedCampaigns = async (workDir: string, stateBase: string, ctx?: ExtensionContext): Promise<string[] | null> => {
+  /** Same move, with the typed reason for moving nothing. Callers that only
+   *  need the legacy array|null shape use archiveFinishedCampaigns below; a
+   *  FINAL exit uses this to distinguish an in-work chain campaign (phase
+   *  briefing/research) from a stopped campaign that could not be archived. */
+  const archiveFinishedCampaignsDetailed = async (
+    workDir: string,
+    stateBase: string,
+    ctx?: ExtensionContext,
+    opts?: { includeChainCampaigns?: boolean },
+  ): Promise<researchState.ResearchArchiveOutcome> => {
     const bases = [...new Set([stateBase, workDir])];
     const found: { base: string; id: string; dir: string }[] = [];
     // research-charter: campaigns of an ACTIVE chain are never archived — the
-    // child checks and the continuation flow still read them. An unreadable
-    // chain journal fails closed (archive nothing). Without a chain (or ctx)
-    // this is the legacy behavior byte-for-byte.
-    const chainIds = ctx ? await chainCampaignIds(ctx) : [];
-    if (chainIds === null) return null;
+    // child checks and the continuation flow still read them. Final exits pass
+    // includeChainCampaigns: the chain is already final and must not skip them.
+    // Without a chain (or ctx) this is the legacy behavior byte-for-byte.
+    const chainIds = ctx && !opts?.includeChainCampaigns ? await chainCampaignIds(ctx) : [];
+    if (chainIds === null) return { ok: false, reason: "unlistable" };
     for (const base of bases) {
       const ids = listResearchCampaignIds(base);
-      if (ids === null) return null;
+      if (ids === null) return { ok: false, reason: "unlistable" };
       for (const id of ids) {
         if (chainIds.includes(id)) continue;
         const resolved = researchState.resolveCampaignDir(base, id);
-        if (!resolved.ok) return null;
-        const read = await researchState.readState(resolved.dir);
-        if (!read.ok || read.state.phase !== "stopped") return null;
-        // bd pi-autoresearch-vhr / 51n.12: a pending-operation marker means an
-        // interrupted operation — the campaign must NOT be archived silently
-        // (the finalize/archive note would claim success over stranded work).
-        // Archive nothing and keep the caller's refusal semantics.
-        if (await researchState.readPendingOp(resolved.dir) !== null) return null;
+        if (!resolved.ok) return { ok: false, reason: "unreadable" };
+        // One ordered inspection: pending op first, then state validity, then
+        // phase. readState-then-pendingOp could report an interrupted STOPPED
+        // campaign as archivable if the read failed closed in a different way;
+        // the shared gate admits only READY + no pending + phase stopped.
+        const insp = await researchState.inspectCampaign(resolved.dir);
+        const reason = campaignPolicyReason(insp);
+        if (reason !== null) return { ok: false, reason };
+        if (insp.status !== "ready" || insp.state?.phase !== "stopped") return { ok: false, reason: "unreadable" };
         found.push({ base, id, dir: resolved.dir });
       }
     }
@@ -4697,11 +4720,28 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         fs.renameSync(dir, target);
         archived.push(path.basename(target));
       }
-      return archived;
+      return { ok: true, archived };
     } catch {
-      return null;
+      return { ok: false, reason: "io" };
     }
   };
+
+  /** Moves every FINISHED (phase stopped) campaign of the session's bases into
+   *  <base>/.auto/research-archive/<id>-<stamp>. A move, never a delete. Returns
+   *  the archived names, or null when any campaign is active, unreadable or
+   *  unlistable: then nothing is moved and the caller keeps its refusal.
+   *  `includeChainCampaigns` is for a FINAL chain exit: the chain pin is still
+   *  bound there, but its campaigns are finished and must leave the root. */
+  const archiveFinishedCampaigns = async (
+    workDir: string,
+    stateBase: string,
+    ctx?: ExtensionContext,
+    opts?: { includeChainCampaigns?: boolean },
+  ): Promise<string[] | null> => {
+    const outcome = await archiveFinishedCampaignsDetailed(workDir, stateBase, ctx, opts);
+    return outcome.ok ? outcome.archived : null;
+  };
+  archiveFinishedCampaignsForTest = archiveFinishedCampaigns;
 
   const staleReportText = (dir: string, snap: ResearchSnapshot, draftBytes: Buffer | null): string => {
     const singleLine = (text: string): string => text.replace(/\s+/g, " ").trim();
@@ -5216,6 +5256,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     evidenceStatus,
     questionLines,
     archiveFinishedCampaigns,
+    get archiveOutcome() { return archiveFinishedCampaignsDetailed; },
     otherCampaignBusyReason,
     sendWhenReady,
     // Helpers declared later in this function body are read through getters:

@@ -22,7 +22,8 @@ type FinalizeResearchTool = Parameters<ExtensionAPI["registerTool"]>[0];
 export interface FinalizeResearchToolDeps {
   pi: ExtensionAPI;
   assertModeActive: (ctx: ExtensionContext) => any;
-  archiveFinishedCampaigns: (workDir: string, stateBase: string, ctx?: ExtensionContext) => Promise<string[] | null>;
+  archiveFinishedCampaigns: (workDir: string, stateBase: string, ctx?: ExtensionContext, opts?: { includeChainCampaigns?: boolean }) => Promise<string[] | null>;
+  archiveOutcome: (workDir: string, stateBase: string, ctx?: ExtensionContext, opts?: { includeChainCampaigns?: boolean }) => Promise<researchState.ResearchArchiveOutcome>;
   autoresearchJsonlPath: (dir: string) => string;
   broadcastDashboardUpdate: (workDir: string) => void;
   campaignBlockedResponse: () => any;
@@ -105,14 +106,31 @@ export function createFinalizeResearchTool(deps: FinalizeResearchToolDeps): Fina
         } else {
           expeditionNote = `🧭 Expedition chain ${expeditionChain.chainId} was already ${chainStatus} (final); nothing to finalize on it.`;
         }
+        // bd tj0.3: archive BEFORE unbinding. The chain campaigns are included
+        // because this chain is final; the old exit-first order only cleared
+        // the pin so the archive could see them. On any refusal/throw a stopped
+        // campaign still blocks, so the mode stays ON and the reply says so.
         // MINOR-3 (review 2026-11-15): this also runs on a manual_check_required
-        // chain — the runtime unbinds while the on-disk marker keeps chain
-        // actions blocked; recovery stays research_questions(action=status).
-        deps.exitResearchMode(ctx, expeditionChain.chainId);
+        // chain — the on-disk marker keeps chain actions blocked; recovery stays
+        // research_questions(action=status).
+        let outcome: researchState.ResearchArchiveOutcome = { ok: false, reason: "io" };
+        let detail = "";
         try {
-          const archived = await deps.archiveFinishedCampaigns(workDir, deps.effectiveResearchBase(workDir, ctx), ctx);
-          if (archived !== null && archived.length > 0) archiveNote = `\n🗄 Archived finished campaigns: ${archived.join(", ")}.`;
-        } catch { /* archival is best effort; the ordinary loop unblocks on the next draft */ }
+          outcome = await deps.archiveOutcome(
+            workDir, deps.effectiveResearchBase(workDir, ctx), ctx, { includeChainCampaigns: true },
+          );
+        } catch (err) {
+          detail = err instanceof Error ? err.message : String(err);
+        }
+        const stillBlocking = !outcome.ok && outcome.reason !== "briefing" && outcome.reason !== "research";
+        if (stillBlocking) {
+          const reason = outcome.ok ? "io" : outcome.reason;
+          archiveNote = `\n⛔ Manual check required: finished campaigns could not be archived (${reason}${detail ? `: ${detail}` : ""}). ` +
+            "Research mode stays ON and the ordinary loop stays blocked until the blocking campaign files are checked by hand.";
+        } else {
+          deps.exitResearchMode(ctx, expeditionChain.chainId);
+          if (outcome.ok && outcome.archived.length > 0) archiveNote = `\n🗄 Archived finished campaigns: ${outcome.archived.join(", ")}.`;
+        }
       } else {
         if (await deps.campaignBlocksOrdinaryLoop(workDir)) return deps.campaignBlockedResponse();
         if (await deps.researchBlocksOrdinaryLoop(workDir, ctx)) return deps.researchBlockedResponse();
