@@ -18,6 +18,7 @@ import * as candidateWorktree from "./candidate-worktree.ts";
 import * as candidateMeasure from "./candidate-measure.ts";
 import {
   candidateWorktreeRoot,
+  canonicalWorktreePath,
   createCandidateExecRunner,
   executeCandidateBranchAction,
 } from "./candidate-campaign.ts";
@@ -37,6 +38,9 @@ export interface CandidateBranchToolDeps {
   researchBlocksOrdinaryLoop: (workDir: string, ctx?: ExtensionContext) => Promise<boolean>;
   resolveWorkDir: (cwd: string) => string;
   validateWorkDir: (cwd: string) => string | null;
+  /** Optional deterministic fault-injection seams; production leaves them unset. */
+  candidateGitExec?: (cmd: string, args: string[], opts?: { cwd?: string; timeout?: number }) => Promise<{ code: number; stdout: string; stderr: string }>;
+  runRepeatedMeasurement?: typeof candidateMeasure.runRepeatedMeasurement;
 }
 
 export function createCandidateBranchTool(deps: CandidateBranchToolDeps): CandidateBranchTool {
@@ -65,7 +69,7 @@ export function createCandidateBranchTool(deps: CandidateBranchToolDeps): Candid
   const candidateExecRunner = createCandidateExecRunner(spawn, killTree, process.env);
 
   /** candidate-worktree ExecFn shape: (cmd, args, {cwd, timeout}). */
-  const candidateGitExec = async (
+  const defaultCandidateGitExec = async (
     cmd: string,
     args: string[],
     opts?: { cwd?: string; timeout?: number },
@@ -73,6 +77,8 @@ export function createCandidateBranchTool(deps: CandidateBranchToolDeps): Candid
     const r = await candidateExecRunner([cmd, ...args], { cwd: opts?.cwd, timeoutMs: opts?.timeout });
     return { code: r.code, stdout: r.stdout, stderr: r.stderr };
   };
+  const candidateGitExec = deps.candidateGitExec ?? defaultCandidateGitExec;
+  const runRepeatedMeasurement = deps.runRepeatedMeasurement ?? candidateMeasure.runRepeatedMeasurement;
 
   /** SHA-256 of one methodology file, read fresh from disk (repo-relative). */
 
@@ -147,6 +153,11 @@ export function createCandidateBranchTool(deps: CandidateBranchToolDeps): Candid
     return state.candidates.find((c) => c.status === "active") ?? null;
   };
 
+  type EphemeralCleanup = { removed: boolean; message?: string };
+  type SideMeasurement =
+    | { ok: true; average: number; wtPath: string }
+    | { ok: false; reason: string; message: string; wtPath: string; cleanup?: EphemeralCleanup };
+
   /** Side measurement in an ephemeral worktree for one side of a confirm. */
   const measureSideInEphemeral = async (
     ctx: ExtensionContext,
@@ -154,35 +165,57 @@ export function createCandidateBranchTool(deps: CandidateBranchToolDeps): Candid
     label: string,
     sideSha: string,
     policy: CandidatePolicy,
-  ): Promise<{ ok: true; average: number; wtPath: string } | { ok: false; reason: string; message: string; wtPath?: string }> => {
+  ): Promise<SideMeasurement> => {
     // Review B1: "confirm-leader"/"confirm-cand" are valid user candidate ids,
     // so a live candidate could occupy the ephemeral path and confirm's force
     // removal would destroy unsaved work. Unique namespaced ids cannot collide.
     const ephemeralId = `tmp-confirm-${label}-${createHash("sha256").update(`${process.pid}:${Date.now()}:${Math.random()}`).digest("hex").slice(0, 12)}`;
     const wtPath = path.join(candidateWtRootOf(workDir), ephemeralId);
-    const wtRes = await candidateWorktree.createCandidateWorktree(candidateGitExec, {
-      repoRoot: workDir,
-      baseCommit: sideSha,
-      worktreePath: wtPath,
-      candidateId: ephemeralId,
-    });
-    if (!wtRes.ok) return { ok: false, reason: wtRes.reason, message: wtRes.reason };
-    const measured = await candidateMeasure.runRepeatedMeasurement(candidateExecRunner, {
-      dir: wtPath,
-      metricName: policy.metric_name,
-      argv: policy.benchmark_argv,
-      timeoutMs: policy.benchmark_timeout_seconds * 1000,
-      repeats: policy.repeats,
-      budgetMs: policy.confirm_budget_seconds * 1000,
-    });
-    if (!measured.ok) {
-      // B-A fix: the worktree WAS created by this call — remove it before
-      // returning the failure, so a failed side leaves no tmp-confirm-* entry
-      // registered in git or on disk.
-      await removeEphemeralWorktree(ctx, workDir, wtPath);
-      return { ok: false, reason: measured.reason, message: measured.message };
+    // bd tj0.6: the path is known before anything can throw. Every failure
+    // result carries it, and every exit after creation cleans up (unless the
+    // caller keeps the worktree for checks after a successful measurement).
+    let created = false;
+    let keepWorktree = false;
+    let cleanupOutcome: EphemeralCleanup | null = null;
+    let thrownCleanup: { wtPath: string; cleanup: EphemeralCleanup | null } | null = null;
+    const cleanupNow = async (): Promise<EphemeralCleanup> => {
+      if (cleanupOutcome === null) cleanupOutcome = await removeEphemeralWorktree(ctx, workDir, wtPath);
+      return cleanupOutcome;
+    };
+    try {
+      const wtRes = await candidateWorktree.createCandidateWorktree(candidateGitExec, {
+        repoRoot: workDir,
+        baseCommit: sideSha,
+        worktreePath: wtPath,
+        candidateId: ephemeralId,
+      });
+      if (!wtRes.ok) return { ok: false, reason: wtRes.reason, message: wtRes.reason, wtPath };
+      created = true;
+      const measured = await runRepeatedMeasurement(candidateExecRunner, {
+        dir: wtPath,
+        metricName: policy.metric_name,
+        argv: policy.benchmark_argv,
+        timeoutMs: policy.benchmark_timeout_seconds * 1000,
+        repeats: policy.repeats,
+        budgetMs: policy.confirm_budget_seconds * 1000,
+      });
+      if (!measured.ok) {
+        return { ok: false, reason: measured.reason, message: measured.message, wtPath, cleanup: await cleanupNow() };
+      }
+      keepWorktree = true;
+      return { ok: true, average: measured.average, wtPath };
+    } catch (err) {
+      // Keep the exception (an uncertain outcome must retain the pending-op
+      // marker), but carry the path and cleanup result to the confirm reply.
+      thrownCleanup = { wtPath, cleanup: null };
+      if (err && typeof err === "object") (err as any).candidateWorktreeCleanup = thrownCleanup;
+      throw err;
+    } finally {
+      if (created && !keepWorktree) {
+        const outcome = await cleanupNow();
+        if (thrownCleanup) thrownCleanup.cleanup = outcome;
+      }
     }
-    return { ok: true, average: measured.average, wtPath };
   };
 
   /**
@@ -201,10 +234,17 @@ export function createCandidateBranchTool(deps: CandidateBranchToolDeps): Candid
     // tool reply by minutes when git itself is wedged — a leftover is the
     // safer outcome, it is surfaced in the reply and by candidate_branch status.
     let r = { code: 1, stdout: "", stderr: "" };
+    const tryRemove = async (args: string[]): Promise<{ code: number; stdout: string; stderr: string }> => {
+      try {
+        return await candidateGitExec("git", ["worktree", "remove", ...args, wtPath], { cwd: workDir, timeout: 3000 });
+      } catch (err) {
+        return { code: 1, stdout: "", stderr: err instanceof Error ? err.message : String(err) };
+      }
+    };
     for (let attempt = 0; attempt < 4; attempt++) {
-      r = await candidateGitExec("git", ["worktree", "remove", wtPath], { cwd: workDir, timeout: 3000 });
+      r = await tryRemove([]);
       if (r.code === 0) break;
-      r = await candidateGitExec("git", ["worktree", "remove", "--force", wtPath], { cwd: workDir, timeout: 3000 });
+      r = await tryRemove(["--force"]);
       if (r.code === 0) break;
       await new Promise((res) => setTimeout(res, 250));
     }
@@ -212,12 +252,13 @@ export function createCandidateBranchTool(deps: CandidateBranchToolDeps): Candid
       // Never fail the confirm for cleanup; remember the leftover for status.
       const message = `git worktree remove failed (code ${r.code}): ${(r.stderr || r.stdout || "").trim().split("\n")[0] || "no output"}`;
       runtime.candidateLeftovers = runtime.candidateLeftovers ?? [];
-      if (!runtime.candidateLeftovers.includes(wtPath)) runtime.candidateLeftovers.push(wtPath);
+      const samePath = (p: string) => canonicalWorktreePath(p) === canonicalWorktreePath(wtPath);
+      if (!runtime.candidateLeftovers.some(samePath)) runtime.candidateLeftovers.push(wtPath);
       return { removed: false, message };
     }
-    // Success clears any stale memory of this path.
+    // Success clears any stale memory of this path (separators/case may differ).
     if (runtime.candidateLeftovers) {
-      runtime.candidateLeftovers = runtime.candidateLeftovers.filter((p) => p !== wtPath);
+      runtime.candidateLeftovers = runtime.candidateLeftovers.filter((p) => canonicalWorktreePath(p) !== canonicalWorktreePath(wtPath));
     }
     return { removed: true };
   };

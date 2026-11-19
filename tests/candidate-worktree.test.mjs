@@ -31,6 +31,7 @@ import {
   candidateRefFor,
   CANDIDATE_REF_PREFIX,
 } from "../extensions/pi-autoresearch/candidate-worktree.ts";
+import { canonicalWorktreePath } from "../extensions/pi-autoresearch/candidate-campaign.ts";
 
 // ─── Node exec implementation of ExecFn (no shell) ──────────────────────────
 
@@ -181,6 +182,21 @@ async function makeCampaignWithWorktree(label) {
 }
 
 // ═══ validateAllowedFilePaths / candidate ids ═══════════════════════════════
+
+test("tj0.6: canonicalWorktreePath unifies worktree path separators and case", () => {
+  assert.equal(
+    canonicalWorktreePath("C:\\Users\\Pi\\pi-ar-candidate\\tmp-confirm-Leader-A"),
+    canonicalWorktreePath("c:/users/pi/pi-ar-candidate/tmp-confirm-leader-a"),
+  );
+  assert.equal(
+    canonicalWorktreePath("D:/tmp/pi-ar-candidate/key\\tmp-confirm-cand-B"),
+    canonicalWorktreePath("d:\\tmp\\pi-ar-candidate\\key\\tmp-confirm-cand-b"),
+  );
+  assert.notEqual(
+    canonicalWorktreePath("D:/tmp/pi-ar-candidate/key/tmp-confirm-a"),
+    canonicalWorktreePath("D:/tmp/pi-ar-candidate/other/tmp-confirm-a"),
+  );
+});
 
 test("validateAllowedFilePaths accepts relative paths and normalizes backslashes", () => {
   const r = validateAllowedFilePaths(["src/a.ts", "src\\b.ts", "plain.txt"]);
