@@ -41,7 +41,8 @@ async function load(dir, label, commandArgs) {
   autoresearchExtension(pi);
   await command("autoresearch").handler(commandArgs, ctx);
   const mod = await import(pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")).href);
-  return { pi, tool, command, hook, ctx, dir, closeStaleCampaign: mod.closeStaleCampaign };
+  // bd tj0.10: bind the module accessor to THIS extension instance.
+  return { pi, tool, command, hook, ctx, dir, closeStaleCampaign: (campaignDir) => mod.closeStaleCampaign(campaignDir, pi) };
 }
 function call(h, name, params) { return h.tool(name).execute("tool-call-id", params, null, null, h.ctx); }
 function textOf(res) { return res?.content?.[0]?.text ?? ""; }

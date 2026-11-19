@@ -34,6 +34,7 @@ import {
 import { readObservations, type ObservationRecord } from "./research-observations.ts";
 import { journalTarget } from "./research-journal.ts";
 import type { ModeTransition } from "./index.ts";
+import { readGetterDeps } from "./run-experiment-tool.ts";
 
 type LogExperimentTool = Parameters<ExtensionAPI["registerTool"]>[0];
 type LogDetails = {
@@ -45,34 +46,35 @@ type LogDetails = {
 
 const autoresearchJsonlPath = (dir: string) => sessionFilePath(dir, "log");
 
-/** Extension-local collaborators injected by index.ts. */
+/** Extension-local collaborators injected by index.ts. Every field is a thunk:
+ *  a collaborator is read when the tool is called, never frozen at creation. */
 export interface LogExperimentToolDeps {
-  pi: ExtensionAPI;
-  LogParams: any;
-  ACTIVITY_TYPES: readonly string[];
-  assertModeActive: (ctx: ExtensionContext) => { content: { type: "text"; text: string }[] } | undefined;
-  buildSessionSnapshot: (state: ExperimentState) => unknown;
-  broadcastDashboardUpdate: (workDir: string) => void;
-  campaignBlockedResponse: () => { content: { type: "text"; text: string }[]; details: Record<string, unknown> };
-  campaignBlocksOrdinaryLoop: (workDir: string) => Promise<boolean>;
-  cloneExperimentState: (state: ExperimentState) => ExperimentState;
-  computeConfidence: (results: ExperimentResult[], segment: number, direction: "lower" | "higher", epoch?: number) => number | null;
-  execBashScript: (args: string[], opts?: Record<string, unknown>) => Promise<unknown>;
-  finalizeExistingNode: (execFn: unknown, workDir: string, nodeId: string, experiment: ExperimentResult, asi: ASI | null) => Promise<string | null>;
-  fireHook: (payload: unknown, ctx?: unknown) => Promise<string | null>;
-  getRuntime: (ctx: ExtensionContext) => any;
-  optimizeNotStartedGate: (ctx: ExtensionContext) => unknown;
-  overlayTui: { requestRender: () => void } | null;
-  readLedgerMaxRun: (workDir: string) => number;
-  recordAutoresearchActivation: (workDir: string, active: boolean) => void;
-  recordTreeNode: (execFn: unknown, workDir: string, payload: unknown) => Promise<string | null>;
-  researchBlockedResponse: () => { content: { type: "text"; text: string }[]; details: Record<string, unknown> };
-  researchBlocksOrdinaryLoop: (workDir: string, ctx?: ExtensionContext) => Promise<boolean>;
-  resolveWorkDir: (cwd: string) => string;
-  runLinkNotConsumedWarning: (runtime: any) => string;
-  transitionAutoresearchMode: (ctx: ExtensionContext, next: ModeTransition) => void;
-  updateWidget: (ctx: ExtensionContext) => void;
-  validateWorkDir: (cwd: string) => string | null;
+  pi: () => ExtensionAPI;
+  LogParams: () => any;
+  ACTIVITY_TYPES: () => readonly string[];
+  assertModeActive: () => (ctx: ExtensionContext) => { content: { type: "text"; text: string }[] } | undefined;
+  buildSessionSnapshot: () => (state: ExperimentState) => unknown;
+  broadcastDashboardUpdate: () => (workDir: string) => void;
+  campaignBlockedResponse: () => () => { content: { type: "text"; text: string }[]; details: Record<string, unknown> };
+  campaignBlocksOrdinaryLoop: () => (workDir: string) => Promise<boolean>;
+  cloneExperimentState: () => (state: ExperimentState) => ExperimentState;
+  computeConfidence: () => (results: ExperimentResult[], segment: number, direction: "lower" | "higher", epoch?: number) => number | null;
+  execBashScript: () => (args: string[], opts?: Record<string, unknown>) => Promise<unknown>;
+  finalizeExistingNode: () => (execFn: unknown, workDir: string, nodeId: string, experiment: ExperimentResult, asi: ASI | null) => Promise<string | null>;
+  fireHook: () => (payload: unknown, ctx?: unknown) => Promise<string | null>;
+  getRuntime: () => (ctx: ExtensionContext) => any;
+  optimizeNotStartedGate: () => (ctx: ExtensionContext) => unknown;
+  overlayTui: () => { requestRender: () => void } | null;
+  readLedgerMaxRun: () => (workDir: string) => number;
+  recordAutoresearchActivation: () => (workDir: string, active: boolean) => void;
+  recordTreeNode: () => (execFn: unknown, workDir: string, payload: unknown) => Promise<string | null>;
+  researchBlockedResponse: () => () => { content: { type: "text"; text: string }[]; details: Record<string, unknown> };
+  researchBlocksOrdinaryLoop: () => (workDir: string, ctx?: ExtensionContext) => Promise<boolean>;
+  resolveWorkDir: () => (cwd: string) => string;
+  runLinkNotConsumedWarning: () => (runtime: any) => string;
+  transitionAutoresearchMode: () => (ctx: ExtensionContext, next: ModeTransition) => void;
+  updateWidget: () => (ctx: ExtensionContext) => void;
+  validateWorkDir: () => (cwd: string) => string | null;
 }
 
   // =======================================================================
@@ -364,7 +366,8 @@ export interface LogExperimentToolDeps {
 
 
 export function createLogExperimentTool(deps: LogExperimentToolDeps): LogExperimentTool {
-  const { LogParams } = deps;
+  // Only the schema is read at construction; all collaborators stay late-bound.
+  const LogParams = deps.LogParams();
 
   return {
     name: "log_experiment",
@@ -386,8 +389,8 @@ export function createLogExperimentTool(deps: LogExperimentToolDeps): LogExperim
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const {
-        pi, ACTIVITY_TYPES, assertModeActive, buildSessionSnapshot, broadcastDashboardUpdate, campaignBlockedResponse, campaignBlocksOrdinaryLoop, cloneExperimentState, computeConfidence, execBashScript, finalizeExistingNode, fireHook, getRuntime, optimizeNotStartedGate, overlayTui, readLedgerMaxRun, recordAutoresearchActivation, recordTreeNode, researchBlockedResponse, researchBlocksOrdinaryLoop, resolveWorkDir, runLinkNotConsumedWarning, transitionAutoresearchMode, updateWidget, validateWorkDir,
-      } = deps;
+        pi, ACTIVITY_TYPES, assertModeActive, buildSessionSnapshot, broadcastDashboardUpdate, campaignBlockedResponse, campaignBlocksOrdinaryLoop, cloneExperimentState, computeConfidence, execBashScript, finalizeExistingNode, fireHook, getRuntime, optimizeNotStartedGate, readLedgerMaxRun, recordAutoresearchActivation, recordTreeNode, researchBlockedResponse, researchBlocksOrdinaryLoop, resolveWorkDir, runLinkNotConsumedWarning, transitionAutoresearchMode, updateWidget, validateWorkDir,
+      } = readGetterDeps(deps);
       const modeGate = assertModeActive(ctx);
       if (modeGate) return modeGate;
       // Candidate-branch campaign guard (tasks 3.2): before any side effect.
@@ -1024,7 +1027,7 @@ export function createLogExperimentTool(deps: LogExperimentToolDeps): LogExperim
       if (!modeTransitioned) updateWidget(ctx);
 
       // Refresh fullscreen overlay if open
-      if (overlayTui) overlayTui.requestRender();
+      deps.overlayTui()?.requestRender();
 
       return {
         content: [{ type: "text", text }],

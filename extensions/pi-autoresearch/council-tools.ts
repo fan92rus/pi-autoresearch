@@ -165,10 +165,12 @@ export interface HypothesisVerdict {
   by: string; // speaker name
 }
 
-const VERDICT_RE = /^VERDICT\s+(H-[A-Za-z]\d+)\s*:\s*(accept|reject|refine)\b\s*(?:—|--|-)?\s*(.*)/gim;
+const VERDICT_RE = /^VERDICT\s+(H-[A-Za-z]\d+)\s*:\s*(accept|reject|refine)\b[ \t]*(?:—|--|-)?[ \t]*([^\r\n]*)/gim;
 const HYP_RE = /^#{2,4}\s*(H-[A-Za-z]\d+)\s*[:—-]\s*(.*)/gm;
 
-/** Collect all VERDICT lines from a challenge entry body. */
+/** Collect all VERDICT lines from a challenge entry body. This is the shared
+ *  parser body: council-delegation.ts re-exports it behind its narrower
+ *  VerdictRecord facade (bd tj0.10), so both callers use one grammar. */
 export function parseVerdicts(content: string, by: string): HypothesisVerdict[] {
   const out: HypothesisVerdict[] = [];
   for (const m of content.matchAll(VERDICT_RE)) {

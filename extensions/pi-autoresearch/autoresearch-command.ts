@@ -33,7 +33,6 @@ export const RESEARCH_KICKOFF_NOTICE = "Research campaign active — continue it
 
 /** Extension-local collaborators injected by index.ts (getter-backed there). */
 export interface AutoresearchCommandDeps {
-  pi: ExtensionAPI;
   BENCHMARK_GUARDRAIL: string;
   acceptLaunchCharter: (ctx: ExtensionContext, workDir: string, charterPath: string) => Promise<{ sha256: string; charter: any } | null>;
   buildSessionSnapshot: (state: any) => any;

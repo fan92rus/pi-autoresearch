@@ -1167,6 +1167,11 @@ async function approvedBriefGuard(dir: string): Promise<Refusal | null> {
  * recovery). The model cannot clear the marker itself: it must go through the
  * tool layer, which asks the human via a dialog and passes the explicit
  * operator token here. The lock is respected; a missing marker is a refusal.
+ *
+ * bd tj0.10: deliberately NOT merged with candidateState.manualResolvePendingOp —
+ * research campaigns require `<workDir>/.auto/research/<id>` containment, have
+ * their own refusal strings and report that the marker is cleared. Both contracts
+ * are pinned in tests/di-contracts.test.mjs.
  */
 export async function manualResolvePendingOp(dir: string, confirmation: string): Promise<Result<{ message: string }>> {
   const contained = requireCampaignContained(dir);

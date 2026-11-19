@@ -15,6 +15,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { resumeSupplementLines } from "./council.ts";
+import { parseVerdicts as parseBlackboardVerdicts } from "./council-tools.ts";
 
 // ─── Minimal structural types (no pi-coding-agent import — keeps council.ts's no-pi rule) ───
 
@@ -173,14 +174,17 @@ export function parseHyps(text: string): Array<{ id: string; title: string }> {
   return out;
 }
 
+/** Delegation-facing shape: only id/verdict/speaker are consumed by the council
+ *  tally. The parsing body is shared with the blackboard facade below (same
+ *  VERDICT grammar and case handling); only the projection differs, by design:
+ *  council-tools' HypothesisVerdict additionally carries reason/by.
+ *  bd tj0.10 — one parser, two typed facades, no behavior change. */
 export function parseVerdicts(text: string, speaker: string): VerdictRecord[] {
-  const out: VerdictRecord[] = [];
-  const re = /^VERDICT\s+(H-[A-Za-z]\d+)\s*:\s*(accept|reject|refine)\b/gim;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(String(text || ""))) !== null) {
-    out.push({ id: m[1].toUpperCase(), verdict: m[2].toLowerCase() as VerdictRecord["verdict"], speaker });
-  }
-  return out;
+  return parseBlackboardVerdicts(text, speaker).map(({ hypothesisId, verdict }) => ({
+    id: hypothesisId,
+    verdict,
+    speaker,
+  }));
 }
 
 // ─── Child task builders (ported verbatim; brief/note interpolated) ───

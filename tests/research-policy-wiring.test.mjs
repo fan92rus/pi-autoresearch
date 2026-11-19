@@ -107,8 +107,8 @@ test("blocking ids: only a READY stopped campaign counts as finished", async () 
   for (const row of MATRIX) {
     const base = workDir(`blocking-${row.kind}`);
     writeCampaign(base, row.kind);
-    await load(base, `blocking-${row.kind}`);
-    const ids = await blockingCampaignIdsForTest([base]);
+    const h = await load(base, `blocking-${row.kind}`);
+    const ids = await blockingCampaignIdsForTest([base], h.pi);
     assert.deepEqual(ids, row.kind === "stopped" ? [] : [ID], `${row.kind}: blocking ids`);
 
     const insp = await inspectCampaign(path.join(researchRoot(base), ID));
@@ -122,8 +122,8 @@ test("archive: only a readable, pending-free stopped campaign is moved", async (
   for (const row of MATRIX) {
     const base = workDir(`archive-${row.kind}`);
     const dir = writeCampaign(base, row.kind);
-    await load(base, `archive-${row.kind}`);
-    const archived = await archiveFinishedCampaignsForTest(base, base, undefined);
+    const h = await load(base, `archive-${row.kind}`);
+    const archived = await archiveFinishedCampaignsForTest(base, base, undefined, undefined, h.pi);
     if (row.kind === "stopped") {
       assert.equal(archived?.length, 1, `${row.kind}: archived`);
       assert.ok(archivedNames(base).some((n) => n.startsWith(`${ID}-`)));
@@ -242,7 +242,7 @@ test("report: a benign campaign sorting before a stopped pending campaign cannot
   writeCampaign(dir, "briefing", "aaa-briefing");
   writeCampaign(dir, "pending_op", "zzz-stopped");
 
-  const outcome = await archiveOutcomeForTest(dir, dir, h.ctx, { includeChainCampaigns: true });
+  const outcome = await archiveOutcomeForTest(dir, dir, h.ctx, { includeChainCampaigns: true }, h.pi);
   assert.deepEqual(outcome, { ok: false, reason: "pending_op" }, `mixed archive reason: ${JSON.stringify(outcome)}`);
 
   const out = textOf(await call(h, "research", { action: "report" }));

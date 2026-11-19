@@ -50,39 +50,53 @@ interface RunDetails {
   metricUnit: string;
 }
 
-/** Extension-local collaborators injected by index.ts. */
+/** Extension-local collaborators injected by index.ts. Every field is a thunk:
+ *  a collaborator is read when the tool is called, never frozen at creation. */
 export interface RunExperimentToolDeps {
-  EXPERIMENT_MAX_BYTES: number;
-  EXPERIMENT_MAX_LINES: number;
-  RunParams: any;
-  assertModeActive: (ctx: ExtensionContext) => any;
-  autoresearchChecksPath: (dir: string) => string;
-  autoresearchJsonlPath: (dir: string) => string;
-  autoresearchScriptPath: (dir: string) => string;
-  campaignBlockedResponse: () => any;
-  campaignBlocksOrdinaryLoop: (workDir: string) => Promise<boolean>;
-  execBashScript: (args: string[], opts?: Record<string, unknown>) => Promise<any>;
-  formatElapsed: (ms: number) => string;
-  getRuntime: (ctx: ExtensionContext) => any;
-  isAutoresearchShCommand: (command: string) => boolean;
-  optimizeNotStartedGate: (ctx: ExtensionContext) => any;
-  overlayTui: { requestRender: () => void } | null;
-  parseMetricLines: (output: string) => Map<string, number>;
-  readExperimentMaxMinutes: (cwd: string) => number | null;
-  readLedgerMaxRun: (workDir: string) => number;
-  readRunAnalysisConfig: (workDir: string) => any;
-  researchBlockedResponse: () => any;
-  researchBlocksOrdinaryLoop: (workDir: string, ctx?: ExtensionContext) => Promise<boolean>;
-  resolveWorkDir: (cwd: string) => string;
-  tryBeginRunIdentity: (runtime: any, run: number | null, prefix: any) => string | null;
-  tryRecordPendingMarker: (runtime: any, kind: "started" | "result", executionId: string, line: string | null) => void;
-  updateWidget: (ctx: ExtensionContext) => void;
-  validateWorkDir: (cwd: string) => string | null;
-  writeRunStartedMarkerWithPrefix: (autoDir: string, jsonlPath: string, buildLine: () => string) => Promise<{ prefix: any; line: string }>;
+  EXPERIMENT_MAX_BYTES: () => number;
+  EXPERIMENT_MAX_LINES: () => number;
+  RunParams: () => any;
+  assertModeActive: () => (ctx: ExtensionContext) => any;
+  autoresearchChecksPath: () => (dir: string) => string;
+  autoresearchJsonlPath: () => (dir: string) => string;
+  autoresearchScriptPath: () => (dir: string) => string;
+  campaignBlockedResponse: () => () => any;
+  campaignBlocksOrdinaryLoop: () => (workDir: string) => Promise<boolean>;
+  execBashScript: () => (args: string[], opts?: Record<string, unknown>) => Promise<any>;
+  formatElapsed: () => (ms: number) => string;
+  getRuntime: () => (ctx: ExtensionContext) => any;
+  isAutoresearchShCommand: () => (command: string) => boolean;
+  optimizeNotStartedGate: () => (ctx: ExtensionContext) => any;
+  overlayTui: () => { requestRender: () => void } | null;
+  parseMetricLines: () => (output: string) => Map<string, number>;
+  readExperimentMaxMinutes: () => (cwd: string) => number | null;
+  readLedgerMaxRun: () => (workDir: string) => number;
+  readRunAnalysisConfig: () => (workDir: string) => any;
+  researchBlockedResponse: () => () => any;
+  researchBlocksOrdinaryLoop: () => (workDir: string, ctx?: ExtensionContext) => Promise<boolean>;
+  resolveWorkDir: () => (cwd: string) => string;
+  tryBeginRunIdentity: () => (runtime: any, run: number | null, prefix: any) => string | null;
+  tryRecordPendingMarker: () => (runtime: any, kind: "started" | "result", executionId: string, line: string | null) => void;
+  updateWidget: () => (ctx: ExtensionContext) => void;
+  validateWorkDir: () => (cwd: string) => string | null;
+  writeRunStartedMarkerWithPrefix: () => (autoDir: string, jsonlPath: string, buildLine: () => string) => Promise<{ prefix: any; line: string }>;
+}
+
+/** Resolve thunks once at the call boundary; the result is scoped to that call. */
+export function readGetterDeps<T extends Record<string, () => any>>(deps: T): { [K in keyof T]: ReturnType<T[K]> } {
+  const out = {} as { [K in keyof T]: ReturnType<T[K]> };
+  for (const key of Object.keys(deps) as (keyof T)[]) {
+    (out as Record<string, unknown>)[String(key)] = deps[key]();
+  }
+  return out;
 }
 
 export function createRunExperimentTool(deps: RunExperimentToolDeps): RunExperimentTool {
-  const { EXPERIMENT_MAX_LINES, EXPERIMENT_MAX_BYTES, RunParams } = deps;
+  // Only schema constants are read at construction: late-declared collaborators
+  // are getters that must not be called before the extension body finishes.
+  const EXPERIMENT_MAX_LINES = deps.EXPERIMENT_MAX_LINES();
+  const EXPERIMENT_MAX_BYTES = deps.EXPERIMENT_MAX_BYTES();
+  const RunParams = deps.RunParams();
   return {
     name: "run_experiment",
     label: "Run Experiment",
@@ -110,7 +124,7 @@ export function createRunExperimentTool(deps: RunExperimentToolDeps): RunExperim
         autoresearchChecksPath, writeRunStartedMarkerWithPrefix,
         tryBeginRunIdentity, tryRecordPendingMarker, parseMetricLines,
         formatElapsed, readRunAnalysisConfig,
-      } = deps;
+      } = readGetterDeps(deps);
       const modeGate = assertModeActive(ctx);
       if (modeGate) return modeGate;
       // Candidate-branch campaign guard (tasks 3.2): an active campaign blocks
@@ -394,7 +408,7 @@ export function createRunExperimentTool(deps: RunExperimentToolDeps): RunExperim
       // mid-benchmark, reconstructState sees a run_started without a matching
       // run_result and marks the hypothesis node crashed.
       updateWidget(ctx);
-      if (deps.overlayTui) deps.overlayTui.requestRender();
+      deps.overlayTui()?.requestRender();
 
       const t0 = Date.now();
 
@@ -550,7 +564,7 @@ export function createRunExperimentTool(deps: RunExperimentToolDeps): RunExperim
         }
         runtime.runningExperiment = null;
         updateWidget(ctx);
-        if (deps.overlayTui) deps.overlayTui.requestRender();
+        deps.overlayTui()?.requestRender();
       });
 
       const durationSeconds = (Date.now() - t0) / 1000;

@@ -922,6 +922,11 @@ export async function manualClearLock(dir: string, confirmation: string): Promis
 /**
  * Clears the pending-operation marker after an operator has checked Git refs
  * and worktrees by hand. The state file is left exactly as last written.
+ *
+ * bd tj0.10: deliberately NOT merged with researchState.manualResolvePendingOp —
+ * this one operates on a candidate worktree (no research-root containment),
+ * uses candidate-state's token wording/refusals and reports that state.json was
+ * left as last written. Both contracts are pinned in tests/di-contracts.test.mjs.
  */
 export async function manualResolvePendingOp(dir: string, confirmation: string): Promise<ManualOk | Refusal> {
   const tokenError = requireOperatorToken(confirmation);
