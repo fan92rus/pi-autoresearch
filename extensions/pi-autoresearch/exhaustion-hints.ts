@@ -538,12 +538,13 @@ interface LogRowContext {
 
 /**
  * Segment and configuration header of every run row (mirrors reconstructJsonlState in
- * jsonl.ts: a config header after the first run starts a new segment). Keyed by line index.
+ * jsonl.ts: a config header after a run in THIS segment starts a new segment). Keyed by line index.
+ * Exported for the segment-wiring regression test; no side effects.
  */
-function scanLogContexts(text: string): Map<number, LogRowContext> {
+export function scanLogContexts(text: string): Map<number, LogRowContext> {
   const contexts = new Map<number, LogRowContext>();
   let segment = 0;
-  let runsSeen = 0;
+  let runsInSegment = 0;
   let metricName: string | null = null;
   let bestDirection: "lower" | "higher" | null = null;
   let index = 0;
@@ -552,13 +553,15 @@ function scanLogContexts(text: string): Map<number, LogRowContext> {
       const entry = parseJsonlEntry(line);
       if (entry !== null) {
         if (entry.type === "config") {
-          // bd lrx.1: shared rule with reconstructJsonlState — only a header
-          // after runs in THIS segment starts a new segment.
-          segment = advanceSegment(segment, runsSeen > 0);
+          // bd lrx.1 / tj0.9: shared rule with reconstructJsonlState — only a
+          // header after a run in THIS segment starts a new segment. The
+          // counter resets here; the cumulative ledger rows are untouched.
+          segment = advanceSegment(segment, runsInSegment > 0);
+          runsInSegment = 0;
           metricName = typeof entry.metricName === "string" && entry.metricName !== "" ? entry.metricName : null;
           bestDirection = entry.bestDirection === "higher" || entry.bestDirection === "lower" ? entry.bestDirection : null;
         } else if (typeof entry.run === "number") {
-          runsSeen++;
+          runsInSegment++;
           contexts.set(index, { segment, metricName, bestDirection });
         }
       }

@@ -1040,7 +1040,8 @@ export function composeFacilitatorMessage(input: FacilitatorInput): string {
          "that is expected and fine), then run them through the normal loop: run_experiment → log_experiment with ASI " +
          "(finding / do_not_retry). The benchmark decides — a council opinion is not evidence."]),
     "",
-    `Budget note: councils are unlimited by default — a long campaign may convene as many as stagnation demands. ` +
-      `Set council.max_councils in .auto/config.json to cap them. A keep from this slate resets the stagnation clock.`,
+    `Budget note: automatic stagnation councils are unlimited by default — a long campaign may convene as many as stagnation demands. ` +
+      `council.max_councils in .auto/config.json caps ONLY the automatic stagnation trigger; it never caps a manual council_convene ` +
+      `(the owner may convene on demand). A keep from this slate resets the stagnation clock.`,
   ].join("\n");
 }

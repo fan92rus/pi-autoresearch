@@ -129,10 +129,11 @@ function updateConfig(state: ReconstructedJsonlState, entry: AutoresearchConfigE
   state.bestDirection = directionFrom(entry.bestDirection);
 }
 
-function nextSegment(state: ReconstructedJsonlState, segment: number): number {
-  if (state.results.length === 0) return segment;
+/** Runs since the last header — cumulative `state.results` must not count toward this split. */
+function nextSegment(state: ReconstructedJsonlState, segment: number, runsInSegment: number): number {
+  if (runsInSegment === 0) return segment;
   state.secondaryMetrics = [];
-  return advanceSegment(segment, state.results.length > 0);
+  return advanceSegment(segment, true);
 }
 
 function observeEpoch(state: ReconstructedJsonlState, entry: JsonlEntry): void {
@@ -199,6 +200,7 @@ export function extractAutoresearchSessionName(jsonlContent: string): string {
 export function reconstructJsonlState(jsonlContent: string): ReconstructedJsonlState {
   const state = reconstructedState();
   let segment = 0;
+  let runsInSegment = 0;
 
   for (const line of nonEmptyLines(jsonlContent)) {
     const entry = parseJsonlEntry(line);
@@ -212,7 +214,8 @@ export function reconstructJsonlState(jsonlContent: string): ReconstructedJsonlS
       // header-less ledger, not a re-init: its runs must stay in the
       // current segment instead of being orphaned into an empty old one.
       if (!firstHeader) {
-        segment = nextSegment(state, segment);
+        segment = nextSegment(state, segment, runsInSegment);
+        runsInSegment = 0;
       }
       state.currentSegment = segment;
       continue;
@@ -241,6 +244,7 @@ export function reconstructJsonlState(jsonlContent: string): ReconstructedJsonlS
 
     const run = runFrom(entry, segment);
     state.results.push(run);
+    runsInSegment++;
     observeEpoch(state, entry);
     registerSecondaryMetrics(state, run.metrics);
   }
