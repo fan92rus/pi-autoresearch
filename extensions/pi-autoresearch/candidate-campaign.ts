@@ -525,6 +525,26 @@ export async function executeCandidateBranchAction(params: any, ctx: any, workDi
           }
         };
         const opRes = await candidateState.beginOperation(campDir, `confirm ${active.id}`, async () => {
+          // bd tj0.7: the captures above happened before beginOperation took
+          // the campaign lock. Re-read all three preconditions here, before
+          // measuring or promoting, so a concurrent promotion or a change of
+          // measurement scale / methodology cannot make the two sides
+          // incomparable. CleanRefusal clears the marker: nothing was started.
+          const lockedLeader = await fullShaOf(workDir, LEADER_REF);
+          const lockedEpoch = String(measurementScaleStatusOfDir(workDir).epoch);
+          const lockedMethodology = await hashMethodologyAtCommit(workDir, cpSha, policy);
+          const changed: string[] = [];
+          if (lockedLeader !== expectedLeader) changed.push("leader ref");
+          if (lockedEpoch !== epoch) changed.push("measurement epoch");
+          const methodologyUnchanged = lockedMethodology.ok
+            && lockedMethodology.hashes.length === currentMethodology.hashes.length
+            && lockedMethodology.hashes.every((h, i) =>
+              h.path === currentMethodology.hashes[i].path && h.sha256 === currentMethodology.hashes[i].sha256);
+          if (!methodologyUnchanged) changed.push("methodology hashes");
+          if (changed.length > 0) {
+            throw new candidateState.CleanRefusal("preconditions_changed" as any,
+              `confirm preconditions changed before the locked operation (${changed.join(", ")}); nothing was promoted`);
+          }
           const leaderSide = await measureSide("leader", expectedLeader);
           if (!leaderSide.ok) {
             noteSideCleanup(leaderSide.wtPath, leaderSide.cleanup);
