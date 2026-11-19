@@ -603,7 +603,23 @@ export function createExpeditionBriefTool(deps: BriefToolsDeps): BriefTool {
           r = await mark(`direction_opened:${i}`, () => add("direction_opened", {dir:d.name,why:d.why}));
           if (!r.ok) return reply(`${r.reason}: ${r.message}`, r.reason);
         }
-        const campaign = await mark("campaign_created", () => researchState.createCampaign(workDir, id));
+        // A journal-write failure after createCampaign leaves a valid empty
+        // campaign but no `campaign_created` step. Reconcile that exact state
+        // on retry instead of failing forever with campaign_exists.
+        const createOrReconcileCampaign = async (): Promise<StepResult> => {
+          const created = await researchState.createCampaign(workDir, id);
+          if (created.ok) return created;
+          if (created.reason !== "campaign_exists") return created;
+          const resolved = researchState.resolveCampaignDir(workDir, id);
+          if (!resolved.ok) return created;
+          const existing = await researchState.readState(resolved.dir);
+          if (!existing.ok) return created;
+          if (existing.state.campaign_id !== id || existing.state.phase !== "briefing") return created;
+          if (fs.existsSync(path.join(resolved.dir, researchState.BRIEF_FILE)) ||
+              fs.existsSync(path.join(resolved.dir, researchState.APPROVAL_FILE))) return created;
+          return { ok: true };
+        };
+        const campaign = await mark("campaign_created", createOrReconcileCampaign);
         if (!campaign.ok) return reply(`${campaign.reason}: ${campaign.message}`, campaign.reason);
         const resolvedCampaign = researchState.resolveCampaignDir(workDir, id);
         if (!resolvedCampaign.ok) return reply(`${resolvedCampaign.reason}: ${resolvedCampaign.message}`, resolvedCampaign.reason);

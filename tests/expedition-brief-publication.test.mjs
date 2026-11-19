@@ -111,6 +111,34 @@ test("partial publication resumes from the journal with the same expedition id",
   assert.deepEqual(chainIds(c.dir), [journal.chain_id]);
 });
 
+test("partial publication reconciles a campaign created just before a journal-write failure", async () => {
+  const c = container(); c.makeWork();
+  const h = await harness(c.dir, true);
+  assert.match(text(await draft(h)), /draft saved/i);
+  const blocker = path.join(c.dir, ".auto", "research");
+  fs.writeFileSync(blocker, "blocked");
+  assert.match(text(await propose(h)), /io_failed/);
+  const journal = JSON.parse(fs.readFileSync(journalPath(c.dir), "utf8"));
+  fs.unlinkSync(blocker);
+  // Simulate the exact partial state: createCampaign succeeded on disk, but
+  // the publication journal write failed before recording campaign_created.
+  fs.mkdirSync(path.join(c.dir, ".auto", "research", journal.id), { recursive: true });
+  fs.writeFileSync(
+    path.join(c.dir, ".auto", "research", journal.id, "state.json"),
+    JSON.stringify({ schema_version: 1, campaign_id: journal.id, created_at: new Date().toISOString(), phase: "briefing" }) + "\n",
+  );
+
+  const resumed = text(await propose(h));
+  assert.match(resumed, /RESUME/i, `retry must announce the journal resume: ${resumed}`);
+  assert.match(resumed, /created/i);
+  const complete = chainEntries(c.dir, journal.chain_id).map(e => e.type);
+  assert.equal(complete.filter(t => t === "campaign_added").length, 1, "campaign is added exactly once");
+  assert.deepEqual(chainIds(c.dir), [journal.chain_id], "still exactly one chain");
+  const kickoffCount = [resumed, ...h.pi.sentMessages.map(m => m.text)].filter(t => /expedition_map\(subaction="activate"/.test(t)).length;
+  assert.equal(kickoffCount, 1, `kickoff still once; messages=${JSON.stringify(h.pi.sentMessages.map(m => m.text))}`);
+  assert.equal(JSON.parse(fs.readFileSync(journalPath(c.dir), "utf8")).step, "complete");
+});
+
 test("an explicit doc_path with the journal digest resumes instead of publishing twice", async () => {
   const c = container(); c.makeWork();
   const h = await harness(c.dir, true);
