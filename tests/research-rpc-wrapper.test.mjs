@@ -126,7 +126,7 @@ test("modifying the brief while the dialog is pending fails closed", async () =>
 
 test("deleting the brief while the dialog is pending fails closed", async () => {
   const ctx = setup();
-  const pending = run(ctx, ["--hold-dialog-ms", "250"], "success");
+  const pending = run(ctx, ["--hold-dialog-until-absent", ctx.brief], "success");
   assert.ok(await waitForEvent(ctx, "brief_dialog_received"), "wrapper should receive the brief dialog before the hold window");
   fs.unlinkSync(ctx.brief);
   const result = await pending;
