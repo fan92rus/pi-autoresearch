@@ -217,7 +217,8 @@ export function createCouncilConveneTool(deps: CouncilConveneToolDeps): Register
     label: "Convene a hypothesis council (autonomous, blocking)",
     description:
       "Convene a stagnation council at any time, with no limits — no stagnation threshold, no cooldown, no cap " +
-      "(only council.enabled in .auto/config.json can veto). The tool itself convenes the council: spawns the " +
+      "(council.max_councils caps only the automatic stagnation trigger, never this manual tool; only council.enabled in " +
+      ".auto/config.json can veto). The tool itself convenes the council: spawns the " +
       "analysts, runs the fileless dispute and the chair, validates the slate (3–5 EXP sections, EXPECTED_GAIN >= 2x " +
       "noise floor, KILL_WHEN) and persists it to the blackboard. It BLOCKS for several minutes and returns the " +
       "finished slate. Use it when you feel stuck; your note is added to the brief the analysts read.",
