@@ -24,8 +24,10 @@ import { setTimeout as delay } from "node:timers/promises";
 
 /** Maximum record size in UTF-8 bytes, including the trailing LF. */
 export const JOURNAL_RECORD_MAX_BYTES = 16 * 1024;
-/** Retries after the first immediate lock attempt. */
+/** Retries after the first immediate lock attempt for a remote/unknown holder. */
 export const JOURNAL_LOCK_RETRY_COUNT = 40;
+/** Retries for a live same-host holder: sibling writers under heavy load need more patience. */
+export const JOURNAL_LOCK_LOCAL_RETRY_COUNT = 120;
 /** Base pause between lock attempts, outside the critical section. */
 export const JOURNAL_LOCK_RETRY_DELAY_MS = 50;
 /** A remote lock older than this is not live contention: refuse immediately. */
@@ -259,7 +261,8 @@ type AcquireOutcome =
   | { status: "failed"; message: string };
 
 async function acquireLock(target: JournalTarget, ops: ResolvedOptions): Promise<AcquireOutcome> {
-  for (let attempt = 0; attempt <= JOURNAL_LOCK_RETRY_COUNT; attempt++) {
+  let maxAttempts = JOURNAL_LOCK_RETRY_COUNT;
+  for (let attempt = 0; attempt <= maxAttempts; attempt++) {
     if (attempt > 0) {
       // Jittered backoff: equal 50 ms retries make concurrent writers wake in
       // lockstep and starve each other under load. The deterministic offset
@@ -297,6 +300,9 @@ async function acquireLock(target: JournalTarget, ops: ResolvedOptions): Promise
           }
           if (age > JOURNAL_LOCK_STALE_MS) {
             return { status: "busy", diagnostic: busyDiagnostic(target, ops, attempt + 1) };
+          }
+          if (holder.info.host === ops.host && maxAttempts < JOURNAL_LOCK_LOCAL_RETRY_COUNT) {
+            maxAttempts = JOURNAL_LOCK_LOCAL_RETRY_COUNT;
           }
         }
         continue;

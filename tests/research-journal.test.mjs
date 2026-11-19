@@ -240,6 +240,23 @@ test("an unrecognized lock file is reported as malformed and kept", async (t) =>
   assert.equal(fs.readFileSync(target.lock, "utf8"), '{"token":"zz"');
 });
 
+test("a live same-host holder gets an extended retry budget under contention", async (t) => {
+  const autoDir = makeAutoDir(t);
+  const target = journalTarget(autoDir, "observations");
+  const now = new Date();
+  writeForeignLock(target.lock, { token: "ab".repeat(16), pid: process.pid, host: os.hostname(), acquired_at: now.toISOString() });
+  let calls = 0;
+  const sleep = async () => {
+    calls++;
+    if (calls === 60) fs.unlinkSync(target.lock);
+  };
+
+  const result = await withJournalLock(target, () => "ok", { sleep, now: () => now });
+
+  assert.equal(result.status, "acquired");
+  assert.equal(calls, 60, "the 41-attempt foreign budget must not starve a live local writer");
+});
+
 test("a live foreign lock is retried with jittered pauses, then reported busy", async (t) => {
   const autoDir = makeAutoDir(t);
   const target = journalTarget(autoDir, "observations");
