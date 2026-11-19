@@ -234,7 +234,7 @@ Formula: `UCB1 = exploitation + C × √(ln(N) / (1 + children))`
 | `underexplored` | Few children relative to total experiments |
 | `neutral` | Neither particularly good nor bad |
 
-**C constant** defaults to 0.5. Configurable via `.auto/config.json` → `parallel.ucb1C`.
+**C constant** is fixed at 0.5. The former config override was removed (bd pi-autoresearch-el3.4); the `parallel` section of `.auto/config.json` is inert legacy storage.
 
 ---
 
@@ -307,7 +307,7 @@ The tree is **non-destructive** — backtracking doesn't delete old branches. Al
 - **Zero migration:** Existing sessions without `.auto/tree.json` work unchanged
 - **log.jsonl unchanged:** The flat log remains as the source of truth for the observer and dashboard
 - **tree.json is an overlay:** Created automatically on `init_experiment`, adds structure on top of the flat log
-- **BestOfN/SpaceSearch:** Not yet integrated with the tree (Phase 2). They work independently.
+- Parallel worker tools were removed (bd pi-autoresearch-el3.4); use `candidate_branch` for alternative exploration.
 
 ---
 
