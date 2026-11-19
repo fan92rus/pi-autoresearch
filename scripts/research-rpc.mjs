@@ -489,6 +489,11 @@ async function main() {
           logEvent("wrapper", { event: "dialog_refused", reason: "not_brief_confirm", id: dialogId });
           return;
         }
+        // Deterministic barrier for tests: this event is emitted before the
+        // hold window, so a test that mutates/deletes the brief can wait until
+        // the wrapper has actually received the dialog (not merely until the
+        // fake pi wrote its request to the session log).
+        logEvent("wrapper", { event: "brief_dialog_received", id: dialogId });
         if (holdDialogMs > 0) await new Promise((resolve) => setTimeout(resolve, holdDialogMs));
         if (finished) return;
         let currentFileHash;

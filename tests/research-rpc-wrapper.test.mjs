@@ -53,6 +53,15 @@ function events(ctx) {
   return fs.readFileSync(ctx.log, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
 
+async function waitForEvent(ctx, event, deadlineMs = 3_000) {
+  const deadline = Date.now() + deadlineMs;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(ctx.log) && fs.readFileSync(ctx.log, "utf8").includes(`"event":"${event}"`)) return true;
+    await delay(10);
+  }
+  return false;
+}
+
 function sentMessages(ctx) {
   return events(ctx).filter((entry) => entry.direction === "to_pi" && entry.record.type === "prompt").map((entry) => entry.record.message);
 }
@@ -107,12 +116,7 @@ test("foreign dialog hash is refused, aborts, and exits 1", async () => {
 test("modifying the brief while the dialog is pending fails closed", async () => {
   const ctx = setup();
   const pending = run(ctx, ["--hold-dialog-ms", "800"], "success");
-  const deadline = Date.now() + 3_000;
-  while (Date.now() < deadline) {
-    if (fs.existsSync(ctx.log) && fs.readFileSync(ctx.log, "utf8").includes("extension_ui_request")) break;
-    await delay(10);
-  }
-  assert.ok(fs.existsSync(ctx.log) && fs.readFileSync(ctx.log, "utf8").includes("extension_ui_request"), "fake should open propose dialog");
+  assert.ok(await waitForEvent(ctx, "brief_dialog_received"), "wrapper should receive the brief dialog before the hold window");
   fs.writeFileSync(ctx.brief, `${JSON.stringify({ schema_version: 1, goal: "modified" }, null, 2)}\n`);
   const result = await pending;
   assert.equal(result.code, 1, result.stderr);
@@ -123,12 +127,7 @@ test("modifying the brief while the dialog is pending fails closed", async () =>
 test("deleting the brief while the dialog is pending fails closed", async () => {
   const ctx = setup();
   const pending = run(ctx, ["--hold-dialog-ms", "250"], "success");
-  const deadline = Date.now() + 3_000;
-  while (Date.now() < deadline) {
-    if (fs.existsSync(ctx.log) && fs.readFileSync(ctx.log, "utf8").includes("extension_ui_request")) break;
-    await delay(10);
-  }
-  assert.ok(fs.existsSync(ctx.log) && fs.readFileSync(ctx.log, "utf8").includes("extension_ui_request"), "fake should open propose dialog");
+  assert.ok(await waitForEvent(ctx, "brief_dialog_received"), "wrapper should receive the brief dialog before the hold window");
   fs.unlinkSync(ctx.brief);
   const result = await pending;
   assert.equal(result.code, 1, result.stderr);
