@@ -40,6 +40,7 @@ E6 exit criterion: **≤ ~6,000 lines**, with no tool/hook lost (full suite gree
 | 8034912 | 6,646 | −332 | tree_status + council_convene extraction (161/E6) |
 | 6b2b990 | 6,349 | −297 | brief + research/map alias tools extraction (parallel worktree, 161/E6) |
 | de21afc | **5,722** | **−627** | autoresearch command handler extraction (161/E6) |
+| <pending> | **5,484** | **−520** | dashboard + HTTP server extraction (bd tj0.13) |
 
 ## Observations
 

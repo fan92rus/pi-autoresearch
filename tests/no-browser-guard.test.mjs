@@ -10,8 +10,26 @@ import * as path from "node:path";
  * the launcher must not be `cmd /c start` with shell:true (console window
  * flash) even when the guard is absent. */
 
-const INDEX = path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts");
 const LOADER = path.join(import.meta.dirname, "redirect-loader.mjs");
+
+/** Sources of every current extension module: index.ts plus extracted files (bd tj0.13). */
+function extensionModules() {
+  const found = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const abs = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(abs);
+      else if (entry.name.endsWith(".ts")) found.push({ file: path.basename(abs), src: fs.readFileSync(abs, "utf8") });
+    }
+  };
+  walk(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch"));
+  return found;
+}
+const moduleContaining = (needle) => {
+  const found = extensionModules().find((m) => m.src.includes(needle));
+  assert.ok(found, `expected a current module containing ${needle}`);
+  return found;
+};
 
 test("redirect-loader sets PI_AUTORESEARCH_NO_BROWSER before extension imports", () => {
   const source = fs.readFileSync(LOADER, "utf8");
@@ -30,7 +48,11 @@ test("openInBrowser honours PI_AUTORESEARCH_NO_BROWSER: no spawn at all", async 
     // the loader-driven module cache: we assert indirectly — the guard branch
     // returns before spawn, so no browser process can appear. To make the
     // assertion mechanical we check the source: the guard returns early.
-    const source = fs.readFileSync(INDEX, "utf8");
+    // openInBrowser may live in an extracted module (bd tj0.13); find its
+    // current owner across every extension source instead of pinning index.ts.
+    const owner = moduleContaining("function openInBrowser");
+    assert.equal(owner.file, "dashboard-tools.ts", "openInBrowser must live in the dashboard module");
+    const source = owner.src;
     assert.match(
       source,
       /if\s*\(process\.env\.PI_AUTORESEARCH_NO_BROWSER\)\s*return;/,
