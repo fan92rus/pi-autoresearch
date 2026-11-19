@@ -1,0 +1,3 @@
+{"task":"spec: обновить формулировку findings/spec.md об источнике строки Measurement health (measurementHealthLine) при финализации дельт","verdict":"merged","branch":"agile/spec-findings-spec-md-measurement-health","head":"aac67adbade57f6b6da5670eabbd9a3767fa7293","note":"deterministic CLI merge"}
+{"task":"dashboard: показывать строку шкалы в пустом состоянии (минор ревью 2.4)","verdict":"merged","branch":"agile/dashboard-2-4","head":"fa460146442f3c3fb089c45c4f5d5c461c1d477f","note":"deterministic CLI merge"}
+{"task":"measurement: тест на revert со ссылкой на другую СУЩЕСТВУЮЩУЮ эпоху (минор ревью s1m)","verdict":"merged","branch":"agile/measurement-revert-s1m","head":"b083d974a98b31f67cdd5e3fe1e4abf3d1f6f2ab","note":"deterministic CLI merge"}

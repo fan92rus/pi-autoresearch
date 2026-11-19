@@ -1,0 +1,1 @@
+{"task":"precedent-search: миноры ревью ozj.2.1 (глубокие листья TEXT_MAX_DEPTH=8 молча пропускаются; SIGTERM без эскалации SIGKILL на POSIX)","verdict":"merged","branch":"agile/precedent-search-ozj-2-1-text-max-depth-","head":"71024068a42f6d14e4579d35ace51c4bbce7d1a9","note":"deterministic CLI merge"}

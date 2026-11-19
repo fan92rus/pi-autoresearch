@@ -1,0 +1,172 @@
+{
+  "work": {
+    "type": "object",
+    "properties": {
+      "what_done": {
+        "type": "string"
+      },
+      "files_changed": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "verification": {
+        "type": "string"
+      },
+      "branch": {
+        "type": "string"
+      },
+      "worktree": {
+        "type": "string"
+      },
+      "completed": {
+        "type": "boolean"
+      },
+      "head": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{40}$",
+        "description": "Full 40-hex SHA of your branch HEAD after the final commit (git rev-parse HEAD)"
+      },
+      "plan_progress": {
+        "type": "string",
+        "description": "Ceremony plan completion, e.g. '4/5 done, 1 n/a'"
+      },
+      "testsAddedOrUpdated": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Test files with case counts ('<file>: <N> cases'); [] exactly when the task adds no tests"
+      },
+      "commandsRun": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "result": {
+              "type": "string",
+              "enum": [
+                "passed",
+                "failed",
+                "not-run"
+              ]
+            },
+            "summary": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command",
+            "result",
+            "summary"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "validationOutput": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": "string"
+        }
+      },
+      "residualRisks": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "noStagedFiles": {
+        "type": "boolean",
+        "description": "true only when `git status --short` is empty in your tree after the final commit"
+      },
+      "criteriaSatisfied": {
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 2,
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "enum": [
+                "criterion-1",
+                "criterion-2"
+              ]
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "satisfied"
+              ]
+            },
+            "evidence": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "status",
+            "evidence"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "required": [
+      "what_done",
+      "files_changed",
+      "verification",
+      "branch",
+      "worktree",
+      "completed",
+      "head",
+      "testsAddedOrUpdated",
+      "commandsRun",
+      "validationOutput",
+      "residualRisks",
+      "noStagedFiles",
+      "criteriaSatisfied"
+    ],
+    "additionalProperties": false
+  },
+  "merge": {
+    "type": "object",
+    "properties": {
+      "merged": {
+        "type": "boolean"
+      },
+      "checks_ok": {
+        "type": "boolean"
+      },
+      "journal_written": {
+        "type": "boolean"
+      },
+      "merge_commit": {
+        "type": "string"
+      },
+      "bd_closed": {
+        "type": "boolean"
+      },
+      "branch_deleted": {
+        "type": "boolean"
+      },
+      "note": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "merged",
+      "checks_ok",
+      "journal_written",
+      "merge_commit",
+      "note"
+    ],
+    "additionalProperties": false
+  }
+}
