@@ -284,6 +284,21 @@ function stateProblem(v: unknown): string | null {
   return null;
 }
 
+/**
+ * Synchronous whole-state validation for callers that cannot await (the
+ * ordinary-loop gates). Returns the parsed state only when it passes the
+ * SAME validation used by every state transition; anything else is null.
+ */
+export function parseValidStateSync(text: string): CampaignState | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  return stateProblem(parsed) === null ? (parsed as CampaignState) : null;
+}
+
 function findCandidate(s: CampaignState, id: string): CandidateRecord | Refusal {
   const found = s.candidates.find((c) => c.id === id);
   return found ?? refuse("unknown_candidate", `candidate ${quote(id)} does not exist`);

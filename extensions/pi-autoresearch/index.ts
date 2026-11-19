@@ -4517,6 +4517,21 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const campaignDirOf = (workDir: string): string => path.join(workDir, CANDIDATE_DIR);
 
+  /**
+   * Only a FULLY valid, disabled state (the same validator used by every
+   * candidate state transition) releases the ordinary loop. Missing, JSON-broken
+   * or schema-invalid files never count as disabled — the gates fail closed.
+   */
+  const disabledCandidateStateSync = (workDir: string): boolean => {
+    const statePath = path.join(campaignDirOf(workDir), candidateState.STATE_FILE);
+    if (!fs.existsSync(statePath)) return false;
+    try {
+      return candidateState.parseValidStateSync(fs.readFileSync(statePath, "utf8"))?.disabled === true;
+    } catch {
+      return false;
+    }
+  };
+
   /** Synchronous: usable from the resume timer. Interrupted operation present. */
   const campaignPendingOpSync = (workDir: string): boolean =>
     fs.existsSync(path.join(campaignDirOf(workDir), candidateState.PENDING_OP_FILE));
@@ -4527,15 +4542,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
    */
   const campaignActiveSync = (workDir: string): boolean => {
     const statePath = path.join(campaignDirOf(workDir), candidateState.STATE_FILE);
-    if (!fs.existsSync(statePath)) return false;
-    try {
-      const raw = JSON.parse(fs.readFileSync(statePath, "utf8"));
-      const schemaValid =
-        raw && typeof raw === "object" && raw.schema_version === 1 && Array.isArray(raw.candidates);
-      return !(schemaValid && raw.disabled === true);
-    } catch {
-      return true;
-    }
+    return fs.existsSync(statePath) && !disabledCandidateStateSync(workDir);
   };
 
   /**
@@ -4569,17 +4576,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // Fail closed (design §4): an existing but unreadable or malformed state is an
     // unclear campaign state, so the ordinary loop stays blocked until the operator
     // resolves it. Only a readable state with disabled === true lets the loop run.
-    try {
-      const raw = JSON.parse(fs.readFileSync(statePath, "utf8"));
-      // Only a schema-valid disabled state lets the loop run; a junk file with
-      // disabled:true is an unclear state and stays blocked (fail closed).
-      const schemaValid =
-        raw && typeof raw === "object" && raw.schema_version === 1 && Array.isArray(raw.candidates);
-      if (schemaValid && raw.disabled === true) return false;
-      return true;
-    } catch {
-      return true;
-    }
+    // Only a fully validated disabled state lets the loop run; a shallow or
+    // junk file with disabled:true is an unclear state and stays blocked.
+    return !disabledCandidateStateSync(workDir);
   };
 
   const campaignBlockedResponse = () => ({

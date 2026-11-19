@@ -33,9 +33,11 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
 import { createHarness } from "./fake-pi.ts";
+import { createCandidateBranchTool } from "../extensions/pi-autoresearch/candidate-branch-tool.ts";
 import { measurementScaleStatusOfDir } from "../extensions/pi-autoresearch/measurement.ts";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -236,6 +238,69 @@ async function withCorruptedWorktreeGit(wt, fn) {
     fs.unlinkSync(gitFile); // remove the garbage gitfile
     fs.renameSync(bak, gitFile);
   }
+}
+
+function ephemeralRootOf(dir) {
+  const key = createHash("sha256").update(path.resolve(dir)).digest("hex").slice(0, 16);
+  return path.join(os.tmpdir(), "pi-ar-candidate", key);
+}
+
+function tmpConfirmEntries(dir) {
+  const root = ephemeralRootOf(dir);
+  return fs.existsSync(root) ? fs.readdirSync(root).filter((n) => n.startsWith("tmp-confirm-")) : [];
+}
+
+function removeTmpConfirmWorktrees(dir) {
+  const root = ephemeralRootOf(dir);
+  for (const name of tmpConfirmEntries(dir)) {
+    const wt = path.join(root, name);
+    try { git(["worktree", "remove", "--force", wt], dir); }
+    catch { git(["worktree", "prune"], dir); fs.rmSync(wt, { recursive: true, force: true }); }
+  }
+}
+
+/** Real git exec with one deterministic interception point (failure injection). */
+function injectedGitExec(intercept) {
+  return (cmd, args, opts = {}) => new Promise((resolve) => {
+    const forced = intercept(cmd, args, opts);
+    if (forced !== undefined) { resolve(forced); return; }
+    const child = spawn(cmd, args, { cwd: opts.cwd, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => { child.kill(); resolve({ code: 124, stdout, stderr }); }, opts.timeout ?? 20000);
+    child.stdout?.on("data", (d) => { stdout += d; });
+    child.stderr?.on("data", (d) => { stderr += d; });
+    child.on("error", (err) => { clearTimeout(timer); resolve({ code: 127, stdout, stderr: stderr + String(err) }); });
+    child.on("close", (code) => { clearTimeout(timer); resolve({ code: code ?? 1, stdout, stderr }); });
+  });
+}
+
+/** candidate_branch with injected faults, executed against a real harness ctx. */
+function injectedConfirm(ctx, { measure, interceptGit } = {}) {
+  const runtimeKey = Symbol.for("pi-ar-tj06-runtime");
+  const tool = createCandidateBranchTool({
+    assertModeActive: () => null,
+    campaignDirOf: (workDir) => path.join(workDir, ".auto", "candidate"),
+    cancelSubagentDeferral: () => {},
+    getRuntime: (c) => (c[runtimeKey] ??= {}),
+    measurementScaleStatusOfDir,
+    requestCandidatePolicyConsent: async () => ({ ok: false }),
+    researchBlockedResponse: () => ({}),
+    researchBlocksOrdinaryLoop: async () => false,
+    resolveWorkDir: (cwd) => cwd,
+    validateWorkDir: () => null,
+    ...(measure ? { runRepeatedMeasurement: measure } : {}),
+    ...(interceptGit ? { candidateGitExec: injectedGitExec(interceptGit) } : {}),
+  });
+  return tool.execute("id", { action: "confirm" }, null, null, ctx);
+}
+
+async function checkpointCandidate(h, wt) {
+  writeFileSyncSafe(path.join(wt, "src", "algo.ts"), "export const a = 2;\n");
+  const cp = await callTool(h, "checkpoint", { allowed_files: ["src/algo.ts"], message: "cp" });
+  const t = textOf(cp);
+  assert.match(t, /Checkpoint saved/i, `checkpoint failed: ${t}`);
+  return t.match(/Checkpoint saved:\s*([0-9a-f]{40})/)[1];
 }
 
 async function campaignWithCandidate(label, bench = BENCH_DETERMINISTIC) {
@@ -551,9 +616,14 @@ test("junk state with disabled:true (no schema) fails closed; a schema-valid dis
   writeFileSyncSafe(statePath, JSON.stringify({ disabled: true, junk: 1 }));
   const junk = await runExp.execute("id", { command: "echo hi", timeout_seconds: 10 }, null, null, h.ctx);
   assert.equal(/candidate campaign active/i.test(textOf(junk)), true, "a non-schema disabled file must keep the loop blocked");
-  writeFileSyncSafe(statePath, JSON.stringify({ schema_version: 1, disabled: true, candidates: [] }));
+  const validState = {
+    schema_version: 1, disabled: true, created_at: new Date().toISOString(),
+    policy: { candidate_step_limit: 5, candidate_time_limit_seconds: 600 },
+    candidates: [],
+  };
+  writeFileSyncSafe(statePath, JSON.stringify(validState));
   const valid = await runExp.execute("id", { command: "echo hi", timeout_seconds: 10 }, null, null, h.ctx);
-  assert.equal(/candidate campaign active/i.test(textOf(valid)), false, "a schema-valid disabled campaign must release the loop");
+  assert.equal(/candidate campaign active/i.test(textOf(valid)), false, "a fully valid disabled campaign must release the loop");
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1256,3 +1326,95 @@ test("bd el3.2: status surfaces a tmp-confirm-* worktree registered by a previou
   const st2 = await callTool(h, "status", {});
   assert.doesNotMatch(textOf(st2), /tmp-confirm-leader-orphansim123/, "removed orphan must disappear from status");
 }, { timeout: 120000 });
+
+// ─── bd tj0.6: no ephemeral leak, no swallowed cleanup failures ─────────────
+
+test("tj0.6: an exception during confirm measurement removes the ephemeral worktree and names its path", async () => {
+  const { h, dir, wtPath: wt } = await campaignWithCandidate("tj06-throw");
+  await checkpointCandidate(h, wt);
+  const confirm = await injectedConfirm(h.ctx, {
+    measure: async () => { throw new Error("TJ06 injected measurement crash"); },
+  });
+  const t = textOf(confirm);
+  assert.match(t, /failed|error/i, `confirm must report the exception: ${t}`);
+  assert.match(t, /tmp-confirm-leader-/, `confirm must surface the ephemeral worktree path: ${t}`);
+  assert.match(t, /clean(ed)?|remov(ed|al)/i, `confirm must report the cleanup outcome: ${t}`);
+  assert.deepEqual(tmpConfirmEntries(dir), [], "no ephemeral directory may remain after a thrown measurement");
+  assert.equal(/tmp-confirm-/.test(git(["worktree", "list", "--porcelain"], dir)), false,
+    "no ephemeral worktree may remain registered after a thrown measurement");
+  assert.equal(fs.existsSync(path.join(dir, ".auto", "candidate", "pending-op.json")), true,
+    "an unexpected exception must keep the pending-op marker");
+  assert.equal(fs.existsSync(wt), true, "the live candidate worktree must survive");
+}, { timeout: 120000 });
+
+test("tj0.6: a failed cleanup after a failed measurement is surfaced with its path in the confirm reply", async () => {
+  const { h, dir, wtPath: wt } = await campaignWithCandidate("tj06-cleanup-fail");
+  await checkpointCandidate(h, wt);
+  let confirm;
+  try {
+    confirm = await injectedConfirm(h.ctx, {
+      measure: async () => ({ ok: false, reason: "exec_failed", message: "TJ06 injected measurement refusal" }),
+      interceptGit: (cmd, args) => cmd === "git" && args[0] === "worktree" && args[1] === "remove"
+        ? { code: 128, stdout: "", stderr: "TJ06 injected remove failure" }
+        : undefined,
+    });
+    const t = textOf(confirm);
+    assert.match(t, /TJ06 injected measurement refusal/, `the side failure must be reported: ${t}`);
+    assert.match(t, /cleanup failed/i, `the cleanup failure must not be swallowed: ${t}`);
+    assert.match(t, /TJ06 injected remove failure/, `the cleanup reason must be reported: ${t}`);
+    assert.match(t, /tmp-confirm-leader-/, `the leftover path must be reported: ${t}`);
+    assert.equal(/PROMOTED/i.test(t), false, "nothing may be promoted");
+    const st = await callTool(h, "status", {});
+    assert.match(textOf(st), /Ephemeral worktree leftovers/, "status must list the failed cleanup");
+  } finally {
+    removeTmpConfirmWorktrees(dir);
+  }
+}, { timeout: 120000 });
+
+test("tj0.6: run refuses a worktree with a broken .git before the benchmark is started", async () => {
+  const bench = 'require("node:fs").writeFileSync("BENCH_RAN", "1");console.log("METRIC p95_ms=100");';
+  const { h, wtPath: wt } = await campaignWithCandidate("tj06-broken-run", bench);
+  const run = await withCorruptedWorktreeGit(wt, () => callTool(h, "run", {}));
+  const t = textOf(run);
+  assert.match(t, /worktree_unreadable/, `run must fail closed on a broken worktree: ${t}`);
+  assert.equal(fs.existsSync(path.join(wt, "BENCH_RAN")), false, "the benchmark must not run in a broken worktree");
+  assert.equal(fs.existsSync(path.join(h.ctx.cwd, ".auto", "candidate", "pending-op.json")), false,
+    "a pre-measurement refusal must not leave a pending op");
+}, { timeout: 120000 });
+
+test("tj0.6: status warns explicitly when the worktree scan is unavailable", async () => {
+  const { h, dir } = await campaignWithCandidate("tj06-scan-fail");
+  const gitDir = path.join(dir, ".git");
+  const backup = path.join(dir, ".git-tj06-scan-backup");
+  fs.renameSync(gitDir, backup);
+  try {
+    const st = await callTool(h, "status", {});
+    const t = textOf(st);
+    assert.match(t, /scan unavailable/i, `status must report an unavailable scan: ${t}`);
+    assert.match(t, /leftovers may not be listed/i, `status must not imply a clean scan: ${t}`);
+    assert.doesNotMatch(t, /no leftovers/i, `status must not claim there are no leftovers: ${t}`);
+  } finally {
+    fs.renameSync(backup, gitDir);
+  }
+}, { timeout: 120000 });
+
+test("tj0.6: a disabled state that fails full validation still blocks the ordinary loop", async () => {
+  const { h, dir } = await setupRepo("tj06-invalid-disabled");
+  const runExp = h.tool("run_experiment");
+  const statePath = path.join(dir, ".auto", "candidate", "state.json");
+  writeFileSyncSafe(statePath, JSON.stringify({
+    schema_version: 1, disabled: true, created_at: new Date().toISOString(),
+    policy: { candidate_step_limit: 5, candidate_time_limit_seconds: 600 },
+    candidates: [],
+  }));
+  const valid = await runExp.execute("id", { command: "echo hi", timeout_seconds: 10 }, null, null, h.ctx);
+  assert.equal(/candidate campaign active/i.test(textOf(valid)), false, "fully valid disabled state must release the loop");
+  writeFileSyncSafe(statePath, JSON.stringify({
+    schema_version: 1, disabled: true, created_at: new Date().toISOString(),
+    policy: { candidate_step_limit: 5, candidate_time_limit_seconds: 600 },
+    candidates: [{ id: "cand-a", status: "bogus", steps_used: 0, time_used_seconds: 0, checkpoints: [], selected_checkpoint: null }],
+  }));
+  const invalid = await runExp.execute("id", { command: "echo hi", timeout_seconds: 10 }, null, null, h.ctx);
+  assert.equal(/candidate campaign active/i.test(textOf(invalid)), true,
+    "a shallow schema_version/candidates check must not release the loop on invalid state");
+}, { timeout: 60000 });

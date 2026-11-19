@@ -8,6 +8,14 @@ import { renderRefusal } from "./refusal.ts";
 import type { CandidatePolicy } from "./candidate-policy.ts";
 import type { spawn as SpawnFn } from "node:child_process";
 
+/**
+ * One canonical spelling for worktree path comparison (bd tj0.6): git and
+ * Windows disagree on separator and case. Originals are kept for display.
+ */
+export function canonicalWorktreePath(p: string): string {
+  return String(p).replace(/\\/g, "/").toLowerCase();
+}
+
 export async function executeCandidateBranchAction(params: any, ctx: any, workDir: string, deps: Record<string, any>) {
       const { campaignDirOf, fullShaOf, LEADER_REF, activeCandidateOf, getRuntime, candidateGitExec, hashMethodologyBlob, requestCandidatePolicyConsent, gitOut, candidateWtRootOf, measurementScaleStatusOfDir, hashMethodologyAtCommit, candidateExecRunner, measureSideInEphemeral, removeEphemeralWorktree, cancelSubagentDeferral } = deps;
       const campDir = campaignDirOf(workDir);
@@ -42,12 +50,14 @@ export async function executeCandidateBranchAction(params: any, ctx: any, workDi
         // failures and a LIVE porcelain scan (a leftover from a previous
         // session is not in runtime memory but still clutters the repo).
         const rt = getRuntime(ctx);
+        let scanWarning = "";
         try {
           const lst = await candidateGitExec("git", ["worktree", "list", "--porcelain"], { cwd: workDir, timeout: 15000 });
-          if (lst.code === 0) {
-            // Windows path case/separators vary between git invocations;
-            // normalize ONLY for comparison, keep originals for display.
-            const norm = (p: string) => p.replace(/\\/g, "/").toLowerCase();
+          if (lst.code !== 0) {
+            // bd tj0.6: a failed scan is NOT evidence of a clean tree.
+            scanWarning = `⚠ Ephemeral worktree scan unavailable (git worktree list --porcelain exited ${lst.code}: ${(lst.stderr || lst.stdout || "").trim().split("\n")[0] || "no output"}); leftovers may not be listed.\n`;
+          } else {
+            const norm = canonicalWorktreePath;
             const entries = lst.stdout.split("\n")
               .filter((l) => l.startsWith("worktree "))
               .map((l) => l.slice("worktree ".length).trim());
@@ -66,7 +76,10 @@ export async function executeCandidateBranchAction(params: any, ctx: any, workDi
               rt.candidateLeftovers = rt.candidateLeftovers.filter((p) => registered.has(norm(p)));
             }
           }
-        } catch { /* git unavailable — memory-only leftovers below still show */ }
+        } catch (err) {
+          scanWarning = `⚠ Ephemeral worktree scan unavailable (git worktree list --porcelain failed: ${err instanceof Error ? err.message.split("\n")[0] : String(err).split("\n")[0]}); leftovers may not be listed.\n`;
+        }
+        if (scanWarning) text += scanWarning;
         if (rt.candidateLeftovers?.length) {
           text += "⚠ Ephemeral worktree leftovers (cleanup failed; remove by hand):\n" + rt.candidateLeftovers.map((p) => `  ${p}`).join("\n") + "\n";
         }
@@ -245,6 +258,12 @@ export async function executeCandidateBranchAction(params: any, ctx: any, workDi
         if (!active) return fail("no_active_candidate", "no active candidate; create or resume one first");
         const wtPath = path.join(candidateWtRootOf(workDir), active.id);
         if (!fs.existsSync(wtPath)) return fail("worktree_missing", `candidate worktree ${wtPath} is missing; resolve manually`);
+        // bd tj0.6: a directory can exist while its git worktree is broken.
+        // An unreadable worktree must never reach the benchmark (fail closed).
+        const wtCheck = await candidateWorktree.collectWorktreeChanges(candidateGitExec, wtPath);
+        if (!wtCheck.ok) {
+          return fail("worktree_unreadable", `cannot inspect candidate ${JSON.stringify(active.id)} worktree (${wtCheck.reason}); refusing run — resolve the worktree by hand first`);
+        }
         const policy = state.policy as unknown as CandidatePolicy;
         let measuredAverage: number | null = null;
         let runError: { reason: string; message: string } | null = null;
@@ -482,16 +501,41 @@ export async function executeCandidateBranchAction(params: any, ctx: any, workDi
         // call actually created; a refused side leaves its path untouched.
         let leaderSideCleanup: { ok: true; wtPath: string } | null = null;
         let candSideCleanup: { ok: true; wtPath: string } | null = null;
+        // bd tj0.6: failures discovered while a side was being measured must
+        // reach the reply even when beginOperation turns the side into a refusal.
+        let leftoverWarn = "";
+        const noteSideCleanup = (wtPath: string, cleanup?: { removed: boolean; message?: string }) => {
+          if (!cleanup) return;
+          if (cleanup.removed) {
+            leftoverWarn += `\nℹ Ephemeral worktree ${wtPath} was cleaned after the failed measurement.`;
+          } else {
+            leftoverWarn += `\n⚠ Ephemeral worktree cleanup failed (${cleanup.message ?? "unknown"}) — ${wtPath} is left in place; it is now listed by candidate_branch status.`;
+          }
+        };
+        const measureSide = async (label: string, sha: string) => {
+          try {
+            return await measureSideInEphemeral(ctx, workDir, label, sha, policy);
+          } catch (err) {
+            // An unexpected exception keeps the pending marker (beginOperation
+            // does not treat it as a CleanRefusal), but its worktree path and
+            // cleanup result are attached by measureSideInEphemeral.
+            const meta = err && typeof err === "object" ? (err as any).candidateWorktreeCleanup : null;
+            if (meta && typeof meta.wtPath === "string") noteSideCleanup(meta.wtPath, meta.cleanup);
+            throw err;
+          }
+        };
         const opRes = await candidateState.beginOperation(campDir, `confirm ${active.id}`, async () => {
-          const leaderSide = await measureSideInEphemeral(ctx, workDir, "leader", expectedLeader, policy);
+          const leaderSide = await measureSide("leader", expectedLeader);
           if (!leaderSide.ok) {
+            noteSideCleanup(leaderSide.wtPath, leaderSide.cleanup);
             // Round-3 B1 (parent decision): a KNOWN side refusal means no
             // promotion and no uncertainty — clean refusal clears the marker.
             throw new candidateState.CleanRefusal(leaderSide.reason as any, leaderSide.message);
           }
           leaderSideCleanup = { ok: true, wtPath: leaderSide.wtPath };
-          const candSide = await measureSideInEphemeral(ctx, workDir, "cand", cpSha, policy);
+          const candSide = await measureSide("cand", cpSha);
           if (!candSide.ok) {
+            noteSideCleanup(candSide.wtPath, candSide.cleanup);
             throw new candidateState.CleanRefusal(candSide.reason as any, candSide.message);
           }
           candSideCleanup = { ok: true, wtPath: candSide.wtPath };
@@ -540,7 +584,6 @@ export async function executeCandidateBranchAction(params: any, ctx: any, workDi
         // the variable null, and a side that failed AFTER creation already
         // cleaned itself up inside measureSideInEphemeral. bd el3.2: a failed
         // removal surfaces ⚠ in the reply AND is remembered for status.
-        let leftoverWarn = "";
         for (const side of [leaderSideCleanup, candSideCleanup]) {
           if (side === null) continue;
           const rm = await removeEphemeralWorktree(ctx, workDir, side.wtPath);
