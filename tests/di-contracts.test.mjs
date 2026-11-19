@@ -180,3 +180,36 @@ test("same-named helpers keep distinct contracts (pins)", async () => {
   assert.match(candidateOk.message, /state\.json was left as last written/);
   assert.match(researchOk.message, /the marker is cleared, state\.json is untouched/);
 });
+
+test("empty and bare-dash verdict reasons do not swallow the next VERDICT line", () => {
+  const cases = [
+    {
+      body: "VERDICT H-F6: reject\r\nVERDICT H-G7: refine",
+      expected: [
+        { id: "H-F6", verdict: "reject", reason: "" },
+        { id: "H-G7", verdict: "refine", reason: "" },
+      ],
+    },
+    {
+      body: "VERDICT H-L3: accept —\nVERDICT H-M4: reject —  spaced reason",
+      expected: [
+        { id: "H-L3", verdict: "accept", reason: "" },
+        { id: "H-M4", verdict: "reject", reason: "spaced reason" },
+      ],
+    },
+  ];
+  for (const { body, expected } of cases) {
+    assert.deepEqual(
+      parseDelegationVerdicts(body, "analyst"),
+      expected.map(({ id, verdict }) => ({ id, verdict, speaker: "analyst" })),
+    );
+    const blackboard = parseBlackboardVerdicts(body, "analyst");
+    assert.deepEqual(
+      blackboard,
+      expected.map(({ id, verdict, reason }) => ({ hypothesisId: id, verdict, reason, by: "analyst" })),
+    );
+    for (const v of blackboard) {
+      assert.doesNotMatch(v.reason, /VERDICT/, "reason must not contain the following VERDICT line");
+    }
+  }
+});

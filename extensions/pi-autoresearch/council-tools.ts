@@ -165,7 +165,7 @@ export interface HypothesisVerdict {
   by: string; // speaker name
 }
 
-const VERDICT_RE = /^VERDICT\s+(H-[A-Za-z]\d+)\s*:\s*(accept|reject|refine)\b\s*(?:—|--|-)?\s*(.*)/gim;
+const VERDICT_RE = /^VERDICT\s+(H-[A-Za-z]\d+)\s*:\s*(accept|reject|refine)\b[ \t]*(?:—|--|-)?[ \t]*([^\r\n]*)/gim;
 const HYP_RE = /^#{2,4}\s*(H-[A-Za-z]\d+)\s*[:—-]\s*(.*)/gm;
 
 /** Collect all VERDICT lines from a challenge entry body. This is the shared
