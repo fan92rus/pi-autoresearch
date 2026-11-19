@@ -375,7 +375,7 @@ test("T10: eight concurrent calls with distinct keys in one process all land as 
   assert.equal(fs.existsSync(project.lock), false);
 });
 
-test("T10/T23: a held lock gives observation_lock_busy within the retry budget, writes nothing and keeps the holder", async (t) => {
+test("T10/T23: a stale held lock gives observation_lock_busy immediately, writes nothing and keeps the holder", async (t) => {
   const project = makeProject(t);
   foreignLock(project.lock, FOREIGN);
   const lockBytes = fs.readFileSync(project.lock);
@@ -386,8 +386,7 @@ test("T10/T23: a held lock gives observation_lock_busy within the retry budget, 
   assert.equal(response.status, "error");
   assert.equal(response.code, "observation_lock_busy");
   assert.match(response.message, /Manual unlock/);
-  assert.equal(calls.length, 40);
-  assert.equal(calls.reduce((sum, ms) => sum + ms, 0) <= 2500, true);
+  assert.deepEqual(calls, [], "stale locks are refused without waiting");
   assert.equal(fs.existsSync(project.observations), false);
   assert.deepEqual(fs.readFileSync(project.lock), lockBytes);
 });

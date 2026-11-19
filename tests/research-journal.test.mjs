@@ -159,7 +159,7 @@ test("a free lock is taken on the first attempt without any pause", async (t) =>
   assert.deepEqual(calls, []);
 });
 
-test("a held lock is retried 40 times at 50 ms and then reported busy without writing", async (t) => {
+test("a stale foreign lock is refused immediately without retrying or writing", async (t) => {
   const autoDir = makeAutoDir(t);
   const target = journalTarget(autoDir, "observations");
   writeForeignLock(target.lock);
@@ -178,9 +178,8 @@ test("a held lock is retried 40 times at 50 ms and then reported busy without wr
   assert.equal(result.status, "lock_busy");
   assert.equal(result.code, "observation_lock_busy");
   assert.equal(ran, false, "critical section must not run while busy");
-  assert.equal(calls.length, 40);
-  assert.ok(calls.every((ms) => ms === 50));
-  assert.equal(result.diagnostic.attempts, 41);
+  assert.deepEqual(calls, [], "a lock older than the stale budget is not live contention");
+  assert.equal(result.diagnostic.attempts, 1);
   assert.deepEqual(result.diagnostic.holder, { state: "present", info: FOREIGN });
   for (const needle of [
     target.lock,
@@ -199,14 +198,15 @@ test("a held lock is retried 40 times at 50 ms and then reported busy without wr
 test("a lock released during the retry window is acquired on a later attempt", async (t) => {
   const autoDir = makeAutoDir(t);
   const target = journalTarget(autoDir, "observations");
-  writeForeignLock(target.lock);
+  const now = new Date();
+  writeForeignLock(target.lock, { ...FOREIGN, acquired_at: now.toISOString() });
   const calls = [];
   const sleep = async (ms) => {
     calls.push(ms);
     if (calls.length === 3) fs.unlinkSync(target.lock);
   };
 
-  const result = await withJournalLock(target, () => "ok", { sleep });
+  const result = await withJournalLock(target, () => "ok", { sleep, now: () => now });
 
   assert.equal(result.status, "acquired");
   assert.equal(result.value, "ok");
@@ -240,18 +240,48 @@ test("an unrecognized lock file is reported as malformed and kept", async (t) =>
   assert.equal(fs.readFileSync(target.lock, "utf8"), '{"token":"zz"');
 });
 
-test("a stale lock from a dead process is never stolen automatically", async (t) => {
+test("a live foreign lock is retried with jittered pauses, then reported busy", async (t) => {
   const autoDir = makeAutoDir(t);
   const target = journalTarget(autoDir, "observations");
-  const stale = { token: "01".repeat(16), pid: 999999, host: os.hostname(), acquired_at: "2000-01-01T00:00:00.000Z" };
+  const now = new Date();
+  writeForeignLock(target.lock, { ...FOREIGN, acquired_at: now.toISOString() });
+  const { calls, sleep } = recordingSleep();
+
+  const result = await withJournalLock(target, () => "never", { sleep, now: () => now });
+
+  assert.equal(result.status, "lock_busy");
+  assert.equal(calls.length, 40);
+  assert.equal(result.diagnostic.attempts, 41);
+  assert.ok(calls.every((ms) => ms >= 50 && ms <= 300), `jitter range: ${calls.slice(0, 8)}`);
+  assert.ok(new Set(calls).size > 1, "retries must not wake in lockstep");
+});
+
+test("a lock abandoned by a dead local process is reclaimed exactly once", async (t) => {
+  const autoDir = makeAutoDir(t);
+  const target = journalTarget(autoDir, "observations");
+  const now = new Date();
+  const stale = { token: "01".repeat(16), pid: 999999, host: os.hostname(), acquired_at: now.toISOString() };
+  writeForeignLock(target.lock, stale);
+  const { sleep } = recordingSleep();
+
+  const result = await withJournalLock(target, () => "ok", { sleep, now: () => now });
+
+  assert.equal(result.status, "acquired");
+  assert.equal(result.value, "ok");
+  assert.equal(fs.existsSync(target.lock), false, "the reclaimed lock is released by the new owner");
+});
+
+test("a stale lock from a dead remote process is never stolen", async (t) => {
+  const autoDir = makeAutoDir(t);
+  const target = journalTarget(autoDir, "observations");
+  const stale = { token: "02".repeat(16), pid: 999999, host: "gone-host", acquired_at: "2000-01-01T00:00:00.000Z" };
   writeForeignLock(target.lock, stale);
   const { calls, sleep } = recordingSleep();
 
   const result = await withJournalLock(target, () => "never", { sleep });
 
   assert.equal(result.status, "lock_busy");
-  assert.equal(calls.length, 40);
-  assert.equal(fs.existsSync(target.lock), true);
+  assert.deepEqual(calls, [], "remote stale locks are refused without waiting");
   assert.deepEqual(JSON.parse(fs.readFileSync(target.lock, "utf8")), stale);
 });
 

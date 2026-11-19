@@ -9,9 +9,11 @@
  * - appendJournalLine: newline-guarded single-write append performed under the lock,
  *   with short-write detection (no retry), a 16 KiB record limit and fsync before close.
  *
- * Nothing here steals a lock. A held or stale lock is reported with manual unlock
- * instructions; the caller decides what to do. A failed or short append is never
- * retried or completed by this module.
+ * A lock held by a live or unknown owner is never stolen: it is reported with
+ * manual unlock instructions. An abandoned lock whose owner is a dead PID on
+ * this host is reclaimed after reading its token, so a crashed writer cannot
+ * block every later append forever. A failed or short append is never retried
+ * or completed by this module.
  */
 
 import { randomBytes as cryptoRandomBytes } from "node:crypto";
@@ -24,8 +26,12 @@ import { setTimeout as delay } from "node:timers/promises";
 export const JOURNAL_RECORD_MAX_BYTES = 16 * 1024;
 /** Retries after the first immediate lock attempt. */
 export const JOURNAL_LOCK_RETRY_COUNT = 40;
-/** Pause between lock attempts, outside the critical section. */
+/** Base pause between lock attempts, outside the critical section. */
 export const JOURNAL_LOCK_RETRY_DELAY_MS = 50;
+/** A lock older than this is not live contention: refuse immediately, no takeover. */
+export const JOURNAL_LOCK_STALE_MS = 5_000;
+/** Jitter spread (ms) added to the base delay. Large enough to tolerate CPU-starved writers under a full test suite. */
+export const JOURNAL_LOCK_JITTER_MS = 250;
 
 export type JournalName = "observations" | "analysis" | "run-links" | "findings";
 
@@ -236,9 +242,18 @@ function describeHolder(holder: JournalLockHolder): string {
   }
 }
 
-function busyDiagnostic(target: JournalTarget, ops: ResolvedOptions): JournalLockBusyDiagnostic {
+function isDeadLocalHolder(info: { pid: number; host: string }, ops: ResolvedOptions): boolean {
+  if (info.host !== ops.host || !Number.isInteger(info.pid) || info.pid <= 0) return false;
+  try {
+    process.kill(info.pid, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
+function busyDiagnostic(target: JournalTarget, ops: ResolvedOptions, attempts = JOURNAL_LOCK_RETRY_COUNT + 1): JournalLockBusyDiagnostic {
   const holder = diagnoseHolder(target.lock, ops);
-  const attempts = JOURNAL_LOCK_RETRY_COUNT + 1;
   const message =
     `${target.busyCode}: journal lock ${target.lock} is held after ${attempts} attempts ` +
     `(${describeHolder(holder)}). Nothing was written; retrying is safe. ` +
@@ -253,7 +268,13 @@ type AcquireOutcome =
 
 async function acquireLock(target: JournalTarget, ops: ResolvedOptions): Promise<AcquireOutcome> {
   for (let attempt = 0; attempt <= JOURNAL_LOCK_RETRY_COUNT; attempt++) {
-    if (attempt > 0) await ops.sleep(JOURNAL_LOCK_RETRY_DELAY_MS);
+    if (attempt > 0) {
+      // Jittered backoff: equal 50 ms retries make concurrent writers wake in
+      // lockstep and starve each other under load. The deterministic offset
+      // depends only on pid and attempt, so tests stay reproducible.
+      const jitter = (ops.pid + attempt * 37) % (JOURNAL_LOCK_JITTER_MS + 1);
+      await ops.sleep(JOURNAL_LOCK_RETRY_DELAY_MS + jitter);
+    }
 
     let fd: number;
     try {
@@ -261,7 +282,30 @@ async function acquireLock(target: JournalTarget, ops: ResolvedOptions): Promise
     } catch (error) {
       const code = errorCode(error);
       // EEXIST: held. EPERM/EBUSY: Windows reports a pending delete of the previous holder this way.
-      if (code === "EEXIST" || code === "EPERM" || code === "EBUSY") continue;
+      if (code === "EEXIST" || code === "EPERM" || code === "EBUSY") {
+        // A long-lived lock is not contention. Refuse at once instead of
+        // spinning for seconds; never steal it (the owner record is truth).
+        const holder = diagnoseHolder(target.lock, ops);
+        if (holder.state === "present") {
+          if (isDeadLocalHolder(holder.info, ops)) {
+            // The owner process is gone on this host. Remove only the exact
+            // lock we just diagnosed; a racing new owner writes a new token.
+            try {
+              const raw = ops.fs.readFileSync(target.lock, "utf8");
+              const parsed = parseLockInfo(raw);
+              if (parsed?.token === holder.info.token) ops.fs.unlinkSync(target.lock);
+            } catch {
+              /* a racing release or removal is fine; the next attempt decides */
+            }
+            continue;
+          }
+          const acquired = Date.parse(holder.info.acquired_at);
+          if (Number.isFinite(acquired) && ops.now().getTime() - acquired > JOURNAL_LOCK_STALE_MS) {
+            return { status: "busy", diagnostic: busyDiagnostic(target, ops, attempt + 1) };
+          }
+        }
+        continue;
+      }
       return { status: "failed", message: `cannot create lock ${target.lock}: ${describeError(error)}` };
     }
 
