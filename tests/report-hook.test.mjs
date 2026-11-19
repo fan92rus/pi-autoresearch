@@ -58,13 +58,13 @@ function initGitRepo(dir) {
 }
 
 async function loadExtension(dir) {
-  const { pi, tool, command } = createFakePi({ dir, sessionId: "report-hook", realGit: true });
+  const { pi, tool, command, hook } = createFakePi({ dir, sessionId: "report-hook", realGit: true });
   const ctx = makeCtx(dir, "report-hook", pi);
   const { default: autoresearchExtension } = await import(
     pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")).href
   );
   autoresearchExtension(pi);
-  return { pi, tool, command, ctx };
+  return { pi, tool, command, hook, ctx, sentMessages: pi.sentMessages };
 }
 
 async function startCampaign(dir) {
@@ -92,6 +92,21 @@ function readReport(dir) {
 // ---------------------------------------------------------------------------
 // finalize_research → .auto/report.md
 // ---------------------------------------------------------------------------
+
+test("finalize_research steer reports the best keep, not the epoch baseline", async () => {
+  const dir = makeTempDir("finalize-best-display");
+  const { tool, ctx, hook, sentMessages } = await startCampaign(dir);
+  appendLedgerLines(dir, [
+    { run: 1, segment: 1, epoch: 1, metric: 46.31, status: "keep", description: "baseline", timestamp: 1700000001000 },
+    { run: 2, segment: 1, epoch: 1, metric: 11.09, status: "keep", description: "champion", timestamp: 1700000002000 },
+  ]);
+  await hook("session_start")({}, ctx);
+  await tool("finalize_research").execute("id", { reason: "done" }, null, null, ctx);
+  const steer = sentMessages.find((m) => m.opts?.deliverAs === "steer");
+  assert.ok(steer, "finalize sends a steer");
+  assert.match(steer.text, /Best metric: 11\.09/, `expected best keep, got: ${steer.text.slice(0, 300)}`);
+  assert.doesNotMatch(steer.text, /Best metric: 46\.31/, "baseline must not be reported as best");
+});
 
 test("finalize_research builds the campaign report with all seven sections", async () => {
   const dir = makeTempDir("finalize");

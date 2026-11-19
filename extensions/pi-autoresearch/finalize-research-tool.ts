@@ -15,6 +15,7 @@ import { ensureParentDir } from "./paths.ts";
 import * as chainJournal from "./chain-journal.ts";
 import * as researchState from "./research-state.ts";
 import { formatNum } from "./widget.ts";
+import { findBestMetric } from "./ledger-metrics.ts";
 
 type FinalizeResearchTool = Parameters<ExtensionAPI["registerTool"]>[0];
 
@@ -174,7 +175,14 @@ export function createFinalizeResearchTool(deps: FinalizeResearchToolDeps): Fina
         `   Reason: ${params.reason}\n` +
         `   Confidence: ${(conf * 100).toFixed(0)}%\n` +
         (params.evidence ? `   Evidence: ${params.evidence.slice(0, 200)}\n` : "") +
-        `   Best ${state.metricName}: ${state.bestMetric !== null ? formatNum(state.bestMetric, state.metricUnit) : "?"}\n` +
+        `   Best ${state.metricName}: ${(() => {
+          const keeps = state.results.filter((r) => r.status === "keep" && r.metric !== 0);
+          const lastSegment = keeps.at(-1)?.segment ?? state.currentSegment;
+          const best = findBestMetric(state.results, lastSegment, state.bestDirection)
+            ?? keeps.reduce<number | null>((acc, r) => acc === null || (state.bestDirection === "lower" ? r.metric < acc : r.metric > acc) ? r.metric : acc, null)
+            ?? state.bestMetric;
+          return best !== null ? formatNum(best, state.metricUnit) : "?";
+        })()}\n` +
         `   Total runs: ${state.results.length}\n` +
         reportNote + `\n\n` +
         `   Run /autoresearch off to finalize, or continue if you disagree.`,
