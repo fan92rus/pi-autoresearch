@@ -180,6 +180,20 @@ async function main() {
   let exitCode = 3;
   let finished = false;
   let stage1Started = false;
+
+  /** Deterministic dialog barrier: one event + optional time/file release gates. */
+  const awaitDialogRelease = async (kind, id) => {
+    logEvent("wrapper", { event: `${kind}_dialog_received`, id });
+    if (holdDialogMs > 0) await new Promise((resolve) => setTimeout(resolve, holdDialogMs));
+    if (holdUntilAbsent !== null) {
+      while (fs.existsSync(holdUntilAbsent) && !finished) await new Promise((resolve) => setTimeout(resolve, 10));
+      logEvent("wrapper", { event: `${kind}_hold_released`, path: holdUntilAbsent });
+    }
+    if (holdUntilExists !== null) {
+      while (!fs.existsSync(holdUntilExists) && !finished) await new Promise((resolve) => setTimeout(resolve, 10));
+      logEvent("wrapper", { event: `${kind}_hold_released`, path: holdUntilExists });
+    }
+  };
   let stage1Settled = false;
   let stage2Sent = false;
   let reportStarted = new Map();
@@ -453,7 +467,7 @@ async function main() {
             logEvent("wrapper", { event: "dialog_refused", reason: "expedition_dialog_without_expedition_mode", id: dialogId });
             return;
           }
-          if (holdDialogMs > 0) await new Promise((resolve) => setTimeout(resolve, holdDialogMs));
+          await awaitDialogRelease("expedition", dialogId);
           if (finished) return;
           let currentFileHash;
           try { currentFileHash = sha256(fs.readFileSync(expeditionPath)); } catch { currentFileHash = null; }
@@ -473,7 +487,7 @@ async function main() {
             logEvent("wrapper", { event: "dialog_refused", reason: "charter_dialog_without_charter_mode", id: dialogId });
             return;
           }
-          if (holdDialogMs > 0) await new Promise((resolve) => setTimeout(resolve, holdDialogMs));
+          await awaitDialogRelease("charter", dialogId);
           if (finished) return;
           const confirmed = charterMatch[1] === charterSha;
           charterConfirmed = confirmed;
@@ -493,20 +507,7 @@ async function main() {
           logEvent("wrapper", { event: "dialog_refused", reason: "not_brief_confirm", id: dialogId });
           return;
         }
-        // Deterministic barrier for tests: this event is emitted before the
-        // hold window, so a test that mutates/deletes the brief can wait until
-        // the wrapper has actually received the dialog (not merely until the
-        // fake pi wrote its request to the session log).
-        logEvent("wrapper", { event: "brief_dialog_received", id: dialogId });
-        if (holdDialogMs > 0) await new Promise((resolve) => setTimeout(resolve, holdDialogMs));
-        if (holdUntilAbsent !== null) {
-          while (fs.existsSync(holdUntilAbsent) && !finished) await new Promise((resolve) => setTimeout(resolve, 10));
-          logEvent("wrapper", { event: "brief_hold_released", path: holdUntilAbsent });
-        }
-        if (holdUntilExists !== null) {
-          while (!fs.existsSync(holdUntilExists) && !finished) await new Promise((resolve) => setTimeout(resolve, 10));
-          logEvent("wrapper", { event: "brief_hold_released", path: holdUntilExists });
-        }
+        await awaitDialogRelease("brief", dialogId);
         if (finished) return;
         let currentFileHash;
         try { currentFileHash = sha256(fs.readFileSync(briefPath)); } catch { currentFileHash = null; }

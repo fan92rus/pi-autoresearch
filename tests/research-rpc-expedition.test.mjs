@@ -32,6 +32,14 @@ function run(ctx, extra = [], dialogSha = ctx.digest) {
   });
 }
 function events(ctx) { return fs.existsSync(ctx.log) ? fs.readFileSync(ctx.log, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse) : []; }
+async function waitForEvent(ctx, event, deadlineMs = 3000) {
+  const deadline = Date.now() + deadlineMs;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(ctx.log) && fs.readFileSync(ctx.log, "utf8").includes(`"event":"${event}"`)) return true;
+    await delay(10);
+  }
+  return false;
+}
 
 test("expedition option pair is mandatory and incompatible with brief or charter options", async () => {
   const ctx = setup();
@@ -61,11 +69,12 @@ test("mismatched dialog hash is refused and exits 3", async () => {
 });
 
 test("document changed while dialog is pending is refused", async () => {
-  const ctx = setup(); const pending = run(ctx, ["--hold-dialog-ms", "800"]);
-  const deadline = Date.now() + 3000;
-  while (Date.now() < deadline && (!fs.existsSync(ctx.log) || !fs.readFileSync(ctx.log, "utf8").includes("extension_ui_request"))) await delay(10);
-  assert.ok(fs.existsSync(ctx.log) && fs.readFileSync(ctx.log, "utf8").includes("extension_ui_request"));
+  const ctx = setup();
+  const release = path.join(ctx.dir, "expedition-changed.ready");
+  const pending = run(ctx, ["--hold-dialog-until-exists", release]);
+  assert.ok(await waitForEvent(ctx, "expedition_dialog_received"), "wrapper should receive the expedition dialog before the hold window");
   fs.writeFileSync(ctx.doc, canonical({ goal: "changed" }));
+  fs.writeFileSync(release, "");
   const result = await pending; assert.equal(result.code, 3, result.stderr);
   assert.ok(events(ctx).some(e => e.record?.event === "expedition_confirmation" && e.record.confirmed === false));
 });
