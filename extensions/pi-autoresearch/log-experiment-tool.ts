@@ -33,6 +33,7 @@ import {
 } from "./exhaustion-hints.ts";
 import { readObservations, type ObservationRecord } from "./research-observations.ts";
 import { journalTarget } from "./research-journal.ts";
+import type { ModeTransition } from "./index.ts";
 
 type LogExperimentTool = Parameters<ExtensionAPI["registerTool"]>[0];
 type LogDetails = {
@@ -69,7 +70,7 @@ export interface LogExperimentToolDeps {
   researchBlocksOrdinaryLoop: (workDir: string, ctx?: ExtensionContext) => Promise<boolean>;
   resolveWorkDir: (cwd: string) => string;
   runLinkNotConsumedWarning: (runtime: any) => string;
-  setAutoresearchMode: (ctx: ExtensionContext, enabled: boolean) => void;
+  transitionAutoresearchMode: (ctx: ExtensionContext, next: ModeTransition) => void;
   updateWidget: (ctx: ExtensionContext) => void;
   validateWorkDir: (cwd: string) => string | null;
 }
@@ -385,7 +386,7 @@ export function createLogExperimentTool(deps: LogExperimentToolDeps): LogExperim
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const {
-        pi, ACTIVITY_TYPES, assertModeActive, buildSessionSnapshot, broadcastDashboardUpdate, campaignBlockedResponse, campaignBlocksOrdinaryLoop, cloneExperimentState, computeConfidence, execBashScript, finalizeExistingNode, fireHook, getRuntime, optimizeNotStartedGate, overlayTui, readLedgerMaxRun, recordAutoresearchActivation, recordTreeNode, researchBlockedResponse, researchBlocksOrdinaryLoop, resolveWorkDir, runLinkNotConsumedWarning, setAutoresearchMode, updateWidget, validateWorkDir,
+        pi, ACTIVITY_TYPES, assertModeActive, buildSessionSnapshot, broadcastDashboardUpdate, campaignBlockedResponse, campaignBlocksOrdinaryLoop, cloneExperimentState, computeConfidence, execBashScript, finalizeExistingNode, fireHook, getRuntime, optimizeNotStartedGate, overlayTui, readLedgerMaxRun, recordAutoresearchActivation, recordTreeNode, researchBlockedResponse, researchBlocksOrdinaryLoop, resolveWorkDir, runLinkNotConsumedWarning, transitionAutoresearchMode, updateWidget, validateWorkDir,
       } = deps;
       const modeGate = assertModeActive(ctx);
       if (modeGate) return modeGate;
@@ -1000,10 +1001,13 @@ export function createLogExperimentTool(deps: LogExperimentToolDeps): LogExperim
       runtime.lastRunDuration = null;
 
       const limitReached = state.maxExperiments !== null && segmentCount >= state.maxExperiments;
+      let modeTransitioned = false;
       if (limitReached) {
         text += `\n\n🛑 Maximum experiments reached (${state.maxExperiments}). STOP the experiment loop now.`;
         recordAutoresearchActivation(workDir, false);
-        setAutoresearchMode(ctx, false);
+        // bd tj0.2: mode off, overlay release and widget refresh are one step.
+        transitionAutoresearchMode(ctx, { enabled: false, uiMode: runtime.uiMode });
+        modeTransitioned = true;
         ctx.abort();
       } else if (runtime.autoresearchMode) {
         text += "\n\nBefore choosing the next experiment, consider whether this result or discovery invalidates a previous discard's rollback reason. If so, name what changed and weigh a targeted retry against other candidates. Otherwise, move on. Don't revive a discarded idea without a changed assumption. Verification reruns to resolve measurement noise are separate.";
@@ -1017,7 +1021,7 @@ export function createLogExperimentTool(deps: LogExperimentToolDeps): LogExperim
         if (beforeSteer) pi.sendUserMessage(beforeSteer, { deliverAs: "steer" });
       }
 
-      updateWidget(ctx);
+      if (!modeTransitioned) updateWidget(ctx);
 
       // Refresh fullscreen overlay if open
       if (overlayTui) overlayTui.requestRender();

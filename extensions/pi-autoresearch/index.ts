@@ -474,6 +474,18 @@ export interface AutoresearchRuntime {
   runLinks: RunLinksRuntime;
 }
 
+/** bd tj0.2: the complete target of one mode transition. Fields left out are
+ *  untouched; a null chain explicitly clears both the binding and its flag. */
+export interface ModeTransition {
+  enabled: boolean;
+  uiMode: "optimization" | "expedition";
+  chain?: AutoresearchRuntime["researchChain"];
+  campaignId?: string | null;
+  stateRoot?: string | null;
+  chainContinuationSent?: boolean;
+  resetCounters?: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Tool Schemas
 // ---------------------------------------------------------------------------
@@ -1897,6 +1909,36 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   };
 
   /**
+   * bd tj0.2: classify the research block at a MANUAL ordinary launch, before
+   * any mode/view/binding mutation. Only a campaign in phase research is a
+   * hard refusal (it owns the current work). Briefing, stopped, pending_op and
+   * unreadable/invalid campaigns need the research tools to resolve/archive
+   * them, so they are a legitimate manual-check activation: mode ON with the
+   * historic notice and no kickoff. This preserves RESEARCH_PHASE_POLICY:
+   * ordinaryLoop never blocked briefing. Mirrors the session state-root pin.
+   */
+  const classifyOrdinaryLaunchResearch = (workDir: string, ctx: ExtensionContext): "none" | "manual" | "active" => {
+    const bases = [workDir];
+    const stateRoot = getRuntime(ctx).researchStateRoot;
+    if (stateRoot && stateRoot !== workDir) bases.push(stateRoot);
+    let manual = false;
+    for (const base of bases) {
+      const scan = researchState.scanCampaignsSync(base);
+      if (!scan.ok) { manual = true; continue; }
+      for (const campaign of scan.campaigns) {
+        if (campaign.state?.phase === "research") return "active";
+        // A briefing campaign is a manual-check path too: the research tools
+        // (not the ordinary kickoff) decide whether it can be archived/started.
+        if (campaign.state?.phase === "briefing" ||
+            researchState.researchPolicyRefusal(campaign, "ordinaryLoop") !== null) manual = true;
+      }
+    }
+    return manual ? "manual" : "none";
+  };
+  const ordinaryLaunchResearchGate = async (workDir: string, ctx: ExtensionContext): Promise<"none" | "manual" | "active"> =>
+    classifyOrdinaryLaunchResearch(workDir, ctx);
+
+  /**
    * Git-gate scan (live lob-collector-data case 2026-11-15): the shell Git ban
    * tracks ACTIVE campaign work only — a campaign in phase research, a pending
    * operation, or an unreadable state (fail closed). A STOPPED (finished)
@@ -2638,6 +2680,29 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }));
   };
 
+  /** bd tj0.2: the one transactional mode transition. Every mode switch goes
+   *  through here: the flag, view and bindings change together, a stale
+   *  fullscreen overlay is dropped, and the widget is refreshed exactly once
+   *  after all mutations. Callers never assign uiMode/chain/pins directly. */
+  const transitionAutoresearchMode = (ctx: ExtensionContext, next: ModeTransition): void => {
+    const runtime = getRuntime(ctx);
+    clearOverlay();
+    setAutoresearchMode(ctx, next.enabled);
+    runtime.uiMode = next.uiMode;
+    if (next.chain !== undefined) {
+      runtime.researchChain = next.chain;
+      if (next.chain === null) runtime.chainContinuationSent = false;
+    }
+    if (next.chainContinuationSent !== undefined) runtime.chainContinuationSent = next.chainContinuationSent;
+    if (next.campaignId !== undefined) runtime.researchCampaignId = next.campaignId;
+    if (next.stateRoot !== undefined) runtime.researchStateRoot = next.stateRoot;
+    if (next.resetCounters ?? next.enabled) {
+      runtime.autoResumeTurns = 0;
+      runtime.consecutiveDriftResumes = 0;
+    }
+    updateWidget(ctx);
+  };
+
   // ── Expedition restart restore (bd pi-autoresearch-es1.3) ───────────────
   // runtime.researchChain lives only in session memory; after a pi restart an
   // active expedition silently degrades. The disk scan finds the most recent
@@ -2677,13 +2742,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // draft of the next child uses chainCampaignIds, and research_questions
     // resolve to the pinned dir instead of the multi-campaign scan.
     const campaignId: string | null = fresh.campaignId ?? null;
-    runtime.researchCampaignId = campaignId;
-    runtime.researchChain = { chainId: fresh.chainId, workDir, charterPath: fresh.docPath, charterSha256: fresh.docSha256, charter: fresh.charter, expedition: true, docSha256: fresh.docSha256 };
-    runtime.uiMode = "expedition";
-    if (!runtime.autoresearchMode) { recordAutoresearchActivation(workDir, true); setAutoresearchMode(ctx, true); }
-    runtime.autoResumeTurns = 0;
-    runtime.consecutiveDriftResumes = 0;
-    updateWidget(ctx);
+    if (!runtime.autoresearchMode) recordAutoresearchActivation(workDir, true);
+    transitionAutoresearchMode(ctx, {
+      enabled: true,
+      uiMode: "expedition",
+      chain: { chainId: fresh.chainId, workDir, charterPath: fresh.docPath, charterSha256: fresh.docSha256, charter: fresh.charter, expedition: true, docSha256: fresh.docSha256 },
+      campaignId,
+    });
     let slice = "";
     const verified = await chainJournal.verifyChain(workDir, fresh.chainId);
     if (verified.ok) { const replay = expedition.replayExpeditionMap(verified.entries); if (replay.ok) slice = expedition.mapSliceText(replay.map); }
@@ -3304,9 +3369,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       const wasInactive = !runtime.autoresearchMode;
       recordAutoresearchActivation(workDir, true);
-      setAutoresearchMode(ctx, true);
-      runtime.uiMode = "optimization";
-      updateWidget(ctx);
+      transitionAutoresearchMode(ctx, { enabled: true, uiMode: "optimization" });
 
       if (wasInactive) {
         const steer = await fireHook({
@@ -3707,7 +3770,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     researchBlocksOrdinaryLoop,
     resolveWorkDir,
     runLinkNotConsumedWarning,
-    setAutoresearchMode,
     updateWidget,
     validateWorkDir,
     get broadcastDashboardUpdate() { return broadcastDashboardUpdate; },
@@ -3715,6 +3777,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     get campaignBlocksOrdinaryLoop() { return campaignBlocksOrdinaryLoop; },
     get optimizeNotStartedGate() { return optimizeNotStartedGate; },
     get overlayTui() { return overlayTui; },
+    get transitionAutoresearchMode() { return transitionAutoresearchMode; },
   }));
 
   // -----------------------------------------------------------------------
@@ -4577,7 +4640,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   /** Is an ordinary-loop tool blocked by an active candidate campaign? A missing
    *  state never blocks. An existing state blocks unless it is readable and
    *  disabled; an unreadable state fails closed (tasks 3.2, design §4). */
-  const campaignBlocksOrdinaryLoop = async (workDir: string): Promise<boolean> => {
+  const candidateBlocksOrdinaryLoop = (workDir: string): boolean => {
     const statePath = path.join(campaignDirOf(workDir), candidateState.STATE_FILE);
     if (!fs.existsSync(statePath)) return false;
     // Fail closed (design §4): an existing but unreadable or malformed state is an
@@ -4587,6 +4650,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // junk file with disabled:true is an unclear state and stays blocked.
     return !disabledCandidateStateSync(workDir);
   };
+  const campaignBlocksOrdinaryLoop = async (workDir: string): Promise<boolean> => candidateBlocksOrdinaryLoop(workDir);
 
   const campaignBlockedResponse = () => ({
     content: [{ type: "text", text: `⛔ ${CAMPAIGN_BLOCK_TEXT}.` }],
@@ -5235,9 +5299,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     unexpectedArgKeys,
     getRuntime,
     recordAutoresearchActivation,
-    setAutoresearchMode,
-    updateWidget,
     sendWhenReady,
+    get cancelPendingResume() { return cancelPendingResume; },
+    get candidateBlocksOrdinaryLoop() { return candidateBlocksOrdinaryLoop; },
+    get classifyOrdinaryLaunchResearch() { return classifyOrdinaryLaunchResearch; },
+    get recordModeSwitchFinalize() { return recordModeSwitchFinalize; },
+    get transitionAutoresearchMode() { return transitionAutoresearchMode; },
     get optimizeBriefDir() { return optimizeBriefDir; },
     set optimizeBriefDir(dir: string | null) { optimizeBriefDir = dir; },
   };
@@ -5259,6 +5326,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     sendWhenReady,
     get activeChain() { return activeChain; },
     get chainCampaignIds() { return chainCampaignIds; },
+    get transitionAutoresearchMode() { return transitionAutoresearchMode; },
     get charterFileIntact() { return charterFileIntact; },
     get collectChainJournals() { return collectChainJournals; },
     get briefPreviewDir() { return briefPreviewDir; },
@@ -5320,11 +5388,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   function stopAutoresearchLoop(ctx: ExtensionContext): void {
     const runtime = getRuntime(ctx);
     recordAutoresearchActivation(resolveWorkDir(ctx.cwd), false);
-    setAutoresearchMode(ctx, false);
-    runtime.researchCampaignId = null;
-    runtime.researchStateRoot = null;
-    runtime.uiMode = "optimization";
-    runtime.autoResumeTurns = 0;
+    // An OFF is a mode transition too: an expedition chain bound earlier in
+    // this session must not survive into the next ordinary launch.
+    transitionAutoresearchMode(ctx, {
+      enabled: false, uiMode: "optimization", chain: null, campaignId: null, stateRoot: null, resetCounters: true,
+    });
     runtime.experimentsThisSession = 0;
     runtime.lastRunChecks = null;
     runtime.lastRunDuration = null;
@@ -5341,23 +5409,20 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
    *  archives the finished campaign. The state-root pin stays, so the final
    *  report still finds the campaign. The final report is available through
    *  research_questions(action=report). */
-  function exitResearchMode(ctx: ExtensionContext, campaignId: string): void {
+  function exitResearchMode(ctx: ExtensionContext, campaignId: string, opts: { silent?: boolean } = {}): void {
     const runtime = getRuntime(ctx);
     recordAutoresearchActivation(resolveWorkDir(ctx.cwd), false);
-    setAutoresearchMode(ctx, false);
-    runtime.uiMode = "optimization";
-    runtime.researchCampaignId = null;
-    // Review R1A: re-arm the continuation flag at the chain boundary — a NEW
-    // chain bound in the same session must be able to send its first
-    // awaiting_child continuation (once-per-period is per CHAIN, not per
-    // session).
-    runtime.chainContinuationSent = false;
-    // Review B4: leaving research mode ends the chain in memory too, so later
-    // campaigns in this session are not routed into a finished chain.
-    runtime.researchChain = null;
-    runtime.autoResumeTurns = 0;
+    // Review R1A/B4: leave the chain boundary with the continuation flag
+    // re-armed and no in-memory binding. The state-root pin stays so the final
+    // report still finds the campaign.
+    transitionAutoresearchMode(ctx, {
+      enabled: false, uiMode: "optimization", chain: null, campaignId: null,
+      chainContinuationSent: false, resetCounters: true,
+    });
     cancelPendingResume(runtime);
-    ctx.ui.notify(`Research campaign ${campaignId} stopped — research mode OFF. The final report stays available: research_questions(action=report).`, "info");
+    // bd tj0.2: an expedition → optimization switch announces ON once; the
+    // research-tool stop path keeps its historic OFF notification.
+    if (!opts.silent) ctx.ui.notify(`Research campaign ${campaignId} stopped — research mode OFF. The final report stays available: research_questions(action=report).`, "info");
   }
 
   // ── research-charter helpers (bd pi-autoresearch-5ol) ────────────────────
@@ -5666,8 +5731,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     let slice = "";
     const chain = activeChain(ctx);
     if (chain?.expedition) {
-      runtime.uiMode = "expedition";
-      updateWidget(ctx);
+      transitionAutoresearchMode(ctx, { enabled: runtime.autoresearchMode, uiMode: "expedition" });
       const verified = await chainJournal.verifyChain(chain.workDir, chain.chainId);
       if (verified.ok) { const replay = expedition.replayExpeditionMap(verified.entries); if (replay.ok) slice = expedition.mapSliceText(replay.map); }
     }
@@ -5683,18 +5747,21 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "Owner-stop rule: if the OWNER asks to finish/stop the expedition and NO charter stop rule has actually fired, call chain_stop WITHOUT rule_id (owner decision, interactive dialog) — never borrow a charter rule whose condition has not fired; a stop rule is a factual self-report, not a way to dress up an owner request.",
       ...(slice ? ["Expedition map snapshot:", slice] : []),
     ].join("\n");
-    runtime.chainContinuationSent = true;
+    transitionAutoresearchMode(ctx, {
+      enabled: runtime.autoresearchMode,
+      uiMode: runtime.uiMode,
+      chainContinuationSent: true,
+    });
     sendWhenReady(ctx, message, { steerIfBusy: true });
   };
 
   const exitChainModeFromPause = (ctx: ExtensionContext, chainId: string): void => {
     const runtime = getRuntime(ctx);
     recordAutoresearchActivation(resolveWorkDir(ctx.cwd), false);
-    setAutoresearchMode(ctx, false);
-    runtime.uiMode = "optimization";
-    runtime.researchCampaignId = null;
-    runtime.researchChain = null;
-    runtime.chainContinuationSent = false;
+    transitionAutoresearchMode(ctx, {
+      enabled: false, uiMode: "optimization", chain: null, campaignId: null,
+      chainContinuationSent: false, resetCounters: true,
+    });
     cancelPendingResume(runtime);
     ctx.ui.notify(`Research chain ${chainId} stopped — research mode OFF (the chain was in awaiting_child; the last report is already saved).`, "info");
   };
@@ -5781,14 +5848,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       if (!completed.ok) return { ok: false, message: `Completed status could not be recorded (${completed.message}); switch to optimization refused.` };
       await writeExpeditionFinalReport(chain, "completed", verified.entries);
     }
-    exitResearchMode(ctx, chain.chainId);
+    // bd tj0.2: write the ledger finalize and campaign report BEFORE unbinding
+    // and archiving, so the snapshot still sees the campaign's full state.
+    cancelPendingResume(runtime);
+    recordModeSwitchFinalize(ctx, "switch to optimization mode");
+    exitResearchMode(ctx, chain.chainId, { silent: true });
     try {
       const archived = await archiveFinishedCampaigns(workDir, effectiveResearchBase(workDir, ctx), ctx);
       if (archived !== null && archived.length > 0) ctx.ui.notify(`Archived finished campaigns: ${archived.join(", ")}.`, "info");
     } catch { /* archival is best effort */ }
-    cancelPendingResume(runtime);
-    recordModeSwitchFinalize(ctx, "switch to optimization mode");
-    runtime.uiMode = "optimization";
     return { ok: true, message: "" };
   };
 
@@ -5817,6 +5885,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     getRuntime,
     get hasAutoresearchRules() { return hasAutoresearchRules; },
     get hasLoggedExperiment() { return hasLoggedExperiment; },
+    get ordinaryLaunchResearchGate() { return ordinaryLaunchResearchGate; },
     get openExpeditionWebDashboard() { return openExpeditionWebDashboard; },
     get openFullscreenDashboard() { return openFullscreenDashboard; },
     get readLastRun() { return readLastRun; },
@@ -5833,6 +5902,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     get stopDashboardServer() { return stopDashboardServer; },
     get syncBriefPreview() { return syncBriefPreview; },
     get testHooks() { return testHooks; },
+    get transitionAutoresearchMode() { return transitionAutoresearchMode; },
     get turnAutoresearchOff() { return turnAutoresearchOff; },
     get updateWidget() { return updateWidget; },
     get writeCampaignReport() { return writeCampaignReport; },

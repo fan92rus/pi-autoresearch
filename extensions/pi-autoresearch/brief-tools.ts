@@ -18,6 +18,10 @@ import * as optimizeBrief from "./optimize-brief.ts";
 import * as expedition from "./expedition.ts";
 import * as chainJournal from "./chain-journal.ts";
 import * as researchState from "./research-state.ts";
+import type { ModeTransition } from "./index.ts";
+import {
+  EXPEDITION_CANDIDATE_ACTIVE_NOTICE, EXPEDITION_RESEARCH_ACTIVE_NOTICE, RESEARCH_KICKOFF_NOTICE,
+} from "./autoresearch-command.ts";
 
 type BriefTool = Parameters<ExtensionAPI["registerTool"]>[0];
 
@@ -33,9 +37,14 @@ export interface BriefToolsDeps {
   unexpectedArgKeys: (params: Record<string, unknown>, allowed: readonly string[], hint?: string) => string | null;
   getRuntime: (ctx: ExtensionContext) => any;
   recordAutoresearchActivation: (workDir: string, active: boolean) => void;
-  setAutoresearchMode: (ctx: ExtensionContext, active: boolean) => void;
-  updateWidget: (ctx: ExtensionContext) => void;
   sendWhenReady: (ctx: ExtensionContext, message: string, opts?: { steerIfBusy?: boolean }) => void;
+  // Late-declared mode helpers (getter-backed in index.ts): a direct propose
+  // is a mode switch and must use the same transactional owner as the command.
+  cancelPendingResume: (runtime: any) => void;
+  candidateBlocksOrdinaryLoop: (workDir: string) => boolean;
+  classifyOrdinaryLaunchResearch: (workDir: string, ctx: ExtensionContext) => "none" | "manual" | "active";
+  recordModeSwitchFinalize: (ctx: ExtensionContext, reason: string) => void;
+  transitionAutoresearchMode: (ctx: ExtensionContext, next: ModeTransition) => void;
   // Mutable state owned by index.ts: live accessors, never destructured.
   optimizeBriefDir: string | null;
 }
@@ -214,6 +223,8 @@ interface ExpeditionPublication {
   doc_sha256: string;
   step: string;
   done: string[];
+  /** The mode-switch finalize was durably recorded before publication steps. */
+  mode_finalized?: boolean;
 }
 type StepResult = { ok: true } | { ok: false; reason: string; message: string };
 
@@ -230,9 +241,18 @@ function readPublication(workDir: string): { state: ExpeditionPublication | null
       typeof raw.doc_path !== "string" || raw.doc_path === "" ||
       typeof raw.doc_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(raw.doc_sha256) ||
       typeof raw.step !== "string" || !Array.isArray(raw.done) ||
-      !raw.done.every((step) => typeof step === "string")
+      !raw.done.every((step) => typeof step === "string") ||
+      (raw.mode_finalized !== undefined && typeof raw.mode_finalized !== "boolean")
     ) return { state: null, problem: "expedition_publication_invalid" };
-    return { state: { schema_version: 1, id: raw.id, chain_id: raw.chain_id, doc_path: raw.doc_path, doc_sha256: raw.doc_sha256, step: raw.step, done: raw.done as string[] } };
+    // Legacy schema-v1 journals written before bd tj0.2 have no mode_finalized
+    // field and are coerced to false. Such a partial journal may already have a
+    // mode-switch finalize from the older code path; retrying it from an active
+    // optimization can therefore append one extra finalize. Journals written by
+    // this version record mode_finalized before the ledger append, so new
+    // partial publications are exactly-once. No automatic migration is attempted:
+    // treat an old partial journal as a manual-check case if duplicate finalize
+    // matters; do not silently rewrite historical journals.
+    return { state: { schema_version: 1, id: raw.id, chain_id: raw.chain_id, doc_path: raw.doc_path, doc_sha256: raw.doc_sha256, step: raw.step, done: raw.done as string[], mode_finalized: raw.mode_finalized === true } };
   } catch {
     return { state: null, problem: "expedition_publication_invalid" };
   }
@@ -346,6 +366,33 @@ function retireCompletedPublication(workDir: string, state: ExpeditionPublicatio
   catch { return false; }
 }
 
+/**
+ * The campaign pinned by this session's expedition chain is not an external
+ * launch block: its own publication verdict still refuses a same-document
+ * re-publish and an unfinished chain, and retires it only after finalization.
+ * Any OTHER research campaign is a hard refusal even when a journal exists.
+ * Mirrors classifyOrdinaryLaunchResearch (including the runtime state root)
+ * with that single exemption; a scan failure stays a manual-check path.
+ */
+function launchResearchOutsidePinnedCampaign(
+  workDir: string, runtime: any, pinnedCampaignId: string | null,
+): "none" | "manual" | "active" {
+  const bases = [workDir];
+  const stateRoot = runtime.researchStateRoot;
+  if (stateRoot && stateRoot !== workDir) bases.push(stateRoot);
+  let manual = false;
+  for (const base of bases) {
+    const scan = researchState.scanCampaignsSync(base);
+    if (!scan.ok) { manual = true; continue; }
+    for (const campaign of scan.campaigns) {
+      if (campaign.id === pinnedCampaignId) continue;
+      if (campaign.state?.phase === "research") return "active";
+      if (campaign.state?.phase === "briefing" || researchState.researchPolicyRefusal(campaign, "ordinaryLoop") !== null) manual = true;
+    }
+  }
+  return manual ? "manual" : "none";
+}
+
 export function createExpeditionBriefTool(deps: BriefToolsDeps): BriefTool {
   return {
     name: "expedition_brief",
@@ -376,6 +423,37 @@ export function createExpeditionBriefTool(deps: BriefToolsDeps): BriefTool {
       if (!ctx.hasUI && action === "propose") return reply("no_ui: expedition confirmation requires TUI", "no_ui");
       const workDir = deps.resolveWorkDir(ctx.cwd), runtime = deps.getRuntime(ctx);
       const stateRoot = runtime.researchStateRoot ?? path.join(workDir, ".auto");
+      // bd tj0.2: a direct propose is ALWAYS a launch, never a passive edit —
+      // including a retry or a completed journal that will be retired for a
+      // different document. Classify the research state against the current
+      // runtime/state root before reading the journal, retiring it, opening
+      // the owner dialog or mutating anything.
+      let manualResearchGate = false;
+      if (action === "propose") {
+        // Synchronous scan: a hard refusal must happen before the owner dialog
+        // and before any disk write, while a clean gate still reaches the
+        // dialog in the same tick (gated publish tests rely on that).
+        let researchGate = deps.classifyOrdinaryLaunchResearch(workDir, ctx);
+        if (researchGate === "active") {
+          const outside = launchResearchOutsidePinnedCampaign(workDir, runtime, runtime.researchCampaignId ?? null);
+          if (outside !== "active") researchGate = outside;
+        }
+        if (researchGate === "active") {
+          ctx.ui.notify(EXPEDITION_RESEARCH_ACTIVE_NOTICE, "error");
+          return reply(EXPEDITION_RESEARCH_ACTIVE_NOTICE, "expedition_launch_research_active");
+        }
+        if (deps.candidateBlocksOrdinaryLoop(workDir)) {
+          ctx.ui.notify(EXPEDITION_CANDIDATE_ACTIVE_NOTICE, "error");
+          return reply(EXPEDITION_CANDIDATE_ACTIVE_NOTICE, "expedition_launch_candidate_active");
+        }
+        if (researchGate === "manual") {
+          // Manual-check campaigns stay reachable through the research tools,
+          // but the autonomous expedition kickoff must not start over them.
+          ctx.ui.notify(RESEARCH_KICKOFF_NOTICE, "info");
+          manualResearchGate = true;
+        }
+      }
+      const loaded = action === "propose" ? readPublication(workDir) : null;
       if (action === "draft") {
         const checked = expedition.validateExpeditionDoc(params.doc);
         if (!checked.ok) return reply(`${checked.reason}: ${checked.message}`, checked.reason);
@@ -384,11 +462,10 @@ export function createExpeditionBriefTool(deps: BriefToolsDeps): BriefTool {
           ? reply(`Expedition draft saved: ${saved.path}. Next: expedition_brief propose.${params.doc_path !== undefined ? " (doc_path ignored on draft; propose uses the saved draft.)" : ""}`)
           : reply(`${saved.reason}: ${saved.message}`, saved.reason);
       }
-      const loaded = readPublication(workDir);
-      if (loaded.problem) return reply(`${loaded.problem}: publication journal ${publicationFile(workDir)} is unreadable; no chain was created`, loaded.problem);
-      let resuming = loaded.state !== null;
-      let resumeStep = loaded.state?.step ?? "";
-      let state = loaded.state;
+      if (loaded?.problem) return reply(`${loaded.problem}: publication journal ${publicationFile(workDir)} is unreadable; no chain was created`, loaded.problem);
+      let resuming = loaded?.state !== null;
+      let resumeStep = loaded?.state?.step ?? "";
+      let state = loaded?.state ?? null;
       let retireChainId: string | null = null;
       let docPath: string;
       let copied = false;
@@ -477,11 +554,27 @@ export function createExpeditionBriefTool(deps: BriefToolsDeps): BriefTool {
           resuming = false;
           resumeStep = "";
         }
+        // es1.7/es1.8: the optimization → expedition switch is finalized once
+        // before the new expedition is bound, with the same reason/order as
+        // '/autoresearch expedition'. An OFF session has nothing to finalize.
+        // bd tj0.2: the finalize is recorded in the durable publication
+        // journal BEFORE the append and before any publication step, so a
+        // forced io_failed retry cannot append a second finalize/report.
+        const needsModeFinalize = runtime.autoresearchMode && runtime.researchChain?.expedition !== true && runtime.uiMode === "optimization";
+        const alreadyFinalized = state?.mode_finalized === true;
         if (!state) {
           // The id and chain id exist only after the claim is won.
           const id = `exp-${Date.now()}-${randomUUID().slice(0, 8)}`;
-          state = { schema_version: 1, id, chain_id: `${id}-chain`, doc_path: docPath, doc_sha256: current.sha256, step: "prepared", done: [] };
+          state = { schema_version: 1, id, chain_id: `${id}-chain`, doc_path: docPath, doc_sha256: current.sha256, step: "prepared", done: [], mode_finalized: needsModeFinalize };
           if (!(await writePublication(workDir, state))) { if (copied) discardDocumentCopy(docPath); return reply(`io_failed: cannot write ${publicationFile(workDir)}`, "io_failed"); }
+        } else if (needsModeFinalize && !alreadyFinalized) {
+          const next = { ...state, mode_finalized: true };
+          if (!(await writePublication(workDir, next))) { if (copied) discardDocumentCopy(docPath); return reply(`io_failed: cannot record mode finalize in ${publicationFile(workDir)}`, "io_failed"); }
+          state = next;
+        }
+        if (needsModeFinalize && !alreadyFinalized) {
+          deps.recordModeSwitchFinalize(ctx, "switch to expedition mode");
+          deps.cancelPendingResume(runtime);
         }
         // Each durable step is recorded before the next one starts. A retry skips
         // recorded steps; a step that cannot be recorded refuses instead of
@@ -531,19 +624,21 @@ export function createExpeditionBriefTool(deps: BriefToolsDeps): BriefTool {
         if (!(await writePublication(workDir, state))) return reply(`expedition_publication_journal_failed: publication step complete but could not be recorded in ${publicationFile(workDir)}; manual check required`, "expedition_publication_journal_failed");
         if (copied && canonical) { try { fs.unlinkSync(canonical); } catch { /* the draft is spent; the charter copy is durable */ } }
         const resumeNote = resuming ? ` (RESUME from publication journal at step ${resumeStep})` : "";
-        // es1.8: every creation path pins the expedition view and refreshes the
-        // widget — including a session where the mode was already ON.
-        if (!runtime.autoresearchMode) { deps.recordAutoresearchActivation(workDir,true); deps.setAutoresearchMode(ctx,true); }
-        runtime.uiMode = "expedition";
-        runtime.researchCampaignId = id;
-        runtime.researchChain = {chainId,workDir,charterPath:docPath,charterSha256:current.sha256,charter:current.doc.charter,expedition:true,docSha256:current.sha256};
-        deps.updateWidget(ctx);
+        // es1.8: every creation path pins the expedition view. The flag, the
+        // bindings and the widget move together in one transactional switch.
+        if (!runtime.autoresearchMode) deps.recordAutoresearchActivation(workDir,true);
+        deps.transitionAutoresearchMode(ctx, {
+          enabled: true,
+          uiMode: "expedition",
+          chain: {chainId,workDir,charterPath:docPath,charterSha256:current.sha256,charter:current.doc.charter,expedition:true,docSha256:current.sha256},
+          campaignId: id,
+        });
         // Restart marker (bd pi-autoresearch-es1.3): lets a fresh session restore
         // the binding from disk. Chain creation is already durable at this point,
         // so a marker failure degrades to a warning, not a rollback.
         const marker = expedition.writeExpeditionMarker(chainDir, {goal: current.doc.goal, docPath, docSha256: current.sha256, campaignId: id, charter: current.doc.charter});
         const markerNote = marker.ok ? "" : `\nwarning: expedition restart marker not written (${marker.reason}: ${marker.message}); the expedition will not survive a pi restart.`;
-        deps.sendWhenReady(ctx, `Expedition ${id} created. Campaign 0 is running; the campaign brief is approved by the expedition confirmation. Before question work: pick a direction and activate it with expedition_map(subaction="activate", dir=<name>, why=<rationale>) — questions of campaign 0 belong to that direction. Use separate research_questions calls with action="open", action="record", or action="close" for campaign questions. When the direction is closed, close its campaign questions first, then call expedition_map(subaction="resolve", dir=<name>, refs=[{campaign,question}]) or make a separate call to expedition_map(subaction="reject", dir=<name>, refs=[{campaign,question}]), expedition_map(subaction="advisory", dir=<name>, review_ref=<path>, review_sha256=<sha256>), or expedition_map(subaction="park", dir=<name>, reason=<why>); activate the next direction with expedition_map(subaction="activate", dir=<name>, why=<rationale>) before drafting the next campaign. Question close is not map direction resolve.`, { steerIfBusy: true });
+        if (!manualResearchGate) deps.sendWhenReady(ctx, `Expedition ${id} created. Campaign 0 is running; the campaign brief is approved by the expedition confirmation. Before question work: pick a direction and activate it with expedition_map(subaction="activate", dir=<name>, why=<rationale>) — questions of campaign 0 belong to that direction. Use separate research_questions calls with action="open", action="record", or action="close" for campaign questions. When the direction is closed, close its campaign questions first, then call expedition_map(subaction="resolve", dir=<name>, refs=[{campaign,question}]) or make a separate call to expedition_map(subaction="reject", dir=<name>, refs=[{campaign,question}]), expedition_map(subaction="advisory", dir=<name>, review_ref=<path>, review_sha256=<sha256>), or expedition_map(subaction="park", dir=<name>, reason=<why>); activate the next direction with expedition_map(subaction="activate", dir=<name>, why=<rationale>) before drafting the next campaign. Question close is not map direction resolve.`, { steerIfBusy: true });
         return reply(`✅ Expedition ${chainId} created${resumeNote}; campaign ${id} started (document sha256 ${current.sha256}). Next: expedition_map(subaction="activate", dir=<name>, why=<rationale>) before question work; use separate research_questions calls with action="open", action="record", or action="close" for questions. After closing a direction with expedition_map(subaction="resolve", dir=<name>, refs=...) or a separate call with expedition_map(subaction="reject", dir=<name>, refs=...), activate the next direction with expedition_map(subaction="activate", dir=<name>, why=<rationale>) before drafting the next campaign.${markerNote}`);
       } finally {
         releaseProposeClaim(workDir, claim.token);

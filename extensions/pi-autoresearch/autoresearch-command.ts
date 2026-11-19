@@ -1,8 +1,9 @@
 /**
  * /autoresearch command registration (extracted from index.ts; command
  * description, argument completions, help text, every subcommand branch,
- * mode switches, cancellation/finalization and notify strings are preserved
- * byte-for-byte apart from deps reads at the call site). Extension-local
+ * cancellation/finalization and notify strings are preserved; mode switches
+ * now funnel through the transactional deps.transitionAutoresearchMode helper
+ * (bd tj0.2). Extension-local
  * collaborators arrive through `deps` and are read as `deps.foo` at the
  * point of use — never destructured into a handler/execute local. Mutable
  * bindings (runtime, uiMode, brief dirs, pending resume, loop mode, research
@@ -22,6 +23,13 @@ import { readCouncilConfig } from "./council.ts";
 import { listResearchCampaignIds } from "./research-scan.ts";
 import { filterSubcommands, applyExperimentLimitArg, configureExperimentLimit, interactiveParallelConfig } from "./parallel/config-ui.ts";
 import type { BoundTestHooks } from "./test-hooks.ts";
+import type { ModeTransition } from "./index.ts";
+
+/** Shared guard/notice wording: the command and the direct expedition_brief
+ *  propose path must refuse and notify with exactly the same text. */
+export const EXPEDITION_RESEARCH_ACTIVE_NOTICE = "Cannot launch expedition while a research campaign is active; resume or finish it first.";
+export const EXPEDITION_CANDIDATE_ACTIVE_NOTICE = "Candidate campaign active; finish it before starting an expedition.";
+export const RESEARCH_KICKOFF_NOTICE = "Research campaign active — continue it with research_questions(action=status); the legacy autoresearch kickoff is not sent.";
 
 /** Extension-local collaborators injected by index.ts (getter-backed there). */
 export interface AutoresearchCommandDeps {
@@ -42,6 +50,7 @@ export interface AutoresearchCommandDeps {
   hasLoggedExperiment: (cwd: string) => boolean;
   openExpeditionWebDashboard: (ctx: ExtensionContext) => Promise<void>;
   openFullscreenDashboard: (ctx: ExtensionContext) => Promise<void> | void;
+  ordinaryLaunchResearchGate: (workDir: string, ctx: ExtensionContext) => Promise<"none" | "manual" | "active">;
   readLastRun: (workDir: string) => Record<string, unknown> | null;
   recordAutoresearchActivation: (workDir: string, active: boolean) => void;
   recordModeSwitchFinalize: (ctx: ExtensionContext, reason: string) => void;
@@ -55,6 +64,7 @@ export interface AutoresearchCommandDeps {
   setAutoresearchMode: (ctx: ExtensionContext, enabled: boolean) => void;
   stopDashboardServer: () => void;
   syncBriefPreview: (ctx: ExtensionContext) => void;
+  transitionAutoresearchMode: (ctx: ExtensionContext, next: ModeTransition) => void;
   testHooks: BoundTestHooks;
   turnAutoresearchOff: (ctx: ExtensionContext) => void;
   updateWidget: (ctx: ExtensionContext) => void;
@@ -199,7 +209,6 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
         }
         const jsonlPaths = sessionFileCandidates(workDir, "log");
         deps.recordAutoresearchActivation(workDir, false);
-        deps.setAutoresearchMode(ctx, false);
         runtime.autoResumeTurns = 0;
         runtime.experimentsThisSession = 0;
         runtime.lastRunChecks = null;
@@ -208,7 +217,7 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
         deps.cancelPendingResume(runtime);
         runtime.state = deps.createExperimentState();
         deps.stopDashboardServer();
-        deps.updateWidget(ctx);
+        deps.transitionAutoresearchMode(ctx, { enabled: false, uiMode: "optimization" });
 
         const deletedPaths: string[] = [];
         const removePath = (target: string, recursive = false): boolean => {
@@ -327,11 +336,7 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
             // existing wording stays correct.
             if (status === "awaiting_child") {
               deps.recordAutoresearchActivation(workDir, true);
-              deps.setAutoresearchMode(ctx, true);
-              runtime.uiMode = "expedition";
-              runtime.autoResumeTurns = 0;
-              runtime.consecutiveDriftResumes = 0;
-              deps.updateWidget(ctx);
+              deps.transitionAutoresearchMode(ctx, { enabled: true, uiMode: "expedition" });
               const ids = await deps.chainCampaignIds(ctx);
               await deps.sendChainContinuation(ctx, ids.at(-1) ?? runtime.researchCampaignId ?? "<campaign>");
               ctx.ui.notify(`Expedition ${chain.chainId} continues (awaiting_child): the agent closes the finished direction and drafts the next campaign brief (auto-approved).`, "info");
@@ -342,21 +347,20 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
           }
         }
         if (!ctx.hasUI) { ctx.ui.notify("Expedition needs TUI confirmation; headless use requires the --expedition-doc wrapper.", "error"); return; }
-        if (await deps.researchBlocksExpeditionLaunch(workDir, ctx)) { ctx.ui.notify("Cannot launch expedition while a research campaign is active; resume or finish it first.", "error"); return; }
-        if (await deps.campaignBlocksOrdinaryLoop(workDir)) { ctx.ui.notify("Candidate campaign active; finish it before starting an expedition.", "error"); return; }
+        if (await deps.researchBlocksExpeditionLaunch(workDir, ctx)) { ctx.ui.notify(EXPEDITION_RESEARCH_ACTIVE_NOTICE, "error"); return; }
+        if (await deps.campaignBlocksOrdinaryLoop(workDir)) { ctx.ui.notify(EXPEDITION_CANDIDATE_ACTIVE_NOTICE, "error"); return; }
         // es1.7: an active optimization loop is finalized (ledger + report) but
         // NOT steered — the design-phase kickoff below is the only message. The
         // persisted off-marker is untouched: the mode stays ON, only the view
         // changes. A chain-bound session is not a mode switch.
-        if (runtime.autoresearchMode && runtime.researchChain?.expedition !== true) {
+        if (runtime.autoresearchMode && runtime.researchChain?.expedition !== true && runtime.uiMode === "optimization") {
           deps.recordModeSwitchFinalize(ctx, "switch to expedition mode");
           deps.cancelPendingResume(runtime);
           runtime.autoResumeTurns = 0;
           runtime.consecutiveDriftResumes = 0;
         }
-        runtime.uiMode = "expedition";
-        deps.recordAutoresearchActivation(workDir, true); deps.setAutoresearchMode(ctx, true);
-        runtime.autoResumeTurns = 0; runtime.consecutiveDriftResumes = 0; deps.updateWidget(ctx);
+        deps.recordAutoresearchActivation(workDir, true);
+        deps.transitionAutoresearchMode(ctx, { enabled: true, uiMode: "expedition" });
         const goal = trimmedArgs.slice("expedition".length).trim();
         const stateRoot = runtime.researchStateRoot ?? path.join(workDir, ".auto");
         const draft = expedition.findLatestDraft(stateRoot);
@@ -606,11 +610,9 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
           }
         }
         if (requestedId !== null) {
-          // Pin before activation: the research tools take no campaign id, so
-          // this session works with exactly this campaign (live bench finding,
-          // bd pi-autoresearch-9o2: the agent invented a second campaign).
-          runtime.researchCampaignId = requestedId;
-          deps.syncBriefPreview(ctx);
+          // The pin is installed by the transactional transition below (the
+          // research tools take no campaign id, so this session works with
+          // exactly this campaign — bd pi-autoresearch-9o2).
           const campaignDir = resolveRequestedCampaignDir(requestedId);
           const insp = campaignDir !== null ? await researchState.inspectCampaign(campaignDir) : null;
           resumePhase = insp?.state?.phase === "briefing" || insp?.state?.phase === "research" ? insp.state.phase : null;
@@ -626,13 +628,14 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
             "info",
           );
         }
-        runtime.researchStateRoot = requestedStateRoot;
-        runtime.uiMode = "optimization"; // a research campaign keeps the legacy dashboard, never the expedition view
         deps.recordAutoresearchActivation(researchWorkDir, true);
-        deps.setAutoresearchMode(ctx, true);
-        runtime.autoResumeTurns = 0;
-        runtime.consecutiveDriftResumes = 0;
-        deps.updateWidget(ctx);
+        // A research campaign keeps the legacy dashboard, never the expedition
+        // view; the pin, the mode and the view move in one transactional step.
+        deps.transitionAutoresearchMode(ctx, {
+          enabled: true, uiMode: "optimization", stateRoot: requestedStateRoot,
+          campaignId: requestedId ?? runtime.researchCampaignId,
+        });
+        deps.syncBriefPreview(ctx);
         // research-charter: accept the charter AFTER the mode is on (the chain
         // lives in the session runtime). A refusal here stops the launch: no
         // kickoff is sent, no chain state exists. The chain id derives from the
@@ -653,7 +656,10 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
             ctx.ui.notify(`Chain refused (${createdChain.reason}): ${createdChain.message}`, "error");
             return;
           }
-          runtime.researchChain = { chainId, workDir: researchWorkDir, charterPath: requestedCharterPath, charterSha256: accepted.sha256, charter: accepted.charter };
+          deps.transitionAutoresearchMode(ctx, {
+            enabled: true, uiMode: "optimization",
+            chain: { chainId, workDir: researchWorkDir, charterPath: requestedCharterPath, charterSha256: accepted.sha256, charter: accepted.charter },
+          });
           ctx.ui.notify(`Research chain ${chainId} started (charter sha256 ${accepted.sha256.slice(0, 12)}); the chain follows the charter limits`, "info");
         }
         // No /skill: prefix: the metric-loop skill must not be expanded into a research campaign.
@@ -696,22 +702,28 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
       }
 
       const workDir = deps.resolveWorkDir(ctx.cwd);
-      deps.recordAutoresearchActivation(workDir, true);
-      deps.setAutoresearchMode(ctx, true);
-      runtime.uiMode = "optimization";
-      runtime.autoResumeTurns = 0;
-      runtime.consecutiveDriftResumes = 0;
-      // Register the widget NOW: the agent may take a while before its first
-      // init_experiment, and the mode indicator must be visible immediately.
-      deps.updateWidget(ctx);
-      // A candidate campaign is active: the legacy create kickoff prescribes the
-      // ordinary loop (run/log), which is blocked. Point to the campaign instead.
-      if (await deps.researchBlocksOrdinaryLoop(deps.resolveWorkDir(ctx.cwd), ctx)) {
-        ctx.ui.notify("Research campaign active — continue it with research_questions(action=status); the legacy autoresearch kickoff is not sent.", "info");
+      // bd tj0.2: refuse BEFORE activating. A rejected launch must not leave
+      // the mode ON with a widget and no kickoff behind it. Research campaigns
+      // in stopped/pending/unreadable states are the exception: their recovery
+      // is a manual-check path through the research tools, so the historic
+      // notification and the suppressed kickoff are preserved.
+      const researchKickoffNotice = RESEARCH_KICKOFF_NOTICE;
+      const researchGate = await deps.ordinaryLaunchResearchGate(workDir, ctx);
+      if (researchGate === "active") {
+        ctx.ui.notify(researchKickoffNotice, "info");
         return;
       }
-      if (await deps.campaignBlocksOrdinaryLoop(deps.resolveWorkDir(ctx.cwd))) {
+      if (await deps.campaignBlocksOrdinaryLoop(workDir)) {
         ctx.ui.notify("Candidate campaign active — continue it with candidate_branch status; the legacy autoresearch kickoff is not sent.", "info");
+        return;
+      }
+      deps.recordAutoresearchActivation(workDir, true);
+      // The transition registers the widget NOW: the agent may take a while
+      // before its first init_experiment, and the mode indicator must be
+      // visible immediately after the guards have passed.
+      deps.transitionAutoresearchMode(ctx, { enabled: true, uiMode: "optimization", chain: null });
+      if (researchGate === "manual") {
+        ctx.ui.notify(researchKickoffNotice, "info");
         return;
       }
       const rulesLoaded = deps.hasAutoresearchRules(ctx);
