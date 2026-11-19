@@ -115,9 +115,11 @@ test("foreign dialog hash is refused, aborts, and exits 1", async () => {
 
 test("modifying the brief while the dialog is pending fails closed", async () => {
   const ctx = setup();
-  const pending = run(ctx, ["--hold-dialog-ms", "800"], "success");
+  const release = path.join(ctx.dir, "brief-modified.ready");
+  const pending = run(ctx, ["--hold-dialog-until-exists", release], "success");
   assert.ok(await waitForEvent(ctx, "brief_dialog_received"), "wrapper should receive the brief dialog before the hold window");
   fs.writeFileSync(ctx.brief, `${JSON.stringify({ schema_version: 1, goal: "modified" }, null, 2)}\n`);
+  fs.writeFileSync(release, "");
   const result = await pending;
   assert.equal(result.code, 1, result.stderr);
   const confirmation = events(ctx).find((event) => event.record?.event === "brief_confirmation");

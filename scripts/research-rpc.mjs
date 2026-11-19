@@ -58,7 +58,7 @@ function parseArgs(argv) {
     args[key] = value;
     i += 1;
   }
-  const KNOWN = new Set(["help", "mode", "brief", "approve-sha", "campaign-id", "state-root", "pi", "cwd", "timeout-sec", "stage1-timeout-sec", "hold-dialog-ms", "hold-dialog-until-absent", "auto-adopt-draft", "log", "charter", "approve-charter-sha", "expedition-doc", "approve-expedition-sha"]);
+  const KNOWN = new Set(["help", "mode", "brief", "approve-sha", "campaign-id", "state-root", "pi", "cwd", "timeout-sec", "stage1-timeout-sec", "hold-dialog-ms", "hold-dialog-until-absent", "hold-dialog-until-exists", "auto-adopt-draft", "log", "charter", "approve-charter-sha", "expedition-doc", "approve-expedition-sha"]);
   for (const key of Object.keys(args)) {
     if (!KNOWN.has(key)) throw new Error(`Unknown option: --${key} (typos silently become part of the campaign description otherwise)`);
   }
@@ -95,12 +95,13 @@ function parseArgs(argv) {
   }
   if (args["hold-dialog-ms"] !== undefined && !/^\d+(?:\.\d+)?$/.test(args["hold-dialog-ms"])) throw new Error("Invalid --hold-dialog-ms");
   if (args["hold-dialog-until-absent"] !== undefined && (typeof args["hold-dialog-until-absent"] !== "string" || args["hold-dialog-until-absent"].trim() === "")) throw new Error("Invalid --hold-dialog-until-absent");
+  if (args["hold-dialog-until-exists"] !== undefined && (typeof args["hold-dialog-until-exists"] !== "string" || args["hold-dialog-until-exists"].trim() === "")) throw new Error("Invalid --hold-dialog-until-exists");
   return args;
 }
 
 function sha256(bytes) { return createHash("sha256").update(bytes).digest("hex"); }
 function jsonLine(value) { return `${JSON.stringify(value)}\n`; }
-function usage() { return "Usage: node scripts/research-rpc.mjs --mode research (--brief <canonical.json> --approve-sha <sha256> | --expedition-doc <canonical.json> --approve-expedition-sha <sha256>) [--campaign-id <id>] [--state-root <dir>] [--charter <path> --approve-charter-sha <sha256>] [--pi <path>] [--cwd <dir>] [--timeout-sec 3600] [--stage1-timeout-sec 30] [--hold-dialog-ms 0] [--hold-dialog-until-absent <path>] [--auto-adopt-draft] [--log <path>]"; }
+function usage() { return "Usage: node scripts/research-rpc.mjs --mode research (--brief <canonical.json> --approve-sha <sha256> | --expedition-doc <canonical.json> --approve-expedition-sha <sha256>) [--campaign-id <id>] [--state-root <dir>] [--charter <path> --approve-charter-sha <sha256>] [--pi <path>] [--cwd <dir>] [--timeout-sec 3600] [--stage1-timeout-sec 30] [--hold-dialog-ms 0] [--hold-dialog-until-absent <path>] [--hold-dialog-until-exists <path>] [--auto-adopt-draft] [--log <path>]"; }
 
 async function main() {
   let args;
@@ -163,6 +164,7 @@ async function main() {
   const stage1TimeoutMs = Number(args["stage1-timeout-sec"] ?? DEFAULT_STAGE1_TIMEOUT) * 1000;
   const holdDialogMs = Number(args["hold-dialog-ms"] ?? 0);
   const holdUntilAbsent = args["hold-dialog-until-absent"] ? path.resolve(cwd, args["hold-dialog-until-absent"]) : null;
+  const holdUntilExists = args["hold-dialog-until-exists"] ? path.resolve(cwd, args["hold-dialog-until-exists"]) : null;
   const configuredPi = args.pi ?? "pi";
   const piPath = resolvePiExecutable(configuredPi);
   // Default log is stored alongside campaign data in the target workspace.
@@ -500,6 +502,10 @@ async function main() {
         if (holdUntilAbsent !== null) {
           while (fs.existsSync(holdUntilAbsent) && !finished) await new Promise((resolve) => setTimeout(resolve, 10));
           logEvent("wrapper", { event: "brief_hold_released", path: holdUntilAbsent });
+        }
+        if (holdUntilExists !== null) {
+          while (!fs.existsSync(holdUntilExists) && !finished) await new Promise((resolve) => setTimeout(resolve, 10));
+          logEvent("wrapper", { event: "brief_hold_released", path: holdUntilExists });
         }
         if (finished) return;
         let currentFileHash;
