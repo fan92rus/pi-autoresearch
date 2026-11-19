@@ -16,6 +16,26 @@ const extensionModule = await import(pathToFileURL(path.join(import.meta.dirname
   (await import(pathToFileURL(path.join(import.meta.dirname, '..', 'extensions', 'pi-autoresearch', 'index.ts')).href)).default(pi);
 }
 
+/** Sources of every current extension module: index.ts plus extracted files. */
+function extensionModules() {
+  const found = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const abs = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(abs);
+      else if (entry.name.endsWith('.ts')) found.push({ file: path.basename(abs), src: fs.readFileSync(abs, 'utf8') });
+    }
+  };
+  walk(path.join(import.meta.dirname, '..', 'extensions', 'pi-autoresearch'));
+  return found;
+}
+const allExtensionSources = () => extensionModules().map((m) => m.src).join('\n');
+const moduleContaining = (needle) => {
+  const found = extensionModules().find((m) => m.src.includes(needle));
+  assert.ok(found, `expected a current module containing ${needle}`);
+  return found.src;
+};
+
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 const brief = {
   schema_version: 1, goal: 'g', plan_source: 'p', caveat_block: 'c',
@@ -119,7 +139,7 @@ test('resolveExpeditionPayload: damaged chain.json → null; the open-page route
   // The spec damage scenario is about the ROUTE while the expedition page is
   // open: dashboardServerExpedition makes /expedition answer with the honest
   // fail:"journal" JSON instead of 404.
-  const source = fs.readFileSync(path.join(import.meta.dirname, '..', 'extensions', 'pi-autoresearch', 'index.ts'), 'utf8');
+  const source = allExtensionSources();
   assert.match(source, /dashboardServerExpedition[\s\S]{0,600}fail: "journal"/, 'expedition route must answer damage with fail journal JSON');
 });
 
@@ -141,7 +161,7 @@ test('resolveExpeditionPayload: fully broken campaign dir → {phase:null, q:[],
 
 // ── resolveServedFile /expedition route ──────────────────────────────────────
 test('resolveServedFile: /expedition returns a non-null JSON-mode marker', () => {
-  const source = fs.readFileSync(path.join(import.meta.dirname, '..', 'extensions', 'pi-autoresearch', 'index.ts'), 'utf8');
+  const source = allExtensionSources();
   assert.match(source, /json:\/expedition/, 'route must be answered with a json: marker');
 });
 
@@ -195,11 +215,13 @@ test('dashboard command outside an expedition → the ordinary fullscreen path (
 });
 
 test('export command stays the ordinary ledger path inside an expedition (no expedition branch)', () => {
-  const source = fs.readFileSync(path.join(import.meta.dirname, '..', 'extensions', 'pi-autoresearch', 'index.ts'), 'utf8');
+  // exportDashboard may move to an extracted module; find its current owner.
+  const source = moduleContaining('async function exportDashboard');
   // exportDashboard must NOT branch to the expedition page: the spec keeps the ledger dashboard for export.
   // Slice precisely: from the exportDashboard signature to the next helper (the expedition detector).
   const start = source.indexOf('async function exportDashboard');
-  const end = source.indexOf('/** Detects an expedition', start);
+  const nextHelper = source.indexOf('/** Detects an expedition', start);
+  const end = nextHelper >= 0 ? nextHelper : source.length;
   const exportFn = source.slice(start, end);
   assert.ok(exportFn.includes('Export failed'), 'slice captured the real exportDashboard body');
   assert.doesNotMatch(exportFn, /buildExpeditionHtml/, 'export must not render the expedition page');
@@ -207,10 +229,17 @@ test('export command stays the ordinary ledger path inside an expedition (no exp
 });
 
 test('no new broadcast points: broadcastDashboardUpdate call sites unchanged', () => {
-  const source = fs.readFileSync(path.join(import.meta.dirname, '..', 'extensions', 'pi-autoresearch', 'index.ts'), 'utf8');
-  const callSites = source.match(/broadcastDashboardUpdate\(/g)?.length ?? 0;
+  // Count across all current modules: extraction must not relax the pin, and
+  // a new broadcast on the expedition path must be caught wherever it lands.
+  const owners = extensionModules().flatMap((m) =>
+    [...(m.src.match(/broadcastDashboardUpdate\(/g) ?? [])].map(() => m.file));
+  const callSites = owners.length;
   // 4 legacy sites (ledger/config writes) + 1 definition = 5. es1.7/es1.8
   // adds one intentional broadcast after the mode-switch finalize entry so
   // an open dashboard sees the new ledger row; the expedition branch adds none.
-  assert.equal(callSites, 6);
+  // The count now spans extracted modules too (index.ts 6 + finalize 1 + log 1).
+  assert.equal(callSites, 8);
+  const expeditionFiles = new Set(['expedition.ts', 'expedition-view.ts', 'dashboard-web.ts']);
+  assert.deepEqual(owners.filter((file) => expeditionFiles.has(file)), [],
+    'the expedition path must not add dashboard broadcasts');
 });

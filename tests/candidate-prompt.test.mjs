@@ -16,6 +16,7 @@ import { pathToFileURL } from "node:url";
 
 import { createFakePi, makeCtx } from "./fake-pi.ts";
 import { markSessionStarted } from "./optimize-approve-helper.mjs";
+import { SETTLED_WINDOW_MS } from "../extensions/pi-autoresearch/resume-policy.ts";
 
 const LEGACY_LOOP_MARKERS = [
   "One idea = one cycle",
@@ -107,6 +108,41 @@ test("disabled candidate campaign does not change the prompt (legacy loop comes 
 
 // ─── B1 steers/compaction + M2 template (final review) ───────────────────────
 
+/**
+ * Run a hook body with the settled-window clock under test control. The
+ * extension schedules one SETTLED_WINDOW_MS timer to deliver a pending resume;
+ * capture that callback and fire it after the body (including any state
+ * changes before delivery) has settled. No fixed 1100 ms wall-clock wait.
+ */
+async function drainSettledResumes(hookBody) {
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const timers = [];
+  globalThis.setTimeout = (callback, ms, ...args) => {
+    if (ms !== SETTLED_WINDOW_MS) return realSetTimeout(callback, ms, ...args);
+    const timer = { handle: { settled: true }, callback, args, cleared: false, fired: false };
+    timers.push(timer);
+    return timer.handle;
+  };
+  globalThis.clearTimeout = (handle) => {
+    const timer = timers.find((t) => t.handle === handle);
+    if (timer) { timer.cleared = true; return; }
+    return realClearTimeout(handle);
+  };
+  try {
+    await hookBody();
+    for (let i = 0; i < 10; i++) {
+      const due = timers.find((t) => !t.cleared && !t.fired);
+      if (!due) break;
+      due.fired = true;
+      await due.callback(...due.args);
+    }
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+  }
+}
+
 /** Full harness for hook-level tests (agent_end / session_compact). */
 async function makeFullHarness(label, { campaignActive }) {
   const dir = makeTempDir(label);
@@ -136,9 +172,10 @@ async function makeFullHarness(label, { campaignActive }) {
 
 test("B1: agent_end under an active campaign never sends legacy-cycle resume text", async () => {
   const { pi, hook, ctx } = await makeFullHarness("steer-active", { campaignActive: true });
-  await hook("agent_start")({ messages: [] }, ctx);
-  await hook("agent_end")({ messages: [] }, ctx);
-  await new Promise((r) => setTimeout(r, 1100)); // SETTLED_WINDOW_MS = 800
+  await drainSettledResumes(async () => {
+    await hook("agent_start")({ messages: [] }, ctx);
+    await hook("agent_end")({ messages: [] }, ctx);
+  }); // SETTLED_WINDOW_MS = 800
   const legacy = pi.sentMessages.filter((m) => /run_experiment|log_experiment|propose_hypothesis/.test(m.text));
   assert.equal(legacy.length, 0, `no legacy-cycle steers under a campaign: ${JSON.stringify(legacy.map((m) => m.text))}`);
 }, { timeout: 30000 });
@@ -146,18 +183,20 @@ test("B1: agent_end under an active campaign never sends legacy-cycle resume tex
 test("B1: agent_end without a campaign keeps the legacy drift-resume text (initialized loop)", async () => {
   const { pi, hook, ctx, dir } = await makeFullHarness("steer-legacy", { campaignActive: false });
   markSessionStarted(dir); // an initialized loop (ledger exists) keeps the legacy wording
-  await hook("agent_start")({ messages: [] }, ctx);
-  await hook("agent_end")({ messages: [] }, ctx);
-  await new Promise((r) => setTimeout(r, 1100));
+  await drainSettledResumes(async () => {
+    await hook("agent_start")({ messages: [] }, ctx);
+    await hook("agent_end")({ messages: [] }, ctx);
+  });
   const drift = pi.sentMessages.filter((m) => /propose_hypothesis → run_experiment → log_experiment/.test(m.text));
   assert.equal(drift.length, 1, `legacy drift resume must survive with an initialized loop: ${JSON.stringify(pi.sentMessages.map((m) => m.text))}`);
 }, { timeout: 30000 });
 
 test("B1: drift without a ledger and without a campaign names the uninitialized loop, not the legacy cycle", async () => {
   const { pi, hook, ctx } = await makeFullHarness("steer-nolog", { campaignActive: false });
-  await hook("agent_start")({ messages: [] }, ctx);
-  await hook("agent_end")({ messages: [] }, ctx);
-  await new Promise((r) => setTimeout(r, 1100));
+  await drainSettledResumes(async () => {
+    await hook("agent_start")({ messages: [] }, ctx);
+    await hook("agent_end")({ messages: [] }, ctx);
+  });
   const legacy = pi.sentMessages.filter((m) => /propose_hypothesis → run_experiment → log_experiment/.test(m.text));
   assert.equal(legacy.length, 0, `no legacy cycle prescription without a ledger: ${JSON.stringify(pi.sentMessages.map((m) => m.text))}`);
   const uninit = pi.sentMessages.filter((m) => /not initialized/.test(m.text));
@@ -166,18 +205,20 @@ test("B1: drift without a ledger and without a campaign names the uninitialized 
 
 test("B1: an expedition_brief tool turn counts as loop work, not drift", async () => {
   const { pi, hook, ctx } = await makeFullHarness("steer-expbrief", { campaignActive: false });
-  await hook("agent_start")({ messages: [] }, ctx);
-  await hook("tool_execution_end")({ toolName: "expedition_brief" }, ctx);
-  await hook("agent_end")({ messages: [] }, ctx);
-  await new Promise((r) => setTimeout(r, 1100));
+  await drainSettledResumes(async () => {
+    await hook("agent_start")({ messages: [] }, ctx);
+    await hook("tool_execution_end")({ toolName: "expedition_brief" }, ctx);
+    await hook("agent_end")({ messages: [] }, ctx);
+  });
   const drift = pi.sentMessages.filter((m) => /used no experiment tools|propose_hypothesis → run_experiment/.test(m.text));
   assert.equal(drift.length, 0, `expedition_brief is loop work: no drift accusation: ${JSON.stringify(pi.sentMessages.map((m) => m.text))}`);
 }, { timeout: 30000 });
 
 test("B1: session_compact under an active campaign resumes the campaign, not the legacy loop", async () => {
   const { pi, hook, ctx } = await makeFullHarness("compact-active", { campaignActive: true });
-  await hook("session_compact")({}, ctx);
-  await new Promise((r) => setTimeout(r, 1100));
+  await drainSettledResumes(async () => {
+    await hook("session_compact")({}, ctx);
+  });
   const legacy = pi.sentMessages.filter((m) => /run_experiment|log_experiment/.test(m.text));
   assert.equal(legacy.length, 0, `compaction must not prescribe the legacy loop under a campaign: ${JSON.stringify(pi.sentMessages.map((m) => m.text))}`);
   const cand = pi.sentMessages.filter((m) => /candidate_branch/.test(m.text));
@@ -212,9 +253,10 @@ test("B1: a partial-cycle turn (loop tool used, no experiment) under a campaign 
   await hook("agent_start")({ messages: [] }, ctx);
   // A loop tool that the campaign does NOT block (propose_hypothesis) marks the
   // turn as partial; agent_end would previously send the default (legacy) resume.
-  await hook("tool_execution_end")({ toolName: "propose_hypothesis" }, ctx);
-  await hook("agent_end")({ messages: [] }, ctx);
-  await new Promise((r) => setTimeout(r, 1100));
+  await drainSettledResumes(async () => {
+    await hook("tool_execution_end")({ toolName: "propose_hypothesis" }, ctx);
+    await hook("agent_end")({ messages: [] }, ctx);
+  });
   const legacy = pi.sentMessages.filter((m) => /run_experiment|log_experiment|propose_hypothesis/.test(m.text));
   assert.equal(legacy.length, 0, `partial-cycle resume must not prescribe the legacy cycle: ${JSON.stringify(legacy.map((m) => m.text))}`);
   const cand = pi.sentMessages.filter((m) => /candidate_branch/.test(m.text));
@@ -224,10 +266,11 @@ test("B1: a partial-cycle turn (loop tool used, no experiment) under a campaign 
 test("B1: a partial-cycle turn without a campaign keeps the legacy default resume", async () => {
   const { pi, hook, ctx, dir } = await makeFullHarness("steer-partial-legacy", { campaignActive: false });
   markSessionStarted(dir); // partial-cycle wording is a legacy-loop concept (initialized loop)
-  await hook("agent_start")({ messages: [] }, ctx);
-  await hook("tool_execution_end")({ toolName: "propose_hypothesis" }, ctx);
-  await hook("agent_end")({ messages: [] }, ctx);
-  await new Promise((r) => setTimeout(r, 1100));
+  await drainSettledResumes(async () => {
+    await hook("agent_start")({ messages: [] }, ctx);
+    await hook("tool_execution_end")({ toolName: "propose_hypothesis" }, ctx);
+    await hook("agent_end")({ messages: [] }, ctx);
+  });
   const legacy = pi.sentMessages.filter((m) => /run_experiment \+ log_experiment/.test(m.text));
   assert.equal(legacy.length, 1, `legacy default resume must survive without a campaign: ${JSON.stringify(pi.sentMessages.map((m) => m.text))}`);
 }, { timeout: 30000 });
@@ -250,10 +293,11 @@ test("B1: a campaign under a configured workingDir is detected by drift/compacti
     "utf8",
   );
   const { pi, hook, ctx } = await makeFullHarnessAt(dir, "steer-wd-ctx");
-  await hook("agent_start")({ messages: [] }, ctx);
-  await hook("agent_end")({ messages: [] }, ctx);
-  await hook("session_compact")({}, ctx);
-  await new Promise((r) => setTimeout(r, 1100));
+  await drainSettledResumes(async () => {
+    await hook("agent_start")({ messages: [] }, ctx);
+    await hook("agent_end")({ messages: [] }, ctx);
+    await hook("session_compact")({}, ctx);
+  });
   const legacy = pi.sentMessages.filter((m) => /run_experiment|log_experiment|propose_hypothesis/.test(m.text));
   assert.equal(legacy.length, 0, `workingDir campaign must be detected for steers: ${JSON.stringify(legacy.map((m) => m.text))}`);
   const cand = pi.sentMessages.filter((m) => /candidate_branch/.test(m.text));
@@ -295,10 +339,11 @@ test("N4: a partial-cycle turn under a campaign with a pending operation sends N
     "utf8",
   );
   const { pi, hook, ctx } = await makeFullHarnessAt(dir, "steer-pending-ctx");
-  await hook("agent_start")({ messages: [] }, ctx);
-  await hook("tool_execution_end")({ toolName: "propose_hypothesis" }, ctx);
-  await hook("agent_end")({ messages: [] }, ctx);
-  await new Promise((r) => setTimeout(r, 1100));
+  await drainSettledResumes(async () => {
+    await hook("agent_start")({ messages: [] }, ctx);
+    await hook("tool_execution_end")({ toolName: "propose_hypothesis" }, ctx);
+    await hook("agent_end")({ messages: [] }, ctx);
+  });
   // Only automatic RESUME steers are forbidden; the /skill kickoff is not a resume.
   const RESUME_TEXT = /Continue the candidate campaign|Last turn did no candidate-campaign work|Run the next iteration|Resume the cycle/;
   const resumes = pi.sentMessages.filter((m) => RESUME_TEXT.test(m.text));
@@ -329,9 +374,10 @@ test("N4 drift path: a settled turn with NO tool events under a pending operatio
     "utf8",
   );
   const { pi, hook, ctx } = await makeFullHarnessAt(dir, "steer-drift-pending-ctx");
-  await hook("agent_start")({ messages: [] }, ctx);
-  await hook("agent_end")({ messages: [] }, ctx);
-  await new Promise((r) => setTimeout(r, 1100));
+  await drainSettledResumes(async () => {
+    await hook("agent_start")({ messages: [] }, ctx);
+    await hook("agent_end")({ messages: [] }, ctx);
+  });
   const RESUME_TEXT = /Continue the candidate campaign|Last turn did no candidate-campaign work|Run the next iteration|Resume the cycle/;
   const resumes = pi.sentMessages.filter((m) => RESUME_TEXT.test(m.text));
   assert.equal(resumes.length, 0, `drift resume must not fire under a pending operation: ${JSON.stringify(resumes.map((m) => m.text))}`);
@@ -353,13 +399,14 @@ test("N4 reschedule: a resume scheduled BEFORE a pending op appears is not deliv
     "utf8",
   );
   const { pi, hook, ctx } = await makeFullHarnessAt(dir, "steer-reschedule-ctx");
-  await hook("agent_start")({ messages: [] }, ctx);
-  await hook("agent_end")({ messages: [] }, ctx); // schedules a drift resume (no pending op yet)
-  await hook("agent_start")({ messages: [] }, ctx); // timer paused, message kept
-  fs.writeFileSync(path.join(dir, ".auto", "candidate", "pending-op.json"),
-    JSON.stringify({ name: "checkpoint cand-a", started_at: new Date().toISOString() }), "utf8");
-  await hook("agent_end")({ messages: [] }, ctx);
-  await new Promise((r) => setTimeout(r, 1200));
+  await drainSettledResumes(async () => {
+    await hook("agent_start")({ messages: [] }, ctx);
+    await hook("agent_end")({ messages: [] }, ctx); // schedules a drift resume (no pending op yet)
+    await hook("agent_start")({ messages: [] }, ctx); // timer paused, message kept
+    fs.writeFileSync(path.join(dir, ".auto", "candidate", "pending-op.json"),
+      JSON.stringify({ name: "checkpoint cand-a", started_at: new Date().toISOString() }), "utf8");
+    await hook("agent_end")({ messages: [] }, ctx);
+  });
   const RESUME_TEXT = /Continue the candidate campaign|Last turn did no candidate-campaign work|Run the next iteration|Resume the cycle/;
   const resumes = pi.sentMessages.filter((m) => RESUME_TEXT.test(m.text));
   assert.equal(resumes.length, 0, `a stored resume must not leak into a pending operation: ${JSON.stringify(resumes.map((m) => m.text))}`);
@@ -368,20 +415,21 @@ test("N4 reschedule: a resume scheduled BEFORE a pending op appears is not deliv
 test("M1: a legacy resume stored before the campaign started is replaced by campaign wording at send time", async () => {
   const dir = makeTempDir("steer-legacy-then-campaign");
   const { pi, hook, ctx } = await makeFullHarnessAt(dir, "steer-legacy-then-campaign-ctx");
-  await hook("agent_start")({ messages: [] }, ctx);
-  await hook("tool_execution_end")({ toolName: "propose_hypothesis" }, ctx);
-  await hook("agent_end")({ messages: [] }, ctx); // legacy partial-cycle resume scheduled
-  // The campaign starts before the timer fires.
-  fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
-  fs.writeFileSync(path.join(dir, ".auto", "candidate", "state.json"),
-    JSON.stringify({
-      schema_version: 1,
-      created_at: "2026-01-01T00:00:00.000Z",
-      disabled: false,
-      policy: { candidate_step_limit: 5, candidate_time_limit_seconds: 300 },
-      candidates: [],
-    }), "utf8");
-  await new Promise((r) => setTimeout(r, 1200));
+  await drainSettledResumes(async () => {
+    await hook("agent_start")({ messages: [] }, ctx);
+    await hook("tool_execution_end")({ toolName: "propose_hypothesis" }, ctx);
+    await hook("agent_end")({ messages: [] }, ctx); // legacy partial-cycle resume scheduled
+    // The campaign starts before the delivered timer callback runs.
+    fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
+    fs.writeFileSync(path.join(dir, ".auto", "candidate", "state.json"),
+      JSON.stringify({
+        schema_version: 1,
+        created_at: "2026-01-01T00:00:00.000Z",
+        disabled: false,
+        policy: { candidate_step_limit: 5, candidate_time_limit_seconds: 300 },
+        candidates: [],
+      }), "utf8");
+  });
   const legacy = pi.sentMessages.filter((m) => /run_experiment \+ log_experiment|Run the next iteration now/.test(m.text));
   assert.equal(legacy.length, 0, `legacy text must not be delivered under a campaign: ${JSON.stringify(pi.sentMessages.map((m) => m.text))}`);
 }, { timeout: 30000 });
@@ -435,22 +483,23 @@ test("M2: a stored campaign resume is not delivered after the campaign was disab
     "utf8",
   );
   const { pi, hook, ctx } = await makeFullHarnessAt(dir, "stored-after-disable-ctx");
-  await hook("agent_start")({ messages: [] }, ctx);
-  await hook("agent_end")({ messages: [] }, ctx); // campaign wording scheduled
-  await hook("agent_start")({ messages: [] }, ctx);
-  fs.writeFileSync(
-    statePath,
-    JSON.stringify({
-      schema_version: 1,
-      created_at: "2026-01-01T00:00:00.000Z",
-      disabled: true,
-      policy: { candidate_step_limit: 5, candidate_time_limit_seconds: 300 },
-      candidates: [],
-    }),
-    "utf8",
-  );
-  await hook("agent_end")({ messages: [] }, ctx);
-  await new Promise((r) => setTimeout(r, 1200));
+  await drainSettledResumes(async () => {
+    await hook("agent_start")({ messages: [] }, ctx);
+    await hook("agent_end")({ messages: [] }, ctx); // campaign wording scheduled
+    await hook("agent_start")({ messages: [] }, ctx);
+    fs.writeFileSync(
+      statePath,
+      JSON.stringify({
+        schema_version: 1,
+        created_at: "2026-01-01T00:00:00.000Z",
+        disabled: true,
+        policy: { candidate_step_limit: 5, candidate_time_limit_seconds: 300 },
+        candidates: [],
+      }),
+      "utf8",
+    );
+    await hook("agent_end")({ messages: [] }, ctx);
+  });
   const campaignText = pi.sentMessages.filter((m) => /candidate_branch/.test(m.text));
   assert.equal(campaignText.length, 0, `a stale campaign resume must not claim the campaign is active: ${JSON.stringify(pi.sentMessages.map((m) => m.text))}`);
 }, { timeout: 30000 });
