@@ -178,17 +178,7 @@ UCB1 Suggestions (expandable nodes):
 💡 Suggestion: explore_from("n6")
 ```
 
-**Configuration:** The exploration constant C defaults to 0.5. Tune via `.auto/config.json`:
-
-```json
-{
-  "parallel": {
-    "ucb1C": 0.7
-  }
-}
-```
-
-Higher C = more exploration (favor unexplored nodes). Lower C = more exploitation (favor proven territory).
+The exploration constant C is fixed at 0.5. The old config override was removed (bd pi-autoresearch-el3.4); the `parallel` key in `.auto/config.json` now only holds inert legacy values with no runtime effect.
 
 ---
 
@@ -268,7 +258,7 @@ Key fields:
 - **Zero migration:** Existing sessions without `.auto/tree.json` work unchanged
 - **log.jsonl unchanged:** The flat log remains as the source of truth
 - **tree.json is an overlay:** Adds structure on top of the existing flat log
-- **BestOfN/SpaceSearch:** Work independently (tree integration planned for Phase 2)
+- Parallel worker tools were removed (bd pi-autoresearch-el3.4); use `candidate_branch` to explore alternatives.
 
 ---
 
@@ -279,7 +269,7 @@ Key fields:
 | SimHash is lexical, not semantic | Rephrased duplicates are caught; semantic duplicates with different words may be missed |
 | Compose only works for orthogonal files | Same-file conflicts return an error — manual merge is planned for Phase 2 |
 | No GC of old refs | All `refs/exp/*` are preserved; GC strategy planned for Phase 2 |
-| BestOfN/SpaceSearch don't write to tree | These parallel tools work independently; tree integration is Phase 2 |
+| Parallel worker tools were removed | Use `candidate_branch` for alternative exploration (bd pi-autoresearch-el3.4) |
 
 ---
 

@@ -1,16 +1,17 @@
 /**
- * config-ui.ts — Interactive TUI configuration for parallel mode.
+ * config-ui.ts — Interactive TUI configuration for campaign settings and the
+ * legacy policy stored under the ".auto/config.json" parallel key.
  *
  * Uses pi's ExtensionUIContext dialogs (select, input, confirm)
- * to let users configure models, concurrency, budget, and observer
- * thresholds without editing .auto/config.json manually.
+ * to let users configure models, observer thresholds, and inert legacy
+ * policy values without editing .auto/config.json manually. Parallel
+ * worker machinery was removed (bd pi-autoresearch-el3.4).
  *
  * Localized: auto-detects Russian locale (ru-RU) and shows Russian UI.
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import * as os from "node:os";
 
 import { resolveConfig, type ParallelConfig, type Tier } from "./config.ts";
 import { DEFAULT_PARTICIPANTS, DEFAULT_CHAIR_MODEL } from "../council.ts";
@@ -75,7 +76,7 @@ const RU = detectRu();
 const L = {
   // Main menu
   councilModels: RU ? "🧠 Модели совета (аналитики + председатель)..." : "🧠 Council models (analysts + chair)...",
-  parallelOff: RU ? " (параллельный режим выключен)" : " (parallel mode is off)",
+  legacyInactive: RU ? " (устаревшая политика неактивна)" : " (legacy policy inactive)",
   presets: RU ? "📦 Пресеты..." : "📦 Presets...",
   models: RU ? "🔧 Модели (индивидуально)..." : "🔧 Models (individual)...",
   concurrency: RU ? "⚡ Конкурентность..." : "⚡ Concurrency...",
@@ -87,7 +88,7 @@ const L = {
   reset: RU ? "♻️ Сбросить к дефолтам" : "♻️ Reset to defaults",
 
   // Headers
-  configTitle: RU ? "Конфигурация кампании (лимит времени + параллельный режим)" : "Campaign Configuration (time limit + parallel mode)",
+  configTitle: RU ? "Конфигурация кампании (лимит времени + устаревшая политика)" : "Campaign Configuration (time limit + legacy policy)",
   currentLabel: RU ? "Текущие:" : "Current:",
   observerTitle: RU ? "Настройки наблюдателя — что настроить?" : "Observer Settings — what to configure?",
   choosePreset: RU ? "Выберите пресет" : "Choose a preset",
@@ -183,11 +184,11 @@ function formatCurrent(cfg: ParallelConfig, expLimit: number | null = null): str
     "  fast:   " + cfg.tiers.fast,
     "  mid:    " + cfg.tiers.mid,
     "  strong: " + cfg.tiers.strong,
-    "  " + (RU ? "конкурентность" : "concurrency") + ": " + conc,
-    "  " + (RU ? "бюджет (parallel)" : "budget (parallel)") + ": " + cfg.budgetSeconds + "s",
+    "  " + (RU ? "конкурентность (устаревшая)" : "concurrency (legacy)") + ": " + conc,
+    "  " + (RU ? "бюджет (устаревшая политика)" : "budget (legacy policy)") + ": " + cfg.budgetSeconds + "s",
 
 // NOTE (bd pi-autoresearch-el3.4): "parallel" here is the legacy config
-// namespace (.auto/config.json "parallel" key) kept as campaign policy
+// namespace (.auto/config.json "parallel" key) kept as inert campaign policy
 // storage — no parallel fan-out machinery exists anymore.
   ].join("\n");
 }
@@ -239,24 +240,12 @@ async function configureModels(ctx: ConfigCtx, workDir: string): Promise<boolean
 async function configureConcurrency(ctx: ConfigCtx, workDir: string): Promise<boolean> {
   const cfg = getConfigParallel(workDir);
   const current = cfg.concurrency?.toString() ?? L.concAuto;
-  const cpuCount = os.cpus().length;
-  const autoVal = Math.max(1, Math.min(cpuCount - 1, 4));
 
   const title = [
-    (RU ? "Конкурентность (текущая: " : "Concurrency (current: ") + current + ")",
+    (RU ? "Конкурентность (устаревшая политика, текущая: " : "Concurrency (legacy policy, current: ") + current + ")",
     "",
-    RU ? "Количество воркер-субагентов, работающих параллельно" : "Number of worker subagents running in parallel",
-    RU ? "в кампаниях (инструменты параллельных режимов удалены —" : "in campaigns (the parallel-mode tools are removed —",
-    RU ? "скоуп-сплит; настройка — часть политики кампании)." : "scope split; the setting is kept as campaign policy).",
-    "",
-    RU ? "Значение сохраняется как политика кампании (.auto/config.json) —" : "The value is stored as campaign policy (.auto/config.json) —",
-    RU ? "Значение сохраняется как политика кампании (.auto/config.json)." : "The value is stored as campaign policy (.auto/config.json).",
-    "",
-    RU ? "Рекомендуемые значения:" : "Recommended values:",
-    "  auto   = min(CPU-1, 4) = " + autoVal + " (" + (RU ? "ваши ядра" : "your cores") + ": " + cpuCount + ")",
-    "  1-2    = " + (RU ? "безопасно для CPU-тяжёлых measure.sh (компиляция, обучение)" : "safe if measure.sh is CPU-heavy (compile, train)"),
-    "  3-4    = " + (RU ? "хорошо для лёгких скриптов (парсинг, тесты)" : "good for lightweight scripts (parsing, tests)"),
-    "  5+     = " + (RU ? "только если measure.sh I/O-bound или network-bound" : "only if measure.sh is I/O or network-bound"),
+    RU ? "Устаревшее поле конфигурации. Параллельный fan-out удалён (bd pi-autoresearch-el3.4): воркеры не запускаются." : "Legacy config field. Parallel fan-out was removed (bd pi-autoresearch-el3.4): no workers are launched.",
+    RU ? "Значение сохраняется только для совместимости старых конфигураций и ни на что не влияет." : "The value is stored only for compatibility with old configs and has no runtime effect.",
     "",
     L.concEnter,
   ].join("\n");
@@ -270,13 +259,13 @@ async function configureConcurrency(ctx: ConfigCtx, workDir: string): Promise<bo
   if (trimmed.toLowerCase() === "auto" || trimmed === "0") {
     delete (raw.parallel as Record<string, unknown>).concurrency;
     writeConfig(workDir, raw);
-    ctx.ui.notify((RU ? "Конкурентность: авто (min(CPU-1, 4) = " : "Concurrency: auto (min(CPU-1, 4) = ") + autoVal + ")", "info");
+    ctx.ui.notify(RU ? "Конкурентность: авто (устаревшая политика)" : "Concurrency: auto (legacy policy)", "info");
   } else {
     const n = parseInt(trimmed, 10);
     if (isNaN(n) || n < 1 || n > 16) { ctx.ui.notify(RU ? "Неверное число (1-16)" : "Invalid number (1-16)", "error"); return false; }
     (raw.parallel as Record<string, unknown>).concurrency = n;
     writeConfig(workDir, raw);
-    ctx.ui.notify((RU ? "Конкурентность: " : "Concurrency: ") + n, "info");
+    ctx.ui.notify((RU ? "Конкурентность (устаревшая политика): " : "Concurrency (legacy policy): ") + n, "info");
   }
   return true;
 }
@@ -286,22 +275,10 @@ async function configureBudget(ctx: ConfigCtx, workDir: string): Promise<boolean
   const current = cfg.budgetSeconds.toString();
 
   const title = [
-    (RU ? "Бюджет на замер в секундах (текущий: " : "Budget per measure in seconds (current: ") + current + "s)",
+    (RU ? "Бюджет (устаревшая политика, текущий: " : "Budget (legacy policy, current: ") + current + "s)",
     "",
-    RU ? "Максимальное время выполнения одного measure.sh." : "Maximum wall-clock time for a single measure.sh execution.",
-    RU ? "При превышении запуск убивается (budget_exceeded)." : "If exceeded, the run is killed and logged as budget_exceeded.",
-    "",
-    RU ? "Бюджет применяется к полному прогону measure.sh при re-measure:" : "This budget applies to the full measure.sh run at re-measure:",
-    "  " + (RU ? "обычный прогон" : "ordinary run") + " — " + (RU ? "полный benchmark" : "complete benchmark"),
-    "",
-    RU ? "Если baseline превышает бюджет — прогон падает с budget_exceeded." : "If the baseline itself exceeds this, the run fails with budget_exceeded.",
-    RU ? "Лучше ускорить measure.sh (добавить BENCH_MODE=quick subset)." : "Fix measure.sh (add BENCH_MODE=quick subset) rather than raising the budget.",
-    "",
-    RU ? "Типичные значения:" : "Typical values:",
-    "  60s    = " + (RU ? "быстрые скрипты (парсинг, unit-тесты)" : "quick scripts (parsing, small unit tests)"),
-    "  120s   = " + (RU ? "умеренные (интеграционные тесты)" : "moderate (integration tests, medium datasets)"),
-    "  300s   = " + (RU ? "дефолт (сборка + тесты, обучение)" : "default (build + test suites, training)"),
-    "  600s   = " + (RU ? "тяжёлые (полные эпохи, большие benchmark)" : "heavy (full training epochs, large benchmarks)"),
+    RU ? "Устаревшее поле конфигурации. Параллельные замеры и их бюджет удалены (bd pi-autoresearch-el3.4)." : "Legacy config field. Parallel measurements and their budget were removed (bd pi-autoresearch-el3.4).",
+    RU ? "Значение сохраняется только для совместимости старых конфигураций и не ограничивает выполнение команд." : "The value is stored only for compatibility with old configs and does not limit any execution.",
     "",
     L.budgetEnter,
   ].join("\n");
@@ -314,7 +291,7 @@ async function configureBudget(ctx: ConfigCtx, workDir: string): Promise<boolean
   if (!raw.parallel) (raw as Record<string, unknown>).parallel = {};
   (raw.parallel as Record<string, unknown>).budgetSeconds = n;
   writeConfig(workDir, raw);
-  ctx.ui.notify((RU ? "Бюджет: " : "Budget: ") + n + "s", "info");
+  ctx.ui.notify((RU ? "Бюджет (устаревшая политика): " : "Budget (legacy policy): ") + n + "s", "info");
   return true;
 }
 
@@ -583,20 +560,20 @@ export async function configureExperimentLimit(ctx: ConfigCtx): Promise<void> {
 
 export async function interactiveParallelConfig(ctx: ConfigCtx, workDir: string): Promise<void> {
   const cfg = getConfigParallel(workDir);
-  ctx.ui.notify((RU ? "Конфигурация:\n" : "Parallel Config:\n") + formatCurrent(cfg, readExperimentMaxMinutes(ctx.cwd)), "info");
+  ctx.ui.notify((RU ? "Конфигурация:\n" : "Config:\n") + formatCurrent(cfg, readExperimentMaxMinutes(ctx.cwd)), "info");
 
   while (true) {
     const current = getConfigParallel(workDir);
     const header = L.configTitle + "\n\n" + L.currentLabel + "\n" + formatCurrent(current, readExperimentMaxMinutes(ctx.cwd)) + "\n";
 
-    const choice = await ctx.ui.select(header, [L.limitItem, L.councilModels, L.presets + L.parallelOff, L.models + L.parallelOff, L.concurrency + L.parallelOff, L.budget + L.parallelOff, L.observer + L.parallelOff, L.done]);
+    const choice = await ctx.ui.select(header, [L.limitItem, L.councilModels, L.presets + L.legacyInactive, L.models + L.legacyInactive, L.concurrency + L.legacyInactive, L.budget + L.legacyInactive, L.observer + L.legacyInactive, L.done]);
     if (!choice || choice === L.done) break;
 
     try {
-      // Parallel items carry the off-marker suffix — match by prefix.
+      // Inactive legacy items carry the marker suffix — match by prefix.
       if (choice === L.councilModels) { await configureCouncilModels(ctx); continue; }
-      const parallelChoice = choice.endsWith(L.parallelOff) ? choice.slice(0, -L.parallelOff.length) : choice;
-      switch (parallelChoice) {
+      const menuChoice = choice.endsWith(L.legacyInactive) ? choice.slice(0, -L.legacyInactive.length) : choice;
+      switch (menuChoice) {
         case L.limitItem: await configureExperimentLimit(ctx); break;
         case L.presets: await configurePresets(ctx, workDir); break;
         case L.models: await configureModels(ctx, workDir); break;

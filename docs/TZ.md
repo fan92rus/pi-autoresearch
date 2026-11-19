@@ -1,6 +1,10 @@
 # ТЗ — parallel-режимы для pi-autoresearch
 
-**Статус:** Draft v0.3 (решения D1–D19 согласованы)
+> **SUPERSEDED (bd pi-autoresearch-el3.4, owner decision 2026-11-16):** режимы A/B/C, инструменты воркеров, команды `/autoresearch parallel-*` и skill `autoresearch-parallel` удалены. Активный путь — `candidate_branch` / `research`. Далее — исторический дизайн, а не действующее ТЗ и не критерии приёмки. Из конфигурации осталось только неактивное хранилище `.auto/config.json` → `parallel` (тиры моделей, concurrency, budget) без влияния на выполнение.
+>
+> **SUPERSEDED:** sections 3–13 below are retained as a historical record only.
+
+**Статус:** Draft v0.3 (SUPERSEDED — el3.4 / candidate_branch; решения D1–D19 исторические)
 **Дата:** 2026-07-23
 **Связанные документы:** [PRD.md](./PRD.md)
 **Репозиторий:** это и есть [fan92rus/pi-autoresearch](https://github.com/fan92rus/pi-autoresearch) (форк [davebcn87/pi-autoresearch](https://github.com/davebcn87/pi-autoresearch) с Windows-fixes + патч `ensureGatedToolsActive`); parallel-режимы — фича на ветке `feat/parallel-modes`. RPC-поставщик: [pi-subagents](https://github.com/fan92rus/pi-subagents).
@@ -455,7 +459,7 @@ Batched, не per-candidate-sequential: round1 ВСЕ на base-tier парал�
 
 - `model: "provider/model:thinking"` или `model: {tier}` — переопределяет тир для **всех** кандидатов (cascade всё ещё работает поверх).
 - `cascade: false` — отключить эскалацию (только один тир, проще/дешевле, но failure = отбросить).
-- Глобально: через config или флаги `/autoresearch parallel-* --tier fast --no-cascade`.
+- Глобально: через config или флаги `/autoresearch parallel-* --tier fast --no-cascade` (SUPERSEDED — el3.4/candidate_branch; флаги и режимы удалены).
 
 ---
 
@@ -682,7 +686,7 @@ LLM может «верить», что улучшение за углом — �
 **Цель:** попробовать 4 подхода одновременно.
 
 ```
-пользователь: /autoresearch parallel-best-of-n 4 "ускорь горячий путь JSON-парсера в src/parse.ts"
+пользователь: /autoresearch parallel-best-of-n 4 "ускорь горячий путь JSON-парсера в src/parse.ts"  // REMOVED — SUPERSEDED by el3.4/candidate_branch
 агент: формулирует 4 гипотезы (текст):
   H1: "Инлайн hot-loop в функции parseValue, устранить call overhead"
   H2: "SIMD-пропуск whitespace черезbulk-skip"
@@ -810,7 +814,7 @@ tool: H2 помечен crash, не участвует в ранжировани
 | **Новое:** tool `SpaceSearch` | registerTool; handler = §11, stateful beam |
 | **Новое:** tools `startPhase`/`commitPhase`/`abortPhase` | registerTool; транзакции с regression allowance (§11.5 М1) |
 | **Новое:** tool `valleyProbe` | registerTool; переиспользует BestOfN mechanics (§11.5 М2) |
-| **Новое:** `/autoresearch parallel-*` commands | activate parallel-mode, направляют агента к skill'у |
+| **Новое (SUPERSEDED — el3.4/candidate_branch, удалено):** `/autoresearch parallel-*` commands | activate parallel-mode, направляют агента к skill'у |
 
 ### 13.2. `paths.ts` — без изменений
 
@@ -819,7 +823,7 @@ tool: H2 помечен crash, не участвует в ранжировани
 ### 13.3. Новый skill `autoresearch-parallel`
 
 `skills/autoresearch-parallel/SKILL.md`:
-- Триггеры: `/autoresearch parallel-*`, цели с измеримой метрикой + пространство гипотез.
+- Триггеры: `/autoresearch parallel-*`, цели с измеримой метрикой + пространство гипотез (SUPERSEDED — el3.4/candidate_branch; skill удалён).
 - Действия (режим A): сформулировать N гипотез (текст) → `BestOfN(...)` → `log_experiment(decision)`.
 - Валидация `BENCH_MODE` в measure.sh (steer дописать при отсутствии).
 - Режим B: идентификация ортогональных подсистем (file-scope) → `CheckOrthogonal`.
