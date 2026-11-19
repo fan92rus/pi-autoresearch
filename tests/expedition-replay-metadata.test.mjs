@@ -76,3 +76,36 @@ test("pivot preserves source and existing target metadata; a new target uses the
   assert.match(report, /\| A \| parked \| Reactivation A \| c1\/Q1 \|/);
   assert.match(report, /\| B \| parked \| Activation B \|/);
 });
+
+test("tool-shaped reopen and park (why and reason) keep the original basis in map, slice and report", () => {
+  // research-dispatch writes both why and reason from the same tool argument.
+  const map = replay([
+    { type: "direction_opened", dir: "D1", why: "Original basis D1", at: "1" },
+    { type: "direction_activated", dir: "D1", why: "Activation basis D1", campaign: "c1", at: "2" },
+    { type: "direction_resolved", dir: "D1", refs, at: "3" },
+    { type: "direction_reopened", dir: "D1", why: "Reopen for a new signal", reason: "Reopen for a new signal", at: "4" },
+    { type: "direction_opened", dir: "D2", why: "Original basis D2", at: "5" },
+    { type: "direction_parked", dir: "D2", why: "Park for a new signal", reason: "Park for a new signal", at: "6" },
+  ]);
+
+  const d1 = map.directions.get("D1");
+  assert.equal(d1.status, "open");
+  assert.equal(d1.why, "Activation basis D1", "tool reopen reason must not replace the basis");
+  assert.equal(d1.reason, "Reopen for a new signal");
+  assert.deepEqual(d1.refs, refs);
+
+  const d2 = map.directions.get("D2");
+  assert.equal(d2.status, "parked");
+  assert.equal(d2.why, "Original basis D2", "tool park reason must not replace the basis");
+  assert.equal(d2.reason, "Park for a new signal");
+
+  const slice = expedition.mapSliceText(map);
+  assert.match(slice, /○ D1 — open: Activation basis D1/);
+  assert.match(slice, /💤 D2 — parked: Original basis D2/);
+  assert.doesNotMatch(slice, /open: Reopen for a new signal|parked: Park for a new signal/);
+
+  const report = expedition.expeditionReportText(map, { chainId: "chain", finalStatus: "awaiting_child", campaigns: [], computedAt: "now" });
+  assert.match(report, /\| D1 \| open \| Activation basis D1 \|/);
+  assert.match(report, /\| D2 \| parked \| Original basis D2 \|/);
+  assert.doesNotMatch(report, /\| D[12] \| (?:open|parked) \| (?:Reopen|Park) for a new signal \|/);
+});

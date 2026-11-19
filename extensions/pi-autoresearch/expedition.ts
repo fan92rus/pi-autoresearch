@@ -64,15 +64,21 @@ export function replayExpeditionMap(entries: ChainEntry[]): Result<{map:Expediti
       if(to){const prev=map.directions.get(to);if(!prev)map.openedCount++;map.directions.set(to,{...prev,dir:to,status:"active",why:prev?.why??(typeof e.why==="string"?e.why:reason),reason,...(!prev&&typeof e.campaign==="string"?{campaign:e.campaign}:{})});}
       map.lastPivotAt=i; return; }
     if(!dir)return;
-    const old=map.directions.get(dir); const why=typeof e.why==="string"?e.why:old?.why??(typeof e.reason==="string"?e.reason:typeof e.note==="string"?e.note:"");
+    const old=map.directions.get(dir);
+    const fallbackWhy=typeof e.why==="string"?e.why:typeof e.reason==="string"?e.reason:typeof e.note==="string"?e.note:"";
+    // Tool-written events carry both why and reason, so only basis-defining
+    // transitions may replace the recorded why; status transitions keep it.
+    let why=old?.why??fallbackWhy;
     let status:DirectionStatus=old?.status??"open";
-    if(type==="direction_opened"){status="open";if(!old)map.openedCount++;}
-    else if(type==="direction_activated")status="active";
-    else if(type==="direction_resolved"){status="resolved";map.lastCloseAt=i;}
-    else if(type==="direction_rejected"){status="rejected";map.lastCloseAt=i;}
-    else if(type==="direction_parked")status="parked";
-    else if(type==="direction_reopened")status="open";
-    else if(type==="direction_advisory")status="advisory_exhausted";
+    switch(type){
+      case "direction_opened": if(typeof e.why==="string")why=e.why; status="open";if(!old)map.openedCount++;break;
+      case "direction_activated": if(typeof e.why==="string")why=e.why; status="active";break;
+      case "direction_resolved": status="resolved";map.lastCloseAt=i;break;
+      case "direction_rejected": status="rejected";map.lastCloseAt=i;break;
+      case "direction_parked": status="parked";break;
+      case "direction_reopened": status="open";break;
+      case "direction_advisory": status="advisory_exhausted";break;
+    }
     map.directions.set(dir,{...old,dir,status,why,
       ...(Array.isArray(e.refs)?{refs:e.refs as DirectionState["refs"]}:old?.refs?{refs:old.refs}:{}),
       ...(typeof e.campaign==="string"?{campaign:e.campaign}:old?.campaign?{campaign:old.campaign}:{}),
