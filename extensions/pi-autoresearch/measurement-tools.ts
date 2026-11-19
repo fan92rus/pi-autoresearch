@@ -8,6 +8,8 @@
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
+import { loadFindings } from "./findings.ts";
+import { refusalDetails } from "./refusal.ts";
 import {
   formatMeasurementScale,
   logMeasurementChange,
@@ -20,6 +22,31 @@ import {
 
 export interface RegisterToolLike {
   registerTool(tool: unknown): void;
+}
+
+const FINDING_ID_RE = /^f\d+$/;
+
+/**
+ * A finding-shaped justification ("f7") must name an existing finding with
+ * theme measurement; anything else stays ordinary free text (bd tj0.8).
+ * The ledger format and the store's own validation are untouched.
+ */
+export function measurementJustificationProblem(workDir: string, justification: unknown): string | null {
+  if (typeof justification !== "string") return null;
+  const id = justification.trim();
+  if (!FINDING_ID_RE.test(id)) return null;
+  const loaded = loadFindings(workDir);
+  if (!loaded.ok) {
+    return `justification: "${id}" — находка не может быть проверена (${loaded.errors.join("; ")}); укажите существующий id или опишите причину словами`;
+  }
+  const finding = loaded.value.findings.get(id);
+  if (!finding) {
+    return `justification: "${id}" — находка с таким id не найдена в .auto/findings.jsonl; укажите существующий id или опишите причину словами`;
+  }
+  if (finding.theme !== "measurement") {
+    return `justification: "${id}" — тема находки ${finding.theme}, а не measurement; изменение измерителя должно ссылаться на находку с темой measurement`;
+  }
+  return null;
 }
 
 export interface GatedToolDeps {
@@ -110,6 +137,13 @@ export function registerMeasurementTools(pi: RegisterToolLike, deps: GatedToolDe
         return { content: [{ type: "text", text: `❌ ${workDirError}` }], details: {} };
       }
       const workDir = resolveWorkDir(ctx.cwd);
+      const justificationProblem = measurementJustificationProblem(workDir, params.justification);
+      if (justificationProblem) {
+        return {
+          content: [{ type: "text", text: `❌ log_measurement_change rejected:\n  ${justificationProblem}` }],
+          details: refusalDetails("invalid_argument"),
+        };
+      }
       const res = logMeasurementChange(workDir, params);
       if (!res.ok) {
         return { content: [{ type: "text", text: `❌ log_measurement_change rejected:\n  ${res.errors.join("\n  ")}` }], details: {} };
@@ -224,6 +258,13 @@ export function registerMeasurementTools(pi: RegisterToolLike, deps: GatedToolDe
         return { content: [{ type: "text", text: `❌ ${workDirError}` }], details: {} };
       }
       const workDir = resolveWorkDir(ctx.cwd);
+      const justificationProblem = measurementJustificationProblem(workDir, params.justification);
+      if (justificationProblem) {
+        return {
+          content: [{ type: "text", text: `❌ revert_measurement_change rejected:\n  ${justificationProblem}` }],
+          details: refusalDetails("invalid_argument"),
+        };
+      }
       const res = revertMeasurementChange(workDir, params);
       if (!res.ok) {
         return { content: [{ type: "text", text: `❌ revert_measurement_change rejected:\n  ${res.errors.join("\n  ")}` }], details: {} };

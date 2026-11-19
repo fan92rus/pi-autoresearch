@@ -11,6 +11,7 @@ import { Type, type Static } from "@sinclair/typebox";
 import {
   FINDING_STATUSES,
   FINDING_THEMES,
+  FINDING_TRANSITIONS,
   recordFinding,
   updateFinding,
 } from "./findings.ts";
@@ -46,10 +47,28 @@ const RecordFindingParams = Type.Object({
   })),
 });
 
-const UpdateFindingParams = Type.Object({
+/** Tool-facing status vocabulary, generated from findings.ts (bd tj0.8). */
+export function findingStatusDescription(): string {
+  return `Target status: ${FINDING_STATUSES.join(" | ")}.`;
+}
+
+/** Tool-facing transition graph, generated from findings.ts (bd tj0.8). */
+export function findingTransitionsDescription(): string {
+  return Object.entries(FINDING_TRANSITIONS)
+    .map(([from, targets]) => `${from}→${targets.join("|")}`)
+    .join(", ");
+}
+
+/** The exact description used by update_finding.status. */
+export function findingStatusAndTransitionsDescription(): string {
+  return `${findingStatusDescription()} Transitions are restricted (${findingTransitionsDescription()}).`;
+}
+
+/** Built per registration so a change to the exported constants reaches the schema. */
+const updateFindingParams = () => Type.Object({
   id: Type.String({ description: "Finding id, e.g. f1." }),
   status: Type.String({
-    description: `Target status: ${FINDING_STATUSES.join(" | ")}. Transitions are restricted (open→verified|revised|deferred, revised→verified|deferred, deferred→open, verified→revised).`,
+    description: findingStatusAndTransitionsDescription(),
   }),
   evidence_ref: Type.Optional(Type.String({
     description: "Required for verified and revised: 'path:start-end' or 'path#anchor' pointing at the verification or counterexample.",
@@ -121,9 +140,9 @@ export function registerFindingsTools(pi: RegisterToolLike, deps: GatedToolDeps)
     promptGuidelines: [
       "verified requires evidence_ref to an independent check; revised requires evidence_ref to a counterexample.",
     ],
-    parameters: UpdateFindingParams,
+    parameters: updateFindingParams(),
 
-    async execute(_toolCallId, params: Static<typeof UpdateFindingParams>, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params: Static<ReturnType<typeof updateFindingParams>>, _signal, _onUpdate, ctx) {
       const modeGate = assertModeActive(ctx);
       if (modeGate) return modeGate;
       const workDirError = validateWorkDir(ctx.cwd);

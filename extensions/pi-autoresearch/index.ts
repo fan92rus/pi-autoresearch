@@ -173,7 +173,7 @@ import {
 } from "./candidate-policy.ts";
 import * as candidateState from "./candidate-state.ts";
 import * as researchState from "./research-state.ts";
-import { renderRefusal } from "./refusal.ts";
+import { inspectionRefusalReason, refusalDetails, renderRefusal } from "./refusal.ts";
 import {
   resolveBriefPreviewDir,
   buildExpeditionWidgetLines,
@@ -1712,7 +1712,30 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const gatedToolNames = new Set<string>();
   const registerGatedTool = (tool: Parameters<typeof pi.registerTool>[0]): void => {
     gatedToolNames.add(tool.name);
-    pi.registerTool(tool);
+    const execute = tool.execute;
+    if (typeof execute !== "function") {
+      pi.registerTool(tool);
+      return;
+    }
+    // Tool-local fail() helpers keep their reason/message text; the canonical
+    // refusal_reason is added here so every gated refusal carries the same
+    // vocabulary (bd tj0.8). Non-refusal details are copied unchanged.
+    pi.registerTool({
+      ...tool,
+      async execute(...args: unknown[]) {
+        const result = await (execute as (...callArgs: unknown[]) => unknown).apply(tool, args);
+        if (result && typeof result === "object" && "details" in result) {
+          const details = (result as { details?: unknown }).details;
+          if (details && typeof details === "object" && !Array.isArray(details)) {
+            const reason = (details as Record<string, unknown>).reason;
+            if (typeof reason === "string" && !("refusal_reason" in details)) {
+              return { ...result, details: { ...details, ...refusalDetails(reason) } };
+            }
+          }
+        }
+        return result;
+      },
+    } as Parameters<typeof pi.registerTool>[0]);
   };
 
   // Ensure the gated tools are present in the active tool set. Returns true if a
@@ -2021,7 +2044,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const researchBlockedResponse = () => ({
     content: [{ type: "text", text: `⛔ ${RESEARCH_BLOCK_TEXT}.` }],
-    details: {},
+    details: refusalDetails(inspectionRefusalReason("manual_check_required")),
   });
 
   const RESEARCH_RESUME_TEXT =
@@ -4542,7 +4565,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // Council blackboard tools: gated under an active research campaign
   // (research-vectors spec §8, review B1). The guard is sync (researchScanSync).
   registerCouncilTools(pi, (cwd) =>
-    researchScanSync(resolveWorkDir(cwd)).blocks ? (researchBlockedResponse() as { content: { type: "text"; text: string }[]; details: Record<string, never> }) : undefined,
+    researchScanSync(resolveWorkDir(cwd)).blocks
+      ? (researchBlockedResponse() as unknown as { content: { type: "text"; text: string }[]; details: Record<string, never> })
+      : undefined,
   );
 
   // Precedent search is standalone: no campaign or autoresearch-mode gate;
@@ -4599,19 +4624,37 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const campaignDirOf = (workDir: string): string => path.join(workDir, CANDIDATE_DIR);
 
   /**
-   * Only a FULLY valid, disabled state (the same validator used by every
-   * candidate state transition) releases the ordinary loop. Missing, JSON-broken
-   * or schema-invalid files never count as disabled — the gates fail closed.
+   * The ONE synchronous inspection behind every candidate ordinary-loop gate.
+   * It reuses candidateState.parseValidStateSync (the full validator used by
+   * every state transition) and the shared inspection/refusal mapper; gates
+   * only read the derived status, so a disabled-but-invalid state can never
+   * release the loop. Missing states are not refusals; unreadable ones are.
    */
-  const disabledCandidateStateSync = (workDir: string): boolean => {
+  const candidateGateInspectionSync = (workDir: string): {
+    status: "uninitialized" | "ready" | "disabled" | "state_unreadable";
+    state: candidateState.CampaignState | null;
+    refusal_reason: string | null;
+  } => {
     const statePath = path.join(campaignDirOf(workDir), candidateState.STATE_FILE);
-    if (!fs.existsSync(statePath)) return false;
-    try {
-      return candidateState.parseValidStateSync(fs.readFileSync(statePath, "utf8"))?.disabled === true;
-    } catch {
-      return false;
+    if (!fs.existsSync(statePath)) {
+      return { status: "uninitialized", state: null, refusal_reason: inspectionRefusalReason("uninitialized") };
     }
+    let state: candidateState.CampaignState | null = null;
+    try {
+      state = candidateState.parseValidStateSync(fs.readFileSync(statePath, "utf8"));
+    } catch {
+      state = null;
+    }
+    if (state === null) {
+      return { status: "state_unreadable", state: null, refusal_reason: inspectionRefusalReason("state_unreadable") };
+    }
+    const status = state.disabled ? "disabled" : "ready";
+    return { status, state, refusal_reason: inspectionRefusalReason(status) };
   };
+
+  /** Only a FULLY valid, disabled state releases the ordinary loop. */
+  const disabledCandidateStateSync = (workDir: string): boolean =>
+    candidateGateInspectionSync(workDir).status === "disabled";
 
   /** Synchronous: usable from the resume timer. Interrupted operation present. */
   const campaignPendingOpSync = (workDir: string): boolean =>
@@ -4622,8 +4665,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
    * or is unreadable — fail closed). Mirrors campaignBlocksOrdinaryLoop.
    */
   const campaignActiveSync = (workDir: string): boolean => {
-    const statePath = path.join(campaignDirOf(workDir), candidateState.STATE_FILE);
-    return fs.existsSync(statePath) && !disabledCandidateStateSync(workDir);
+    const status = candidateGateInspectionSync(workDir).status;
+    return status !== "uninitialized" && status !== "disabled";
   };
 
   /**
@@ -4652,20 +4695,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
    *  state never blocks. An existing state blocks unless it is readable and
    *  disabled; an unreadable state fails closed (tasks 3.2, design §4). */
   const candidateBlocksOrdinaryLoop = (workDir: string): boolean => {
-    const statePath = path.join(campaignDirOf(workDir), candidateState.STATE_FILE);
-    if (!fs.existsSync(statePath)) return false;
-    // Fail closed (design §4): an existing but unreadable or malformed state is an
-    // unclear campaign state, so the ordinary loop stays blocked until the operator
-    // resolves it. Only a readable state with disabled === true lets the loop run.
-    // Only a fully validated disabled state lets the loop run; a shallow or
-    // junk file with disabled:true is an unclear state and stays blocked.
-    return !disabledCandidateStateSync(workDir);
+    // Fail closed (design §4): an existing but unreadable or malformed state is
+    // an unclear campaign state, so the ordinary loop stays blocked until the
+    // operator resolves it. Only a fully validated disabled state lets it run.
+    const status = candidateGateInspectionSync(workDir).status;
+    return status !== "uninitialized" && status !== "disabled";
   };
   const campaignBlocksOrdinaryLoop = async (workDir: string): Promise<boolean> => candidateBlocksOrdinaryLoop(workDir);
 
   const campaignBlockedResponse = () => ({
     content: [{ type: "text", text: `⛔ ${CAMPAIGN_BLOCK_TEXT}.` }],
-    details: {},
+    details: refusalDetails(inspectionRefusalReason("manual_check_required")),
   });
 
   /** Single-line refusal text shared with tool adapters (bd pi-autoresearch-161.4). */

@@ -40,7 +40,8 @@
 import { randomBytes } from "node:crypto";
 import { mkdir, open, readFile, rename, stat, unlink } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
+import { inspectionRefusalReason } from "./refusal.ts";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -168,7 +169,9 @@ export interface ManualOk {
 }
 
 export interface CampaignInspection {
-  status: "uninitialized" | "ready" | "disabled" | "state_unreadable" | "manual_check_required";
+  status: "uninitialized" | "ready" | "disabled" | "state_unreadable" | "manual_check_required" | "invalid_argument";
+  /** Derived from `status` by the shared inspectionRefusalReason mapper; null means not a refusal. */
+  refusal_reason?: RefusalReason | null;
   state: CampaignState | null;
   pendingOp: PendingOp | null;
   lockPresent: boolean;
@@ -830,15 +833,43 @@ export async function beginOperation(
 
 // ─── Inspection and operator actions ─────────────────────────────────────────
 
+/**
+ * A candidate campaign is the single <workDir>/.auto/candidate directory.
+ * Read-only inspection must not turn an arbitrary directory (or an empty
+ * path, which would resolve relative to the process cwd) into campaign state.
+ */
+function candidateContainmentProblem(dir: unknown): string | null {
+  if (typeof dir !== "string" || dir.length === 0) {
+    return "campaign directory must be a non-empty string";
+  }
+  if (basename(dir) !== "candidate") {
+    return `campaign directory must be <workDir>/.auto/candidate; got ${quote(basename(dir))}`;
+  }
+  return null;
+}
+
 /** Read-only status. Takes no lock and writes nothing. */
 export async function inspectCampaign(dir: string): Promise<CampaignInspection> {
+  const containment = candidateContainmentProblem(dir);
+  if (containment) {
+    return {
+      status: "invalid_argument",
+      refusal_reason: inspectionRefusalReason("invalid_argument"),
+      state: null,
+      pendingOp: null,
+      lockPresent: false,
+      message: containment,
+    };
+  }
   const pendingOp = await readPendingOp(dir);
   const lockPresent = await exists(join(dir, LOCK_FILE));
   const loaded = await readStateFile(dir);
   const state = loaded.ok ? loaded.state : null;
   if (pendingOp) {
+    const status = "manual_check_required";
     return {
-      status: "manual_check_required",
+      status,
+      refusal_reason: inspectionRefusalReason(status),
       state,
       pendingOp,
       lockPresent,
@@ -846,16 +877,20 @@ export async function inspectCampaign(dir: string): Promise<CampaignInspection> 
     };
   }
   if (!loaded.ok) {
+    const status = loaded.reason === "not_initialized" ? "uninitialized" : "state_unreadable";
     return {
-      status: loaded.reason === "not_initialized" ? "uninitialized" : "state_unreadable",
+      status,
+      refusal_reason: inspectionRefusalReason(status),
       state: null,
       pendingOp: null,
       lockPresent,
       message: loaded.message,
     };
   }
+  const status = loaded.state.disabled ? "disabled" : "ready";
   return {
-    status: loaded.state.disabled ? "disabled" : "ready",
+    status,
+    refusal_reason: inspectionRefusalReason(status),
     state: loaded.state,
     pendingOp: null,
     lockPresent,
