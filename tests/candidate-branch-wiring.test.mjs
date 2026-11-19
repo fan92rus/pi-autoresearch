@@ -1234,20 +1234,23 @@ test("methodology ./METHOD.md with change_files METHOD.md: init or checkpoint re
 
 // ─── Review 65ac927: the TUI starter widget must not show the ordinary sequence ──
 
-test("the starter widget under an active campaign names candidate_branch, not run_experiment", async () => {
+test("an ordinary launch under an active campaign refuses before registering any widget", async () => {
   const { h } = await campaignWithCandidate("widget-campaign");
-  // setupRepo already switched the mode on; switch it off so the next "on" renders the widget.
+  // setupRepo already switched the mode on; an explicit OFF/ON is the normal
+  // way an owner asks for the ordinary loop. Under an active candidate
+  // campaign the tj0.2 gate must refuse BEFORE mode/widget/kickoff mutation.
   await h.command("autoresearch").handler("off", h.ctx);
   const calls = [];
   h.ctx.ui.setWidget = (key, factory) => calls.push({ key, factory });
+  const sentBefore = h.pi.sentMessages.length;
   await h.command("autoresearch").handler("on", h.ctx);
-  const widget = [...calls].reverse().find((c) => c.key === "autoresearch" && typeof c.factory === "function");
-  assert.ok(widget, "the starter widget must be set when the mode is switched on under an active campaign");
-  const theme = { fg: (_c, t) => t };
-  const comp = widget.factory({ requestRender() {} }, theme);
-  const text = comp.render(400).join("\n");
-  assert.match(text, /candidate_branch/, "widget must name the campaign tool: " + text);
-  assert.doesNotMatch(text, /run_experiment|log_experiment|init_experiment/, "widget must not show the ordinary loop: " + text);
+
+  assert.equal(calls.length, 0, "the campaign gate must not register a starter widget");
+  assert.equal(h.pi.sentMessages.length, sentBefore, "the campaign gate must not send the ordinary kickoff");
+  assert.ok(
+    h.pi.notifications.some((n) => /Candidate campaign active — continue it with candidate_branch status/.test(n.text)),
+    "the owner must be told to continue with candidate_branch",
+  );
 });
 
 // ─── Review round (4c5532d): propose_hypothesis is part of the ordinary loop ──
