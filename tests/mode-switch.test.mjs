@@ -60,6 +60,21 @@ function lastWidget(h) {
   return obj.render(200).join("\n");
 }
 
+test("a --charter launch without --id refuses before activating research mode", async () => {
+  const dir = workdir();
+  const h = await harness(dir);
+  const charterDir = fs.mkdtempSync(path.join(os.tmpdir(), "mode-switch-charter-"));
+  const charterPath = path.join(charterDir, "charter.md");
+  fs.writeFileSync(charterPath, "charter\n");
+
+  await h.command("autoresearch").handler(`research --charter ${charterPath}`, h.ctx);
+
+  const rt = h.ext.runtimeForTest(h.ctx);
+  assert.equal(rt.autoresearchMode, false, "a refused charter launch leaves mode OFF");
+  assert.equal(rt.researchCampaignId, null, "no campaign pin is installed");
+  assert.ok(h.pi.notifications.some((n) => /Chain refused: --charter needs --id/.test(n.text)), "the owner sees the refusal");
+});
+
 test("expedition launch finalizes active optimization and shows the expedition TUI", async () => {
   const dir = workdir();
   const h = await harness(dir);

@@ -410,6 +410,12 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
           requestedId = idMatch[1];
           args_ = args_.slice(idMatch[0].length).trim();
         }
+        // A chain needs a pinned root campaign. Refuse BEFORE mode/widget/
+        // activation mutation: an error here must leave autoresearch OFF.
+        if (requestedCharterPath !== null && requestedId === null) {
+          ctx.ui.notify("Chain refused: --charter needs --id <root campaign> so the chain has a root to continue from", "error");
+          return;
+        }
         let requestedStateRoot: string | null = null;
         const stateRootMatch = /^--state-root\s+(\S+)(\s|$)/.exec(args_);
         if (stateRootMatch) {
@@ -641,12 +647,6 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
         // kickoff is sent, no chain state exists. The chain id derives from the
         // pinned (or first pinned-at-draft) campaign: <campaignId>-chain.
         if (requestedCharterPath !== null) {
-          // Review B3: a chain needs a pinned root campaign; without --id the
-          // root brief could never be drafted (parent_not_reported forever).
-          if (requestedId === null) {
-            ctx.ui.notify("Chain refused: --charter needs --id <root campaign> so the chain has a root to continue from", "error");
-            return;
-          }
           const accepted = await deps.acceptLaunchCharter(ctx, researchWorkDir, requestedCharterPath);
           if (accepted === null) return;
           const chainSeedId = requestedId ?? runtime.researchCampaignId ?? `bench-chain`;
