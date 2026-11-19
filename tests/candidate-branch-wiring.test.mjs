@@ -751,16 +751,30 @@ test("B2 happy path still promotes with checks passing on the checkpoint", async
   assert.equal(leader, cpSha);
 });
 
-test("B3: run accumulates real time_used_seconds and the time limit exhausts", async () => {
+test("B3: run accumulates real time_used_seconds and the time limit exhausts", async (t) => {
   const s = await setupRepo("timebudget");
   const policy = policyOf(s.dir);
-  policy.benchmark_argv = ["node", "-e", 'await new Promise(r=>setTimeout(r,300));console.log("METRIC p95_ms=1");'];
+  // No 300 ms benchmark sleep: the benchmark writes a settle marker, and the
+  // fake clock keys elapsed time to that observable event instead of wall time.
+  const markerPath = path.join(s.dir, ".auto", "candidate", "clock-settle.marker");
+  policy.benchmark_argv = ["node", "-e",
+    `require("fs").writeFileSync(${JSON.stringify(markerPath)}, "1");console.log("METRIC p95_ms=1");`];
   policy.candidate_time_limit_seconds = 1;
   await callTool(s.h, "init", { policy });
   const created = await callTool(s.h, "create", { candidate_id: "cand-a" });
   const wt = wtPathFromCreateResponse(created);
   writeFileSyncSafe(path.join(wt, "src", "algo.ts"), "export const a = 2;\n");
 
+  // candidate-campaign measures elapsed time with Date.now(): t0 is read
+  // before the benchmark starts, the end read after it settles. Once the
+  // marker exists the fake clock jumps past the 1 s limit; real time still
+  // accrues, and the state check / refusal are the real behavior assertions.
+  const realNow = Date.now;
+  const jumpMs = policy.candidate_time_limit_seconds * 1000 + 100;
+  Date.now = () => realNow() + (fs.existsSync(markerPath) ? jumpMs : 0);
+  t.after(() => { Date.now = realNow; });
+
+  fs.rmSync(markerPath, { force: true });
   const run1 = await callTool(s.h, "run", {});
   assert.match(textOf(run1), /measured|average/i, `run1 failed: ${textOf(run1)}`);
   const state1 = JSON.parse(fs.readFileSync(path.join(s.dir, ".auto", "candidate", "state.json"), "utf8"));
@@ -768,7 +782,10 @@ test("B3: run accumulates real time_used_seconds and the time limit exhausts", a
   assert.equal(cand1.time_used_seconds > 0, true, `time_used_seconds must accumulate, got ${cand1.time_used_seconds}`);
 
   let exhausted = null;
-  for (let i = 0; i < 6; i++) {
+  for (let i = 0; i < 2; i++) {
+    // The awaited run reply is the observable settle point; reset the marker
+    // before the next call so the real budget check can refuse it.
+    fs.rmSync(markerPath, { force: true });
     const r = await callTool(s.h, "run", {});
     if (/budget|limit|refus/i.test(textOf(r))) { exhausted = textOf(r); break; }
   }

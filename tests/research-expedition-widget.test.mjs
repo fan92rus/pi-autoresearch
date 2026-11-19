@@ -8,6 +8,21 @@ import { createFakePi, makeCtx } from "./fake-pi.ts";
 import * as expedition from "../extensions/pi-autoresearch/expedition.ts";
 
 const extensionModule = await import(pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")).href);
+
+/** Sources of every current extension module: index.ts plus extracted files. */
+function allExtensionSources() {
+  const files = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const abs = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(abs);
+      else if (entry.name.endsWith(".ts")) files.push(abs);
+    }
+  };
+  walk(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch"));
+  return files.map((file) => fs.readFileSync(file, "utf8")).join("\n");
+}
+
 const fixture = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "expedition-widget-"));
   const chain = path.join(root, "chain"), campaign = path.join(root, "campaign");
@@ -55,7 +70,9 @@ test("missing files produce a safe fallback without throwing", () => {
 });
 
 test("non-expedition research chains retain the ordinary dashboard path", () => {
-  const source = fs.readFileSync(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts"), "utf8");
+  // The widget wiring moved between modules during extraction; scan all of
+  // them so the three original guards stay pinned wherever the code lives.
+  const source = allExtensionSources();
   assert.match(source, /if \(runtime\.researchChain && \(runtime\.researchChain as typeof runtime\.researchChain & \{ expedition\?: boolean \}\)\.expedition === true\)/);
   assert.match(source, /if \(state\.results\.length === 0\)[\s\S]*?Full dashboard table rendered as widget/);
   assert.match(source, /\.\.\.renderDashboardLines\(/);

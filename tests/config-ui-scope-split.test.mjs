@@ -12,10 +12,24 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+const extensionDir = path.join(repoRoot, "extensions", "pi-autoresearch");
+
+/** All current extension modules (index.ts plus every extracted module). */
+function extensionModuleSources() {
+  const found = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const abs = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(abs);
+      else if (entry.name.endsWith(".ts")) found.push({ file: abs, src: fs.readFileSync(abs, "utf-8") });
+    }
+  };
+  walk(extensionDir);
+  return found;
+}
+
 const configUiPath = path.join(repoRoot, "extensions", "pi-autoresearch", "parallel", "config-ui.ts");
 const configTsPath = path.join(repoRoot, "extensions", "pi-autoresearch", "parallel", "config.ts");
-const indexTsPath = path.join(repoRoot, "extensions", "pi-autoresearch", "index.ts");
-const commandTsPath = path.join(repoRoot, "extensions", "pi-autoresearch", "autoresearch-command.ts");
 const skillPath = path.join(repoRoot, "skills", "autoresearch-parallel");
 const worktreePath = path.join(repoRoot, "extensions", "pi-autoresearch", "parallel", "worktree.ts");
 
@@ -46,6 +60,20 @@ test("parallel-* subcommands are removed from autocomplete", async () => {
   }
 });
 
+test("help and TAB-completion command lists stay in parity", async () => {
+  const { SUBCOMMANDS, getAutoresearchArgumentCompletions } = await import("../extensions/pi-autoresearch/commands.ts");
+  const { AUTORESEARCH_SUBCOMMANDS, filterSubcommands } = await import("../extensions/pi-autoresearch/parallel/config-ui.ts");
+  const helpNames = SUBCOMMANDS.map((s) => s.name).sort();
+  const completionNames = AUTORESEARCH_SUBCOMMANDS.map((s) => s.value).sort();
+  assert.deepEqual(completionNames, helpNames, "TAB completion and /autoresearch help must offer the same subcommands");
+  const offered = (getAutoresearchArgumentCompletions("") ?? []).map((s) => s.value).sort();
+  assert.deepEqual(offered, helpNames, "the help list must drive the live argument completions");
+  for (const value of ["parallel-best-of-n", "parallel-stack", "parallel-search"]) {
+    assert.ok(!helpNames.includes(value), `${value} still in the help list`);
+    assert.ok(!filterSubcommands(value).some((s) => s.value === value), `${value} still in TAB completion`);
+  }
+});
+
 test("non-parallel completions keep their descriptions", async () => {
   const { filterSubcommands } = await import("../extensions/pi-autoresearch/parallel/config-ui.ts");
   const research = filterSubcommands("research").find((s) => s.value === "research");
@@ -70,22 +98,26 @@ test("config-ui.ts user-facing strings name no removed tool", () => {
   }
 });
 
-test("the legacy parallel skill is deleted and index.ts has no parallel-* dispatch", () => {
+test("the legacy parallel skill is deleted and no module has parallel-* dispatch", () => {
   assert.ok(!fs.existsSync(skillPath), "skills/autoresearch-parallel must not exist");
-  // The command body lives in autoresearch-command.ts (extracted from index.ts);
-  // scan both sources so the rejection guard is checked where it now lives.
-  const indexSrc = fs.readFileSync(indexTsPath, "utf-8") + fs.readFileSync(commandTsPath, "utf-8");
+  // The command body was extracted from index.ts into autoresearch-command.ts;
+  // scan EVERY current module so a further extraction keeps the guard pinned.
+  const modules = extensionModuleSources();
   // The only allowed parallel-* reference is the explicit rejection guard:
   // it must notify "removed" and return — never dispatch or activate a mode.
   const guardAnchor = 'if (/^parallel-(best-of-n|stack|search)\\b/.test(command)) {';
+  const guardModule = modules.find(({ src }) => src.includes(guardAnchor));
+  assert.ok(guardModule, "rejection guard for parallel-* commands expected");
+  const indexSrc = guardModule.src;
   const gi = indexSrc.indexOf(guardAnchor);
   assert.ok(gi >= 0, "rejection guard for parallel-* commands expected");
   const guardBlock = indexSrc.slice(gi, indexSrc.indexOf("}", gi));
   assert.match(guardBlock, /were removed/, "guard must explain the removal");
   assert.match(guardBlock, /return;/, "guard must return");
-  assert.ok(!indexSrc.includes("parallelMatch"), "legacy dispatch machinery still present");
-  assert.ok(!indexSrc.includes("autoresearch-parallel"), "index.ts still references the removed skill");
-  assert.ok(!indexSrc.includes("cleanupAllWorktrees"), "index.ts still imports legacy worktree cleanup");
+  const allSrc = modules.map(({ src }) => src).join("\n");
+  assert.ok(!allSrc.includes("parallelMatch"), "legacy dispatch machinery still present");
+  assert.ok(!allSrc.includes("autoresearch-parallel"), "index.ts still references the removed skill");
+  assert.ok(!allSrc.includes("cleanupAllWorktrees"), "index.ts still imports legacy worktree cleanup");
 });
 
 test("dead parallel config API is removed; worktree.ts is gone", () => {
