@@ -20,7 +20,10 @@ const skillPath = path.join(repoRoot, "skills", "autoresearch-parallel");
 const worktreePath = path.join(repoRoot, "extensions", "pi-autoresearch", "parallel", "worktree.ts");
 
 const REMOVED_TOOL_RE = /BestOfN|SpaceSearch|valleyProbe|CheckOrthogonal|startPhase/;
-const ACTIVE_DOC_PATHS = ["docs/USER-GUIDE.md", "docs/AGENT-GUIDE.md"];
+const ACTIVE_DOC_PATHS = [
+  "docs/USER-GUIDE.md", "docs/AGENT-GUIDE.md",
+  "docs/PRD-decision-tree.md", "docs/TZ-decision-tree.md",
+];
 const HISTORICAL_DOC_PATHS = ["docs/PRD.md", "docs/TZ.md"];
 // Policy fields with no runtime reader left after the el3.4 removal.
 const REMOVED_POLICY_FIELDS = [
@@ -99,6 +102,13 @@ test("candidate-worktree.ts defines ExecFn locally", async () => {
 });
 
 test("removed parallel worker names and promises are absent from source and active docs", () => {
+  const configUiLines = fs.readFileSync(configUiPath, "utf-8").split("\n");
+  const balancedLine = configUiLines.find((line) => line.includes("presetBalancedDesc:"));
+  assert.ok(balancedLine, "presetBalancedDesc line expected in config-ui.ts");
+  assert.ok(
+    !/for workers|для воркеров/i.test(balancedLine),
+    `presetBalancedDesc still promises parallel workers: ${balancedLine.trim()}`,
+  );
   const files = [configTsPath, configUiPath, ...ACTIVE_DOC_PATHS.map((p) => path.join(repoRoot, p))];
   for (const file of files) {
     const label = path.relative(repoRoot, file);

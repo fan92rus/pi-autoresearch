@@ -100,7 +100,7 @@ const L = {
   presetBudget: RU ? "💰 Бюджет" : "💰 Budget",
   presetBudgetDesc: RU ? "Везде deepseek-flash — дешевле всего" : "All deepseek-flash — cheapest",
   presetBalanced: RU ? "⚖️ Сбалансированный" : "⚖️ Balanced",
-  presetBalancedDesc: RU ? "Flash для воркеров + GLM для сложного — рекомендуется" : "Flash for workers + GLM for complex — recommended",
+  presetBalancedDesc: RU ? "Flash для fast/mid + GLM для strong" : "Flash for fast/mid + GLM for strong",
   presetPremium: RU ? "🚀 Премиум" : "🚀 Premium",
   presetPremiumDesc: RU ? "GLM везде — лучшее качество, выше цена" : "GLM everywhere — best quality, highest cost",
   presetApplied: RU ? "пресет применён" : "preset applied",

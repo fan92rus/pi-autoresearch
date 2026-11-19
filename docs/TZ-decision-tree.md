@@ -1,5 +1,11 @@
 # ТЗ: Decision Tree для autoresearch
 
+> **SUPERSEDED (bd pi-autoresearch-el3.4, owner decision 2026-11-16):** параллельные
+> инструменты воркеров и их временные ветки удалены. Активный путь исследования гипотез —
+> `candidate_branch` / `research`. Разделы ниже описывают исторический дизайн, а не действующее
+> ТЗ и не критерии приёмки.
+> **SUPERSEDED:** all requirements and designs below are historical; do not use them as active requirements.
+
 > **Статус:** Draft
 > **Версия:** 1.0
 > **Связанные документы:** [PRD](./PRD-decision-tree.md)
@@ -389,7 +395,7 @@ Suggestion: explore_from("n6") — underexplored branch with high reward.
 4. Извлечь диффы:
    - `diffA = git diff <LCA> <a.commit>`
    - `diffB = git diff <LCA> <b.commit>`
-5. Проверить file-scope conflict (как CheckOrthogonal):
+5. Проверить file-scope conflict (по пересечению изменённых файлов):
    - Извлечь изменённые файлы из каждого диффа
    - Если пересекаются → вернуть conflict: true со списком файлов
 6. provisionWorktree на LCA commit
@@ -928,7 +934,7 @@ Action: call explore_from() to backtrack, or tree_status() for full map.
 - `log.jsonl` не меняется (плоский лог остается)
 - `tree.json` создается при `init_experiment` (если еще не существует)
 - Если сессия уже идет без tree.json → `log_experiment` продолжает работать как раньше
-- BestOfN/SpaceSearch не требуют изменений (они просто не пишут в tree — это phase 2)
+- Параллельные инструменты, удалённые в el3.4 (SUPERSEDED), больше не требуют интеграции с деревом; активный путь — `candidate_branch` / `research`
 
 ### 8.2 Восстановление дерева из log.jsonl (опционально)
 
@@ -1040,5 +1046,6 @@ tree.json: n0 → n1(run1) → n2(run2) → n3(run3, dead) → n4(run4)
 5. **Nested trees** — может ли compose-узел быть parent для новых экспериментов? Да,
    он создаётся как обычный keep-узел (activeNodeId может указывать на него).
 
-6. **BestOfN/SpaceSearch integration** — Phase 2. Проигравшие кандидаты сохраняются как
-   dead-leaf children; победитель → child-узел на main.
+6. **Интеграция с параллельными инструментами** — REMOVED / SUPERSEDED by el3.4.
+   Инструменты воркеров удалены, план сохранять проигравшие кандидаты как dead-leaf children
+   отменён; активный путь — `candidate_branch` / `research`.
