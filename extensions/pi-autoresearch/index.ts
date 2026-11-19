@@ -5747,7 +5747,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "Owner-stop rule: if the OWNER asks to finish/stop the expedition and NO charter stop rule has actually fired, call chain_stop WITHOUT rule_id (owner decision, interactive dialog) — never borrow a charter rule whose condition has not fired; a stop rule is a factual self-report, not a way to dress up an owner request.",
       ...(slice ? ["Expedition map snapshot:", slice] : []),
     ].join("\n");
-    runtime.chainContinuationSent = true;
+    transitionAutoresearchMode(ctx, {
+      enabled: runtime.autoresearchMode,
+      uiMode: runtime.uiMode,
+      chainContinuationSent: true,
+    });
     sendWhenReady(ctx, message, { steerIfBusy: true });
   };
 

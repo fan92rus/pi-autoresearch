@@ -223,6 +223,8 @@ interface ExpeditionPublication {
   doc_sha256: string;
   step: string;
   done: string[];
+  /** The mode-switch finalize was durably recorded before publication steps. */
+  mode_finalized?: boolean;
 }
 type StepResult = { ok: true } | { ok: false; reason: string; message: string };
 
@@ -239,9 +241,10 @@ function readPublication(workDir: string): { state: ExpeditionPublication | null
       typeof raw.doc_path !== "string" || raw.doc_path === "" ||
       typeof raw.doc_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(raw.doc_sha256) ||
       typeof raw.step !== "string" || !Array.isArray(raw.done) ||
-      !raw.done.every((step) => typeof step === "string")
+      !raw.done.every((step) => typeof step === "string") ||
+      (raw.mode_finalized !== undefined && typeof raw.mode_finalized !== "boolean")
     ) return { state: null, problem: "expedition_publication_invalid" };
-    return { state: { schema_version: 1, id: raw.id, chain_id: raw.chain_id, doc_path: raw.doc_path, doc_sha256: raw.doc_sha256, step: raw.step, done: raw.done as string[] } };
+    return { state: { schema_version: 1, id: raw.id, chain_id: raw.chain_id, doc_path: raw.doc_path, doc_sha256: raw.doc_sha256, step: raw.step, done: raw.done as string[], mode_finalized: raw.mode_finalized === true } };
   } catch {
     return { state: null, problem: "expedition_publication_invalid" };
   }
@@ -355,6 +358,33 @@ function retireCompletedPublication(workDir: string, state: ExpeditionPublicatio
   catch { return false; }
 }
 
+/**
+ * The campaign pinned by this session's expedition chain is not an external
+ * launch block: its own publication verdict still refuses a same-document
+ * re-publish and an unfinished chain, and retires it only after finalization.
+ * Any OTHER research campaign is a hard refusal even when a journal exists.
+ * Mirrors classifyOrdinaryLaunchResearch (including the runtime state root)
+ * with that single exemption; a scan failure stays a manual-check path.
+ */
+function launchResearchOutsidePinnedCampaign(
+  workDir: string, runtime: any, pinnedCampaignId: string | null,
+): "none" | "manual" | "active" {
+  const bases = [workDir];
+  const stateRoot = runtime.researchStateRoot;
+  if (stateRoot && stateRoot !== workDir) bases.push(stateRoot);
+  let manual = false;
+  for (const base of bases) {
+    const scan = researchState.scanCampaignsSync(base);
+    if (!scan.ok) { manual = true; continue; }
+    for (const campaign of scan.campaigns) {
+      if (campaign.id === pinnedCampaignId) continue;
+      if (campaign.state?.phase === "research") return "active";
+      if (campaign.state?.phase === "briefing" || researchState.researchPolicyRefusal(campaign, "ordinaryLoop") !== null) manual = true;
+    }
+  }
+  return manual ? "manual" : "none";
+}
+
 export function createExpeditionBriefTool(deps: BriefToolsDeps): BriefTool {
   return {
     name: "expedition_brief",
@@ -385,18 +415,21 @@ export function createExpeditionBriefTool(deps: BriefToolsDeps): BriefTool {
       if (!ctx.hasUI && action === "propose") return reply("no_ui: expedition confirmation requires TUI", "no_ui");
       const workDir = deps.resolveWorkDir(ctx.cwd), runtime = deps.getRuntime(ctx);
       const stateRoot = runtime.researchStateRoot ?? path.join(workDir, ".auto");
-      // bd tj0.2: a direct propose is a launch, not a passive edit. Classify
-      // the research state BEFORE the owner dialog, the claim or any disk
-      // write. A pending/completed publication is a retry of this expedition
-      // (its own campaign must not block the resume), so the gate applies to
-      // a fresh publication only.
-      const loaded = action === "propose" ? readPublication(workDir) : null;
+      // bd tj0.2: a direct propose is ALWAYS a launch, never a passive edit —
+      // including a retry or a completed journal that will be retired for a
+      // different document. Classify the research state against the current
+      // runtime/state root before reading the journal, retiring it, opening
+      // the owner dialog or mutating anything.
       let manualResearchGate = false;
-      if (action === "propose" && loaded !== null && !loaded.problem && loaded.state === null) {
+      if (action === "propose") {
         // Synchronous scan: a hard refusal must happen before the owner dialog
         // and before any disk write, while a clean gate still reaches the
         // dialog in the same tick (gated publish tests rely on that).
-        const researchGate = deps.classifyOrdinaryLaunchResearch(workDir, ctx);
+        let researchGate = deps.classifyOrdinaryLaunchResearch(workDir, ctx);
+        if (researchGate === "active") {
+          const outside = launchResearchOutsidePinnedCampaign(workDir, runtime, runtime.researchCampaignId ?? null);
+          if (outside !== "active") researchGate = outside;
+        }
         if (researchGate === "active") {
           ctx.ui.notify(EXPEDITION_RESEARCH_ACTIVE_NOTICE, "error");
           return reply(EXPEDITION_RESEARCH_ACTIVE_NOTICE, "expedition_launch_research_active");
@@ -412,6 +445,7 @@ export function createExpeditionBriefTool(deps: BriefToolsDeps): BriefTool {
           manualResearchGate = true;
         }
       }
+      const loaded = action === "propose" ? readPublication(workDir) : null;
       if (action === "draft") {
         const checked = expedition.validateExpeditionDoc(params.doc);
         if (!checked.ok) return reply(`${checked.reason}: ${checked.message}`, checked.reason);
@@ -515,15 +549,24 @@ export function createExpeditionBriefTool(deps: BriefToolsDeps): BriefTool {
         // es1.7/es1.8: the optimization → expedition switch is finalized once
         // before the new expedition is bound, with the same reason/order as
         // '/autoresearch expedition'. An OFF session has nothing to finalize.
-        if (runtime.autoresearchMode && runtime.researchChain?.expedition !== true && runtime.uiMode === "optimization") {
-          deps.recordModeSwitchFinalize(ctx, "switch to expedition mode");
-          deps.cancelPendingResume(runtime);
-        }
+        // bd tj0.2: the finalize is recorded in the durable publication
+        // journal BEFORE the append and before any publication step, so a
+        // forced io_failed retry cannot append a second finalize/report.
+        const needsModeFinalize = runtime.autoresearchMode && runtime.researchChain?.expedition !== true && runtime.uiMode === "optimization";
+        const alreadyFinalized = state?.mode_finalized === true;
         if (!state) {
           // The id and chain id exist only after the claim is won.
           const id = `exp-${Date.now()}-${randomUUID().slice(0, 8)}`;
-          state = { schema_version: 1, id, chain_id: `${id}-chain`, doc_path: docPath, doc_sha256: current.sha256, step: "prepared", done: [] };
+          state = { schema_version: 1, id, chain_id: `${id}-chain`, doc_path: docPath, doc_sha256: current.sha256, step: "prepared", done: [], mode_finalized: needsModeFinalize };
           if (!(await writePublication(workDir, state))) { if (copied) discardDocumentCopy(docPath); return reply(`io_failed: cannot write ${publicationFile(workDir)}`, "io_failed"); }
+        } else if (needsModeFinalize && !alreadyFinalized) {
+          const next = { ...state, mode_finalized: true };
+          if (!(await writePublication(workDir, next))) { if (copied) discardDocumentCopy(docPath); return reply(`io_failed: cannot record mode finalize in ${publicationFile(workDir)}`, "io_failed"); }
+          state = next;
+        }
+        if (needsModeFinalize && !alreadyFinalized) {
+          deps.recordModeSwitchFinalize(ctx, "switch to expedition mode");
+          deps.cancelPendingResume(runtime);
         }
         // Each durable step is recorded before the next one starts. A retry skips
         // recorded steps; a step that cannot be recorded refuses instead of

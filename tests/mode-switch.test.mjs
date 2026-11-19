@@ -13,6 +13,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createFakePi, makeCtx } from "./fake-pi.ts";
+import * as chainJournal from "../extensions/pi-autoresearch/chain-journal.ts";
 
 const brief = {
   schema_version: 1, goal: "Study cache latency", plan_source: "plan.md", caveat_block: "Observational only",
@@ -114,6 +115,11 @@ function ledgerEntries(dir) {
 
 function switchFinalizes(dir, reason) {
   return ledgerEntries(dir).filter((e) => e.type === "finalize" && e.reason === reason);
+}
+
+function chainIds(dir) {
+  const root = path.join(dir, ".auto", "research-chain");
+  return fs.existsSync(root) ? fs.readdirSync(root).filter((name) => name.endsWith("-chain")) : [];
 }
 
 async function launchAndProposeExpedition(h) {
@@ -361,6 +367,42 @@ test("tj0.2 direct expedition_brief propose follows the same mode guards", async
     assert.equal(h.ext.runtimeForTest(h.ctx).uiMode, "expedition");
   });
 
+  await t.test("completed journal for another document still refuses active research before retirement", async () => {
+    const dir = workdir();
+    const h = await harness(dir);
+    const id = await launchAndProposeExpedition(h);
+    const chainId = `${id}-chain`;
+    assert.equal((await chainJournal.setChainStatus(dir, chainId, "completed")).ok, true);
+    setCampaignPhase(dir, id, "stopped");
+    const different = structuredClone(doc);
+    different.goal = "A different expedition";
+    await h.tool("expedition_brief").execute("id", { action: "draft", doc: different }, null, null, h.ctx);
+    seedBlockingCampaign(dir, "other-research", { phase: "research" });
+    const journalPath = path.join(dir, ".auto", "expedition-publication.json");
+    const journalBefore = fs.readFileSync(journalPath, "utf8");
+    const retiredBefore = fs.readdirSync(path.join(dir, ".auto")).filter((name) => name.startsWith("expedition-publication.retired-"));
+    const rt = h.ext.runtimeForTest(h.ctx);
+    const messagesBefore = h.pi.sentMessages.length;
+    const widgetsBefore = h.pi.widgets.length;
+    let confirms = 0;
+    h.ctx.ui.confirm = async () => { confirms++; return true; };
+
+    const result = await h.tool("expedition_brief").execute("id", { action: "propose" }, null, null, h.ctx);
+    assert.equal(result.details.reason, "expedition_launch_research_active");
+    assert.match(text(result), /Cannot launch expedition while a research campaign is active; resume or finish it first\./);
+    assert.ok(h.pi.notifications.some((n) => /Cannot launch expedition while a research campaign is active/.test(n.text)));
+    assert.equal(confirms, 0, "the gate runs before the owner dialog");
+    assert.equal(fs.readFileSync(journalPath, "utf8"), journalBefore, "the completed journal is not retired on refusal");
+    assert.deepEqual(fs.readdirSync(path.join(dir, ".auto")).filter((name) => name.startsWith("expedition-publication.retired-")), retiredBefore);
+    assert.deepEqual(chainIds(dir), [chainId], "no second chain is created");
+    assert.equal(rt.researchChain?.chainId, chainId, "the existing chain stays bound");
+    assert.equal(rt.researchCampaignId, id);
+    assert.equal(rt.uiMode, "expedition");
+    assert.equal(h.pi.widgets.length, widgetsBefore);
+    assert.equal(h.pi.sentMessages.length, messagesBefore);
+    assert.equal(switchFinalizes(dir, "switch to expedition mode").length, 0);
+  });
+
   await t.test("propose refuses an active research campaign before any mutation", async () => {
     const dir = workdir();
     const h = await harness(dir);
@@ -384,6 +426,37 @@ test("tj0.2 direct expedition_brief propose follows the same mode guards", async
     assert.deepEqual(ledgerEntries(dir), [], "no finalize on refusal");
     assert.equal(fs.existsSync(path.join(dir, ".auto", "report.md")), false);
     assert.equal(fs.existsSync(path.join(dir, ".auto", "research-chain")), false, "no chain journal on refusal");
+  });
+
+  await t.test("partial publication retry finalizes exactly once", async () => {
+    const dir = workdir();
+    const h = await harness(dir);
+    plantOptimization(dir);
+    await h.command("autoresearch").handler("on", h.ctx);
+    await h.tool("expedition_brief").execute("id", { action: "draft", doc }, null, null, h.ctx);
+    // Fail at campaign creation, after the chain and its first steps are durable.
+    const blocker = path.join(dir, ".auto", "research");
+    fs.writeFileSync(blocker, "blocked");
+    const failed = await h.tool("expedition_brief").execute("id", { action: "propose" }, null, null, h.ctx);
+    assert.equal(failed.details.reason, "io_failed", text(failed));
+    const journalPath = path.join(dir, ".auto", "expedition-publication.json");
+    const partial = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+    assert.equal(partial.mode_finalized, true, "finalize is recorded durably before publication steps");
+    assert.equal(switchFinalizes(dir, "switch to expedition mode").length, 1);
+    assert.ok(fs.existsSync(path.join(dir, ".auto", "report.md")), "finalize writes the campaign report");
+
+    fs.unlinkSync(blocker);
+    const resumed = await h.tool("expedition_brief").execute("id", { action: "propose" }, null, null, h.ctx);
+    assert.match(text(resumed), /RESUME from publication journal/);
+    assert.match(text(resumed), /✅ Expedition .* created/);
+    const finalizes = switchFinalizes(dir, "switch to expedition mode");
+    assert.equal(finalizes.length, 1, "partial publication retry must not append a second finalize");
+    assert.equal(finalizes[0].evidence, "");
+    assert.equal(finalizes[0].confidence, 1);
+    const complete = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+    assert.equal(complete.chain_id, partial.chain_id, "the retry resumes the same chain");
+    assert.equal(complete.mode_finalized, true);
+    assert.deepEqual(chainIds(dir), [partial.chain_id]);
   });
 });
 
