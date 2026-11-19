@@ -30,6 +30,7 @@ import {
   isValidCandidateId,
   candidateRefFor,
   CANDIDATE_REF_PREFIX,
+  GIT_TIMEOUT_MS,
 } from "../extensions/pi-autoresearch/candidate-worktree.ts";
 import { canonicalWorktreePath } from "../extensions/pi-autoresearch/candidate-campaign.ts";
 
@@ -465,6 +466,26 @@ test("checkpoint: commits exactly the allowed files and sets the candidate ref",
   const after = await collectWorktreeChanges(exec, wtPath);
   assert.equal(after.ok, true);
   assert.deepEqual(after.changes.all, []);
+});
+
+test("checkpoint: git metadata calls use the load-tolerant timeout", async () => {
+  const { repo, wtPath } = await makeCampaignWithWorktree("git-timeout");
+  writeFile(path.join(wtPath, "src", "algo.ts"), "export const a = 42;\n");
+  const seen = [];
+  const trackingExec = (cmd, args, opts) => {
+    if (cmd === "git") seen.push(opts?.timeout);
+    return exec(cmd, args, opts);
+  };
+  const r = await checkpointCandidateWorktree(trackingExec, {
+    repoRoot: repo,
+    worktreePath: wtPath,
+    candidateId: "c1",
+    allowedFiles: ["src/algo.ts"],
+    message: "checkpoint timeout check",
+  });
+  assert.equal(r.ok, true, r.reason ?? "");
+  assert.ok(seen.length > 0, "git metadata calls were observed");
+  assert.ok(seen.every((value) => value === GIT_TIMEOUT_MS), `all git calls must use ${GIT_TIMEOUT_MS}ms, got ${seen}`);
 });
 
 // Separate assertion of the "untracked file stays untracked" guarantee:

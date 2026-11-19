@@ -59,13 +59,16 @@ export type ExecFn = (
 
 // ─── Exec helper ─────────────────────────────────────────────────────────────
 
+/** Bounded but load-tolerant timeout for local git metadata calls. */
+export const GIT_TIMEOUT_MS = 45_000;
+
 /** Run git via the injected exec; throw a single-line error on non-zero exit. */
 async function git(
   exec: ExecFn,
   args: string[],
   opts?: { cwd?: string; timeout?: number },
 ): Promise<string> {
-  const res = await exec("git", args, { timeout: 15000, ...opts });
+  const res = await exec("git", args, { timeout: GIT_TIMEOUT_MS, ...opts });
   if (res.code !== 0) {
     const detail = `${res.stdout}\n${res.stderr}`
       .replace(/\s+/g, " ")
