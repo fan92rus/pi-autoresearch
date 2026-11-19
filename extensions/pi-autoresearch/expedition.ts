@@ -59,9 +59,12 @@ export function replayExpeditionMap(entries: ChainEntry[]): Result<{map:Expediti
     const note=typeof e.why==="string"?e.why:typeof e.reason==="string"?e.reason:typeof e.note==="string"?e.note:undefined;
     map.timeline.push({type,...(dir?{dir}:{}),...(to?{to}:{}),at:typeof e.at==="string"?e.at:"",...(note?{note}:{})});
     if(type==="expedition_stop"){map.stopEvent={rule:typeof e.rule==="string"?e.rule:"",basis:typeof e.basis==="string"?e.basis:""};return;}
-    if(type==="pivot") { if(dir){map.directions.set(dir,{dir,status:"parked",why:typeof e.reason==="string"?e.reason:"",reason:typeof e.reason==="string"?e.reason:""});} if(to){if(!map.directions.has(to))map.openedCount++;map.directions.set(to,{dir:to,status:"active",why:typeof e.reason==="string"?e.reason:"",reason:typeof e.reason==="string"?e.reason:"",campaign:typeof e.campaign==="string"?e.campaign:undefined});} map.lastPivotAt=i; return; }
+    if(type==="pivot") { const reason=typeof e.reason==="string"?e.reason:"";
+      if(dir){const prev=map.directions.get(dir);map.directions.set(dir,{...prev,dir,status:"parked",why:prev?.why??(typeof e.why==="string"?e.why:reason),reason});}
+      if(to){const prev=map.directions.get(to);if(!prev)map.openedCount++;map.directions.set(to,{...prev,dir:to,status:"active",why:prev?.why??(typeof e.why==="string"?e.why:reason),reason,...(!prev&&typeof e.campaign==="string"?{campaign:e.campaign}:{})});}
+      map.lastPivotAt=i; return; }
     if(!dir)return;
-    const old=map.directions.get(dir); const why=typeof e.why==="string"?e.why:typeof e.reason==="string"?e.reason:typeof e.note==="string"?e.note:old?.why??"";
+    const old=map.directions.get(dir); const why=typeof e.why==="string"?e.why:old?.why??(typeof e.reason==="string"?e.reason:typeof e.note==="string"?e.note:"");
     let status:DirectionStatus=old?.status??"open";
     if(type==="direction_opened"){status="open";if(!old)map.openedCount++;}
     else if(type==="direction_activated")status="active";
@@ -70,7 +73,12 @@ export function replayExpeditionMap(entries: ChainEntry[]): Result<{map:Expediti
     else if(type==="direction_parked")status="parked";
     else if(type==="direction_reopened")status="open";
     else if(type==="direction_advisory")status="advisory_exhausted";
-    map.directions.set(dir,{dir,status,why,...(Array.isArray(e.refs)?{refs:e.refs as DirectionState["refs"]}:{}),...(typeof e.campaign==="string"?{campaign:e.campaign}:{}),...(typeof e.reason==="string"?{reason:e.reason}:{}),...(typeof e.review_ref==="string"?{reviewRef:e.review_ref}:{}),...(typeof e.review_sha256==="string"?{reviewSha256:e.review_sha256}:{})});
+    map.directions.set(dir,{...old,dir,status,why,
+      ...(Array.isArray(e.refs)?{refs:e.refs as DirectionState["refs"]}:old?.refs?{refs:old.refs}:{}),
+      ...(typeof e.campaign==="string"?{campaign:e.campaign}:old?.campaign?{campaign:old.campaign}:{}),
+      ...(typeof e.reason==="string"?{reason:e.reason}:old?.reason?{reason:old.reason}:{}),
+      ...(typeof e.review_ref==="string"?{reviewRef:e.review_ref}:old?.reviewRef?{reviewRef:old.reviewRef}:{}),
+      ...(typeof e.review_sha256==="string"?{reviewSha256:e.review_sha256}:old?.reviewSha256?{reviewSha256:old.reviewSha256}:{})});
   }); return {ok:true,map};
 }
 /** Checks the proposed map event without mutating the replayed map. For activation, journals coverage is the chain-membership proof; the research-phase condition is enforced by the caller passing the runtime campaign id. */
