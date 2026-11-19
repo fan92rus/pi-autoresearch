@@ -36,7 +36,13 @@ async function loadPrompt(label, { campaignActive }) {
     fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
     fs.writeFileSync(
       path.join(dir, ".auto", "candidate", "state.json"),
-      JSON.stringify({ schema_version: 1, disabled: false, policy: {}, candidates: [] }),
+      JSON.stringify({
+        schema_version: 1,
+        created_at: "2026-01-01T00:00:00.000Z",
+        disabled: false,
+        policy: { candidate_step_limit: 5, candidate_time_limit_seconds: 300 },
+        candidates: [],
+      }),
       "utf8",
     );
   }
@@ -76,7 +82,13 @@ test("disabled candidate campaign does not change the prompt (legacy loop comes 
   fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
   fs.writeFileSync(
     path.join(dir, ".auto", "candidate", "state.json"),
-    JSON.stringify({ schema_version: 1, disabled: true, policy: {}, candidates: [] }),
+    JSON.stringify({
+      schema_version: 1,
+      created_at: "2026-01-01T00:00:00.000Z",
+      disabled: true,
+      policy: { candidate_step_limit: 5, candidate_time_limit_seconds: 300 },
+      candidates: [],
+    }),
     "utf8",
   );
   const { pi, command, hook } = createFakePi({ dir, sessionId: "candprompt-disabled", realGit: false });
@@ -102,7 +114,13 @@ async function makeFullHarness(label, { campaignActive }) {
     fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
     fs.writeFileSync(
       path.join(dir, ".auto", "candidate", "state.json"),
-      JSON.stringify({ schema_version: 1, disabled: false, policy: {}, candidates: [] }),
+      JSON.stringify({
+        schema_version: 1,
+        created_at: "2026-01-01T00:00:00.000Z",
+        disabled: false,
+        policy: { candidate_step_limit: 5, candidate_time_limit_seconds: 300 },
+        candidates: [],
+      }),
       "utf8",
     );
   }
@@ -222,7 +240,13 @@ test("B1: a campaign under a configured workingDir is detected by drift/compacti
   fs.mkdirSync(path.join(dir, "sub", ".auto", "candidate"), { recursive: true });
   fs.writeFileSync(
     path.join(dir, "sub", ".auto", "candidate", "state.json"),
-    JSON.stringify({ schema_version: 1, disabled: false, policy: {}, candidates: [] }),
+    JSON.stringify({
+      schema_version: 1,
+      created_at: "2026-01-01T00:00:00.000Z",
+      disabled: false,
+      policy: { candidate_step_limit: 5, candidate_time_limit_seconds: 300 },
+      candidates: [],
+    }),
     "utf8",
   );
   const { pi, hook, ctx } = await makeFullHarnessAt(dir, "steer-wd-ctx");
@@ -255,7 +279,13 @@ test("N4: a partial-cycle turn under a campaign with a pending operation sends N
   fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
   fs.writeFileSync(
     path.join(dir, ".auto", "candidate", "state.json"),
-    JSON.stringify({ schema_version: 1, disabled: false, policy: {}, candidates: [] }),
+    JSON.stringify({
+      schema_version: 1,
+      created_at: "2026-01-01T00:00:00.000Z",
+      disabled: false,
+      policy: { candidate_step_limit: 5, candidate_time_limit_seconds: 300 },
+      candidates: [],
+    }),
     "utf8",
   );
   // An interrupted operation: design §5 requires stopping, not an automatic resume.
@@ -284,7 +314,13 @@ test("N4 drift path: a settled turn with NO tool events under a pending operatio
   fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
   fs.writeFileSync(
     path.join(dir, ".auto", "candidate", "state.json"),
-    JSON.stringify({ schema_version: 1, disabled: false, policy: {}, candidates: [] }),
+    JSON.stringify({
+      schema_version: 1,
+      created_at: "2026-01-01T00:00:00.000Z",
+      disabled: false,
+      policy: { candidate_step_limit: 5, candidate_time_limit_seconds: 300 },
+      candidates: [],
+    }),
     "utf8",
   );
   fs.writeFileSync(
@@ -305,7 +341,17 @@ test("N4 reschedule: a resume scheduled BEFORE a pending op appears is not deliv
   const dir = makeTempDir("steer-reschedule");
   fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
   const statePath = path.join(dir, ".auto", "candidate", "state.json");
-  fs.writeFileSync(statePath, JSON.stringify({ schema_version: 1, disabled: false, policy: {}, candidates: [] }), "utf8");
+  fs.writeFileSync(
+    statePath,
+    JSON.stringify({
+      schema_version: 1,
+      created_at: "2026-01-01T00:00:00.000Z",
+      disabled: false,
+      policy: { candidate_step_limit: 5, candidate_time_limit_seconds: 300 },
+      candidates: [],
+    }),
+    "utf8",
+  );
   const { pi, hook, ctx } = await makeFullHarnessAt(dir, "steer-reschedule-ctx");
   await hook("agent_start")({ messages: [] }, ctx);
   await hook("agent_end")({ messages: [] }, ctx); // schedules a drift resume (no pending op yet)
@@ -328,7 +374,13 @@ test("M1: a legacy resume stored before the campaign started is replaced by camp
   // The campaign starts before the timer fires.
   fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
   fs.writeFileSync(path.join(dir, ".auto", "candidate", "state.json"),
-    JSON.stringify({ schema_version: 1, disabled: false, policy: {}, candidates: [] }), "utf8");
+    JSON.stringify({
+      schema_version: 1,
+      created_at: "2026-01-01T00:00:00.000Z",
+      disabled: false,
+      policy: { candidate_step_limit: 5, candidate_time_limit_seconds: 300 },
+      candidates: [],
+    }), "utf8");
   await new Promise((r) => setTimeout(r, 1200));
   const legacy = pi.sentMessages.filter((m) => /run_experiment \+ log_experiment|Run the next iteration now/.test(m.text));
   assert.equal(legacy.length, 0, `legacy text must not be delivered under a campaign: ${JSON.stringify(pi.sentMessages.map((m) => m.text))}`);
@@ -338,7 +390,13 @@ test("B2: compaction under an active campaign does not restart the experiment lo
   const dir = makeTempDir("compact-campaign");
   fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
   fs.writeFileSync(path.join(dir, ".auto", "candidate", "state.json"),
-    JSON.stringify({ schema_version: 1, disabled: false, policy: {}, candidates: [] }), "utf8");
+    JSON.stringify({
+      schema_version: 1,
+      created_at: "2026-01-01T00:00:00.000Z",
+      disabled: false,
+      policy: { candidate_step_limit: 5, candidate_time_limit_seconds: 300 },
+      candidates: [],
+    }), "utf8");
   const { hook, ctx } = await makeFullHarnessAt(dir, "compact-campaign-ctx");
   const out = await hook("session_before_compact")(
     { preparation: { firstKeptEntryId: "e1", tokensBefore: 10 } },
@@ -365,12 +423,32 @@ test("M2: a stored campaign resume is not delivered after the campaign was disab
   const dir = makeTempDir("stored-after-disable");
   fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
   const statePath = path.join(dir, ".auto", "candidate", "state.json");
-  fs.writeFileSync(statePath, JSON.stringify({ schema_version: 1, disabled: false, policy: {}, candidates: [] }), "utf8");
+  fs.writeFileSync(
+    statePath,
+    JSON.stringify({
+      schema_version: 1,
+      created_at: "2026-01-01T00:00:00.000Z",
+      disabled: false,
+      policy: { candidate_step_limit: 5, candidate_time_limit_seconds: 300 },
+      candidates: [],
+    }),
+    "utf8",
+  );
   const { pi, hook, ctx } = await makeFullHarnessAt(dir, "stored-after-disable-ctx");
   await hook("agent_start")({ messages: [] }, ctx);
   await hook("agent_end")({ messages: [] }, ctx); // campaign wording scheduled
   await hook("agent_start")({ messages: [] }, ctx);
-  fs.writeFileSync(statePath, JSON.stringify({ schema_version: 1, disabled: true, policy: {}, candidates: [] }), "utf8");
+  fs.writeFileSync(
+    statePath,
+    JSON.stringify({
+      schema_version: 1,
+      created_at: "2026-01-01T00:00:00.000Z",
+      disabled: true,
+      policy: { candidate_step_limit: 5, candidate_time_limit_seconds: 300 },
+      candidates: [],
+    }),
+    "utf8",
+  );
   await hook("agent_end")({ messages: [] }, ctx);
   await new Promise((r) => setTimeout(r, 1200));
   const campaignText = pi.sentMessages.filter((m) => /candidate_branch/.test(m.text));
@@ -381,7 +459,13 @@ test("B1 (re-review): compaction under a campaign omits the prompt.md rules that
   const dir = makeTempDir("compact-campaign-rules");
   fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
   fs.writeFileSync(path.join(dir, ".auto", "candidate", "state.json"),
-    JSON.stringify({ schema_version: 1, disabled: false, policy: {}, candidates: [] }), "utf8");
+    JSON.stringify({
+      schema_version: 1,
+      created_at: "2026-01-01T00:00:00.000Z",
+      disabled: false,
+      policy: { candidate_step_limit: 5, candidate_time_limit_seconds: 300 },
+      candidates: [],
+    }), "utf8");
   fs.writeFileSync(path.join(dir, ".auto", "prompt.md"),
     "# Experiment rules\nOne idea = one cycle: propose_hypothesis -> run_experiment -> log_experiment.\n", "utf8");
   const { hook, ctx } = await makeFullHarnessAt(dir, "compact-campaign-rules-ctx");
@@ -399,7 +483,13 @@ test("B1 (round 3): legacy promptGuidelines lines are stripped from the system p
   const dir = makeTempDir("guidelines-campaign");
   fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
   fs.writeFileSync(path.join(dir, ".auto", "candidate", "state.json"),
-    JSON.stringify({ schema_version: 1, disabled: false, policy: {}, candidates: [] }), "utf8");
+    JSON.stringify({
+      schema_version: 1,
+      created_at: "2026-01-01T00:00:00.000Z",
+      disabled: false,
+      policy: { candidate_step_limit: 5, candidate_time_limit_seconds: 300 },
+      candidates: [],
+    }), "utf8");
   const { hook, ctx } = await makeFullHarnessAt(dir, "guidelines-campaign-ctx");
   const legacyLine = "- ALWAYS call propose_hypothesis BEFORE run_experiment to register the idea.";
   const keepLine = "- Keep this unrelated guideline.";
@@ -415,7 +505,13 @@ test("review 65ac927: record_analysis, direction_review and tree_status loop gui
   const dir = makeTempDir("guidelines-campaign-more");
   fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
   fs.writeFileSync(path.join(dir, ".auto", "candidate", "state.json"),
-    JSON.stringify({ schema_version: 1, disabled: false, policy: {}, candidates: [] }), "utf8");
+    JSON.stringify({
+      schema_version: 1,
+      created_at: "2026-01-01T00:00:00.000Z",
+      disabled: false,
+      policy: { candidate_step_limit: 5, candidate_time_limit_seconds: 300 },
+      candidates: [],
+    }), "utf8");
   const { hook, ctx } = await makeFullHarnessAt(dir, "guidelines-campaign-more-ctx");
   const loopLines = [
     "prereg BEFORE the run captures ordering proof; a comparison recorded after results is never a prereg.",
