@@ -27,6 +27,7 @@ const HASH_V2 = "b".repeat(64);
 const EPOCH_V1 = "epoch-1";
 const EPOCH_V2 = "epoch-2";
 const METHOD_PATH = "METHOD.md";
+const CHANGED_LABEL = { leader: "leader ref", epoch: "measurement epoch", methodology: "methodology hashes" };
 
 function campaignPolicy() {
   return {
@@ -66,11 +67,19 @@ async function runConfirm({ raceField = null } = {}) {
   const { root, workDir, campDir } = await setupCampaign();
   const world = { leader: LEADER, epoch: EPOCH_V1, methodHash: HASH_V1 };
   const reads = { leader: 0, epoch: 0, methodology: 0 };
+  // A locked re-validation runs after beginOperation has taken the lock and
+  // written the pending-op marker. Recording that at the second read proves
+  // the check is inside the operation, not in the pre-capture window.
+  const lockedSecondRead = { leader: false, epoch: false, methodology: false };
   const execCalls = [];
   let mutations = 0;
 
   const onSecondRead = (field, mutate) => {
     reads[field] += 1;
+    if (reads[field] === 2) {
+      lockedSecondRead[field] = fs.existsSync(path.join(campDir, candidateState.PENDING_OP_FILE))
+        && fs.existsSync(path.join(campDir, candidateState.LOCK_FILE));
+    }
     if (raceField === field && reads[field] === 2) {
       mutate();
       mutations += 1;
@@ -120,7 +129,12 @@ async function runConfirm({ raceField = null } = {}) {
   try {
     const result = await executeCandidateBranchAction({ action: "confirm" }, {}, workDir, deps);
     const promotions = execCalls.filter((argv) => argv[1] === "update-ref");
-    return { result, reads, mutations, promotions, campDir };
+    // Snapshot before the finally block removes root — otherwise the marker
+    // assertions below inspect a deleted directory and are always true.
+    return {
+      result, reads, mutations, promotions, campDir, lockedSecondRead,
+      pendingMarkerPresent: fs.existsSync(path.join(campDir, candidateState.PENDING_OP_FILE)),
+    };
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -131,27 +145,34 @@ function textOf(result) {
 }
 
 test("control: unchanged preconditions still promote exactly once", async () => {
-  const { result, reads, mutations, promotions, campDir } = await runConfirm();
+  const { result, reads, mutations, promotions, campDir, lockedSecondRead, pendingMarkerPresent } = await runConfirm();
   assert.equal(mutations, 0, "control must not simulate a racing writer");
   assert.deepEqual(reads, { leader: 2, epoch: 2, methodology: 2 },
     "even an unchanged campaign must be re-validated under the lock");
+  assert.deepEqual(lockedSecondRead, { leader: true, epoch: true, methodology: true },
+    "the second read of every precondition must happen under the campaign lock");
   assert.match(textOf(result), /PROMOTED/, `control must promote: ${textOf(result)}`);
   assert.equal(promotions.length, 1, "control must issue exactly one CAS promotion");
-  assert.equal(fs.existsSync(path.join(campDir, "pending-op.json")), false, "no pending op after confirm");
+  assert.equal(pendingMarkerPresent, false, "no pending op after a successful confirm");
 });
 
 for (const field of ["leader", "epoch", "methodology"]) {
   test(`confirm refuses when ${field} changes between capture and the locked callback`, async () => {
-    const { result, reads, mutations, promotions, campDir } = await runConfirm({ raceField: field });
+    const { result, reads, mutations, promotions, campDir, lockedSecondRead, pendingMarkerPresent } = await runConfirm({ raceField: field });
     assert.equal(result?.details?.reason, "preconditions_changed",
       `expected a specific refusal (old code promotes with stale values), got ${JSON.stringify(result?.details)}`);
     assert.match(textOf(result), /⛔ preconditions_changed:/, `unexpected reply: ${textOf(result)}`);
+    assert.match(textOf(result), /nothing was promoted/, `refusal message was lost: ${textOf(result)}`);
+    assert.match(textOf(result), new RegExp(CHANGED_LABEL[field]), `refusal must name the changed precondition: ${textOf(result)}`);
+    assert.equal(result?.details?.promoted, false, "a precondition refusal must not report a promotion");
     assert.equal(/PROMOTED/.test(textOf(result)), false, "no stale precondition may be promoted");
     assert.deepEqual(promotions, [], "no CAS promotion may be attempted after a precondition change");
     assert.equal(mutations, 1, `the racing writer must fire once for ${field}`);
     assert.deepEqual(reads, { leader: 2, epoch: 2, methodology: 2 },
       "confirm must re-read all three preconditions inside the locked callback");
-    assert.equal(fs.existsSync(path.join(campDir, "pending-op.json")), false,
+    assert.deepEqual(lockedSecondRead, { leader: true, epoch: true, methodology: true },
+      "confirm must re-read all three preconditions under the campaign lock");
+    assert.equal(pendingMarkerPresent, false,
       "a known precondition refusal must clear the pending-op marker");
   });
 }

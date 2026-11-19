@@ -529,7 +529,8 @@ export async function executeCandidateBranchAction(params: any, ctx: any, workDi
           // the campaign lock. Re-read all three preconditions here, before
           // measuring or promoting, so a concurrent promotion or a change of
           // measurement scale / methodology cannot make the two sides
-          // incomparable. CleanRefusal clears the marker: nothing was started.
+          // incomparable. A normal-return outcome clears the marker: nothing
+          // was started, so the campaign stays usable (no manual check).
           const lockedLeader = await fullShaOf(workDir, LEADER_REF);
           const lockedEpoch = String(measurementScaleStatusOfDir(workDir).epoch);
           const lockedMethodology = await hashMethodologyAtCommit(workDir, cpSha, policy);
@@ -542,8 +543,12 @@ export async function executeCandidateBranchAction(params: any, ctx: any, workDi
               h.path === currentMethodology.hashes[i].path && h.sha256 === currentMethodology.hashes[i].sha256);
           if (!methodologyUnchanged) changed.push("methodology hashes");
           if (changed.length > 0) {
-            throw new candidateState.CleanRefusal("preconditions_changed" as any,
-              `confirm preconditions changed before the locked operation (${changed.join(", ")}); nothing was promoted`);
+            const message = `confirm preconditions changed before the locked operation (${changed.join(", ")}); nothing was promoted`;
+            outcome = {
+              text: renderRefusal({ reason: "preconditions_changed", message }),
+              details: { action: "confirm", promoted: false, reason: "preconditions_changed" },
+            };
+            return;
           }
           const leaderSide = await measureSide("leader", expectedLeader);
           if (!leaderSide.ok) {
