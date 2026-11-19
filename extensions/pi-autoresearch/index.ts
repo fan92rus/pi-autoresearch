@@ -1771,18 +1771,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     ensureGatedToolsActive();
   };
 
-  const recordAutoresearchActivation = (workDir: string, active: boolean): void => {
-    pi.appendEntry(AUTORESEARCH_ACTIVATION_ENTRY, {
-      version: 1,
-      workDir: canonicalPath(workDir),
-      active,
-    });
-    // Persisted manual-off marker (live lob-collector-data case 2026-11-16):
-    // the session-branch entry dies with the session, but the owner's intent
-    // must survive a restart — without this, a still-awaiting_child expedition
-    // chain resurrects research mode on every new session. Only OFF is
-    // persisted: mode-on decisions stay ephemeral so a fresh session never
-    // silently re-activates the loop just because someone once ran /autoresearch on.
+  // Persisted manual-off marker (live lob-collector-data case 2026-11-16):
+  // the session-branch entry dies with the session, but the owner's intent must
+  // survive a restart — without it a still-awaiting_child expedition chain
+  // resurrects research mode on every new session. Only OFF is persisted:
+  // mode-on decisions stay ephemeral so a fresh session never silently
+  // re-activates the loop just because someone once ran /autoresearch on.
+  // One helper owns the marker for both activation and an explicit launch that
+  // is refused by a campaign gate: the marker resolves from the SAME workDir
+  // in either case (no second, differently resolved path).
+  const setPersistedOffMarker = (workDir: string, active: boolean): void => {
     try {
       const markerPath = path.join(resolveWorkDir(workDir), ".auto", "autoresearch-off.json");
       if (active) {
@@ -1792,6 +1790,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         fs.writeFileSync(markerPath, JSON.stringify({ version: 1, workDir: canonicalPath(workDir), off_at: new Date().toISOString() }, null, 2) + "\n");
       }
     } catch { /* best-effort: session-branch record remains the fallback */ }
+  };
+
+  /** Explicit /autoresearch on clears the off marker even when a campaign gate
+   *  refuses the kickoff; no activation entry or mode change is recorded here. */
+  const clearPersistedOffMarker = (workDir: string): void => setPersistedOffMarker(workDir, true);
+
+  const recordAutoresearchActivation = (workDir: string, active: boolean): void => {
+    pi.appendEntry(AUTORESEARCH_ACTIVATION_ENTRY, {
+      version: 1,
+      workDir: canonicalPath(workDir),
+      active,
+    });
+    setPersistedOffMarker(workDir, active);
   };
 
   const readPersistedOffMarker = (workDir: string): boolean => {
@@ -5878,6 +5889,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     get cancelPendingResume() { return cancelPendingResume; },
     get chainCampaignIds() { return chainCampaignIds; },
     get createExperimentState() { return createExperimentState; },
+    get clearPersistedOffMarker() { return clearPersistedOffMarker; },
     get exportDashboard() { return exportDashboard; },
     get expeditionForWeb() { return expeditionForWeb; },
     get finalizeExpeditionForOptimization() { return finalizeExpeditionForOptimization; },

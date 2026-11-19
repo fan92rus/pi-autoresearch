@@ -32,6 +32,15 @@ function makeTempDir(label) {
 
 async function loadPrompt(label, { campaignActive }) {
   const dir = makeTempDir(label);
+  const { pi, command, hook } = createFakePi({ dir, sessionId: `candprompt-${label}`, realGit: false });
+  const ctx = makeCtx(dir, `candprompt-${label}`, pi);
+  const { default: autoresearchExtension } = await import(
+    pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")).href
+  );
+  autoresearchExtension(pi);
+  // tj0.2 refuses an ordinary launch while a campaign is active: arm the mode
+  // first, then plant the campaign state (as candidate_branch init does).
+  await command("autoresearch").handler("on", ctx);
   if (campaignActive) {
     // campaignBlocksOrdinaryLoop reads .auto/candidate/state.json and blocks when disabled === false.
     fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
@@ -47,13 +56,6 @@ async function loadPrompt(label, { campaignActive }) {
       "utf8",
     );
   }
-  const { pi, command, hook } = createFakePi({ dir, sessionId: `candprompt-${label}`, realGit: false });
-  const ctx = makeCtx(dir, `candprompt-${label}`, pi);
-  const { default: autoresearchExtension } = await import(
-    pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")).href
-  );
-  autoresearchExtension(pi);
-  await command("autoresearch").handler("on", ctx);
   const event = { systemPrompt: "BASE" };
   const out = await hook("before_agent_start")(event, ctx);
   return out?.systemPrompt ?? event.systemPrompt;
@@ -80,6 +82,13 @@ test("no candidate campaign: the legacy experiment-loop prompt is unchanged", as
 
 test("disabled candidate campaign does not change the prompt (legacy loop comes back)", async () => {
   const dir = makeTempDir("disabled");
+  const { pi, command, hook } = createFakePi({ dir, sessionId: "candprompt-disabled", realGit: false });
+  const ctx = makeCtx(dir, "candprompt-disabled", pi);
+  const { default: autoresearchExtension } = await import(
+    pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")).href
+  );
+  autoresearchExtension(pi);
+  await command("autoresearch").handler("on", ctx);
   fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
   fs.writeFileSync(
     path.join(dir, ".auto", "candidate", "state.json"),
@@ -92,13 +101,6 @@ test("disabled candidate campaign does not change the prompt (legacy loop comes 
     }),
     "utf8",
   );
-  const { pi, command, hook } = createFakePi({ dir, sessionId: "candprompt-disabled", realGit: false });
-  const ctx = makeCtx(dir, "candprompt-disabled", pi);
-  const { default: autoresearchExtension } = await import(
-    pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")).href
-  );
-  autoresearchExtension(pi);
-  await command("autoresearch").handler("on", ctx);
   const event = { systemPrompt: "BASE" };
   const out = await hook("before_agent_start")(event, ctx);
   const prompt = out?.systemPrompt ?? event.systemPrompt;
@@ -146,6 +148,15 @@ async function drainSettledResumes(hookBody) {
 /** Full harness for hook-level tests (agent_end / session_compact). */
 async function makeFullHarness(label, { campaignActive }) {
   const dir = makeTempDir(label);
+  const { pi, command, hook } = createFakePi({ dir, sessionId: `candprompt-${label}`, realGit: false });
+  const ctx = makeCtx(dir, `candprompt-${label}`, pi);
+  const { default: autoresearchExtension } = await import(
+    pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")).href
+  );
+  autoresearchExtension(pi);
+  // tj0.2 refuses an ordinary launch while a campaign is active: arm the mode
+  // first, then plant the campaign state (as candidate_branch init does).
+  await command("autoresearch").handler("on", ctx);
   if (campaignActive) {
     fs.mkdirSync(path.join(dir, ".auto", "candidate"), { recursive: true });
     fs.writeFileSync(
@@ -160,13 +171,6 @@ async function makeFullHarness(label, { campaignActive }) {
       "utf8",
     );
   }
-  const { pi, command, hook } = createFakePi({ dir, sessionId: `candprompt-${label}`, realGit: false });
-  const ctx = makeCtx(dir, `candprompt-${label}`, pi);
-  const { default: autoresearchExtension } = await import(
-    pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")).href
-  );
-  autoresearchExtension(pi);
-  await command("autoresearch").handler("on", ctx);
   return { pi, hook, dir, ctx };
 }
 
@@ -308,13 +312,19 @@ test("B1: a campaign under a configured workingDir is detected by drift/compacti
 
 /** Harness bound to an explicit directory (workingDir fixtures). */
 async function makeFullHarnessAt(dir, label) {
-  const { pi, command, hook } = createFakePi({ dir, sessionId: `candprompt-${label}`, realGit: false });
+  const { pi, hook } = createFakePi({ dir, sessionId: `candprompt-${label}`, realGit: false });
   const ctx = makeCtx(dir, `candprompt-${label}`, pi);
-  const { default: autoresearchExtension } = await import(
+  const extension = await import(
     pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")).href
   );
-  autoresearchExtension(pi);
-  await command("autoresearch").handler("on", ctx);
+  extension.default(pi);
+  // These fixtures plant the campaign state BEFORE the harness runs: they test
+  // prompt/steer selection, not the launch guard (mode-switch.test.mjs covers
+  // that guard). Since tj0.2 an ordinary launch is refused with a campaign, so
+  // arm the mode flag directly for the already-active-campaign scenario.
+  const runtime = extension.runtimeForTest(ctx);
+  runtime.autoresearchMode = true;
+  runtime.uiMode = "optimization";
   return { pi, hook, ctx };
 }
 
