@@ -12,6 +12,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Text } from "@earendil-works/pi-tui";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import { askConsent } from "./brief-consent.ts";
 import * as optimizeBrief from "./optimize-brief.ts";
 import * as expedition from "./expedition.ts";
@@ -198,6 +199,153 @@ export function createOptimizeBriefTool(deps: BriefToolsDeps): BriefTool {
   };
 }
 
+/**
+ * Publication journal (tj0.5): a partially committed expedition must keep its
+ * id, document digest and completed step so a retry resumes the same chain
+ * instead of starting a new exp-*. The canonical draft is kept until the chain
+ * is fully published; only the out-of-workdir copy is removed on refusal.
+ */
+const EXPEDITION_PUBLICATION_FILE = "expedition-publication.json";
+interface ExpeditionPublication {
+  schema_version: 1;
+  id: string;
+  chain_id: string;
+  doc_path: string;
+  doc_sha256: string;
+  step: string;
+  done: string[];
+}
+type StepResult = { ok: true } | { ok: false; reason: string; message: string };
+
+const publicationFile = (workDir: string) => path.join(workDir, ".auto", EXPEDITION_PUBLICATION_FILE);
+
+function readPublication(workDir: string): { state: ExpeditionPublication | null; problem?: string } {
+  const file = publicationFile(workDir);
+  if (!fs.existsSync(file)) return { state: null };
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+    if (
+      raw.schema_version !== 1 || typeof raw.id !== "string" || !raw.id.startsWith("exp-") ||
+      typeof raw.chain_id !== "string" || !raw.chain_id.endsWith("-chain") ||
+      typeof raw.doc_path !== "string" || raw.doc_path === "" ||
+      typeof raw.doc_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(raw.doc_sha256) ||
+      typeof raw.step !== "string" || !Array.isArray(raw.done) ||
+      !raw.done.every((step) => typeof step === "string")
+    ) return { state: null, problem: "expedition_publication_invalid" };
+    return { state: { schema_version: 1, id: raw.id, chain_id: raw.chain_id, doc_path: raw.doc_path, doc_sha256: raw.doc_sha256, step: raw.step, done: raw.done as string[] } };
+  } catch {
+    return { state: null, problem: "expedition_publication_invalid" };
+  }
+}
+
+async function writePublication(workDir: string, state: ExpeditionPublication): Promise<boolean> {
+  try {
+    fs.mkdirSync(path.dirname(publicationFile(workDir)), { recursive: true });
+    await researchState.writeFileAtomic(publicationFile(workDir), JSON.stringify(state, null, 2) + "\n");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Refuse a resume whose recorded steps disagree with the on-disk journal. */
+function publicationMatchesChain(workDir: string, state: ExpeditionPublication): boolean {
+  const dir = chainJournal.chainDir(workDir, state.chain_id);
+  if (!dir) return false;
+  try {
+    const actual = fs.readFileSync(path.join(dir, "chain.json"), "utf8").trim().split("\n").filter(Boolean)
+      .map((line) => (JSON.parse(line) as { type?: unknown }).type);
+    const entryTypes: Record<string, string> = {
+      chain_created: "chain_created", expedition_created: "expedition_created",
+      chain_brief_approved: "brief_approved", chain_campaign_added: "campaign_added", chain_active: "status_change",
+    };
+    // Campaign/brief steps leave no chain entry; only chain steps are compared.
+    const expected = state.done.filter((step) => step !== "complete")
+      .map((step) => step.startsWith("direction_opened:") ? "direction_opened" : entryTypes[step])
+      .filter((type): type is string => typeof type === "string");
+    const prefixMatches = expected.every((type, i) => actual[i] === type);
+    // A completed publication may have later chain entries (map actions), an
+    // unfinished one must match exactly: extra entries mean a write raced the
+    // journal and appending again would duplicate a step.
+    return prefixMatches && (state.step === "complete" || actual.length === expected.length);
+  } catch {
+    return false;
+  }
+}
+
+function discardDocumentCopy(docPath: string): void {
+  try { fs.unlinkSync(docPath); } catch { /* the copy may already be gone; the canonical draft is never touched here */ }
+}
+
+/**
+ * Exclusive, workdir-scoped propose claim. It is acquired only after the owner
+ * confirms and the document is re-read, and released by its owner in a finally
+ * block: while it exists no other propose can re-read and rewrite the journal,
+ * so two gated confirms cannot mint two chains. It never outlives its propose,
+ * so a later, unrelated expedition is not blocked.
+ */
+const PROPOSE_CLAIM_FILE = "expedition-propose.claim";
+const proposeClaimFile = (workDir: string) => path.join(workDir, ".auto", PROPOSE_CLAIM_FILE);
+
+function acquireProposeClaim(workDir: string): { ok: true; token: string } | { ok: false; reason: string; message: string } {
+  const file = proposeClaimFile(workDir);
+  const token = randomUUID();
+  let ours = false;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const fd = fs.openSync(file, "wx");
+    ours = true;
+    try {
+      const payload = Buffer.from(JSON.stringify({ token, pid: process.pid }), "utf8");
+      if (fs.writeSync(fd, payload) !== payload.length) throw new Error("short propose claim write");
+    } finally { fs.closeSync(fd); }
+    return { ok: true, token };
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (ours) { try { fs.unlinkSync(file); } catch { /* the claim is not writable; no chain was started */ } }
+    if (code === "EEXIST" || code === "EPERM" || code === "EBUSY") {
+      return { ok: false, reason: "expedition_publication_in_progress", message: `another expedition propose holds the publication claim for ${workDir}; no chain was created` };
+    }
+    return { ok: false, reason: "io_failed", message: `cannot create propose claim ${file}: ${String(e)}` };
+  }
+}
+
+function releaseProposeClaim(workDir: string, token: string): void {
+  const file = proposeClaimFile(workDir);
+  try {
+    const info = JSON.parse(fs.readFileSync(file, "utf8")) as { token?: unknown };
+    if (info?.token === token) fs.unlinkSync(file);
+  } catch { /* missing or foreign claim: never remove another owner's marker */ }
+}
+
+/**
+ * A completed journal may be retired only for a different document whose old
+ * chain is finalized. Republishing the same sha and an in-progress old chain
+ * stay explicit refusals.
+ */
+async function completedJournalVerdict(
+  workDir: string, state: ExpeditionPublication, docSha: string,
+): Promise<{ retire: true } | { retire: false; reason: string; message: string }> {
+  if (state.doc_sha256 === docSha) {
+    return { retire: false, reason: "expedition_already_published", message: `expedition_already_published: sha256 ${docSha} was already published as ${state.chain_id}; no second chain was created. Resume work on that chain` };
+  }
+  let status: string;
+  try { status = await chainJournal.statusOf(workDir, state.chain_id); }
+  catch (e) {
+    return { retire: false, reason: "expedition_publication_inconsistent", message: `expedition_publication_inconsistent: completed chain ${state.chain_id} cannot be verified (${String(e)}); manual check required` };
+  }
+  if (!chainJournal.isFinal(status) || status === "manual_check_required") {
+    return { retire: false, reason: "expedition_publication_conflict", message: `expedition_publication_conflict: completed publication ${state.chain_id} is bound to sha256 ${state.doc_sha256} and its chain is still ${status}; resolve ${publicationFile(workDir)} before proposing another document` };
+  }
+  return { retire: true };
+}
+
+function retireCompletedPublication(workDir: string, state: ExpeditionPublication): boolean {
+  const retired = path.join(path.dirname(publicationFile(workDir)), `expedition-publication.retired-${state.chain_id}-${randomUUID().slice(0, 8)}.json`);
+  try { fs.renameSync(publicationFile(workDir), retired); return true; }
+  catch { return false; }
+}
+
 export function createExpeditionBriefTool(deps: BriefToolsDeps): BriefTool {
   return {
     name: "expedition_brief",
@@ -219,7 +367,9 @@ export function createExpeditionBriefTool(deps: BriefToolsDeps): BriefTool {
     async execute(_id: string, params: any, _signal: any, _update: any, ctx: ExtensionContext) {
       const action = params?.action;
       const reply = (text: string, reason?: string) => ({content:[{type:"text" as const,text}],details:{action,...(reason?{reason}:{})}});
-      const allowed = action === "draft" ? ["action","doc"] : action === "propose" ? ["action","doc_path"] : null;
+      // doc_path is in the published schema for both actions. On draft it has no
+      // meaning (the canonical draft path is fixed), so it is accepted and ignored.
+      const allowed = action === "draft" ? ["action","doc","doc_path"] : action === "propose" ? ["action","doc_path"] : null;
       if (!allowed) return reply("invalid_argument: action must be draft or propose", "invalid_argument");
       const extra = deps.unexpectedArgKeys(params ?? {}, allowed);
       if (extra) return reply(`invalid_argument: ${extra}`, "invalid_argument");
@@ -230,63 +380,174 @@ export function createExpeditionBriefTool(deps: BriefToolsDeps): BriefTool {
         const checked = expedition.validateExpeditionDoc(params.doc);
         if (!checked.ok) return reply(`${checked.reason}: ${checked.message}`, checked.reason);
         const saved = expedition.saveExpeditionDraft(stateRoot, checked.doc);
-        return saved.ok ? reply(`Expedition draft saved: ${saved.path}. Next: expedition_brief propose.`) : reply(`${saved.reason}: ${saved.message}`, saved.reason);
+        return saved.ok
+          ? reply(`Expedition draft saved: ${saved.path}. Next: expedition_brief propose.${params.doc_path !== undefined ? " (doc_path ignored on draft; propose uses the saved draft.)" : ""}`)
+          : reply(`${saved.reason}: ${saved.message}`, saved.reason);
       }
+      const loaded = readPublication(workDir);
+      if (loaded.problem) return reply(`${loaded.problem}: publication journal ${publicationFile(workDir)} is unreadable; no chain was created`, loaded.problem);
+      let resuming = loaded.state !== null;
+      let resumeStep = loaded.state?.step ?? "";
+      let state = loaded.state;
+      let retireChainId: string | null = null;
       let docPath: string;
-      if (typeof params.doc_path === "string") docPath = path.resolve(workDir, params.doc_path);
-      else {
+      let copied = false;
+      let canonical: string | null = null;
+      if (typeof params.doc_path === "string") {
+        docPath = path.resolve(workDir, params.doc_path);
+        if (state) {
+          let explicitBytes: string;
+          try { explicitBytes = fs.readFileSync(docPath, "utf8"); }
+          catch (e) { return reply(`expedition_doc_unreadable: ${String(e)}`, "expedition_doc_unreadable"); }
+          const explicitSha = researchState.sha256Hex(explicitBytes);
+          // A completed journal is decided after the document is read, so a
+          // different sha can retire it while the same sha stays refused.
+          if (state.step !== "complete" && explicitSha !== state.doc_sha256) return reply(`expedition_publication_conflict: pending publication ${state.chain_id} is bound to sha256 ${state.doc_sha256}, the document is ${explicitSha}; resolve ${publicationFile(workDir)} before proposing another document`, "expedition_publication_conflict");
+          if (state.step !== "complete") {
+            if (path.resolve(state.doc_path) !== docPath) return reply(`expedition_publication_conflict: pending publication ${state.chain_id} is bound to ${state.doc_path}; resume with that document or resolve ${publicationFile(workDir)} first`, "expedition_publication_conflict");
+            if (!publicationMatchesChain(workDir, state)) return reply(`expedition_publication_inconsistent: journal step ${state.step} does not match chain ${state.chain_id}; manual check required`, "expedition_publication_inconsistent");
+          }
+        }
+      } else {
         const latest = expedition.findLatestDraft(stateRoot);
         if (!latest) return reply("expedition_draft_missing: no draft found", "expedition_draft_missing");
-        docPath = path.join(path.dirname(workDir), `expedition-${Date.now()}.json`);
-        try { fs.writeFileSync(docPath, fs.readFileSync(latest)); fs.unlinkSync(latest); } catch (e) { return reply(`io_failed: ${String(e)}`, "io_failed"); }
+        canonical = latest;
+        let bytes: string;
+        try { bytes = fs.readFileSync(latest, "utf8"); }
+        catch (e) { return reply(`io_failed: ${String(e)}`, "io_failed"); }
+        const sha = researchState.sha256Hex(bytes);
+        if (state && state.step !== "complete" && state.doc_sha256 !== sha) return reply(`expedition_publication_conflict: pending publication ${state.chain_id} is bound to sha256 ${state.doc_sha256}, the draft is ${sha}; resolve ${publicationFile(workDir)} before proposing another document`, "expedition_publication_conflict");
+        if (state && state.step !== "complete") {
+          docPath = state.doc_path;
+          if (!fs.existsSync(docPath)) return reply(`expedition_publication_unreadable: published document ${docPath} is missing; resume is not possible without it`, "expedition_publication_unreadable");
+          if (!publicationMatchesChain(workDir, state)) return reply(`expedition_publication_inconsistent: journal step ${state.step} does not match chain ${state.chain_id}; manual check required`, "expedition_publication_inconsistent");
+        } else {
+          // The canonical draft stays in place until publication succeeds; a
+          // refusal only removes this out-of-workdir copy.
+          docPath = path.join(path.dirname(workDir), `expedition-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
+          try { fs.writeFileSync(docPath, bytes); copied = true; } catch (e) { return reply(`io_failed: ${String(e)}`, "io_failed"); }
+        }
       }
       try {
         const real = fs.realpathSync(docPath), realWork = fs.realpathSync(workDir), rel = path.relative(realWork, real);
-        if (rel === "" || (!path.isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${path.sep}`))) return reply("path_inside_workdir: document must be outside the work directory", "path_inside_workdir");
-      } catch (e) { return reply(`expedition_doc_unreadable: ${String(e)}`, "expedition_doc_unreadable"); }
+        if (rel === "" || (!path.isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${path.sep}`))) { if (copied) discardDocumentCopy(docPath); return reply("path_inside_workdir: document must be outside the work directory", "path_inside_workdir"); }
+      } catch (e) { if (copied) discardDocumentCopy(docPath); return reply(`expedition_doc_unreadable: ${String(e)}`, "expedition_doc_unreadable"); }
       const initial = expedition.readExpeditionDoc(docPath);
-      if (!initial.ok) return reply(`${initial.reason}: ${initial.message}`, initial.reason);
+      if (!initial.ok) { if (copied) discardDocumentCopy(docPath); return reply(`${initial.reason}: ${initial.message}`, initial.reason); }
+      if (state?.step === "complete") {
+        const verdict = await completedJournalVerdict(workDir, state, initial.sha256);
+        if (!verdict.retire) { if (copied) discardDocumentCopy(docPath); return reply(verdict.message, verdict.reason); }
+        retireChainId = state.chain_id;
+        state = null;
+        resuming = false;
+        resumeStep = "";
+      }
       const dialog = expedition.expeditionDialogText(initial.doc, initial.sha256);
       const confirmed = await ctx.ui.confirm("Confirm expedition document", dialog);
       const current = expedition.readExpeditionDoc(docPath);
-      if (!current.ok || current.sha256 !== initial.sha256) return reply("expedition_changed: document changed during confirmation", "expedition_changed");
-      if (confirmed !== true) return reply("owner_declined: expedition was not created", "owner_declined");
-      const id = `exp-${Date.now()}`, chainId = `${id}-chain`;
-      const createdChain = await chainJournal.createChain(workDir, chainId, id);
-      if (!createdChain.ok) return reply(`${createdChain.reason}: ${createdChain.message}`, createdChain.reason);
-      const chainDir = chainJournal.chainDir(workDir, chainId)!;
-      const add = async (type: string, payload: Record<string, unknown>) => chainJournal.appendEntry(chainDir, workDir, chainId, type, payload);
-      let r = await add("expedition_created", {goal: current.doc.goal, doc_sha256: current.sha256});
-      if (!r.ok) return reply(`${r.reason}: ${r.message}`, r.reason);
-      for (const d of current.doc.directions) { r = await add("direction_opened", {dir:d.name,why:d.why}); if (!r.ok) return reply(`${r.reason}: ${r.message}`, r.reason); }
-      const campaign = await researchState.createCampaign(workDir, id);
-      if (!campaign.ok) return reply(`${campaign.reason}: ${campaign.message}`, campaign.reason);
-      const brief = await researchState.writeBriefDraft(campaign.dir, current.doc.campaign0);
-      if (!brief.ok) return reply(`${brief.reason}: ${brief.message}`, brief.reason);
-      const approval = await researchState.writeApproval(campaign.dir, brief.sha256);
-      if (!approval.ok) return reply(`${approval.reason}: ${approval.message}`, approval.reason);
-      r = await add("brief_approved", {campaign_id:id,brief_sha256:brief.sha256,source:"expedition"});
-      if (!r.ok) return reply(`${r.reason}: ${r.message}`, r.reason);
-      r = await add("campaign_added", {campaign_id:id});
-      if (!r.ok) return reply(`${r.reason}: ${r.message}`, r.reason);
-      const started = await researchState.transitionPhase(campaign.dir, "start expedition campaign", "briefing", "research");
-      if (!started.ok) return reply(`${started.reason}: ${started.message}`, started.reason);
-      const status = await chainJournal.setChainStatus(workDir, chainId, "active");
-      if (!status.ok) return reply(`${status.reason}: ${status.message}`, status.reason);
-      // es1.8: every creation path pins the expedition view and refreshes the
-      // widget — including a session where the mode was already ON.
-      if (!runtime.autoresearchMode) { deps.recordAutoresearchActivation(workDir,true); deps.setAutoresearchMode(ctx,true); }
-      runtime.uiMode = "expedition";
-      runtime.researchCampaignId = id;
-      runtime.researchChain = {chainId,workDir,charterPath:docPath,charterSha256:current.sha256,charter:current.doc.charter,expedition:true,docSha256:current.sha256};
-      deps.updateWidget(ctx);
-      // Restart marker (bd pi-autoresearch-es1.3): lets a fresh session restore
-      // the binding from disk. Chain creation is already durable at this point,
-      // so a marker failure degrades to a warning, not a rollback.
-      const marker = expedition.writeExpeditionMarker(chainDir, {goal: current.doc.goal, docPath, docSha256: current.sha256, campaignId: id, charter: current.doc.charter});
-      const markerNote = marker.ok ? "" : `\nwarning: expedition restart marker not written (${marker.reason}: ${marker.message}); the expedition will not survive a pi restart.`;
-      deps.sendWhenReady(ctx, `Expedition ${id} created. Campaign 0 is running; the campaign brief is approved by the expedition confirmation. Before question work: pick a direction and activate it with expedition_map(subaction="activate", dir=<name>, why=<rationale>) — questions of campaign 0 belong to that direction. Use separate research_questions calls with action="open", action="record", or action="close" for campaign questions. When the direction is closed, close its campaign questions first, then call expedition_map(subaction="resolve", dir=<name>, refs=[{campaign,question}]) or make a separate call to expedition_map(subaction="reject", dir=<name>, refs=[{campaign,question}]), expedition_map(subaction="advisory", dir=<name>, review_ref=<path>, review_sha256=<sha256>), or expedition_map(subaction="park", dir=<name>, reason=<why>); activate the next direction with expedition_map(subaction="activate", dir=<name>, why=<rationale>) before drafting the next campaign. Question close is not map direction resolve.`, { steerIfBusy: true });
-      return reply(`✅ Expedition ${chainId} created; campaign ${id} started (document sha256 ${current.sha256}). Next: expedition_map(subaction="activate", dir=<name>, why=<rationale>) before question work; use separate research_questions calls with action="open", action="record", or action="close" for questions. After closing a direction with expedition_map(subaction="resolve", dir=<name>, refs=...) or a separate call with expedition_map(subaction="reject", dir=<name>, refs=...), activate the next direction with expedition_map(subaction="activate", dir=<name>, why=<rationale>) before drafting the next campaign.${markerNote}`);
+      if (!current.ok || current.sha256 !== initial.sha256) { if (copied) discardDocumentCopy(docPath); return reply("expedition_changed: document changed during confirmation", "expedition_changed"); }
+      if (confirmed !== true) { if (copied) discardDocumentCopy(docPath); return reply("owner_declined: expedition was not created", "owner_declined"); }
+      const claim = acquireProposeClaim(workDir);
+      if (!claim.ok) { if (copied) discardDocumentCopy(docPath); return reply(`${claim.reason}: ${claim.message}`, claim.reason); }
+      try {
+        // The journal is re-read under the exclusive claim: a journal that
+        // appeared while our confirm was open belongs to another propose and
+        // must never be silently resumed into a second chain.
+        const fresh = readPublication(workDir);
+        if (fresh.problem) { if (copied) discardDocumentCopy(docPath); return reply(`${fresh.problem}: publication journal ${publicationFile(workDir)} is unreadable; no chain was created`, fresh.problem); }
+        const claimedDuringConfirm = (other: ExpeditionPublication) => {
+          if (copied) discardDocumentCopy(docPath);
+          return reply(`expedition_publication_claimed: another propose claimed sha256 ${other.doc_sha256} as ${other.chain_id} during this confirmation; no second chain was created`, "expedition_publication_claimed");
+        };
+        if (retireChainId !== null) {
+          if (fresh.state && fresh.state.chain_id === retireChainId && fresh.state.step === "complete") {
+            const verdict = await completedJournalVerdict(workDir, fresh.state, current.sha256);
+            if (!verdict.retire) { if (copied) discardDocumentCopy(docPath); return reply(verdict.message, verdict.reason); }
+            if (!retireCompletedPublication(workDir, fresh.state)) { if (copied) discardDocumentCopy(docPath); return reply(`io_failed: cannot retire ${publicationFile(workDir)}`, "io_failed"); }
+          } else if (fresh.state) return claimedDuringConfirm(fresh.state);
+        } else if (!resuming && fresh.state !== null) {
+          return claimedDuringConfirm(fresh.state);
+        } else if (resuming && fresh.state) {
+          if (fresh.state.doc_sha256 !== current.sha256) return reply(`expedition_publication_conflict: pending publication ${fresh.state.chain_id} is bound to sha256 ${fresh.state.doc_sha256}, the document is ${current.sha256}; resolve ${publicationFile(workDir)} before proposing another document`, "expedition_publication_conflict");
+          if (fresh.state.step === "complete") return reply(`expedition_already_published: sha256 ${current.sha256} was already published as ${fresh.state.chain_id}; no second chain was created. Resume work on that chain`, "expedition_already_published");
+          if (path.resolve(fresh.state.doc_path) !== docPath) return reply(`expedition_publication_conflict: pending publication ${fresh.state.chain_id} is bound to ${fresh.state.doc_path}; resume with that document or resolve ${publicationFile(workDir)} first`, "expedition_publication_conflict");
+          if (!publicationMatchesChain(workDir, fresh.state)) return reply(`expedition_publication_inconsistent: journal step ${fresh.state.step} does not match chain ${fresh.state.chain_id}; manual check required`, "expedition_publication_inconsistent");
+          state = fresh.state;
+        } else if (resuming && !fresh.state) {
+          resuming = false;
+          resumeStep = "";
+        }
+        if (!state) {
+          // The id and chain id exist only after the claim is won.
+          const id = `exp-${Date.now()}-${randomUUID().slice(0, 8)}`;
+          state = { schema_version: 1, id, chain_id: `${id}-chain`, doc_path: docPath, doc_sha256: current.sha256, step: "prepared", done: [] };
+          if (!(await writePublication(workDir, state))) { if (copied) discardDocumentCopy(docPath); return reply(`io_failed: cannot write ${publicationFile(workDir)}`, "io_failed"); }
+        }
+        // Each durable step is recorded before the next one starts. A retry skips
+        // recorded steps; a step that cannot be recorded refuses instead of
+        // risking a duplicate append on the next attempt.
+        const stepDone = (step: string) => state!.done.includes(step);
+        const mark = async (step: string, run: () => Promise<StepResult>): Promise<StepResult> => {
+          if (stepDone(step)) return { ok: true };
+          const result = await run();
+          if (!result.ok) return result;
+          const next = { ...state!, done: [...state!.done, step], step };
+          if (!(await writePublication(workDir, next))) return { ok: false, reason: "expedition_publication_journal_failed", message: `step ${step} completed but was not recorded in ${publicationFile(workDir)}; manual check required` };
+          state = next;
+          return { ok: true };
+        };
+        const id = state.id, chainId = state.chain_id;
+        const createdChain = await mark("chain_created", () => chainJournal.createChain(workDir, chainId, id));
+        if (!createdChain.ok) return reply(`${createdChain.reason}: ${createdChain.message}`, createdChain.reason);
+        const chainDir = chainJournal.chainDir(workDir, chainId)!;
+        const add = async (type: string, payload: Record<string, unknown>) => chainJournal.appendEntry(chainDir, workDir, chainId, type, payload);
+        let r = await mark("expedition_created", () => add("expedition_created", {goal: current.doc.goal, doc_sha256: current.sha256}));
+        if (!r.ok) return reply(`${r.reason}: ${r.message}`, r.reason);
+        for (let i = 0; i < current.doc.directions.length; i++) {
+          const d = current.doc.directions[i];
+          r = await mark(`direction_opened:${i}`, () => add("direction_opened", {dir:d.name,why:d.why}));
+          if (!r.ok) return reply(`${r.reason}: ${r.message}`, r.reason);
+        }
+        const campaign = await mark("campaign_created", () => researchState.createCampaign(workDir, id));
+        if (!campaign.ok) return reply(`${campaign.reason}: ${campaign.message}`, campaign.reason);
+        const resolvedCampaign = researchState.resolveCampaignDir(workDir, id);
+        if (!resolvedCampaign.ok) return reply(`${resolvedCampaign.reason}: ${resolvedCampaign.message}`, resolvedCampaign.reason);
+        const campaignDir = resolvedCampaign.dir;
+        const draftBrief = await mark("campaign_brief_drafted", () => researchState.writeBriefDraft(campaignDir, current.doc.campaign0));
+        if (!draftBrief.ok) return reply(`${draftBrief.reason}: ${draftBrief.message}`, draftBrief.reason);
+        const briefDigest = await researchState.briefSha256(campaignDir);
+        if (!briefDigest.ok) return reply(`${briefDigest.reason}: ${briefDigest.message}`, briefDigest.reason);
+        const approval = await mark("campaign_brief_approved", () => researchState.writeApproval(campaignDir, briefDigest.sha256));
+        if (!approval.ok) return reply(`${approval.reason}: ${approval.message}`, approval.reason);
+        r = await mark("chain_brief_approved", () => add("brief_approved", {campaign_id:id,brief_sha256:briefDigest.sha256,source:"expedition"}));
+        if (!r.ok) return reply(`${r.reason}: ${r.message}`, r.reason);
+        r = await mark("chain_campaign_added", () => add("campaign_added", {campaign_id:id}));
+        if (!r.ok) return reply(`${r.reason}: ${r.message}`, r.reason);
+        const started = await mark("campaign_started", () => researchState.transitionPhase(campaignDir, "start expedition campaign", "briefing", "research"));
+        if (!started.ok) return reply(`${started.reason}: ${started.message}`, started.reason);
+        const status = await mark("chain_active", () => chainJournal.setChainStatus(workDir, chainId, "active"));
+        if (!status.ok) return reply(`${status.reason}: ${status.message}`, status.reason);
+        state = { ...state, done: [...state.done, "complete"], step: "complete" };
+        if (!(await writePublication(workDir, state))) return reply(`expedition_publication_journal_failed: publication step complete but could not be recorded in ${publicationFile(workDir)}; manual check required`, "expedition_publication_journal_failed");
+        if (copied && canonical) { try { fs.unlinkSync(canonical); } catch { /* the draft is spent; the charter copy is durable */ } }
+        const resumeNote = resuming ? ` (RESUME from publication journal at step ${resumeStep})` : "";
+        // es1.8: every creation path pins the expedition view and refreshes the
+        // widget — including a session where the mode was already ON.
+        if (!runtime.autoresearchMode) { deps.recordAutoresearchActivation(workDir,true); deps.setAutoresearchMode(ctx,true); }
+        runtime.uiMode = "expedition";
+        runtime.researchCampaignId = id;
+        runtime.researchChain = {chainId,workDir,charterPath:docPath,charterSha256:current.sha256,charter:current.doc.charter,expedition:true,docSha256:current.sha256};
+        deps.updateWidget(ctx);
+        // Restart marker (bd pi-autoresearch-es1.3): lets a fresh session restore
+        // the binding from disk. Chain creation is already durable at this point,
+        // so a marker failure degrades to a warning, not a rollback.
+        const marker = expedition.writeExpeditionMarker(chainDir, {goal: current.doc.goal, docPath, docSha256: current.sha256, campaignId: id, charter: current.doc.charter});
+        const markerNote = marker.ok ? "" : `\nwarning: expedition restart marker not written (${marker.reason}: ${marker.message}); the expedition will not survive a pi restart.`;
+        deps.sendWhenReady(ctx, `Expedition ${id} created. Campaign 0 is running; the campaign brief is approved by the expedition confirmation. Before question work: pick a direction and activate it with expedition_map(subaction="activate", dir=<name>, why=<rationale>) — questions of campaign 0 belong to that direction. Use separate research_questions calls with action="open", action="record", or action="close" for campaign questions. When the direction is closed, close its campaign questions first, then call expedition_map(subaction="resolve", dir=<name>, refs=[{campaign,question}]) or make a separate call to expedition_map(subaction="reject", dir=<name>, refs=[{campaign,question}]), expedition_map(subaction="advisory", dir=<name>, review_ref=<path>, review_sha256=<sha256>), or expedition_map(subaction="park", dir=<name>, reason=<why>); activate the next direction with expedition_map(subaction="activate", dir=<name>, why=<rationale>) before drafting the next campaign. Question close is not map direction resolve.`, { steerIfBusy: true });
+        return reply(`✅ Expedition ${chainId} created${resumeNote}; campaign ${id} started (document sha256 ${current.sha256}). Next: expedition_map(subaction="activate", dir=<name>, why=<rationale>) before question work; use separate research_questions calls with action="open", action="record", or action="close" for questions. After closing a direction with expedition_map(subaction="resolve", dir=<name>, refs=...) or a separate call with expedition_map(subaction="reject", dir=<name>, refs=...), activate the next direction with expedition_map(subaction="activate", dir=<name>, why=<rationale>) before drafting the next campaign.${markerNote}`);
+      } finally {
+        releaseProposeClaim(workDir, claim.token);
+      }
     },
   };
 }
