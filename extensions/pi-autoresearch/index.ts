@@ -1917,7 +1917,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
    * historic notice and no kickoff. This preserves RESEARCH_PHASE_POLICY:
    * ordinaryLoop never blocked briefing. Mirrors the session state-root pin.
    */
-  const ordinaryLaunchResearchGate = async (workDir: string, ctx: ExtensionContext): Promise<"none" | "manual" | "active"> => {
+  const classifyOrdinaryLaunchResearch = (workDir: string, ctx: ExtensionContext): "none" | "manual" | "active" => {
     const bases = [workDir];
     const stateRoot = getRuntime(ctx).researchStateRoot;
     if (stateRoot && stateRoot !== workDir) bases.push(stateRoot);
@@ -1935,6 +1935,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
     return manual ? "manual" : "none";
   };
+  const ordinaryLaunchResearchGate = async (workDir: string, ctx: ExtensionContext): Promise<"none" | "manual" | "active"> =>
+    classifyOrdinaryLaunchResearch(workDir, ctx);
 
   /**
    * Git-gate scan (live lob-collector-data case 2026-11-15): the shell Git ban
@@ -3768,7 +3770,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     researchBlocksOrdinaryLoop,
     resolveWorkDir,
     runLinkNotConsumedWarning,
-    setAutoresearchMode,
     updateWidget,
     validateWorkDir,
     get broadcastDashboardUpdate() { return broadcastDashboardUpdate; },
@@ -3776,6 +3777,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     get campaignBlocksOrdinaryLoop() { return campaignBlocksOrdinaryLoop; },
     get optimizeNotStartedGate() { return optimizeNotStartedGate; },
     get overlayTui() { return overlayTui; },
+    get transitionAutoresearchMode() { return transitionAutoresearchMode; },
   }));
 
   // -----------------------------------------------------------------------
@@ -4638,7 +4640,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   /** Is an ordinary-loop tool blocked by an active candidate campaign? A missing
    *  state never blocks. An existing state blocks unless it is readable and
    *  disabled; an unreadable state fails closed (tasks 3.2, design §4). */
-  const campaignBlocksOrdinaryLoop = async (workDir: string): Promise<boolean> => {
+  const candidateBlocksOrdinaryLoop = (workDir: string): boolean => {
     const statePath = path.join(campaignDirOf(workDir), candidateState.STATE_FILE);
     if (!fs.existsSync(statePath)) return false;
     // Fail closed (design §4): an existing but unreadable or malformed state is an
@@ -4648,6 +4650,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // junk file with disabled:true is an unclear state and stays blocked.
     return !disabledCandidateStateSync(workDir);
   };
+  const campaignBlocksOrdinaryLoop = async (workDir: string): Promise<boolean> => candidateBlocksOrdinaryLoop(workDir);
 
   const campaignBlockedResponse = () => ({
     content: [{ type: "text", text: `⛔ ${CAMPAIGN_BLOCK_TEXT}.` }],
@@ -5296,9 +5299,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     unexpectedArgKeys,
     getRuntime,
     recordAutoresearchActivation,
-    setAutoresearchMode,
-    updateWidget,
     sendWhenReady,
+    get cancelPendingResume() { return cancelPendingResume; },
+    get candidateBlocksOrdinaryLoop() { return candidateBlocksOrdinaryLoop; },
+    get classifyOrdinaryLaunchResearch() { return classifyOrdinaryLaunchResearch; },
+    get recordModeSwitchFinalize() { return recordModeSwitchFinalize; },
+    get transitionAutoresearchMode() { return transitionAutoresearchMode; },
     get optimizeBriefDir() { return optimizeBriefDir; },
     set optimizeBriefDir(dir: string | null) { optimizeBriefDir = dir; },
   };
@@ -5320,6 +5326,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     sendWhenReady,
     get activeChain() { return activeChain; },
     get chainCampaignIds() { return chainCampaignIds; },
+    get transitionAutoresearchMode() { return transitionAutoresearchMode; },
     get charterFileIntact() { return charterFileIntact; },
     get collectChainJournals() { return collectChainJournals; },
     get briefPreviewDir() { return briefPreviewDir; },

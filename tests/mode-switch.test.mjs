@@ -306,6 +306,87 @@ test("tj0.2 mode-transition invariant matrix", async (t) => {
   });
 });
 
+// ── tj0.2: a direct expedition_brief propose is a mode switch too ────────
+async function directPropose(h, value = doc) {
+  await h.tool("expedition_brief").execute("id", { action: "draft", doc: value }, null, null, h.ctx);
+  return h.tool("expedition_brief").execute("id", { action: "propose" }, null, null, h.ctx);
+}
+
+test("tj0.2 direct expedition_brief propose follows the same mode guards", async (t) => {
+  await t.test("propose from OFF binds the expedition without any finalize", async () => {
+    const dir = workdir();
+    const h = await harness(dir);
+    const rt = h.ext.runtimeForTest(h.ctx);
+    assert.equal(rt.autoresearchMode, false);
+
+    const created = await directPropose(h);
+    assert.match(text(created), /✅ Expedition .* created/, text(created));
+    assert.equal(ledgerEntries(dir).filter((e) => e.type === "finalize").length, 0, "OFF has no optimization to finalize");
+    assert.equal(fs.existsSync(path.join(dir, ".auto", "report.md")), false, "OFF writes no campaign report");
+    assert.equal(rt.autoresearchMode, true);
+    assert.equal(rt.uiMode, "expedition");
+    assert.equal(rt.researchChain?.expedition, true, "the expedition is bound in one transactional switch");
+    assert.match(lastWidget(h), /expedition/i);
+  });
+
+  await t.test("propose from active optimization finalizes once (and stays idempotent)", async () => {
+    const dir = workdir();
+    const h = await harness(dir);
+    plantOptimization(dir);
+    await h.command("autoresearch").handler("on", h.ctx);
+    assert.equal(h.ext.runtimeForTest(h.ctx).uiMode, "optimization");
+
+    const created = await directPropose(h);
+    assert.match(text(created), /✅ Expedition .* created/, text(created));
+    assert.equal(switchFinalizes(dir, "switch to expedition mode").length, 1);
+    assert.ok(fs.existsSync(path.join(dir, ".auto", "report.md")), "finalize refreshes the campaign report");
+    assert.equal(h.ext.runtimeForTest(h.ctx).uiMode, "expedition");
+    assert.equal(h.ext.runtimeForTest(h.ctx).researchChain?.expedition, true);
+    assert.ok(h.pi.sentMessages.some((m) => /expedition_map\(subaction="activate"/.test(m.text)), "the expedition kickoff is still delivered");
+
+    const again = await directPropose(h);
+    assert.match(text(again), /expedition_already_published/, text(again));
+    assert.equal(switchFinalizes(dir, "switch to expedition mode").length, 1, "repeated propose does not finalize twice");
+  });
+
+  await t.test("propose with a manual research state notifies and suppresses the kickoff", async () => {
+    const dir = workdir();
+    const h = await harness(dir);
+    seedBlockingCampaign(dir, "manual-briefing", { phase: "briefing" });
+
+    const created = await directPropose(h);
+    assert.match(text(created), /✅ Expedition .* created/, text(created));
+    assert.ok(h.pi.notifications.some((n) => n.text === "Research campaign active — continue it with research_questions(action=status); the legacy autoresearch kickoff is not sent."));
+    assert.equal(h.pi.sentMessages.filter((m) => /Expedition .* created/.test(m.text)).length, 0, "no autonomous expedition kickoff over a manual campaign");
+    assert.equal(h.ext.runtimeForTest(h.ctx).uiMode, "expedition");
+  });
+
+  await t.test("propose refuses an active research campaign before any mutation", async () => {
+    const dir = workdir();
+    const h = await harness(dir);
+    seedBlockingCampaign(dir, "research-active", { phase: "research" });
+    const rt = h.ext.runtimeForTest(h.ctx);
+    const messagesBefore = h.pi.sentMessages.length;
+    const widgetsBefore = h.pi.widgets.length;
+    let confirms = 0;
+    h.ctx.ui.confirm = async () => { confirms++; return true; };
+
+    const result = await directPropose(h);
+    assert.match(text(result), /Cannot launch expedition while a research campaign is active; resume or finish it first\./, text(result));
+    assert.ok(h.pi.notifications.some((n) => /Cannot launch expedition while a research campaign is active/.test(n.text)));
+    assert.equal(confirms, 0, "refusal happens before the owner dialog");
+    assert.equal(rt.autoresearchMode, false, "no activation on refusal");
+    assert.equal(rt.uiMode, "optimization", "no view switch on refusal");
+    assert.equal(rt.researchCampaignId, null, "no campaign pin on refusal");
+    assert.equal(rt.researchChain, null, "no chain binding on refusal");
+    assert.equal(h.pi.widgets.length, widgetsBefore, "no widget registration on refusal");
+    assert.equal(h.pi.sentMessages.length, messagesBefore, "no kickoff on refusal");
+    assert.deepEqual(ledgerEntries(dir), [], "no finalize on refusal");
+    assert.equal(fs.existsSync(path.join(dir, ".auto", "report.md")), false);
+    assert.equal(fs.existsSync(path.join(dir, ".auto", "research-chain")), false, "no chain journal on refusal");
+  });
+});
+
 test("starting optimization refuses while an expedition campaign is still in research", async () => {
   const dir = workdir();
   const h = await harness(dir);

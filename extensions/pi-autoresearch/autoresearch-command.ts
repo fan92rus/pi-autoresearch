@@ -25,6 +25,12 @@ import { filterSubcommands, applyExperimentLimitArg, configureExperimentLimit, i
 import type { BoundTestHooks } from "./test-hooks.ts";
 import type { ModeTransition } from "./index.ts";
 
+/** Shared guard/notice wording: the command and the direct expedition_brief
+ *  propose path must refuse and notify with exactly the same text. */
+export const EXPEDITION_RESEARCH_ACTIVE_NOTICE = "Cannot launch expedition while a research campaign is active; resume or finish it first.";
+export const EXPEDITION_CANDIDATE_ACTIVE_NOTICE = "Candidate campaign active; finish it before starting an expedition.";
+export const RESEARCH_KICKOFF_NOTICE = "Research campaign active — continue it with research_questions(action=status); the legacy autoresearch kickoff is not sent.";
+
 /** Extension-local collaborators injected by index.ts (getter-backed there). */
 export interface AutoresearchCommandDeps {
   pi: ExtensionAPI;
@@ -341,8 +347,8 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
           }
         }
         if (!ctx.hasUI) { ctx.ui.notify("Expedition needs TUI confirmation; headless use requires the --expedition-doc wrapper.", "error"); return; }
-        if (await deps.researchBlocksExpeditionLaunch(workDir, ctx)) { ctx.ui.notify("Cannot launch expedition while a research campaign is active; resume or finish it first.", "error"); return; }
-        if (await deps.campaignBlocksOrdinaryLoop(workDir)) { ctx.ui.notify("Candidate campaign active; finish it before starting an expedition.", "error"); return; }
+        if (await deps.researchBlocksExpeditionLaunch(workDir, ctx)) { ctx.ui.notify(EXPEDITION_RESEARCH_ACTIVE_NOTICE, "error"); return; }
+        if (await deps.campaignBlocksOrdinaryLoop(workDir)) { ctx.ui.notify(EXPEDITION_CANDIDATE_ACTIVE_NOTICE, "error"); return; }
         // es1.7: an active optimization loop is finalized (ledger + report) but
         // NOT steered — the design-phase kickoff below is the only message. The
         // persisted off-marker is untouched: the mode stays ON, only the view
@@ -604,11 +610,9 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
           }
         }
         if (requestedId !== null) {
-          // Pin before activation: the research tools take no campaign id, so
-          // this session works with exactly this campaign (live bench finding,
-          // bd pi-autoresearch-9o2: the agent invented a second campaign).
-          runtime.researchCampaignId = requestedId;
-          deps.syncBriefPreview(ctx);
+          // The pin is installed by the transactional transition below (the
+          // research tools take no campaign id, so this session works with
+          // exactly this campaign — bd pi-autoresearch-9o2).
           const campaignDir = resolveRequestedCampaignDir(requestedId);
           const insp = campaignDir !== null ? await researchState.inspectCampaign(campaignDir) : null;
           resumePhase = insp?.state?.phase === "briefing" || insp?.state?.phase === "research" ? insp.state.phase : null;
@@ -626,10 +630,12 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
         }
         deps.recordAutoresearchActivation(researchWorkDir, true);
         // A research campaign keeps the legacy dashboard, never the expedition
-        // view; the pin and the mode/view move in one transactional step.
+        // view; the pin, the mode and the view move in one transactional step.
         deps.transitionAutoresearchMode(ctx, {
           enabled: true, uiMode: "optimization", stateRoot: requestedStateRoot,
+          campaignId: requestedId ?? runtime.researchCampaignId,
         });
+        deps.syncBriefPreview(ctx);
         // research-charter: accept the charter AFTER the mode is on (the chain
         // lives in the session runtime). A refusal here stops the launch: no
         // kickoff is sent, no chain state exists. The chain id derives from the
@@ -650,7 +656,10 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
             ctx.ui.notify(`Chain refused (${createdChain.reason}): ${createdChain.message}`, "error");
             return;
           }
-          runtime.researchChain = { chainId, workDir: researchWorkDir, charterPath: requestedCharterPath, charterSha256: accepted.sha256, charter: accepted.charter };
+          deps.transitionAutoresearchMode(ctx, {
+            enabled: true, uiMode: "optimization",
+            chain: { chainId, workDir: researchWorkDir, charterPath: requestedCharterPath, charterSha256: accepted.sha256, charter: accepted.charter },
+          });
           ctx.ui.notify(`Research chain ${chainId} started (charter sha256 ${accepted.sha256.slice(0, 12)}); the chain follows the charter limits`, "info");
         }
         // No /skill: prefix: the metric-loop skill must not be expanded into a research campaign.
@@ -698,7 +707,7 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
       // in stopped/pending/unreadable states are the exception: their recovery
       // is a manual-check path through the research tools, so the historic
       // notification and the suppressed kickoff are preserved.
-      const researchKickoffNotice = "Research campaign active — continue it with research_questions(action=status); the legacy autoresearch kickoff is not sent.";
+      const researchKickoffNotice = RESEARCH_KICKOFF_NOTICE;
       const researchGate = await deps.ordinaryLaunchResearchGate(workDir, ctx);
       if (researchGate === "active") {
         ctx.ui.notify(researchKickoffNotice, "info");
