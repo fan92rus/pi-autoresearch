@@ -1784,7 +1784,7 @@ await test("/autoresearch limit without args opens the interactive dialog (TUI)"
   assert.ok(!("experiment_max_minutes" in cfg3), "blank input cancels");
 });
 
-await test("config menu header shows the experiment limit separately from the parallel budget", async () => {
+await test("config menu header shows the experiment limit separately from the inactive legacy parallel budget", async () => {
   const dir = makeTempDir("limit-header");
   initGitRepo(dir);
   fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
@@ -1793,11 +1793,16 @@ await test("config menu header shows the experiment limit separately from the pa
   ctx.hasUI = true;
   const notes = [];
   ctx.ui.notify = (text, type) => notes.push({ text, type });
-  ctx.ui.select = async (_t, options) => options[options.length - 1]; // done immediately
+  let menuOptions = [];
+  ctx.ui.select = async (_t, options) => { menuOptions = options; return options[options.length - 1]; }; // done immediately
   await command("autoresearch").handler("config", ctx);
   const shown = notes.map((n) => n.text).join("\n");
   assert.ok(/лимит эксперимента|experiment limit/.test(shown) && /16\s*(мин|min)/.test(shown), `limit shown: ${shown.slice(0, 300)}`);
-  assert.ok(shown.includes("(parallel)"), "parallel budget is labeled as parallel");
+  assert.ok(
+    /(бюджет|budget)\s*\((устаревшая политика|legacy policy)\)/.test(shown) &&
+    menuOptions.some((item) => /бюджет|budget/i.test(item) && /(устаревшая политика неактивна|legacy policy inactive)/.test(item)),
+    `legacy budget label: header=${shown.slice(0, 300)} options=${menuOptions.join(" | ").slice(0, 300)}`
+  );
 });
 
 await test("/autoresearch config menu includes the limit item and opens its dialog", async () => {
