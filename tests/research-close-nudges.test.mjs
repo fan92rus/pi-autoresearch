@@ -43,7 +43,9 @@ async function fixture() {
   async function nudge() {
     await hook("agent_start")({}, ctx);
     await hook("agent_end")({ messages: [] }, ctx);
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    // Fire the same delivery path the settled-window timer would call. A
+    // fixed 1 s sleep made this test scheduler-dependent under full load.
+    await module.sendPendingResumeIfReadyForTest(ctx, module.runtimeForTest(ctx));
     return pi.sentMessages.at(-1)?.text ?? "";
   }
   return { dir, close, nudge, pi, ctx, module };
