@@ -17,6 +17,10 @@ export interface ResumeRuntime {
   pendingResumeMessage: PendingResume;
   pendingResumeTimer: ReturnType<typeof setTimeout> | null;
   pendingResumeIsDrift: boolean;
+  /** Monotonic cancellation token: off/turn-boundary paths bump it, and an in-flight
+   *  sender re-checks it after every await. Optional so hand-built test runtimes
+   *  remain valid; the extension runtime always carries it. */
+  resumeEpoch?: number;
   consecutiveDriftResumes: number;
   autoResumeTurns: number;
 }
@@ -161,14 +165,22 @@ export function createResumePolicy<Ctx extends ResumeContext, Runtime extends Re
   const sendPendingResumeIfReady = async (ctx: Ctx, runtime: Runtime): Promise<void> => {
     const pending = runtime.pendingResumeMessage;
     if (pending === null || "kind" in pending) return;
+    // Gates and composers await: the owner can turn the loop off (or a new
+    // turn can drop a stale nudge) while this sender is suspended. A snapshot
+    // of the epoch plus the live mode flag decides whether this particular
+    // sender may still deliver — never clear a newer pending message here.
+    const epoch = runtime.resumeEpoch ?? 0;
+    const stillCurrent = (): boolean => (runtime.resumeEpoch ?? 0) === epoch && runtime.autoresearchMode;
+    if (!stillCurrent()) return;
     const gates = await evaluateResumeGates(ctx, runtime);
+    if (!stillCurrent()) return;
     if (gates.verdict === "cancel") {
       cancelPendingResume(runtime);
       if (gates.notify) deps.notifyAutoResumeLimitReached(ctx, gates.notify);
       return;
     }
     if (gates.verdict === "retry") {
-      reschedulePendingResume(ctx, runtime);
+      if (stillCurrent()) reschedulePendingResume(ctx, runtime);
       return;
     }
     if (pending.mode === "candidate" && !deps.campaignActive(gates.workDir)) {
@@ -177,16 +189,23 @@ export function createResumePolicy<Ctx extends ResumeContext, Runtime extends Re
     }
     const wasDrift = runtime.pendingResumeIsDrift;
     cancelPendingResume(runtime);
-    if (wasDrift) runtime.consecutiveDriftResumes++;
-    runtime.autoResumeTurns++;
+    if (!stillCurrent()) return;
     const liveMode = await deps.resolveLoopMode(gates.workDir, ctx);
+    if (!stillCurrent()) return;
     let sendText = pending.text;
     if (liveMode.mode === "research" && pending.mode === "legacy") {
       sendText = gates.researchBlocks ? deps.researchResumeText : await deps.composeCampaignResumeMessage(ctx);
+      if (!stillCurrent()) return;
     } else if (liveMode.mode === "candidate" && pending.mode !== "candidate") {
       sendText = await deps.composeCampaignResumeMessage(ctx);
+      if (!stillCurrent()) return;
     }
+    // Last check immediately before delivery. Counters move only after the
+    // message is actually sent: a nudge cancelled mid-flight spends no budget.
+    if (!stillCurrent()) return;
     deps.sendUserMessage(sendText);
+    if (wasDrift) runtime.consecutiveDriftResumes++;
+    runtime.autoResumeTurns++;
   };
 
   const schedulePendingResume = (

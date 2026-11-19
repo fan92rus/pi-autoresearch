@@ -431,6 +431,9 @@ export interface AutoresearchRuntime {
   pendingResumeMessage: PendingResume;
   /** bd 8e5.1: drift-mode accounting flag kept on the runtime (delivery-time increment is decided by the pending message’s mode tag + drift kind; see pendingResumeMessage). */
   pendingResumeIsDrift: boolean;
+  /** Monotonic cancellation token: every off path and every stale-turn drop
+   *  bumps it; pending senders re-check it after each await and before send. */
+  resumeEpoch: number;
   /** TUI view mode: 'list' (dashboard table) or 'tree' (experiment tree). Toggle with Tab. */
   treeViewMode: boolean;
   /** True when the current turn used a loop tool (run_experiment/log_experiment/propose_hypothesis). Reset in before_agent_start; read by agent_end drift policy. */
@@ -1029,11 +1032,15 @@ export function shouldAutoActivateAutoresearch(
   workDir: string,
   hasPersistedLog: boolean,
   recordedDecision: boolean | null = null,
+  persistedOff = false,
 ): boolean {
   if (!hasPersistedLog) return false;
   // An explicit `/autoresearch on|off` in this session always wins, so a manual
   // off survives /tree, compaction, and reloads instead of snapping back on.
   if (recordedDecision !== null) return recordedDecision;
+  // A persisted off marker is the owner's cross-session decision: a fresh
+  // session in the same cwd must not resurrect the loop from an old ledger.
+  if (persistedOff) return false;
   // With no recorded decision, same-cwd sessions default on (a log implies intent);
   // redirected workingDir sessions default off until this session opts in.
   return samePath(ctxCwd, workDir);
@@ -1542,6 +1549,7 @@ function createSessionRuntime(): AutoresearchRuntime {
     pendingResumeTimer: null,
     pendingResumeMessage: null,
     pendingResumeIsDrift: false,
+    resumeEpoch: 0,
     treeViewMode: false,
     lastTurnUsedExperimentTools: false,
     candidateLeftovers: null,
@@ -1725,9 +1733,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   // The one place mode flips: gated tools follow the flag, never drifting from it.
   const setAutoresearchMode = (ctx: ExtensionContext, enabled: boolean): void => {
-    getRuntime(ctx).autoresearchMode = enabled;
-    // Mode off: a pending deferral must not fire later (design Decision 6 reset points).
-    if (!enabled) cancelSubagentDeferral(getRuntime(ctx));
+    const runtime = getRuntime(ctx);
+    runtime.autoresearchMode = enabled;
+    // Every off path funnels through here, including commands and tools owned
+    // by other modules: bump the epoch so a sender suspended in a gate or a
+    // composer cannot deliver a nudge decided before the owner turned off.
+    if (!enabled) {
+      runtime.resumeEpoch++;
+      // Mode off: neither a pending deferral nor a queued nudge may fire later
+      // (design Decision 6 reset points). This also covers off paths owned by
+      // other modules that do not call cancelPendingResume themselves.
+      resumePolicy.cancelPendingResume(runtime);
+      cancelSubagentDeferral(runtime);
+    }
     // Keep gated tools always-active (see ensureGatedToolsActive). The mode flag
     // itself gates execution inside each handler, so we no longer add/remove
     // tools from the active set here — that path is unreliable in headless
@@ -1772,8 +1790,17 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const hasPendingResume = (runtime: AutoresearchRuntime): boolean =>
     runtime.pendingResumeMessage !== null;
 
+  /** True only while the resume slot still belongs to the epoch that created it
+   *  and the loop is on. Rechecked after every await on the delivery paths. */
+  const resumeEpochIsCurrent = (runtime: AutoresearchRuntime, epoch: number): boolean =>
+    runtime.resumeEpoch === epoch && runtime.autoresearchMode;
+
   const pausePendingResume = (runtime: AutoresearchRuntime): void => resumePolicy.pausePendingResume(runtime);
-  const cancelPendingResume = (runtime: AutoresearchRuntime): void => resumePolicy.cancelPendingResume(runtime);
+  const cancelPendingResume = (runtime: AutoresearchRuntime): void => {
+    resumePolicy.cancelPendingResume(runtime);
+    // Turn boundaries and off paths must invalidate an already-running sender.
+    runtime.resumeEpoch++;
+  };
   const sendPendingResumeIfReady = (ctx: ExtensionContext, runtime: AutoresearchRuntime): Promise<void> =>
     resumePolicy.sendPendingResumeIfReady(ctx, runtime);
   const schedulePendingResume = (
@@ -2048,8 +2075,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     ctx: ExtensionContext,
     runtime: AutoresearchRuntime,
   ): Promise<void> => {
+    const epoch = runtime.resumeEpoch;
     cancelSubagentDeferral(runtime);
-    if (!runtime.autoresearchMode || runtime.experimentsThisSession !== 0 || hasPendingResume(runtime)) return;
+    if (!resumeEpochIsCurrent(runtime, epoch) || runtime.experimentsThisSession !== 0 || hasPendingResume(runtime)) return;
     if (runtime.consecutiveDriftResumes >= MAX_CONSECUTIVE_DRIFT_RESUMES) {
       // The drift limit is checked BEFORE the probe in agent_end; reaching it
       // while deferred behaves like the ordinary path: stop with a notice.
@@ -2060,6 +2088,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // settled) via evaluateResumeGates. "retry" (agent unsettled) proceeds to
     // schedule: the send-time path re-evaluates the gates and retries anyway.
     const gates = await evaluateResumeGates(ctx, runtime);
+    if (!resumeEpochIsCurrent(runtime, epoch)) return;
     if (gates.verdict === "cancel") {
       if (gates.notify) await notifyAutoResumeLimitReachedAsync(ctx, gates.notify);
       return;
@@ -2067,6 +2096,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // bd 8e5.1: drift counters move to DELIVERY (sendPendingResumeIfReady) —
     // the deferral path now matches the ordinary path, both under Decision 3.
     const driftMsg = await composeDriftResumeMessage(gates.verdict === "deliver" ? gates.workDir : resolveWorkDir(ctx.cwd), ctx);
+    if (!resumeEpochIsCurrent(runtime, epoch)) return;
     schedulePendingResume(ctx, runtime, driftMsg.text, { mode: driftMsg.mode });
     runtime.pendingResumeIsDrift = true;
   };
@@ -2420,6 +2450,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         workDir,
         hasPersistedLog,
         recordedActivationDecision(ctx, workDir),
+        readPersistedOffMarker(workDir),
       ),
     );
 
@@ -2703,7 +2734,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   pi.on("agent_start", async (_event, ctx) => {
     const runtime = getRuntime(ctx);
     runtime.experimentsThisSession = 0;
-    pausePendingResume(runtime);
+    // A drift nudge describes the PREVIOUS turn: dropping it here stops a
+    // productive user turn from being answered by a stale 'no work' accusation
+    // (and stops it from spending the drift budget). Explicit compaction
+    // resumes are not drift-tagged and keep their paused timer.
+    if (runtime.pendingResumeIsDrift && hasPendingResume(runtime)) cancelPendingResume(runtime);
+    else pausePendingResume(runtime);
     // New turn: a deferral from the previous settled turn must not fire into it.
     cancelSubagentDeferral(runtime);
     rememberSubagentSession(ctx);
@@ -2715,26 +2751,30 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     composeMessage?: (ctx: ExtensionContext) => string | Promise<string>,
   ): Promise<void> => {
     const runtime = getRuntime(ctx);
+    const epoch = runtime.resumeEpoch;
     if (hasPendingResume(runtime)) {
-      reschedulePendingResume(ctx, runtime);
+      if (resumeEpochIsCurrent(runtime, epoch)) reschedulePendingResume(ctx, runtime);
       return;
     }
-    if (!gate(runtime)) return;
+    if (!gate(runtime) || !resumeEpochIsCurrent(runtime, epoch)) return;
     if (await campaignNeedsManualCheck(resolveWorkDir(ctx.cwd), ctx)) {
       // Unclear campaign state: stop and let the operator decide (design §5).
       return;
     }
+    if (!resumeEpochIsCurrent(runtime, epoch)) return;
     const stopReason = autoResumeStopReasonFor(runtime);
     if (stopReason !== null) {
+      if (!resumeEpochIsCurrent(runtime, epoch)) return;
       await notifyAutoResumeLimitReachedAsync(ctx, stopReason);
       return;
     }
+    if (!resumeEpochIsCurrent(runtime, epoch)) return;
     // bd 8e5.2 (F4): the mode decision lives in resolveLoopMode. The default
     // resume must not prescribe the legacy cycle while a campaign runs (design
     // §5); explicit composers (drift, compaction) branch by mode themselves.
     let composed: Promise<{ mode: "legacy" | "research" | "candidate"; text: string }>;
     if (composeMessage) {
-      composed = (async () => ({ mode: (await resolveLoopMode(resolveWorkDir(ctx.cwd), ctx)).mode, text: await composeMessage(ctx) }));
+      composed = (async () => ({ mode: (await resolveLoopMode(resolveWorkDir(ctx.cwd), ctx)).mode, text: await composeMessage(ctx) }))();
     } else {
       const mode = await resolveLoopMode(resolveWorkDir(ctx.cwd), ctx);
       composed = mode.mode === "legacy"
@@ -2745,8 +2785,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // settling in the same window would otherwise both pass hasPendingResume and
     // double-schedule (review M-4). The typed claim is distinct from a deliverable
     // message; send/reschedule ignore it until this composer replaces it.
-    runtime.pendingResumeMessage = { kind: "claimed" };
+    const claim: { kind: "claimed" } = { kind: "claimed" };
+    runtime.pendingResumeMessage = claim;
     const resolved = await composed;
+    if (!resumeEpochIsCurrent(runtime, epoch)) {
+      // Off (or a turn boundary) happened while composing: drop only OUR claim,
+      // never a newer pending message installed by the cancelling path.
+      if (runtime.pendingResumeMessage === claim) runtime.pendingResumeMessage = null;
+      return;
+    }
     schedulePendingResume(ctx, runtime, resolved.text, { mode: resolved.mode });
   };
 
@@ -2762,6 +2809,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   pi.on("agent_end", async (_event, ctx) => {
     const runtime = getRuntime(ctx);
+    const epoch = runtime.resumeEpoch;
     runtime.runningExperiment = null;
     if (overlayTui) overlayTui.requestRender();
 
@@ -2789,7 +2837,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // defer; counters move to delivery (design Decision 3). Guard disarmed
         // or zero/unknown active → fall through to the ordinary nudge.
         if (await maybeDeferDriftForSubagents(ctx, runtime)) return;
+        if (!resumeEpochIsCurrent(runtime, epoch)) return;
         const gates = await evaluateResumeGates(ctx, runtime);
+        if (!resumeEpochIsCurrent(runtime, epoch)) return;
         if (gates.verdict === "cancel") {
           if (gates.notify) await notifyAutoResumeLimitReachedAsync(ctx, gates.notify);
           return;
@@ -2802,6 +2852,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         // gates.workDir: the campaign may live under a configured workingDir,
         // so the campaign check must not use the raw session cwd.
         const driftMsg = await composeDriftResumeMessage(gates.verdict === "deliver" ? gates.workDir : resolveWorkDir(ctx.cwd), ctx);
+        if (!resumeEpochIsCurrent(runtime, epoch)) return;
         schedulePendingResume(ctx, runtime, driftMsg.text, { mode: driftMsg.mode });
         runtime.pendingResumeIsDrift = true;
         return;
@@ -2812,7 +2863,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       return;
     }
 
-    await ensurePendingResume(ctx, shouldAutoResumeAfterTurn);
+    if (resumeEpochIsCurrent(runtime, epoch)) await ensurePendingResume(ctx, shouldAutoResumeAfterTurn);
   });
 
   // Track whether the in-flight turn does real loop work (goal-x pattern:
