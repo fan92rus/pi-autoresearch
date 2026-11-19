@@ -4350,9 +4350,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // child checks and the continuation flow still read them. Final exits pass
     // includeChainCampaigns: the chain is already final and must not skip them.
     // Without a chain (or ctx) this is the legacy behavior byte-for-byte.
-    const chainIds = ctx && !opts?.includeChainCampaigns ? await chainCampaignIds(ctx) : [];
-    if (chainIds === null) reasons.push("unlistable");
-    const chainIdList = chainIds ?? [];
+    const chainIds = ctx && !opts?.includeChainCampaigns ? await chainCampaignIdsOutcome(ctx) : { ok: true, ids: [] };
+    if (!chainIds.ok) reasons.push(chainIds.reason);
+    const chainIdList = chainIds.ok ? chainIds.ids : [];
     for (const base of bases) {
       const ids = listResearchCampaignIds(base);
       if (ids === null) { reasons.push("unlistable"); continue; }
@@ -5343,12 +5343,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   /** Campaign ids recorded in the chain journal (never archived while the chain
    *  exists — spec: an active chain keeps its campaigns). The root id comes in
-   *  chain_created; child campaigns are appended as campaign_added entries. */
-  const chainCampaignIds = async (ctx: ExtensionContext): Promise<string[]> => {
+   *  chain_created; child campaigns are appended as campaign_added entries.
+   *  The plain form stays fail-soft for read-only callers; archive uses the
+   *  outcome form so a damaged journal can never silently allow archival. */
+  const chainCampaignIdsOutcome = async (
+    ctx: ExtensionContext,
+  ): Promise<{ ok: true; ids: string[] } | { ok: false; reason: "unlistable" }> => {
     const chain = activeChain(ctx);
-    if (chain === null) return [];
+    if (chain === null) return { ok: true, ids: [] };
     const verified = await chainJournal.verifyChain(chain.workDir, chain.chainId);
-    if (!verified.ok) return [];
+    if (!verified.ok) return { ok: false, reason: "unlistable" };
     const ids: string[] = [];
     for (const e of verified.entries) {
       if (e.type === "chain_created" && typeof (e as { root_campaign_id?: string }).root_campaign_id === "string") {
@@ -5357,7 +5361,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         ids.push((e as { campaign_id: string }).campaign_id);
       }
     }
-    return ids;
+    return { ok: true, ids };
+  };
+  const chainCampaignIds = async (ctx: ExtensionContext): Promise<string[]> => {
+    const outcome = await chainCampaignIdsOutcome(ctx);
+    return outcome.ok ? outcome.ids : [];
   };
 
   /** es1.7/es1.8: a mode switch records the same finalize shape as
