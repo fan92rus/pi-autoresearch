@@ -204,7 +204,7 @@ import { createCandidateBranchTool } from "./candidate-branch-tool.ts";
 import { createFinalizeResearchTool } from "./finalize-research-tool.ts";
 import { createAutoresearchCommand } from "./autoresearch-command.ts";
 import { createTreeStatusTool, createCouncilConveneTool } from "./tree-council-tools.ts";
-import { createTestHooks, type AutoresearchTestHooks, type BoundTestHooks } from "./test-hooks.ts";
+import { createTestHooks, testHookRegistry, type AutoresearchTestHooks, type BoundTestHooks } from "./test-hooks.ts";
 import { interactiveParallelConfig, filterSubcommands, applyExperimentLimitArg, configureExperimentLimit } from "./parallel/config-ui.ts";
 import {
   treeExists,
@@ -310,32 +310,78 @@ export function computeConfidence(
 export const AUTORESUME_TURN_LIMIT = 200;
 export const CONSECUTIVE_FAILURE_OVERRIDE_LIMIT = 20;
 
-/** Compatibility aliases for the canonical hooks object (bd pi-autoresearch-161.3).
- *  The extension binds all of them from one `BoundTestHooks` instance at init;
- *  tests keep importing these names unchanged. */
-/** Test hook for the internal stale-close operation. Set by the extension instance. */
-export let closeStaleCampaign: AutoresearchTestHooks["closeStaleCampaign"] = null;
+/** Compatibility ACCESSORS for the canonical hooks object (bd pi-autoresearch-161.3,
+ *  bd tj0.10). Each export is a function: it resolves the hooks registered by the
+ *  `pi`/`ctx` that initialized the extension. No module-level mutable binding, so
+ *  several fake-pi instances in one process never overwrite each other's hooks.
+ *  Pass the explicit pi/ctx target for no-ctx hooks; ctx-taking hooks resolve it
+ *  from their context (see `TEST_PI_KEY` in test-hooks.ts). */
+/** Test hook for the internal stale-close operation. */
+export function closeStaleCampaign(
+  dir: string,
+  target?: object | null,
+): ReturnType<NonNullable<AutoresearchTestHooks["closeStaleCampaign"]>> {
+  return testHookRegistry.forTarget(target).closeStaleCampaign(dir);
+}
 /** Test hook for send-time pending-resume policy. */
-export let sendPendingResumeIfReadyForTest: AutoresearchTestHooks["sendPendingResumeIfReady"] = null;
+export function sendPendingResumeIfReadyForTest(
+  ctx: ExtensionContext,
+  runtime: AutoresearchRuntime,
+): ReturnType<NonNullable<AutoresearchTestHooks["sendPendingResumeIfReady"]>> {
+  return testHookRegistry.forContext(ctx).sendPendingResumeIfReady(ctx, runtime);
+}
 /** Test hook: direct access to the session runtime (pin/recovery tests). */
-export let runtimeForTest: AutoresearchTestHooks["getRuntime"] = null;
+export function runtimeForTest(ctx: ExtensionContext): AutoresearchRuntime {
+  return testHookRegistry.forContext(ctx).getRuntime(ctx);
+}
 /** Test hook for the async auto-resume limit notification. */
-export let notifyAutoResumeLimitReachedAsyncForTest: AutoresearchTestHooks["notifyAutoResumeLimitReachedAsync"] = null;
+export function notifyAutoResumeLimitReachedAsyncForTest(
+  ctx: ExtensionContext,
+  reason?: string | null,
+): ReturnType<NonNullable<AutoresearchTestHooks["notifyAutoResumeLimitReachedAsync"]>> {
+  return testHookRegistry.forContext(ctx).notifyAutoResumeLimitReachedAsync(ctx, reason);
+}
 /** Test hook for expedition restart restore (bd pi-autoresearch-es1.3). */
-export let restoreExpeditionForTest: AutoresearchTestHooks["restoreExpeditionFromDisk"] = null;
-/** Test/CLI hook for the expedition web payload (expedition-tui group 4): the
- *  shared builder behind GET /expedition and the initial page. Bound when the
- *  extension initializes; typed as a const export so tests can call it. */
-export let resolveExpeditionPayload: AutoresearchTestHooks["resolveExpeditionPayload"] = null;
-/** Test hook: stops the dashboard static server so tests that started it can
- *  release the listen socket and let the process exit. */
-export let stopDashboardServerForTest: AutoresearchTestHooks["stopDashboardServer"] = null;
-/** bd tj0.3: the two extension-local policy resolvers, bound at init so the
- *  matrix test can drive them without a tool-level detour. */
-export let blockingCampaignIdsForTest: ((bases: string[]) => Promise<string[]>) | null = null;
-export let archiveFinishedCampaignsForTest: ((workDir: string, stateBase: string, ctx?: ExtensionContext, opts?: { includeChainCampaigns?: boolean }) => Promise<string[] | null>) | null = null;
-/** bd tj0.3: the typed archive outcome, bound at init for the mixed-campaign test. */
-export let archiveOutcomeForTest: ((workDir: string, stateBase: string, ctx?: ExtensionContext, opts?: { includeChainCampaigns?: boolean }) => Promise<researchState.ResearchArchiveOutcome>) | null = null;
+export function restoreExpeditionForTest(
+  ctx: ExtensionContext,
+): ReturnType<NonNullable<AutoresearchTestHooks["restoreExpeditionFromDisk"]>> {
+  return testHookRegistry.forContext(ctx).restoreExpeditionFromDisk(ctx);
+}
+/** Test/CLI hook for the expedition web payload: the shared builder behind
+ *  GET /expedition and the initial page. */
+export function resolveExpeditionPayload(
+  workDir: string,
+  target?: object | null,
+): ReturnType<NonNullable<AutoresearchTestHooks["resolveExpeditionPayload"]>> {
+  return testHookRegistry.forTarget(target).resolveExpeditionPayload(workDir);
+}
+/** Test hook: release the dashboard server socket of a specific instance. */
+export function stopDashboardServerForTest(target?: object | null): void {
+  testHookRegistry.forTarget(target).stopDashboardServer();
+}
+/** bd tj0.3: extension-local research policy resolvers, bound at init. */
+export function blockingCampaignIdsForTest(bases: string[], target?: object | null): Promise<string[]> {
+  return testHookRegistry.forTarget(target).blockingCampaignIds(bases);
+}
+/** bd tj0.3: typed archive outcome, bound at init for the mixed-campaign test. */
+export function archiveFinishedCampaignsForTest(
+  workDir: string,
+  stateBase: string,
+  ctx?: ExtensionContext,
+  opts?: { includeChainCampaigns?: boolean },
+  target?: object | null,
+): Promise<string[] | null> {
+  return testHookRegistry.forTarget(ctx ?? target).archiveFinishedCampaigns(workDir, stateBase, ctx, opts);
+}
+export function archiveOutcomeForTest(
+  workDir: string,
+  stateBase: string,
+  ctx?: ExtensionContext,
+  opts?: { includeChainCampaigns?: boolean },
+  target?: object | null,
+): Promise<researchState.ResearchArchiveOutcome> {
+  return testHookRegistry.forTarget(ctx ?? target).archiveOutcome(workDir, stateBase, ctx, opts);
+}
 
 type AutoResumeGuardState = Pick<ExperimentState, "results" | "currentSegment">;
 type AutoResumeGuardRuntime = {
@@ -3751,34 +3797,36 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // run_experiment tool
   // -----------------------------------------------------------------------
 
+  // bd tj0.10: getter-only contract — every collaborator is a thunk read at
+  // call time, so no snapshot can outlive a mutable extension binding.
   registerGatedTool(createRunExperimentTool({
-    EXPERIMENT_MAX_LINES,
-    EXPERIMENT_MAX_BYTES,
-    RunParams,
-    assertModeActive,
-    autoresearchChecksPath,
-    autoresearchJsonlPath,
-    autoresearchScriptPath,
-    get campaignBlockedResponse() { return campaignBlockedResponse; },
-    get campaignBlocksOrdinaryLoop() { return campaignBlocksOrdinaryLoop; },
-    execBashScript,
-    formatElapsed,
-    getRuntime,
-    isAutoresearchShCommand,
-    get optimizeNotStartedGate() { return optimizeNotStartedGate; },
-    get overlayTui() { return overlayTui; },
-    parseMetricLines,
-    readExperimentMaxMinutes,
-    readLedgerMaxRun,
-    readRunAnalysisConfig,
-    researchBlockedResponse,
-    researchBlocksOrdinaryLoop,
-    resolveWorkDir,
-    tryBeginRunIdentity,
-    tryRecordPendingMarker,
-    updateWidget,
-    validateWorkDir,
-    writeRunStartedMarkerWithPrefix,
+    EXPERIMENT_MAX_LINES: () => EXPERIMENT_MAX_LINES,
+    EXPERIMENT_MAX_BYTES: () => EXPERIMENT_MAX_BYTES,
+    RunParams: () => RunParams,
+    assertModeActive: () => assertModeActive,
+    autoresearchChecksPath: () => autoresearchChecksPath,
+    autoresearchJsonlPath: () => autoresearchJsonlPath,
+    autoresearchScriptPath: () => autoresearchScriptPath,
+    campaignBlockedResponse: () => campaignBlockedResponse,
+    campaignBlocksOrdinaryLoop: () => campaignBlocksOrdinaryLoop,
+    execBashScript: () => execBashScript,
+    formatElapsed: () => formatElapsed,
+    getRuntime: () => getRuntime,
+    isAutoresearchShCommand: () => isAutoresearchShCommand,
+    optimizeNotStartedGate: () => optimizeNotStartedGate,
+    overlayTui: () => overlayTui,
+    parseMetricLines: () => parseMetricLines,
+    readExperimentMaxMinutes: () => readExperimentMaxMinutes,
+    readLedgerMaxRun: () => readLedgerMaxRun,
+    readRunAnalysisConfig: () => readRunAnalysisConfig,
+    researchBlockedResponse: () => researchBlockedResponse,
+    researchBlocksOrdinaryLoop: () => researchBlocksOrdinaryLoop,
+    resolveWorkDir: () => resolveWorkDir,
+    tryBeginRunIdentity: () => tryBeginRunIdentity,
+    tryRecordPendingMarker: () => tryRecordPendingMarker,
+    updateWidget: () => updateWidget,
+    validateWorkDir: () => validateWorkDir,
+    writeRunStartedMarkerWithPrefix: () => writeRunStartedMarkerWithPrefix,
   }));
 
   // -----------------------------------------------------------------------
@@ -3786,32 +3834,34 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // -----------------------------------------------------------------------
 
   registerGatedTool(createLogExperimentTool({
-    pi,
-    LogParams,
-    ACTIVITY_TYPES,
-    assertModeActive,
-    buildSessionSnapshot,
-    cloneExperimentState,
-    computeConfidence,
-    execBashScript,
-    finalizeExistingNode,
-    fireHook,
-    getRuntime,
-    readLedgerMaxRun,
-    recordAutoresearchActivation,
-    recordTreeNode,
-    researchBlockedResponse,
-    researchBlocksOrdinaryLoop,
-    resolveWorkDir,
-    runLinkNotConsumedWarning,
-    updateWidget,
-    validateWorkDir,
-    get broadcastDashboardUpdate() { return broadcastDashboardUpdate; },
-    get campaignBlockedResponse() { return campaignBlockedResponse; },
-    get campaignBlocksOrdinaryLoop() { return campaignBlocksOrdinaryLoop; },
-    get optimizeNotStartedGate() { return optimizeNotStartedGate; },
-    get overlayTui() { return overlayTui; },
-    get transitionAutoresearchMode() { return transitionAutoresearchMode; },
+    pi: () => pi,
+    LogParams: () => LogParams,
+    ACTIVITY_TYPES: () => ACTIVITY_TYPES,
+    assertModeActive: () => assertModeActive,
+    buildSessionSnapshot: () => buildSessionSnapshot,
+    cloneExperimentState: () => cloneExperimentState,
+    computeConfidence: () => computeConfidence,
+    execBashScript: () => execBashScript,
+    finalizeExistingNode: () => finalizeExistingNode,
+    fireHook: () => fireHook,
+    getRuntime: () => getRuntime,
+    readLedgerMaxRun: () => readLedgerMaxRun,
+    recordAutoresearchActivation: () => recordAutoresearchActivation,
+    recordTreeNode: () => recordTreeNode,
+    researchBlockedResponse: () => researchBlockedResponse,
+    researchBlocksOrdinaryLoop: () => researchBlocksOrdinaryLoop,
+    resolveWorkDir: () => resolveWorkDir,
+    runLinkNotConsumedWarning: () => runLinkNotConsumedWarning,
+    updateWidget: () => updateWidget,
+    validateWorkDir: () => validateWorkDir,
+    // Getter form preserves the source-text broadcast call-site pin while the
+    // value it yields is still a thunk (getter-only deps contract).
+    get broadcastDashboardUpdate() { return () => broadcastDashboardUpdate; },
+    campaignBlockedResponse: () => campaignBlockedResponse,
+    campaignBlocksOrdinaryLoop: () => campaignBlocksOrdinaryLoop,
+    optimizeNotStartedGate: () => optimizeNotStartedGate,
+    overlayTui: () => overlayTui,
+    transitionAutoresearchMode: () => transitionAutoresearchMode,
   }));
 
   // -----------------------------------------------------------------------
@@ -4788,7 +4838,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
     return [...new Set(out)].sort();
   };
-  blockingCampaignIdsForTest = blockingCampaignIds;
 
   /** bd tj0.3: a phase reason only says THIS campaign has nothing to move.
    *  It must never hide a blocking campaign inspected later in sorted-id
@@ -4881,8 +4930,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const outcome = await archiveFinishedCampaignsDetailed(workDir, stateBase, ctx, opts);
     return outcome.ok ? outcome.archived : null;
   };
-  archiveFinishedCampaignsForTest = archiveFinishedCampaigns;
-  archiveOutcomeForTest = archiveFinishedCampaignsDetailed;
 
   const staleReportText = (dir: string, snap: ResearchSnapshot, draftBytes: Buffer | null): string => {
     const singleLine = (text: string): string => text.replace(/\s+/g, " ").trim();
@@ -4956,9 +5003,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       await fs.promises.writeFile(path.join(dir, "report.md"), staleReportText(dir, snap, draftBytes) + "\n", "utf8");
     });
   };
-  // bd pi-autoresearch-161.3 (F-20): one explicit initialization point for all
-  // test hooks. The bound object is passed to extracted adapters as deps; the
-  // exported lets are thin aliases so existing tests keep importing the same names.
+  // bd pi-autoresearch-161.3 (F-20), bd tj0.10: one explicit initialization point
+  // for all test hooks. The bound object is registered under THIS pi and passed
+  // to extracted adapters as deps; exported accessors resolve it per instance.
   const testHooks: BoundTestHooks = createTestHooks({
     closeStaleCampaign: closeStaleCampaignInternal,
     sendPendingResumeIfReady,
@@ -4967,14 +5014,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     restoreExpeditionFromDisk: (ctx: ExtensionContext) => restoreExpeditionFromDisk(ctx),
     resolveExpeditionPayload: (workDir: string) => buildExpeditionPayload(workDir),
     stopDashboardServer: () => stopDashboardServer(),
+    blockingCampaignIds,
+    archiveFinishedCampaigns,
+    archiveOutcome: archiveFinishedCampaignsDetailed,
   });
-  closeStaleCampaign = testHooks.closeStaleCampaign;
-  sendPendingResumeIfReadyForTest = testHooks.sendPendingResumeIfReady;
-  runtimeForTest = testHooks.getRuntime;
-  notifyAutoResumeLimitReachedAsyncForTest = testHooks.notifyAutoResumeLimitReachedAsync;
-  restoreExpeditionForTest = testHooks.restoreExpeditionFromDisk;
-  resolveExpeditionPayload = testHooks.resolveExpeditionPayload;
-  stopDashboardServerForTest = testHooks.stopDashboardServer;
+  testHookRegistry.bind(pi, testHooks);
 
   /** Base the campaign state lives under: the pinned --state-root (resolved
    *  absolute) or the work directory itself. Byte-identical to the previous
@@ -5334,30 +5378,30 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // dialog body comes from the shared brief-consent.ts.
   let optimizeBriefDir: string | null = null;
   const { optimizeRefusal, optimizeStartGate, optimizeNotStartedGate } = createOptimizeGates({
-    resolveWorkDir,
-    autoresearchJsonlPath,
+    resolveWorkDir: () => resolveWorkDir,
+    autoresearchJsonlPath: () => autoresearchJsonlPath,
   });
-  // Both brief tools receive getter-backed collaborators; optimizeBriefDir is a
-  // mutable binding also assigned by the command section above.
+  // Both brief tools receive getter-only collaborators; optimizeBriefDir is a
+  // mutable binding with an explicit getter/setter pair (no writable deps field).
   const briefToolDeps: BriefToolsDeps = {
-    assertModeActive,
-    campaignBlocksOrdinaryLoop,
-    campaignBlockedResponse,
-    researchBlocksOrdinaryLoop,
-    researchBlockedResponse,
-    resolveWorkDir,
-    optimizeRefusal,
-    unexpectedArgKeys,
-    getRuntime,
-    recordAutoresearchActivation,
-    sendWhenReady,
-    get cancelPendingResume() { return cancelPendingResume; },
-    get candidateBlocksOrdinaryLoop() { return candidateBlocksOrdinaryLoop; },
-    get classifyOrdinaryLaunchResearch() { return classifyOrdinaryLaunchResearch; },
-    get recordModeSwitchFinalize() { return recordModeSwitchFinalize; },
-    get transitionAutoresearchMode() { return transitionAutoresearchMode; },
-    get optimizeBriefDir() { return optimizeBriefDir; },
-    set optimizeBriefDir(dir: string | null) { optimizeBriefDir = dir; },
+    assertModeActive: () => assertModeActive,
+    campaignBlocksOrdinaryLoop: () => campaignBlocksOrdinaryLoop,
+    campaignBlockedResponse: () => campaignBlockedResponse,
+    researchBlocksOrdinaryLoop: () => researchBlocksOrdinaryLoop,
+    researchBlockedResponse: () => researchBlockedResponse,
+    resolveWorkDir: () => resolveWorkDir,
+    optimizeRefusal: () => optimizeRefusal,
+    unexpectedArgKeys: () => unexpectedArgKeys,
+    getRuntime: () => getRuntime,
+    recordAutoresearchActivation: () => recordAutoresearchActivation,
+    sendWhenReady: () => sendWhenReady,
+    cancelPendingResume: () => cancelPendingResume,
+    candidateBlocksOrdinaryLoop: () => candidateBlocksOrdinaryLoop,
+    classifyOrdinaryLaunchResearch: () => classifyOrdinaryLaunchResearch,
+    recordModeSwitchFinalize: () => recordModeSwitchFinalize,
+    transitionAutoresearchMode: () => transitionAutoresearchMode,
+    optimizeBriefDir: () => optimizeBriefDir,
+    setOptimizeBriefDir: (dir: string | null) => { optimizeBriefDir = dir; },
   };
   registerGatedTool(createOptimizeBriefTool(briefToolDeps));
 
@@ -5921,7 +5965,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   }
 
   createAutoresearchCommand({
-    pi,
     get BENCHMARK_GUARDRAIL() { return BENCHMARK_GUARDRAIL; },
     get acceptLaunchCharter() { return acceptLaunchCharter; },
     get buildSessionSnapshot() { return buildSessionSnapshot; },

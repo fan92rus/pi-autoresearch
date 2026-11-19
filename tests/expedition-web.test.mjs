@@ -8,13 +8,13 @@ import { createFakePi, makeCtx } from './fake-pi.ts';
 import * as expedition from '../extensions/pi-autoresearch/expedition.ts';
 
 const extensionModule = await import(pathToFileURL(path.join(import.meta.dirname, '..', 'extensions', 'pi-autoresearch', 'index.ts')).href);
-// Bind the module-level test hooks (resolveExpeditionPayload etc.): the
-// extension binds them inside autoresearchExtension(), so initialize it once
-// on a throwaway fake pi at load time.
-{
+// Register one test-hook instance at load time; bd tj0.10 made the module
+// exports accessors, so the accessor calls below pass this pi explicitly.
+const bootstrapPi = (() => {
   const { pi } = createFakePi({ dir: fs.mkdtempSync(path.join(os.tmpdir(), 'expweb-init-')), sessionId: 'expweb-init', realGit: false });
-  (await import(pathToFileURL(path.join(import.meta.dirname, '..', 'extensions', 'pi-autoresearch', 'index.ts')).href)).default(pi);
-}
+  extensionModule.default(pi);
+  return pi;
+})();
 
 /** Sources of every current extension module: index.ts plus extracted files. */
 function extensionModules() {
@@ -84,10 +84,10 @@ const seedExpeditionWorkDir = () => {
 };
 
 // ── resolveExpeditionPayload ─────────────────────────────────────────────────
-const payloadOf = () => extensionModule.resolveExpeditionPayload;
+const payloadOf = () => (workDir) => extensionModule.resolveExpeditionPayload(workDir, bootstrapPi);
 test('resolveExpeditionPayload: full journal → dirs/campaigns/verdicts per the contract', () => {
   const f = seedExpeditionWorkDir();
-  const payload = extensionModule.resolveExpeditionPayload(f.workDir);
+  const payload = extensionModule.resolveExpeditionPayload(f.workDir, bootstrapPi);
   assert.equal(payload.schema_version, 1);
   assert.equal(payload.fail, null);
   assert.equal(payload.goal, 'Explore the lens');
@@ -145,7 +145,7 @@ test('resolveExpeditionPayload: damaged chain.json → null; the open-page route
 
 test('resolveExpeditionPayload: no expedition on disk → null (not an error payload)', () => {
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'expweb-none-'));
-  assert.equal(extensionModule.resolveExpeditionPayload(workDir), null);
+  assert.equal(extensionModule.resolveExpeditionPayload(workDir, bootstrapPi), null);
 });
 
 test('resolveExpeditionPayload: fully broken campaign dir → {phase:null, q:[], evidenceCount:0}', () => {
@@ -182,7 +182,7 @@ const runDashboardCommand = async (workDir, label, { hasUI = true } = {}) => {
 test('dashboard command with an active expedition + hasUI → web dashboard (page written, server up, URL notify)', async (t) => {
   const f = seedExpeditionWorkDir();
   const { pi } = await runDashboardCommand(f.workDir, 'active');
-  t.after(() => { extensionModule.stopDashboardServerForTest?.(); }); // release the listen socket
+  t.after(() => { extensionModule.stopDashboardServerForTest(pi); }); // release THIS instance's listen socket
   const notified = pi.notifications.map((n) => n.text).join('\n');
   assert.match(notified, /Expedition dashboard at http:\/\/127\.0\.0\.1:\d+/);
   // The live route answers with the expedition JSON payload on the same server.

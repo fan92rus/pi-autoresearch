@@ -1,4 +1,5 @@
 import { approveOptimizeBrief } from "./optimize-approve-helper.mjs";
+import { testHookRegistry } from "../extensions/pi-autoresearch/test-hooks.ts";
 /**
  * Fake pi API harness — lets tests drive the REAL extension
  * (extensions/pi-autoresearch/index.ts) without a running pi instance.
@@ -268,7 +269,7 @@ export function createFakePi({
  */
 export function makeCtx(dir, sessionId, piRef) {
   const sessionManager = createSessionManager(sessionId);
-  return {
+  const ctx = {
     cwd: dir,
     hasUI: true,
     sessionManager,
@@ -289,6 +290,10 @@ export function makeCtx(dir, sessionId, piRef) {
     isIdle: () => true,
     hasPendingMessages: () => false,
   };
+  // bd tj0.10: link this context to its pi so per-instance test hooks resolve
+  // deterministically even when several fake-pi instances share a process.
+  if (piRef) testHookRegistry.registerContext(ctx, piRef);
+  return ctx;
 }
 
 /**

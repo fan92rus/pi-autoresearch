@@ -10,13 +10,13 @@ import { createFakePi, makeCtx } from './fake-pi.ts';
 import * as expedition from '../extensions/pi-autoresearch/expedition.ts';
 
 const extensionModule = await import(pathToFileURL(path.join(import.meta.dirname, '..', 'extensions', 'pi-autoresearch', 'index.ts')).href);
-// Bind the module-level test hooks (resolveExpeditionPayload etc.): the
-// extension binds them inside autoresearchExtension(), so initialize it once
-// on a throwaway fake pi at load time.
-{
+// Register one test-hook instance at load time; bd tj0.10 made the module
+// exports accessors, so the accessor calls below pass this pi explicitly.
+const bootstrapPi = (() => {
   const { pi } = createFakePi({ dir: fs.mkdtempSync(path.join(os.tmpdir(), 'expinact-init-')), sessionId: 'expinact-init', realGit: false });
-  (await import(pathToFileURL(path.join(import.meta.dirname, '..', 'extensions', 'pi-autoresearch', 'index.ts')).href)).default(pi);
-}
+  extensionModule.default(pi);
+  return pi;
+})();
 
 // ── Fixtures (mirrors tests/expedition.test.mjs seed helpers) ────────────────
 const doc = { charter: { max_campaigns: 3, stop_rules: ['territory_complete'] }, goal: 'Explore', directions: [{ name: 'D1', why: 'Initial basis' }], campaign0: { schema_version: 1, goal: 'g', plan_source: 'p', caveat_block: 'c', data_roles: { explore: [], validate: [], confirm: [] }, questions: [], process_metrics: [], stop_rules: [] } };
@@ -96,7 +96,7 @@ test('resolveExpeditionPayload: stopped expedition → full payload with chainSt
   ];
   fs.writeFileSync(join(chainDir, 'chain.json'), entries.map((e) => JSON.stringify(e)).join('\n') + '\n');
   expedition.writeExpeditionMarker(chainDir, { goal: 'Frozen lens', docPath: 'doc.json', docSha256: 'a'.repeat(64), campaignId: 'c0', charter: doc.charter });
-  const payload = extensionModule.resolveExpeditionPayload(workDir);
+  const payload = extensionModule.resolveExpeditionPayload(workDir, bootstrapPi);
   assert.notEqual(payload, null);
   assert.equal(payload.chainStatus, 'stopped_by_rule');
   assert.equal(payload.goal, 'Frozen lens');
@@ -115,11 +115,11 @@ test('resolveExpeditionPayload: active expedition → chainStatus "active"; no e
   ];
   fs.writeFileSync(join(chainDir, 'chain.json'), entries.map((e) => JSON.stringify(e)).join('\n') + '\n');
   expedition.writeExpeditionMarker(chainDir, { goal: 'Live', docPath: 'doc.json', docSha256: 'a'.repeat(64), campaignId: 'c0', charter: doc.charter });
-  const payload = extensionModule.resolveExpeditionPayload(workDir);
+  const payload = extensionModule.resolveExpeditionPayload(workDir, bootstrapPi);
   assert.equal(payload.chainStatus, 'active');
   const empty = fs.mkdtempSync(join(tmpdir(), 'expinact-wd3-'));
   fs.mkdirSync(join(empty, '.auto', 'research-chain'), { recursive: true });
-  assert.equal(extensionModule.resolveExpeditionPayload(empty), null);
+  assert.equal(extensionModule.resolveExpeditionPayload(empty, bootstrapPi), null);
 });
 
 // ── Command wiring: stopped expedition opens the WEB dashboard ──────────────
@@ -150,7 +150,7 @@ test('dashboard command with a STOPPED expedition + hasUI → web dashboard (not
   const { default: autoresearchExtension } = await import(pathToFileURL(path.join(import.meta.dirname, '..', 'extensions', 'pi-autoresearch', 'index.ts')).href);
   autoresearchExtension(pi);
   await command('autoresearch').handler('dashboard', ctx);
-  t.after(() => { extensionModule.stopDashboardServerForTest?.(); });
+  t.after(() => { extensionModule.stopDashboardServerForTest(pi); });
   const notified = pi.notifications.map((n) => n.text).join('\n');
   assert.match(notified, /Expedition dashboard at http:\/\/127\.0\.0\.1:\d+/);
   // The live route serves the stopped-expedition payload with an honest chainStatus.
@@ -196,7 +196,7 @@ test('payload questions carry rule and reason from close events (dashboard answe
     { at: 'b', event: 'close', question_id: 'Q1', rule_id: 'r-no', verdict: 'rejected', reason: 'signal broke on fresh data' },
   ];
   fs.writeFileSync(join(campDir, 'log.jsonl'), logLines.map((e) => JSON.stringify(e)).join('\n') + '\n');
-  const payload = extensionModule.resolveExpeditionPayload(workDir);
+  const payload = extensionModule.resolveExpeditionPayload(workDir, bootstrapPi);
   const q = payload.campaigns[0].q[0];
   assert.equal(q.verdict, 'rejected');
   assert.equal(q.rule, 'r-no', 'deciding rule exposed in the payload');
