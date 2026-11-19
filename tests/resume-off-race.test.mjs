@@ -105,6 +105,39 @@ test("fresh session with a persisted off marker stays off; explicit /autoresearc
   assert.equal(fs.existsSync(marker), false, "explicit on clears the marker");
 }, { timeout: 60000 });
 
+test("a newer pending nudge replaces an in-flight sender instead of being cancelled by it", async () => {
+  const h = await readySession("replacement-race");
+  const ext = await extensionModule();
+  const runtime = ext.runtimeForTest(h.ctx);
+
+  await h.hook("agent_start")({}, h.ctx);
+  await h.hook("agent_end")({ messages: [] }, h.ctx);
+  assert.equal(runtime.pendingResumeIsDrift, true, "a drift nudge is scheduled");
+  const staleText = runtime.pendingResumeMessage.text;
+  const replacement = { mode: "legacy", text: "NEWER PENDING NUDGE" };
+
+  let gatesEvaluated = false;
+  let replacementFired = false;
+  const racingCtx = Object.create(h.ctx);
+  racingCtx.isIdle = () => {
+    if (!replacementFired) {
+      replacementFired = true;
+      gatesEvaluated = true;
+      runtime.pendingResumeMessage = replacement;
+    }
+    return h.ctx.isIdle();
+  };
+
+  await ext.sendPendingResumeIfReadyForTest(racingCtx, runtime);
+
+  assert.ok(replacementFired, "replacement really fired inside the gate/send window");
+  assert.equal(runtime.pendingResumeMessage, replacement, "the newer pending object survives the stale sender");
+  assert.ok(!nudges(h).some((m) => m.text === staleText), "the stale drift nudge is not delivered");
+  assert.equal(runtime.consecutiveDriftResumes, 0, "the stale sender does not spend the drift budget");
+  await ext.sendPendingResumeIfReadyForTest(h.ctx, runtime);
+  assert.ok(nudges(h).some((m) => m.text === replacement.text), "the replacement nudge is still deliverable");
+}, { timeout: 60000 });
+
 test("off during an in-flight send cancels the nudge and leaves both counters untouched", async () => {
   const h = await readySession("off-race");
   const ext = await extensionModule();

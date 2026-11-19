@@ -171,10 +171,12 @@ export function createResumePolicy<Ctx extends ResumeContext, Runtime extends Re
     // sender may still deliver — never clear a newer pending message here.
     const epoch = runtime.resumeEpoch ?? 0;
     const stillCurrent = (): boolean => (runtime.resumeEpoch ?? 0) === epoch && runtime.autoresearchMode;
+    const stillOwnsPending = (): boolean => runtime.pendingResumeMessage === pending;
     if (!stillCurrent()) return;
     const gates = await evaluateResumeGates(ctx, runtime);
     if (!stillCurrent()) return;
     if (gates.verdict === "cancel") {
+      if (!stillOwnsPending()) return;
       cancelPendingResume(runtime);
       if (gates.notify) deps.notifyAutoResumeLimitReached(ctx, gates.notify);
       return;
@@ -184,10 +186,12 @@ export function createResumePolicy<Ctx extends ResumeContext, Runtime extends Re
       return;
     }
     if (pending.mode === "candidate" && !deps.campaignActive(gates.workDir)) {
+      if (!stillOwnsPending()) return;
       cancelPendingResume(runtime);
       return;
     }
     const wasDrift = runtime.pendingResumeIsDrift;
+    if (!stillOwnsPending()) return;
     cancelPendingResume(runtime);
     if (!stillCurrent()) return;
     const liveMode = await deps.resolveLoopMode(gates.workDir, ctx);
