@@ -202,6 +202,23 @@ test("tj0.2 mode-transition invariant matrix", async (t) => {
     assert.ok(h.pi.sentMessages.some((m) => /Expedition design phase\. Goal: second goal/.test(m.text)), "kickoff is still delivered");
   });
 
+  await t.test("ordinary launch preserves an existing research chain", async () => {
+    const dir = workdir();
+    const h = await harness(dir);
+    const rt = h.ext.runtimeForTest(h.ctx);
+    const chain = {
+      chainId: "manual-chain", workDir: dir, charterPath: "charter.md",
+      charterSha256: "0".repeat(64), charter: { stop_rules: [] },
+    };
+    rt.researchChain = chain;
+    rt.chainContinuationSent = true;
+
+    await h.command("autoresearch").handler("on", h.ctx);
+    assert.equal(rt.researchChain, chain, "an ordinary launch must not unbind a research chain");
+    assert.equal(rt.chainContinuationSent, true, "an ordinary launch must not re-arm the continuation flag");
+    assert.equal(rt.uiMode, "optimization");
+  });
+
   await t.test("off → on: stale expedition chain and view are cleared", async () => {
     const dir = workdir();
     const h = await harness(dir);
@@ -285,6 +302,37 @@ test("tj0.2 mode-transition invariant matrix", async (t) => {
       assert.match(lastWidget(h), /0 runs — waiting for baseline/);
       assert.equal(h.pi.sentMessages.length, messagesBefore, `${variant.name}: the ordinary kickoff stays suppressed`);
       assert.ok(h.pi.notifications.some((n) => /Research campaign active — continue it with research_questions\(action=status\); the legacy autoresearch kickoff is not sent\./.test(n.text)), `${variant.name}: exact notice`);
+    }
+  });
+
+  await t.test("explicit on clears the persisted off marker even when the launch is refused", async () => {
+    const variants = [
+      { name: "plain cwd", setup: (dir) => dir },
+      { name: "configured workingDir", setup: (dir) => {
+        fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
+        fs.writeFileSync(path.join(dir, ".auto", "config.json"), JSON.stringify({ workingDir: "sub" }));
+        fs.mkdirSync(path.join(dir, "sub"), { recursive: true });
+        return path.join(dir, "sub");
+      } },
+    ];
+    for (const variant of variants) {
+      const dir = workdir();
+      const workDir = variant.setup(dir);
+      const h = await harness(dir);
+      await h.command("autoresearch").handler("off", h.ctx);
+      const marker = path.join(workDir, ".auto", "autoresearch-off.json");
+      assert.equal(fs.existsSync(marker), true, `${variant.name}: off persists the marker`);
+      seedBlockingCampaign(workDir, "exp-blocking"); // research phase → launch refused
+
+      const activationCount = () => h.pi.entries.filter((e) => e.customType === "pi-autoresearch.activation").length;
+      const before = { messages: h.pi.sentMessages.length, activations: activationCount(), widgets: h.pi.widgets.length };
+      await h.command("autoresearch").handler("on", h.ctx);
+      const rt = h.ext.runtimeForTest(h.ctx);
+      assert.equal(fs.existsSync(marker), false, `${variant.name}: on clears the marker even on refusal`);
+      assert.equal(rt.autoresearchMode, false, `${variant.name}: refusal keeps the mode off`);
+      assert.equal(h.pi.sentMessages.length, before.messages, `${variant.name}: no kickoff`);
+      assert.equal(activationCount(), before.activations, `${variant.name}: no activation entry`);
+      assert.equal(h.pi.widgets.length, before.widgets, `${variant.name}: no widget registration`);
     }
   });
 

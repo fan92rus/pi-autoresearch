@@ -40,6 +40,7 @@ export interface AutoresearchCommandDeps {
   campaignBlocksOrdinaryLoop: (workDir: string, ctx?: ExtensionContext) => Promise<boolean>;
   cancelPendingResume: (runtime: any) => void;
   chainCampaignIds: (ctx: ExtensionContext) => Promise<string[]>;
+  clearPersistedOffMarker: (workDir: string) => void;
   createExperimentState: () => any;
   exportDashboard: (ctx: ExtensionContext) => Promise<void>;
   expeditionForWeb: (ctx: ExtensionContext) => boolean;
@@ -702,6 +703,11 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
       }
 
       const workDir = deps.resolveWorkDir(ctx.cwd);
+      // An explicit ON always releases the persisted manual-off marker, even
+      // when a campaign gate below refuses the kickoff: the marker records the
+      // owner's last decision, and this request supersedes it. No activation
+      // entry, mode flag or widget is touched by this housekeeping step.
+      deps.clearPersistedOffMarker(workDir);
       // bd tj0.2: refuse BEFORE activating. A rejected launch must not leave
       // the mode ON with a widget and no kickoff behind it. Research campaigns
       // in stopped/pending/unreadable states are the exception: their recovery
@@ -721,7 +727,11 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
       // The transition registers the widget NOW: the agent may take a while
       // before its first init_experiment, and the mode indicator must be
       // visible immediately after the guards have passed.
-      deps.transitionAutoresearchMode(ctx, { enabled: true, uiMode: "optimization", chain: null });
+      // A research chain is session state owned by the campaign paths: an
+      // ordinary launch must not unbind it. Off/stop paths and the expedition
+      // → optimization switch clear it explicitly through their transactional
+      // transitions (finalizeExpeditionForOptimization / exitResearchMode).
+      deps.transitionAutoresearchMode(ctx, { enabled: true, uiMode: "optimization" });
       if (researchGate === "manual") {
         ctx.ui.notify(researchKickoffNotice, "info");
         return;
