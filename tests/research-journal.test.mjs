@@ -260,7 +260,7 @@ test("a lock abandoned by a dead local process is reclaimed exactly once", async
   const autoDir = makeAutoDir(t);
   const target = journalTarget(autoDir, "observations");
   const now = new Date();
-  const stale = { token: "01".repeat(16), pid: 999999, host: os.hostname(), acquired_at: now.toISOString() };
+  const stale = { token: "01".repeat(16), pid: 999999, host: os.hostname(), acquired_at: new Date(now.getTime() - 3_000).toISOString() };
   writeForeignLock(target.lock, stale);
   const { sleep } = recordingSleep();
 

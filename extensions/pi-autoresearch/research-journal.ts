@@ -9,11 +9,11 @@
  * - appendJournalLine: newline-guarded single-write append performed under the lock,
  *   with short-write detection (no retry), a 16 KiB record limit and fsync before close.
  *
- * A lock held by a live or unknown owner is never stolen: it is reported with
- * manual unlock instructions. An abandoned lock whose owner is a dead PID on
- * this host is reclaimed after reading its token, so a crashed writer cannot
- * block every later append forever. A failed or short append is never retried
- * or completed by this module.
+ * A lock held by a remote or recently acquired owner is never stolen: it is
+ * reported with manual unlock instructions. A same-host lock older than the
+ * bounded critical-section budget is reclaimed after reading its token, so a
+ * zombie or crashed writer cannot block every later append forever. A failed
+ * or short append is never retried or completed by this module.
  */
 
 import { randomBytes as cryptoRandomBytes } from "node:crypto";
@@ -28,8 +28,10 @@ export const JOURNAL_RECORD_MAX_BYTES = 16 * 1024;
 export const JOURNAL_LOCK_RETRY_COUNT = 40;
 /** Base pause between lock attempts, outside the critical section. */
 export const JOURNAL_LOCK_RETRY_DELAY_MS = 50;
-/** A lock older than this is not live contention: refuse immediately, no takeover. */
+/** A remote lock older than this is not live contention: refuse immediately. */
 export const JOURNAL_LOCK_STALE_MS = 5_000;
+/** A local holder older than this cannot still be in the synchronous critical section. */
+export const JOURNAL_LOCK_LOCAL_ABANDONED_MS = 2_000;
 /** Jitter spread (ms) added to the base delay. Large enough to tolerate CPU-starved writers under a full test suite. */
 export const JOURNAL_LOCK_JITTER_MS = 250;
 
@@ -242,16 +244,6 @@ function describeHolder(holder: JournalLockHolder): string {
   }
 }
 
-function isDeadLocalHolder(info: { pid: number; host: string }, ops: ResolvedOptions): boolean {
-  if (info.host !== ops.host || !Number.isInteger(info.pid) || info.pid <= 0) return false;
-  try {
-    process.kill(info.pid, 0);
-    return false;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ESRCH";
-  }
-}
-
 function busyDiagnostic(target: JournalTarget, ops: ResolvedOptions, attempts = JOURNAL_LOCK_RETRY_COUNT + 1): JournalLockBusyDiagnostic {
   const holder = diagnoseHolder(target.lock, ops);
   const message =
@@ -287,9 +279,13 @@ async function acquireLock(target: JournalTarget, ops: ResolvedOptions): Promise
         // spinning for seconds; never steal it (the owner record is truth).
         const holder = diagnoseHolder(target.lock, ops);
         if (holder.state === "present") {
-          if (isDeadLocalHolder(holder.info, ops)) {
-            // The owner process is gone on this host. Remove only the exact
-            // lock we just diagnosed; a racing new owner writes a new token.
+          const acquired = Date.parse(holder.info.acquired_at);
+          const age = Number.isFinite(acquired) ? ops.now().getTime() - acquired : 0;
+          if (holder.info.host === ops.host && age > JOURNAL_LOCK_LOCAL_ABANDONED_MS) {
+            // The critical section is synchronous and cannot legitimately hold
+            // the lock this long. PID liveness is not enough: a finished child
+            // can remain a zombie until its parent reaps it. Reclaim only the
+            // exact lock we just diagnosed; a racing owner writes a new token.
             try {
               const raw = ops.fs.readFileSync(target.lock, "utf8");
               const parsed = parseLockInfo(raw);
@@ -299,8 +295,7 @@ async function acquireLock(target: JournalTarget, ops: ResolvedOptions): Promise
             }
             continue;
           }
-          const acquired = Date.parse(holder.info.acquired_at);
-          if (Number.isFinite(acquired) && ops.now().getTime() - acquired > JOURNAL_LOCK_STALE_MS) {
+          if (age > JOURNAL_LOCK_STALE_MS) {
             return { status: "busy", diagnostic: busyDiagnostic(target, ops, attempt + 1) };
           }
         }
