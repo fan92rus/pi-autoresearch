@@ -6,6 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createFakePi, makeCtx } from "./fake-pi.ts";
+import * as chainJournal from "../extensions/pi-autoresearch/chain-journal.ts";
 
 const brief = { schema_version:1, goal:"Study cache latency", plan_source:"plan.md", caveat_block:"Observational only", data_roles:{explore:[],validate:[],confirm:[]}, questions:[{id:"Q1",text:"Does latency improve?",decision_rules:[{id:"yes",verdict:"confirmed",when:"measured improvement"},{id:"no",verdict:"rejected",when:"no improvement"},{id:"unknown",verdict:"inconclusive",when:"unclear"},{id:"wait",verdict:"waiting_for_data",when:"data missing"}],needs_data:null}], process_metrics:[], stop_rules:[] };
 const doc = { charter:{stop_rules:[]}, goal:"Study cache latency", directions:[{name:"cache",why:"Measure cache effects"}], campaign0:brief };
@@ -17,6 +18,7 @@ function container() {
 }
 const draftPath = dir => path.join(dir, ".auto", "research-expedition-drafts", "expedition-draft.json");
 const journalPath = dir => path.join(dir, ".auto", "expedition-publication.json");
+const claimPath = dir => path.join(dir, ".auto", "expedition-propose.claim");
 const copies = root => fs.readdirSync(root).filter(n => /^expedition-\d+-[0-9a-f]+\.json$/.test(n));
 const chainRoot = dir => path.join(dir, ".auto", "research-chain");
 const chainIds = dir => fs.existsSync(chainRoot(dir)) ? fs.readdirSync(chainRoot(dir)).filter(n => n.endsWith("-chain")) : [];
@@ -152,4 +154,95 @@ test("draft accepts a schema-conformant doc_path and ignores it", async () => {
   assert.ok(!/invalid_argument/.test(result), `doc_path is in the schema and must not be refused: ${result}`);
   assert.equal(fs.readFileSync(explicit, "utf8"), JSON.stringify(doc), "doc_path is ignored on draft");
   assert.ok(fs.existsSync(draftPath(c.dir)), "the canonical draft is still written");
+});
+
+test("two gated confirms for the same sha publish one chain and refuse the other", async () => {
+  const c = container(); c.makeWork();
+  const h = await harness(c.dir, true);
+  assert.match(text(await draft(h)), /draft saved/i);
+  // Both confirms are reached before either propose passes the confirmation
+  // gate; releasing them together forces the post-confirm race deterministically.
+  let openGate = () => {};
+  const gate = new Promise(resolve => { openGate = resolve; });
+  let confirms = 0;
+  h.ctx.ui.confirm = async () => { confirms++; await gate; return true; };
+  const first = propose(h);
+  const second = propose(h);
+  assert.equal(confirms, 2, "both proposes must be waiting at the owner dialog");
+  openGate();
+  const [a, b] = await Promise.all([first, second]);
+  const replies = [text(a), text(b)];
+  assert.equal(replies.filter(reply => /✅ Expedition .* created/.test(reply)).length, 1, replies.join("\n---\n"));
+  const refused = [a, b].find(result => result?.details?.reason === "expedition_publication_in_progress");
+  assert.ok(refused, `the losing propose must refuse explicitly: ${replies.join("\n---\n")}`);
+  assert.match(text(refused), /publication claim/);
+  assert.equal(chainIds(c.dir).length, 1, "only one chain is minted for the sha");
+  const journal = JSON.parse(fs.readFileSync(journalPath(c.dir), "utf8"));
+  assert.deepEqual(chainIds(c.dir), [journal.chain_id]);
+  assert.equal(fs.existsSync(claimPath(c.dir)), false, "the claim is released, not left behind");
+  assert.equal(h.pi.sentMessages.filter(m => /expedition_map\(subaction="activate"/.test(m.text)).length, 1);
+});
+
+test("a completed journal retires for a different document once its chain is finalized", async () => {
+  const c = container(); c.makeWork();
+  const h = await harness(c.dir, true);
+  assert.match(text(await draft(h)), /draft saved/i);
+  assert.match(text(await propose(h)), /created/i);
+  const first = JSON.parse(fs.readFileSync(journalPath(c.dir), "utf8"));
+  assert.equal(first.step, "complete");
+  assert.equal(await chainJournal.statusOf(c.dir, first.chain_id), "active");
+
+  const changed = structuredClone(doc);
+  changed.goal = "A different expedition";
+  assert.match(text(await draft(h, changed)), /draft saved/i);
+  assert.match(text(await propose(h)), /expedition_publication_conflict/, "an in-progress chain still blocks another document");
+  assert.deepEqual(chainIds(c.dir), [first.chain_id]);
+
+  assert.equal((await chainJournal.setChainStatus(c.dir, first.chain_id, "completed")).ok, true);
+  const reply = text(await propose(h));
+  assert.match(reply, /created/i, `a finalized chain must not block the next expedition: ${reply}`);
+  const second = JSON.parse(fs.readFileSync(journalPath(c.dir), "utf8"));
+  assert.notEqual(second.chain_id, first.chain_id, "a new chain id is minted after the claim");
+  assert.notEqual(second.doc_sha256, first.doc_sha256);
+  assert.equal(second.step, "complete");
+  assert.deepEqual(chainIds(c.dir).slice().sort(), [first.chain_id, second.chain_id].sort());
+  assert.equal(await chainJournal.statusOf(c.dir, first.chain_id), "completed", "the old chain is untouched");
+  const retired = fs.readdirSync(path.join(c.dir, ".auto")).filter(n => n.startsWith("expedition-publication.retired-"));
+  assert.equal(retired.length, 1, `the completed journal is retired, not overwritten: ${retired.join(",")}`);
+  assert.ok(retired[0].includes(first.chain_id), `the retired file names the old chain: ${retired[0]}`);
+  assert.equal(fs.existsSync(claimPath(c.dir)), false);
+});
+
+test("republishing the same sha stays explicitly refused after finalization", async () => {
+  const c = container(); c.makeWork();
+  const h = await harness(c.dir, true);
+  assert.match(text(await draft(h)), /draft saved/i);
+  assert.match(text(await propose(h)), /created/i);
+  const journal = JSON.parse(fs.readFileSync(journalPath(c.dir), "utf8"));
+  assert.equal((await chainJournal.setChainStatus(c.dir, journal.chain_id, "completed")).ok, true);
+  const before = fs.readFileSync(journalPath(c.dir), "utf8");
+
+  assert.match(text(await draft(h, doc)), /draft saved/i);
+  const again = await propose(h);
+  assert.match(text(again), /expedition_already_published/);
+  assert.equal(again.details.reason, "expedition_already_published");
+  assert.equal(fs.readFileSync(journalPath(c.dir), "utf8"), before, "a refusal leaves the journal unchanged");
+  assert.deepEqual(chainIds(c.dir), [journal.chain_id]);
+
+  const explicit = await h.tool("expedition_brief").execute("propose", { action: "propose", doc_path: journal.doc_path }, null, null, h.ctx);
+  assert.equal(explicit.details.reason, "expedition_already_published");
+  assert.deepEqual(chainIds(c.dir), [journal.chain_id]);
+});
+
+test("an unreadable canonical draft keeps the baseline io_failed refusal", async () => {
+  const c = container(); c.makeWork();
+  const h = await harness(c.dir, true);
+  assert.match(text(await draft(h)), /draft saved/i);
+  fs.rmSync(draftPath(c.dir));
+  fs.mkdirSync(draftPath(c.dir)); // exists as a draft but cannot be read as a document
+  const out = await propose(h);
+  assert.match(text(out), /^io_failed:/);
+  assert.equal(out.details.reason, "io_failed");
+  assert.equal(fs.existsSync(journalPath(c.dir)), false);
+  assert.deepEqual(chainIds(c.dir), []);
 });
