@@ -334,6 +334,8 @@ export let stopDashboardServerForTest: AutoresearchTestHooks["stopDashboardServe
  *  matrix test can drive them without a tool-level detour. */
 export let blockingCampaignIdsForTest: ((bases: string[]) => Promise<string[]>) | null = null;
 export let archiveFinishedCampaignsForTest: ((workDir: string, stateBase: string, ctx?: ExtensionContext, opts?: { includeChainCampaigns?: boolean }) => Promise<string[] | null>) | null = null;
+/** bd tj0.3: the typed archive outcome, bound at init for the mixed-campaign test. */
+export let archiveOutcomeForTest: ((workDir: string, stateBase: string, ctx?: ExtensionContext, opts?: { includeChainCampaigns?: boolean }) => Promise<researchState.ResearchArchiveOutcome>) | null = null;
 
 type AutoResumeGuardState = Pick<ExperimentState, "results" | "currentSegment">;
 type AutoResumeGuardRuntime = {
@@ -4673,10 +4675,24 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   };
   blockingCampaignIdsForTest = blockingCampaignIds;
 
+  /** bd tj0.3: a phase reason only says THIS campaign has nothing to move.
+   *  It must never hide a blocking campaign inspected later in sorted-id
+   *  order: an exit caller treats briefing/research as benign and would turn
+   *  the mode OFF with a pending-op blocker still on disk. */
+  const benignArchiveReasons: ReadonlySet<researchState.ResearchArchiveRefusalReason> = new Set(["briefing", "research"]);
+  const blockingArchiveReasonOrder: readonly researchState.ResearchArchiveRefusalReason[] = ["pending_op", "unreadable", "unlistable", "io"];
+  const archiveReasonRank = (reason: researchState.ResearchArchiveRefusalReason): number => {
+    const rank = blockingArchiveReasonOrder.indexOf(reason);
+    return rank === -1 ? blockingArchiveReasonOrder.length : rank;
+  };
+
   /** Same move, with the typed reason for moving nothing. Callers that only
    *  need the legacy array|null shape use archiveFinishedCampaigns below; a
    *  FINAL exit uses this to distinguish an in-work chain campaign (phase
-   *  briefing/research) from a stopped campaign that could not be archived. */
+   *  briefing/research) from a stopped campaign that could not be archived.
+   *  Every campaign is inspected before a reason is chosen; blockers (pending
+   *  op, including inspectCampaign's manual_check_required status, unreadable,
+   *  unlistable, io) outrank benign phase reasons. */
   const archiveFinishedCampaignsDetailed = async (
     workDir: string,
     stateBase: string,
@@ -4685,29 +4701,38 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   ): Promise<researchState.ResearchArchiveOutcome> => {
     const bases = [...new Set([stateBase, workDir])];
     const found: { base: string; id: string; dir: string }[] = [];
+    const reasons: researchState.ResearchArchiveRefusalReason[] = [];
     // research-charter: campaigns of an ACTIVE chain are never archived — the
     // child checks and the continuation flow still read them. Final exits pass
     // includeChainCampaigns: the chain is already final and must not skip them.
     // Without a chain (or ctx) this is the legacy behavior byte-for-byte.
     const chainIds = ctx && !opts?.includeChainCampaigns ? await chainCampaignIds(ctx) : [];
-    if (chainIds === null) return { ok: false, reason: "unlistable" };
+    if (chainIds === null) reasons.push("unlistable");
+    const chainIdList = chainIds ?? [];
     for (const base of bases) {
       const ids = listResearchCampaignIds(base);
-      if (ids === null) return { ok: false, reason: "unlistable" };
+      if (ids === null) { reasons.push("unlistable"); continue; }
       for (const id of ids) {
-        if (chainIds.includes(id)) continue;
+        if (chainIdList.includes(id)) continue;
         const resolved = researchState.resolveCampaignDir(base, id);
-        if (!resolved.ok) return { ok: false, reason: "unreadable" };
+        if (!resolved.ok) { reasons.push("unreadable"); continue; }
         // One ordered inspection: pending op first, then state validity, then
         // phase. readState-then-pendingOp could report an interrupted STOPPED
         // campaign as archivable if the read failed closed in a different way;
         // the shared gate admits only READY + no pending + phase stopped.
         const insp = await researchState.inspectCampaign(resolved.dir);
         const reason = campaignPolicyReason(insp);
-        if (reason !== null) return { ok: false, reason };
-        if (insp.status !== "ready" || insp.state?.phase !== "stopped") return { ok: false, reason: "unreadable" };
+        if (reason !== null) { reasons.push(reason); continue; }
+        if (insp.status !== "ready" || insp.state?.phase !== "stopped") { reasons.push("unreadable"); continue; }
         found.push({ base, id, dir: resolved.dir });
       }
+    }
+    if (reasons.length > 0) {
+      const blockers = reasons.filter((reason) => !benignArchiveReasons.has(reason));
+      const chosen = [...(blockers.length > 0 ? blockers : reasons)]
+        .sort((a, b) => archiveReasonRank(a) - archiveReasonRank(b))[0];
+      // A benign phase is returned only when no campaign produced a blocker.
+      return { ok: false, reason: chosen };
     }
     try {
       const archived: string[] = [];
@@ -4742,6 +4767,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return outcome.ok ? outcome.archived : null;
   };
   archiveFinishedCampaignsForTest = archiveFinishedCampaigns;
+  archiveOutcomeForTest = archiveFinishedCampaignsDetailed;
 
   const staleReportText = (dir: string, snap: ResearchSnapshot, draftBytes: Buffer | null): string => {
     const singleLine = (text: string): string => text.replace(/\s+/g, " ").trim();

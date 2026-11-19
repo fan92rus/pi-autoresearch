@@ -24,6 +24,7 @@ import {
 } from "../extensions/pi-autoresearch/research-state.ts";
 import {
   archiveFinishedCampaignsForTest,
+  archiveOutcomeForTest,
   blockingCampaignIdsForTest,
 } from "../extensions/pi-autoresearch/index.ts";
 
@@ -45,11 +46,11 @@ function workDir(label) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `pi-ar-policy-${label}-`));
 }
 
-function writeCampaign(base, kind) {
-  const dir = path.join(researchRoot(base), ID);
+function writeCampaign(base, kind, id = ID) {
+  const dir = path.join(researchRoot(base), id);
   fs.mkdirSync(dir, { recursive: true });
   const phase = kind === "briefing" || kind === "research" ? kind : "stopped";
-  const state = { schema_version: 1, campaign_id: ID, created_at: new Date().toISOString(), phase };
+  const state = { schema_version: 1, campaign_id: id, created_at: new Date().toISOString(), phase };
   if (kind === "invalid") state.extra_field = "readState refuses this, so the scanner must too";
   fs.writeFileSync(
     path.join(dir, STATE_FILE),
@@ -230,6 +231,26 @@ test("report with an unarchivable campaign keeps research mode ON", { timeout: 6
   assert.match(out, /stays ON/i, out);
   assert.equal(h.pi.notifications.some((n) => /research mode OFF/i.test(n.text)), false, "no OFF notice on archive refusal");
   assert.equal(fs.existsSync(path.join(researchRoot(dir), "c1", "state.json")), true, "blocked campaign is not archived");
+  assert.deepEqual(archivedNames(dir), []);
+});
+
+test("report: a benign campaign sorting before a stopped pending campaign cannot mask the blocker", { timeout: 60000 }, async () => {
+  const dir = workDir("report-mixed-archive");
+  const h = await load(dir, "report-mixed-archive", "research --id c1");
+  await draftApproveStartStop(h, "c1");
+  // listResearchCampaignIds sorts by id, so aaa-briefing is inspected first.
+  writeCampaign(dir, "briefing", "aaa-briefing");
+  writeCampaign(dir, "pending_op", "zzz-stopped");
+
+  const outcome = await archiveOutcomeForTest(dir, dir, h.ctx, { includeChainCampaigns: true });
+  assert.deepEqual(outcome, { ok: false, reason: "pending_op" }, `mixed archive reason: ${JSON.stringify(outcome)}`);
+
+  const out = textOf(await call(h, "research", { action: "report" }));
+  assert.match(out, /Manual check required/i, out);
+  assert.match(out, /\(pending_op\)/, out);
+  assert.match(out, /stays ON/i, out);
+  assert.equal(h.pi.notifications.some((n) => /research mode OFF/i.test(n.text)), false, "no OFF notice when a blocking campaign is masked by a benign one");
+  assert.equal(fs.existsSync(path.join(researchRoot(dir), "c1", "state.json")), true, "no campaign is archived while a blocker exists");
   assert.deepEqual(archivedNames(dir), []);
 });
 
