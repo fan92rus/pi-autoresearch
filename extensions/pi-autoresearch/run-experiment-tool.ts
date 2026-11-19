@@ -14,7 +14,7 @@ import * as path from "node:path";
 import { spawn } from "node:child_process";
 import { getBashSpawnOptions, killTree } from "./bash-shell.ts";
 import { AUTO_DIR } from "./paths.ts";
-import { currentResults } from "./ledger-metrics.ts";
+import { currentResults, findBestMetric } from "./ledger-metrics.ts";
 import { loadFindings } from "./findings.ts";
 import { treeExists, loadTree, saveTree, treeDist, findRunningNode } from "./parallel/tree.ts";
 import {
@@ -689,8 +689,12 @@ export function createRunExperimentTool(deps: RunExperimentToolDeps): RunExperim
         }
       }
 
-      if (state.bestMetric !== null) {
-        text += `📊 Current best ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}\n`;
+      // `state.bestMetric` is the restored epoch baseline, not the best kept
+      // result (a re-init resets it to the baseline). Show the actual best
+      // so the agent's decision gate compares against the right number.
+      const displayedBest = findBestMetric(state.results, state.currentSegment, state.bestDirection) ?? state.bestMetric;
+      if (displayedBest !== null) {
+        text += `📊 Current best ${state.metricName}: ${formatNum(displayedBest, state.metricUnit)}\n`;
       }
 
       // Show parsed METRIC lines to the LLM

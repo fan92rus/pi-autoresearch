@@ -93,6 +93,37 @@ test("4.3: a repeat of the hypothesis that beats the baseline confirms the keep"
   assert.equal(row.asi?.keep_status, undefined, "ledger row unchanged: the status is derived on read, not stored");
 });
 
+test("run_experiment reports the best kept metric after a fresh session restore", async () => {
+  const dir = makeDir();
+  const s = await session(dir);
+  s.dir = dir;
+  await keep(s, 100, {}, "baseline");
+  await keep(s, 90, {}, "idea one");
+
+  // Fresh extension instance: state is restored from JSONL, where bestMetric
+  // is the epoch baseline. The displayed "Current best" must still be 90.
+  const { pi, tool, command, hook } = createFakePi({ dir, sessionId: "rigor-wire", realGit: true, optimizeFixture: true });
+  const ctx = makeCtx(dir, "rigor-wire", pi);
+  const { default: ext } = await import(
+    pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")).href
+  );
+  ext(pi);
+  await hook("session_start")({}, ctx);
+  await command("autoresearch").handler("on", ctx);
+  const proposed = await tool("propose_hypothesis").execute("id", { description: "reporting check" }, null, null, ctx);
+  const nodeId = /\b(n\d+)\b/.exec(proposed.content[0].text ?? "")?.[1];
+  assert.ok(nodeId, "hypothesis registration succeeded");
+
+  const run = await tool("run_experiment").execute("id", {
+    command: `node -e "console.log('METRIC ms=95')"`,
+    timeout_seconds: 30,
+    hypothesis_id: nodeId,
+  }, null, null, ctx);
+  const text = run.content[0].text ?? "";
+  assert.match(text, /Current best ms: 90/, `expected best kept result, got: ${text.slice(0, 300)}`);
+  assert.doesNotMatch(text, /Current best ms: 100/, "the epoch baseline must not be presented as current best");
+}, { timeout: 60000 });
+
 test("B1: a repeat registered with repeat_of is grouped with its original and gives a confidence", async () => {
   const dir = makeDir();
   const s = await session(dir);
