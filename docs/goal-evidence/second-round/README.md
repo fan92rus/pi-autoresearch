@@ -39,4 +39,12 @@ Each stage epic has a verifiable close condition in its acceptance criteria.
 
 `expedition_brief propose` now records `mode_finalized` in the durable publication journal before appending the mode-switch finalize. Partial publications produced by the rejected intermediate code (`1324007`/`9ea6a79`) may be legacy schema-v1 journals without this field; `readPublication` coerces a missing field to `false`. Retrying such an old partial journal from an active optimization can append one extra finalize. New partial publications are exactly-once; historical journals are deliberately not migrated — treat one as a manual-check case if duplicate finalize matters.
 
-No code was changed as part of this review round.
+## Remediation status
+
+All 13 follow-ups (`tj0.1`–`tj0.13`) are CLOSED with real bd VERDICT comments. Each landed through an isolated worktree, a fresh refuting reviewer with ГОДЕН and 0 blockers after any rework, targeted tests from both worker and reviewer, a full `npm test` after merge, a Conventional Commit and a push.
+
+Final code HEAD `62746c4`: `index.ts` 5,484 lines (from 6,004 at the start of E9, −520; from 12,158 at the original baseline, −6,674 / −54.9%). Final full suite: 2,031 tests / 2,022 pass / 5 fail / 4 skipped. The five failures are the known baseline families: the starter-widget pin reproduced at the pre-change base, the prompt-size budget pin, and three cross-process journal flakes. No new deterministic regression remains.
+
+Known residual risks are documented in the individual bd comments: legacy expedition publication journals can duplicate a mode-switch finalize on retry (tj0.2), manual `council_convene` remains intentionally uncapped (tj0.9), and `manualResolvePendingOp` remains two deliberately distinct contracts (tj0.10). Each was judged in scope-acceptable by fresh review.
+
+No unrelated code was changed as part of the original review round; all subsequent edits belong to the remediation tasks above.

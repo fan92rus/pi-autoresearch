@@ -40,12 +40,12 @@ E6 exit criterion: **≤ ~6,000 lines**, with no tool/hook lost (full suite gree
 | 8034912 | 6,646 | −332 | tree_status + council_convene extraction (161/E6) |
 | 6b2b990 | 6,349 | −297 | brief + research/map alias tools extraction (parallel worktree, 161/E6) |
 | de21afc | **5,722** | **−627** | autoresearch command handler extraction (161/E6) |
-| <pending> | **5,484** | **−520** | dashboard + HTTP server extraction (bd tj0.13) |
+| 62746c4 | **5,484** | **−520** | dashboard + HTTP server extraction (bd tj0.13) |
 
 ## Observations
 
 - Bugfix waves typically ADD lines (+15…+66); only true extractions reduce the file.
-- lrx.1 is the first extraction with a measurable reduction (−152, 1.25% of the file); cumulative reduction at HEAD (de21afc, remeasured by `git show <sha>:index.ts | wc -l`) is −6,436 lines (−52.9% from the 12,158 baseline); E6 target ≤6k reached.
+- lrx.1 is the first extraction with a measurable reduction (−152, 1.25% of the file); cumulative reduction at de21afc was −6,436 lines (−52.9% from the 12,158 baseline); E6 target ≤6k reached. At final E9 HEAD (62746c4) `index.ts` is 5,484 lines: −6,674 lines (−54.9%) from the 12,158-line baseline.
 - Large extractions already landed: lrx.1 ledger-metrics, 8e5.6 resume-policy, el3.3 candidate dispatcher, 161.1 widget renderers, 161.2 findings/measurement adapters, 8af.5 dispatcher/research-tool, direction-review tool , log_experiment tool, run_experiment tool, candidate_branch wrapper , finalize_research tool and research_brief tool; E6 target ≤6k reached at 5,722 lines.
 - To reach ≤6k, several of the large extractions MUST land — bugfix-only waves cannot get there.
 
