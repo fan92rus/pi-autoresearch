@@ -47,12 +47,12 @@ export interface CouncilConfig {
 }
 
 export const DEFAULT_PARTICIPANTS: CouncilParticipantConfig[] = [
-  { name: "AnalystA", model: "anthropic/claude-haiku-5-5", persona: "patterns" },
-  { name: "AnalystB", model: "zai-coding-cn/glm-5.3-flash", persona: "explorer" },
-  { name: "AnalystC", model: "openai-codex/gpt-6-luna", persona: "skeptic" },
+  { name: "AnalystA", model: "openai-codex/gpt-6-luna", persona: "patterns" },
+  { name: "AnalystB", model: "opencode-go/hy4-flash-free", persona: "explorer" },
+  { name: "AnalystC", model: "openai-codex/gpt-6-sol", persona: "skeptic" },
 ];
 
-export const DEFAULT_CHAIR_MODEL = "zai-coding-cn/glm-5.3:high";
+export const DEFAULT_CHAIR_MODEL = "openai-codex/gpt-6-sol";
 
 const PERSONA_CYCLE: CouncilPersona[] = ["patterns", "explorer", "skeptic"];
 

@@ -1843,18 +1843,18 @@ await test("/autoresearch config council models dialog sets analyst and chair mo
     if (!next) return options[options.length - 1]; // Back
     return options.find((o) => o.startsWith(next));
   };
-  const inputs = ["openai-codex/gpt-6-luna", "zai-coding-cn/glm-5.3:high"];
+  const inputs = ["openai-codex/gpt-6-luna", "openai-codex/gpt-6-sol"];
   ctx.ui.input = async () => inputs.shift() ?? "";
 
   await command("autoresearch").handler("config", ctx);
   const cfg = JSON.parse(fs.readFileSync(path.join(dir, ".auto", "config.json"), "utf-8"));
   assert.ok(cfg.council, "council section written");
-  assert.strictEqual(cfg.council.chair_model, "zai-coding-cn/glm-5.3:high", "chair model set");
+  assert.strictEqual(cfg.council.chair_model, "openai-codex/gpt-6-sol", "chair model set");
   const b = cfg.council.participants.find((p) => p.name === "AnalystB");
   assert.strictEqual(b.model, "openai-codex/gpt-6-luna", "AnalystB model set");
   assert.strictEqual(b.persona, "explorer", "persona preserved");
   const a = cfg.council.participants.find((p) => p.name === "AnalystA");
-  assert.strictEqual(a.model, "anthropic/claude-haiku-5-5", "untouched analyst keeps default model");
+  assert.strictEqual(a.model, "openai-codex/gpt-6-luna", "untouched analyst keeps current default model");
 
   // blank input does not write
   const before = fs.readFileSync(path.join(dir, ".auto", "config.json"), "utf-8");
