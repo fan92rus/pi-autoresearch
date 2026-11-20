@@ -16,6 +16,11 @@ import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
 import { createFakePi, makeCtx } from "./fake-pi.ts";
+import { sendPendingResumeIfReadyForTest, runtimeForTest } from "../extensions/pi-autoresearch/index.ts";
+
+async function flushPendingResume(h) {
+  await sendPendingResumeIfReadyForTest(h.ctx, runtimeForTest(h.ctx));
+}
 
 function makeWorkDir(label) {
   const dir = path.join(os.tmpdir(), `pi-ar-sr-${label}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
@@ -323,7 +328,7 @@ test("B2: a pinned state-root campaign with a pending-op marker never auto-resum
   h.pi.sentMessages.length = 0;
   await h.hook("agent_start")({ messages: [] }, h.ctx);
   await h.hook("agent_end")({ messages: [] }, h.ctx);
-  await new Promise((r) => setTimeout(r, 1100)); // SETTLED_WINDOW_MS = 800
+  await flushPendingResume(h);
   assert.equal(h.pi.sentMessages.length, 0, `pending-op campaign must not auto-resume: ${JSON.stringify(h.pi.sentMessages.map((m) => m.text))}`);
 }, { timeout: 30000 });
 
@@ -335,7 +340,7 @@ test("B2 contrast: a pinned CLEAN research-phase state-root campaign resumes wit
   h.pi.sentMessages.length = 0;
   await h.hook("agent_start")({ messages: [] }, h.ctx);
   await h.hook("agent_end")({ messages: [] }, h.ctx);
-  await new Promise((r) => setTimeout(r, 1100));
+  await flushPendingResume(h);
   const research = h.pi.sentMessages.filter((m) => /Continue the research campaign/.test(m.text));
   assert.equal(research.length, 1, `state-root campaign resumes with research wording: ${JSON.stringify(h.pi.sentMessages.map((m) => m.text))}`);
   const legacy = h.pi.sentMessages.filter((m) => /run_experiment/.test(m.text));
