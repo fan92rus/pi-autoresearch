@@ -24,3 +24,10 @@ test("v2 scorer detects changes to its own files", () => {
   assert.match(scorer, /SCORER_CHANGED=.*\.auto\/measure\.sh/);
   assert.match(scorer, /SCORER_CHANGED=.*\.auto\/config\.json/);
 });
+
+test("v2 scorer keeps strict anti-gaming penalties", () => {
+  assert.match(scorer, /BUDGET=\$\(\(200\s*\*\s*FIXED\)\)/, "scope budget must scale with credited fixes");
+  assert.match(scorer, /20\*sc/, "scorer tampering must carry the full fixed penalty");
+  assert.match(scorer, /10\*bad/, "invalid proofs must carry the full fixed penalty");
+  assert.match(scorer, /5\*r/, "new regressions must carry the full fixed penalty");
+});
