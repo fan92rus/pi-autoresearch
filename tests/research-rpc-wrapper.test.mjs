@@ -27,7 +27,9 @@ function run(ctx, extra = [], scenario = "success") {
     const overridden = new Set(extra.filter((value) => value.startsWith("--")));
     const pairs = [["--mode", "research"], ["--brief", ctx.brief], ["--approve-sha", ctx.digest],
       ["--campaign-id", "test-campaign"], ["--pi", fakePi], ["--cwd", ctx.dir], ["--log", ctx.log],
-      ["--timeout-sec", "2"], ["--stage1-timeout-sec", "1.5"]];
+      // Bounded but load-tolerant: a 2 s whole-run timeout expired at 2322 ms
+      // under full-suite load and preempted the expected code-1 exhaustion path.
+      ["--timeout-sec", "5"], ["--stage1-timeout-sec", "3"]];
     const defaults = pairs.filter(([name]) => !overridden.has(name)).flat();
     const args = [wrapper, ...defaults, ...extra];
     const child = spawn(process.execPath, args, {
@@ -634,4 +636,10 @@ test("review-4.6: the legacy exit codes are unchanged without --charter", async 
   const ctx = setup();
   fs.writeFileSync(ctx.brief, Buffer.from("{broken\n"));
   assert.equal((await run(ctx)).code, 2, "invalid canonical brief still exits 2");
+});
+
+test("RPC wrapper test defaults are load-tolerant but bounded", () => {
+  const source = fs.readFileSync(fileURLToPath(import.meta.url), "utf8");
+  assert.match(source, /\["--timeout-sec", "5"\], \["--stage1-timeout-sec", "3"\]/);
+  assert.doesNotMatch(source, /\["--timeout-sec", "2"\]/);
 });
