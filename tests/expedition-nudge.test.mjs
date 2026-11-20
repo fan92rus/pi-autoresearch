@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
 import { createFakePi, makeCtx } from "./fake-pi.ts";
 import * as chainJournal from "../extensions/pi-autoresearch/chain-journal.ts";
+import { sendPendingResumeIfReadyForTest, runtimeForTest } from "../extensions/pi-autoresearch/index.ts";
 
 /* Expedition direction nudges (bd pi-autoresearch-es1.6 follow-up): after a
  * direction is closed (resolve/reject/advisory/park) while the campaign is in
@@ -53,6 +54,13 @@ async function setup(directions) {
   const chainDir = chainJournal.chainDir(dir, chainId);
   assert.ok(chainDir);
   return { dir, ctx, pi, call, chainId, chainDir, campaignId, hook };
+}
+
+/** Deliver the pending drift nudge explicitly instead of sleeping past its timer. */
+async function flushPendingResume(h) {
+  const before = h.pi.sentMessages.length;
+  await sendPendingResumeIfReadyForTest(h.ctx, runtimeForTest(h.ctx));
+  assert.ok(h.pi.sentMessages.length > before, "explicit drift delivery seam must send the pending nudge");
 }
 
 /** Activates a direction on the campaign and closes one question with evidence
@@ -266,7 +274,7 @@ test("drift resume in an expedition with live directions: expedition continuatio
   // message must prescribe expedition continuation, not a campaign stop.
   await h.hook("agent_start")({}, h.ctx);
   await h.hook("agent_end")({ messages: [] }, h.ctx);
-  await new Promise((resolve) => setTimeout(resolve, 1100));
+  await flushPendingResume(h);
   const last = h.pi.sentMessages[h.pi.sentMessages.length - 1]?.text ?? "";
   assert.match(last, /Last turn did no research-campaign work/);
   assert.match(last, /Continue the expedition now/, "expedition branch must replace the legacy selection");
@@ -288,7 +296,7 @@ test("unverifiable campaign snapshot in drift falls back to the safe legacy resu
   fs.writeFileSync(path.join(h.dir, ".auto", "research", h.campaignId, "brief.json"), "{ broken");
   await h.hook("agent_start")({}, h.ctx);
   await h.hook("agent_end")({ messages: [] }, h.ctx);
-  await new Promise((resolve) => setTimeout(resolve, 1100));
+  await flushPendingResume(h);
   const last = h.pi.sentMessages[h.pi.sentMessages.length - 1]?.text ?? "";
   assert.match(last, /Continue the expedition now/, "expedition branch still guides (safe brief path)");
   assert.match(last, /research_brief draft/, "unknown question state -> next-campaign brief path, not stop");
@@ -389,7 +397,7 @@ test("agent_end hook carries the expedition continuation with the exhausted note
   const before = h.pi.sentMessages.length;
   await h.hook("agent_start")({}, h.ctx);
   await h.hook("agent_end")({ messages: [] }, h.ctx);
-  await new Promise((resolve) => setTimeout(resolve, 1100));
+  await flushPendingResume(h);
   assert.ok(h.pi.sentMessages.length > before, "agent_end pushes a continuation");
   const last = h.pi.sentMessages[h.pi.sentMessages.length - 1]?.text ?? "";
   assert.match(last, /Continue the expedition now/, "expedition branch (not generic resume)");
