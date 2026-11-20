@@ -31,3 +31,10 @@ test("v2 scorer keeps strict anti-gaming penalties", () => {
   assert.match(scorer, /10\*bad/, "invalid proofs must carry the full fixed penalty");
   assert.match(scorer, /5\*r/, "new regressions must carry the full fixed penalty");
 });
+
+test("v2 scorer keeps regression and test-gain accounting constants", () => {
+  assert.match(scorer, /BASELINE_FAIL=6/, "baseline failure count must stay pinned");
+  assert.match(scorer, /TESTS_GAIN=\$\(\( \$\{TESTS:-0\} - 2031 \)\)/, "test-gain baseline must stay pinned");
+  assert.match(scorer, /if \[ "\$TESTS_GAIN" -lt 0 \]; then TESTS_GAIN=0; fi/, "test gain must never go negative");
+  assert.match(scorer, /w\/Math\.sqrt\(1\+0\.35\*\(n-1\)\)/, "batch-credit divisor must stay pinned");
+});
