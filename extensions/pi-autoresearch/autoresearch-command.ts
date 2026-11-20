@@ -30,6 +30,11 @@ import type { ModeTransition } from "./index.ts";
 export const EXPEDITION_RESEARCH_ACTIVE_NOTICE = "Cannot launch expedition while a research campaign is active; resume or finish it first.";
 export const EXPEDITION_CANDIDATE_ACTIVE_NOTICE = "Candidate campaign active; finish it before starting an expedition.";
 export const RESEARCH_KICKOFF_NOTICE = "Research campaign active — continue it with research_questions(action=status); the legacy autoresearch kickoff is not sent.";
+export const BUGFIX_KICKOFF = [
+  "Bugfix mode active. Use bugfix_mode(action=\"prepare\", campaignId, config) once with explicit project parameters and a clean working tree.",
+  "Then bugfix_mode(action=\"record\", phase=\"discover\", ...) pays for a confirmed defect, bugfix_mode(action=\"record\", phase=\"proof\", ...) checks the fix, and bugfix_mode(action=\"decide\", status=\"keep|discard\", ...) records the decision.",
+  "Run the returned node command with run_experiment, then log_experiment. Use tree_status/direction_review for stagnation; the metric loop's optimize_brief/init_experiment setup is not needed here.",
+].join(" ");
 
 /** Extension-local collaborators injected by index.ts (getter-backed there). */
 export interface AutoresearchCommandDeps {
@@ -684,6 +689,36 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
               "5. research_questions(action=stop, rule_id, reason), then research_questions(action=report).",
             ].join("\n");
         deps.sendWhenReady(ctx, researchKickoff);
+        return;
+      }
+
+      // ===== bugfix subcommand: the reusable defect-hunting loop =====
+      // Enter autoresearch mode (so the gated bugfix_mode tools work) and send
+      // a self-contained kickoff. It deliberately does NOT load the
+      // optimization setup skill: bugfix_mode carries its own campaign config.
+      if (/^bugfix(\s|$)/.test(command)) {
+        if (runtime.autoresearchMode && (runtime.researchChain?.expedition === true || runtime.uiMode === "expedition")) {
+          ctx.ui.notify("Finish the active expedition before starting a bugfix campaign.", "info");
+          return;
+        }
+        if (!runtime.autoresearchMode) {
+          const workDir = deps.resolveWorkDir(ctx.cwd);
+          deps.clearPersistedOffMarker(workDir);
+          const researchGate = await deps.ordinaryLaunchResearchGate(workDir, ctx);
+          if (researchGate !== "none") {
+            ctx.ui.notify(RESEARCH_KICKOFF_NOTICE, "info");
+            return;
+          }
+          if (await deps.campaignBlocksOrdinaryLoop(workDir)) {
+            ctx.ui.notify("Candidate campaign active — continue it with candidate_branch status; the bugfix kickoff is not sent.", "info");
+            return;
+          }
+          deps.recordAutoresearchActivation(workDir, true);
+          deps.transitionAutoresearchMode(ctx, { enabled: true, uiMode: "optimization" });
+          ctx.ui.notify("Bugfix mode ON — bugfix_mode tools are available", "info");
+        }
+        const goal = trimmedArgs.slice("bugfix".length).trim();
+        deps.sendWhenReady(ctx, `${BUGFIX_KICKOFF}${goal ? ` Goal: ${goal}` : ""}`);
         return;
       }
 

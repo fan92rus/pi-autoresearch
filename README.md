@@ -97,6 +97,7 @@ The guard covers the ordinary loop, including campaigns that block it. Partial-c
 | `/autoresearch dashboard` | Open the fullscreen scrollable dashboard overlay in the terminal. Navigate with `↑`/`↓`/`j`/`k`, `PageUp`/`PageDown`/`u`/`d`, `g`/`G` for top/bottom, `Escape` or `q` to close. |
 | `/autoresearch research <text>` | Start a research campaign from a research plan (briefing via `research_brief`, owner approval, then `research_questions`); supports headless launch flags. See [docs/research-vectors.md](docs/research-vectors.md). |
 | `/autoresearch expedition <text>` | Start a research expedition: one goal, a map of directions, campaign 0 launched after the single document confirmation. `research` and `expedition` are reserved as the first word: a goal whose first word is `research` or `expedition` routes to the campaign/expedition launch, not the ordinary loop. |
+| `/autoresearch bugfix <text>` | Turn on the defect-hunting loop: enables the gated `bugfix_mode` tool and sends a `prepare → record → decide` proof-cycle kickoff. No `optimize_brief`/`init_experiment` setup is needed. |
 | `/autoresearch council <note>` | Delegate a stagnation council to `council_convene` (runs analysts, dispute and chair autonomously). |
 | `/autoresearch config` | Interactive campaign configuration (time limit, models, concurrency, budget, observer toggles). |
 | `/autoresearch limit [N\|off]` | Set or clear the experiment time limit in minutes without editing the config; bare `/autoresearch limit` is interactive. |

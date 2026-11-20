@@ -42,6 +42,7 @@ export const AUTORESEARCH_SUBCOMMANDS: AutocompleteEntry[] = [
   { value: "off", label: "off", description: "Turn autoresearch mode off" },
   { value: "research", label: "research", description: "Start a research campaign (briefing via research_brief)" },
   { value: "expedition", label: "expedition", description: "Start a research expedition" },
+  { value: "bugfix", label: "bugfix", description: "Start a defect-hunting campaign (bugfix_mode prepare/record/decide)" },
   { value: "finalize", label: "finalize", description: "Stop the loop and load the autoresearch-finalize skill" },
   { value: "report", label: "report", description: "Write the campaign report to .auto/report.md now" },
   { value: "clear", label: "clear", description: "Delete session log and reset state" },
