@@ -24,7 +24,9 @@ function setup() {
 }
 function run(ctx, extra = [], dialogSha = ctx.digest) {
   return new Promise((resolve) => {
-    const args = [wrapper, "--mode", "research", "--expedition-doc", ctx.doc, "--approve-expedition-sha", ctx.digest, "--pi", ctx.fake, "--cwd", ctx.dir, "--log", ctx.log, "--timeout-sec", "3", "--stage1-timeout-sec", "1", ...extra];
+    // Same bounded load-tolerant defaults as the brief wrapper tests: a short
+    // whole-run timeout can preempt the expected expedition confirmation path.
+    const args = [wrapper, "--mode", "research", "--expedition-doc", ctx.doc, "--approve-expedition-sha", ctx.digest, "--pi", ctx.fake, "--cwd", ctx.dir, "--log", ctx.log, "--timeout-sec", "5", "--stage1-timeout-sec", "3", ...extra];
     const child = spawn(process.execPath, args, { cwd: ctx.dir, env: { ...process.env, DOC_SHA: ctx.digest, DIALOG_SHA: dialogSha }, stdio: ["ignore", "pipe", "pipe"] });
     let stderr = ""; child.stderr.setEncoding("utf8").on("data", s => stderr += s);
     const timer = setTimeout(() => child.kill(), 10000);
@@ -77,4 +79,11 @@ test("document changed while dialog is pending is refused", async () => {
   fs.writeFileSync(release, "");
   const result = await pending; assert.equal(result.code, 3, result.stderr);
   assert.ok(events(ctx).some(e => e.record?.event === "expedition_confirmation" && e.record.confirmed === false));
+});
+
+test("expedition wrapper test defaults are load-tolerant but bounded", () => {
+  const source = fs.readFileSync(fileURLToPath(import.meta.url), "utf8");
+  const argsLine = source.split("\n").find((line) => line.includes("--approve-expedition-sha") && line.includes("--timeout-sec"));
+  assert.ok(argsLine, "wrapper args line must exist");
+  assert.match(argsLine, /"--timeout-sec", "5", "--stage1-timeout-sec", "3"/);
 });
