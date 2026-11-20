@@ -200,6 +200,7 @@ import {
   PASSPORT_COMPONENTS, reviewRequestedStatementHint, runPassportView, trailingBestImprovements,
 } from "./log-experiment-tool.ts";
 import { createRunExperimentTool } from "./run-experiment-tool.ts";
+import { createBugfixModeTool } from "./bugfix-mode-tool.ts";
 import { createCandidateBranchTool } from "./candidate-branch-tool.ts";
 import { createFinalizeResearchTool } from "./finalize-research-tool.ts";
 import { createAutoresearchCommand } from "./autoresearch-command.ts";
@@ -3835,6 +3836,30 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // -----------------------------------------------------------------------
 
   registerMeasurementTools(gatedToolSink, gatedToolDeps);
+
+  // -----------------------------------------------------------------------
+  // bugfix_mode tool (openspec bugfix-mode): reusable defect-hunting loop.
+  // The tool only writes campaign state under .auto/bugfix/<id>/ and never
+  // commits or reverts the working tree.
+  // -----------------------------------------------------------------------
+  const bugfixModuleDir = path.dirname(fileURLToPath(import.meta.url));
+  const bugfixMeasureCliPath = path.join(bugfixModuleDir, "bugfix-mode-measure.ts");
+  registerGatedTool(createBugfixModeTool({
+    get assertModeActive() { return assertModeActive; },
+    get validateWorkDir() { return validateWorkDir; },
+    get resolveWorkDir() { return resolveWorkDir; },
+    get campaignBlocksOrdinaryLoop() { return campaignBlocksOrdinaryLoop; },
+    get campaignBlockedResponse() { return campaignBlockedResponse; },
+    get researchBlocksOrdinaryLoop() { return researchBlocksOrdinaryLoop; },
+    get researchBlockedResponse() { return researchBlockedResponse; },
+    get execBashScript() { return execBashScript; },
+    scorerFilePaths: [
+      path.join(bugfixModuleDir, "bugfix-mode.ts"),
+      path.join(bugfixModuleDir, "bugfix-mode-store.ts"),
+      bugfixMeasureCliPath,
+    ],
+    measureCliPath: bugfixMeasureCliPath,
+  }));
 
   // -----------------------------------------------------------------------
   // run_experiment tool

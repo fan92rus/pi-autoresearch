@@ -68,7 +68,7 @@ async function loadExtension(dir, sessionId = "smoke", opts = {}) {
 console.log("## Smoke: real-extension registration");
 
 const EXPECTED_TOOLS = ["optimize_brief", 
-  "init_experiment", "propose_hypothesis", "run_experiment", "log_experiment",
+  "init_experiment", "propose_hypothesis", "run_experiment", "log_experiment", "bugfix_mode",
   "tree_status", "finalize_research", "candidate_branch",
   "council_write_entry", "council_read_index", "council_read_entry", "council_check_consensus",
   "council_convene", "record_finding", "update_finding", "search_precedents", "assess_precedents", "inspect_results",
@@ -89,14 +89,14 @@ const EXPECTED_HOOKS = [
   "before_agent_start", "tool_execution_end", "tool_call",
 ];
 
-await test("registers all 29 tools with the combined dispatcher hidden (parallel + branching disabled)", async () => {
+await test("registers all 30 tools with the combined dispatcher hidden (parallel + branching disabled)", async () => {
   const dir = makeTempDir("reg");
   const { pi } = await loadExtension(dir);
   const names = pi.tools.map((t) => t.name);
   for (const expected of EXPECTED_TOOLS) {
     assert.ok(names.includes(expected), `Missing tool: ${expected}`);
   }
-  assert.strictEqual(names.length, 29, `Expected 29 tools, got ${names.length}: ${names.join(", ")}`);
+  assert.strictEqual(names.length, 30, `Expected 30 tools, got ${names.length}: ${names.join(", ")}`);
   assert.strictEqual(pi.tools.find((t) => t.name === "research").exposure, "hidden", "combined dispatcher is registered internally but hidden from the model");
   assert.notStrictEqual(pi.tools.find((t) => t.name === "research_questions").exposure, "hidden");
   assert.notStrictEqual(pi.tools.find((t) => t.name === "expedition_map").exposure, "hidden");
