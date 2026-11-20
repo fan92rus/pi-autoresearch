@@ -118,6 +118,11 @@ test("bugfix_mode prepares isolated campaign, executes proofs and gates decision
   const credit = evaluateCredit(evidence, readRows(dir, "campaign1", DECISIONS_FILE));
   assert.equal(credit.invalidKeepCount, 0);
   assert.equal(credit.creditedExperiments.length, 1);
+
+  const removedAction = await bugfix.execute("continue-1", {
+    action: "continue", campaignId: "campaign1",
+  }, null, null, ctx);
+  assert.equal(removedAction.details.reason, "invalid_action");
 });
 
 test("checkout and prune failures block evidence and leave no worktree behind", async () => {

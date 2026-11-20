@@ -168,12 +168,6 @@ export interface EvidenceRecord {
   checks: ProofCheck[];
 }
 
-export interface DecisionRecord {
-  kind: "decision";
-  experimentId: string;
-  status: "keep" | "discard";
-}
-
 const CHECK_NAMES: readonly CheckName[] = ["defect", "fixed", "counterfactual"];
 
 function nonEmptyCheckField(value: unknown): boolean {
@@ -358,16 +352,4 @@ export function formatMetricLines(result: BugfixScore): string[] {
     `METRIC tests_total=${result.testsTotal}`,
     `METRIC tests_gain=${result.testsGain}`,
   ];
-}
-
-/** Stagnation is a signal to change direction, never a claim that search is exhausted. */
-export function continuationSignal(decisionRows: unknown[], window = 3): string {
-  const statuses = decisionRows
-    .filter((row): row is DecisionRecord => isRecord(row) && row.kind === "decision" && (row.status === "keep" || row.status === "discard"))
-    .slice(-window)
-    .map((row) => row.status);
-  if (statuses.length < window || statuses.some((status) => status !== "discard")) {
-    return `Последние решения: ${statuses.length ? statuses.join(", ") : "нет"}. Поиск продолжается.`;
-  }
-  return `Последние ${window} решения — discard. Это признак стагнации, а не доказательство, что дефектов больше нет: попробуйте другое направление поиска.`;
 }

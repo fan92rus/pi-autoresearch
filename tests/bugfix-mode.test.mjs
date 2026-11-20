@@ -5,7 +5,6 @@ import * as path from "node:path";
 import {
   BUGFIX_METRIC_VERSION,
   computeBugfixScore,
-  continuationSignal,
   evaluateCredit,
   formatMetricLines,
   inspectEvidence,
@@ -133,10 +132,4 @@ test("a timed-out check is not an expected failure", () => {
   const timedOut = proof("e1", "P1:bug");
   timedOut.checks[0].killed = true;
   assert.equal(inspectEvidence(timedOut).valid, false);
-});
-
-test("stagnation is shown without claiming search exhaustion", () => {
-  const discards = [1, 2, 3].map((n) => ({ kind: "decision", experimentId: `e${n}`, status: "discard" }));
-  assert.match(continuationSignal(discards), /не доказательство/);
-  assert.match(continuationSignal([...discards.slice(0, 2), { kind: "decision", experimentId: "e4", status: "keep" }]), /Поиск продолжается/);
 });

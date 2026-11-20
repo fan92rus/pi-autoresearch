@@ -12,7 +12,6 @@ import * as path from "node:path";
 import {
   inspectEvidence,
   isSafeCampaignId,
-  continuationSignal,
   validateBugfixConfig,
   type CheckName,
   type Severity,
@@ -52,7 +51,7 @@ const CHECK_NAMES: readonly CheckName[] = ["defect", "fixed", "counterfactual"];
 const SEVERITIES: readonly Severity[] = ["P1", "P2", "P3"];
 
 const BugfixModeParams = Type.Object({
-  action: Type.String({ description: "prepare | record | decide | continue" }),
+  action: Type.String({ description: "prepare | record | decide" }),
   campaignId: Type.String({ description: "Stable campaign id: [A-Za-z0-9._-]{1,64}" }),
   config: Type.Optional(Type.Object({
     name: Type.String(),
@@ -106,13 +105,13 @@ export function createBugfixModeTool(deps: BugfixModeToolDeps): ToolLike {
     name: "bugfix_mode",
     label: "Bugfix mode",
     description:
-      "Prepare a reusable defect-hunting campaign, execute proof checks, record keep/discard decisions and report continuation. " +
+      "Prepare a reusable defect-hunting campaign, execute proof checks and record keep/discard decisions. " +
       "Campaign state stays under .auto/bugfix/<id>/; existing .auto/measure.sh and the working tree are not touched.",
     promptSnippet: "Prepare/run the reusable bugfix campaign with executable proofs",
     promptGuidelines: [
       "Call prepare once with explicit project parameters, then record executable defect/fixed/counterfactual checks before decide keep.",
       "Use the returned node command with run_experiment; a discard earns no credit but is not an invalid proof.",
-      "Stagnation is a prompt to search elsewhere, not proof that all defects are found.",
+      "For stagnation analysis use the existing tree_status and direction_review tools; stagnation is not proof that all defects are found.",
     ],
     parameters: BugfixModeParams,
 
@@ -273,10 +272,6 @@ export function createBugfixModeTool(deps: BugfixModeToolDeps): ToolLike {
             : "Discard recorded: no credit and no invalid-proof penalty.",
           { status: params.status },
         );
-      }
-
-      if (action === "continue") {
-        return reply(continuationSignal(readRows(workDir, campaignId, DECISIONS_FILE)));
       }
 
       return refusal(`unknown action ${String(action)}`, "invalid_action");
