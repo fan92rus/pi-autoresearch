@@ -14,6 +14,7 @@ import { pathToFileURL } from "node:url";
 
 import { createFakePi, makeCtx } from "./fake-pi.ts";
 import { sessionFilePath } from "../extensions/pi-autoresearch/paths.ts";
+import { runtimeForTest } from "../extensions/pi-autoresearch/index.ts";
 import { loadTree } from "../extensions/pi-autoresearch/parallel/tree.ts";
 import { repeatConfidence } from "../extensions/pi-autoresearch/confidence.ts";
 
@@ -109,7 +110,7 @@ test("run_experiment reports the best kept metric after a fresh session restore"
   );
   ext(pi);
   await hook("session_start")({}, ctx);
-  await command("autoresearch").handler("on", ctx);
+  await command("autoresearch").handler("continue", ctx);
   const proposed = await tool("propose_hypothesis").execute("id", { description: "reporting check" }, null, null, ctx);
   const nodeId = /\b(n\d+)\b/.exec(proposed.content[0].text ?? "")?.[1];
   assert.ok(nodeId, "hypothesis registration succeeded");
@@ -122,6 +123,33 @@ test("run_experiment reports the best kept metric after a fresh session restore"
   const text = run.content[0].text ?? "";
   assert.match(text, /Current best ms: 90/, `expected best kept result, got: ${text.slice(0, 300)}`);
   assert.doesNotMatch(text, /Current best ms: 100/, "the epoch baseline must not be presented as current best");
+}, { timeout: 60000 });
+
+test("a new /autoresearch launch starts fresh; only /autoresearch continue restores the old ledger", async () => {
+  const dir = makeDir();
+  const s = await session(dir);
+  s.dir = dir;
+  await keep(s, 100, {}, "old baseline");
+  await keep(s, 90, {}, "old best");
+
+  const sessionId = "rigor-wire-fresh-launch";
+  const { pi, tool: freshTool, command: freshCommand, hook: freshHook } = createFakePi({ dir, sessionId, realGit: true, optimizeFixture: true });
+  const ctx = makeCtx(dir, sessionId, pi);
+  const { default: ext } = await import(
+    pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")).href
+  );
+  ext(pi);
+  await freshHook("session_start")({}, ctx);
+  assert.equal(runtimeForTest(ctx).state.results.length, 2, "session_start alone still sees the saved ledger");
+
+  await freshCommand("autoresearch").handler("optimize a brand new target", ctx);
+  const rt = runtimeForTest(ctx);
+  assert.equal(rt.state.results.length, 0, "a new launch must not inherit the previous campaign");
+  assert.equal(rt.state.bestMetric, null, "a new launch must not inherit the previous best");
+
+  await freshCommand("autoresearch").handler("continue", ctx);
+  assert.equal(runtimeForTest(ctx).state.results.length, 2, "continue explicitly restores the saved ledger");
+  assert.ok(freshTool, "fresh harness exposes the tools");
 }, { timeout: 60000 });
 
 test("B1: a repeat registered with repeat_of is grouped with its original and gives a confidence", async () => {

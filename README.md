@@ -89,6 +89,7 @@ The guard covers the ordinary loop, including campaigns that block it. Partial-c
 | `/autoresearch` or `/autoresearch help` | Show help without activating autoresearch mode. `--help` and `-h` work too. |
 | `/autoresearch <text>` | Enter autoresearch mode. If `.auto/prompt.md` exists, resumes the loop with `<text>` as context. Otherwise, sets up a new session. |
 | `/autoresearch off` | Leave autoresearch mode. Stops auto-resume and clears runtime state but keeps `.auto/log.jsonl` intact. |
+| `/autoresearch continue` | Resume the previous autoresearch ledger. A plain `/autoresearch <goal>` starts a fresh campaign instead of inheriting old results. |
 | `/autoresearch finalize` | Stop the loop like `off` (aborting a run in progress), then load the `autoresearch-finalize` skill to turn kept experiments into reviewable branches. |
 | `/autoresearch report` | Write the campaign report to `.auto/report.md` from the current ledger, findings and measurement state. Works with the loop on or off and does not stop it; each call overwrites the file. `report` is a reserved subcommand: a goal of exactly `report` no longer starts a session. |
 | `/autoresearch clear` | Delete `.auto/log.jsonl`, reset all state, and turn autoresearch mode off. Use this for a clean start. |

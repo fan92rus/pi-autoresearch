@@ -57,12 +57,14 @@ export interface AutoresearchCommandDeps {
   openFullscreenDashboard: (ctx: ExtensionContext) => Promise<void> | void;
   ordinaryLaunchResearchGate: (workDir: string, ctx: ExtensionContext) => Promise<"none" | "manual" | "active">;
   readLastRun: (workDir: string) => Record<string, unknown> | null;
+  reconstructStateForCommand: (ctx: ExtensionContext) => void;
   recordAutoresearchActivation: (workDir: string, active: boolean) => void;
   recordModeSwitchFinalize: (ctx: ExtensionContext, reason: string) => void;
   researchBlocksExpeditionLaunch: (workDir: string, ctx?: ExtensionContext) => Promise<boolean>;
   researchBlocksOrdinaryLoop: (workDir: string, ctx?: ExtensionContext) => Promise<boolean>;
   researchCampaignExists: (workDir: string, ctx?: ExtensionContext) => boolean;
   resolveWorkDir: (cwd: string) => string;
+  resetStateForNewLaunch: (ctx: ExtensionContext) => void;
   saveDeadEnds: (workDir: string) => void;
   sendChainContinuation: (ctx: ExtensionContext, parentCampaignId: string) => Promise<void>;
   sendWhenReady: (ctx: ExtensionContext, message: string, opts?: { steerIfBusy?: boolean }) => void;
@@ -111,6 +113,26 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
 
       if (isHelpRequest(command)) {
         ctx.ui.notify(renderAutoresearchHelp(), "info");
+        return;
+      }
+
+      if (command === "continue") {
+        const workDir = deps.resolveWorkDir(ctx.cwd);
+        deps.clearPersistedOffMarker(workDir);
+        const researchGate = await deps.ordinaryLaunchResearchGate(workDir, ctx);
+        if (researchGate !== "none") {
+          ctx.ui.notify(RESEARCH_KICKOFF_NOTICE, "info");
+          return;
+        }
+        if (await deps.campaignBlocksOrdinaryLoop(workDir)) {
+          ctx.ui.notify("Candidate campaign active — continue it with candidate_branch status; the legacy autoresearch loop is not resumed.", "info");
+          return;
+        }
+        deps.reconstructStateForCommand(ctx);
+        deps.recordAutoresearchActivation(workDir, true);
+        deps.transitionAutoresearchMode(ctx, { enabled: true, uiMode: "optimization" });
+        ctx.ui.notify("Autoresearch mode ON — previous ledger restored", "info");
+        deps.sendWhenReady(ctx, `Autoresearch resumed from the saved ledger. Continue the loop from the restored best. ${deps.BENCHMARK_GUARDRAIL}`);
         return;
       }
 
@@ -713,6 +735,7 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
             ctx.ui.notify("Candidate campaign active — continue it with candidate_branch status; the bugfix kickoff is not sent.", "info");
             return;
           }
+          deps.resetStateForNewLaunch(ctx);
           deps.recordAutoresearchActivation(workDir, true);
           deps.transitionAutoresearchMode(ctx, { enabled: true, uiMode: "optimization" });
           ctx.ui.notify("Bugfix mode ON — bugfix_mode tools are available", "info");
@@ -726,15 +749,13 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
       // exactly like finalize_research does, but the ordinary launch then
       // continues instead of being refused as "already active". A session
       // that was explicitly turned OFF keeps the legacy launch/restore path.
-      if (runtime.autoresearchMode) {
-        if (runtime.researchChain?.expedition === true) {
-          const switched = await deps.finalizeExpeditionForOptimization(ctx);
-          if (!switched.ok) { ctx.ui.notify(switched.message, "error"); return; }
-        } else {
-          ctx.ui.notify("Autoresearch already active — use '/autoresearch off' to stop first", "info");
-          return;
-        }
+      if (runtime.autoresearchMode && runtime.researchChain?.expedition === true) {
+        const switched = await deps.finalizeExpeditionForOptimization(ctx);
+        if (!switched.ok) { ctx.ui.notify(switched.message, "error"); return; }
       }
+      // An already-active optimization loop is not a blocker: a plain
+      // /autoresearch <goal> is a NEW campaign, so fall through to the reset
+      // below. Only /autoresearch continue keeps the previous ledger.
 
       const workDir = deps.resolveWorkDir(ctx.cwd);
       // An explicit ON always releases the persisted manual-off marker, even
@@ -757,6 +778,7 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
         ctx.ui.notify("Candidate campaign active — continue it with candidate_branch status; the legacy autoresearch kickoff is not sent.", "info");
         return;
       }
+      deps.resetStateForNewLaunch(ctx);
       deps.recordAutoresearchActivation(workDir, true);
       // The transition registers the widget NOW: the agent may take a while
       // before its first init_experiment, and the mode indicator must be

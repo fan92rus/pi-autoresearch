@@ -40,6 +40,7 @@ export interface AutocompleteEntry {
 
 export const AUTORESEARCH_SUBCOMMANDS: AutocompleteEntry[] = [
   { value: "off", label: "off", description: "Turn autoresearch mode off" },
+  { value: "continue", label: "continue", description: "Resume the previous autoresearch ledger" },
   { value: "research", label: "research", description: "Start a research campaign (briefing via research_brief)" },
   { value: "expedition", label: "expedition", description: "Start a research expedition" },
   { value: "bugfix", label: "bugfix", description: "Start a defect-hunting campaign (bugfix_mode prepare/record/decide)" },

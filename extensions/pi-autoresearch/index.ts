@@ -2480,7 +2480,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // State reconstruction
   // -----------------------------------------------------------------------
 
-  const reconstructState = (ctx: ExtensionContext) => {
+  /** Fresh in-memory experiment state. A new /autoresearch launch must not
+   *  inherit the previous ledger; only /autoresearch continue restores it. */
+  const resetStateForNewLaunch = (ctx: ExtensionContext) => {
     const runtime = getRuntime(ctx);
     cancelPendingResume(runtime);
     runtime.lastRunChecks = null;
@@ -2494,7 +2496,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // by run number after a restart, so a fresh session starts empty.
     runtime.runLinks = resetRunIdentities(runtime.runLinks);
     runtime.state = createExperimentState();
+  };
 
+  const reconstructState = (ctx: ExtensionContext) => {
+    resetStateForNewLaunch(ctx);
+    const runtime = getRuntime(ctx);
     let state = runtime.state;
 
     // Resolve effective working directory (config stays in ctx.cwd, files in workDir)
@@ -5497,12 +5503,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     get openExpeditionWebDashboard() { return openExpeditionWebDashboard; },
     get openFullscreenDashboard() { return openFullscreenDashboard; },
     get readLastRun() { return readLastRun; },
+    get reconstructStateForCommand() { return reconstructState; },
     get recordAutoresearchActivation() { return recordAutoresearchActivation; },
     get recordModeSwitchFinalize() { return recordModeSwitchFinalize; },
     get researchBlocksExpeditionLaunch() { return researchBlocksExpeditionLaunch; },
     get researchBlocksOrdinaryLoop() { return researchBlocksOrdinaryLoop; },
     get researchCampaignExists() { return researchCampaignExists; },
     get resolveWorkDir() { return resolveWorkDir; },
+    get resetStateForNewLaunch() { return resetStateForNewLaunch; },
     get saveDeadEnds() { return saveDeadEnds; },
     get sendChainContinuation() { return sendChainContinuation; },
     get sendWhenReady() { return sendWhenReady; },
