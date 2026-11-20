@@ -392,7 +392,7 @@ test("log_experiment после measurement_change: epoch в леджере, д�
 
   const { tool, command, hook, ctx } = await createHarness({ dir, sessionId: "cross-epoch-wiring", realGit: true });
   await hook("session_start")({}, ctx);
-  await command("autoresearch").handler("on", ctx);
+  await command("autoresearch").handler("continue", ctx);
 
   const changeRes = await tool("log_measurement_change").execute("id", {
     diff_ref: writeDiff(dir),
@@ -458,7 +458,7 @@ test("tree_status и виджет дерева: текущая эпоха, пр�
 
   const { tool, command, hook, ctx } = await createHarness({ dir, sessionId: "cross-epoch-tree", realGit: true });
   await hook("session_start")({}, ctx);
-  await command("autoresearch").handler("on", ctx);
+  await command("autoresearch").handler("continue", ctx);
 
   const res = await tool("tree_status").execute("id", {}, null, null, ctx);
   const text = res.content[0].text;

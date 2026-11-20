@@ -15,6 +15,7 @@ import { spawn } from "node:child_process";
 import { getBashSpawnOptions, killTree } from "./bash-shell.ts";
 import { AUTO_DIR } from "./paths.ts";
 import { currentResults, findBestMetric } from "./ledger-metrics.ts";
+import { reconstructJsonlState } from "./jsonl.ts";
 import { loadFindings } from "./findings.ts";
 import { treeExists, loadTree, saveTree, treeDist, findRunningNode } from "./parallel/tree.ts";
 import {
@@ -25,6 +26,24 @@ import { isRunNumber } from "./run-links.ts";
 import { formatNum } from "./widget.ts";
 
 type RunExperimentTool = Parameters<ExtensionAPI["registerTool"]>[0];
+
+/**
+ * Best kept metric of the durable JSONL ledger. The in-memory runtime state can
+ * lag behind after measurement changes/compaction (its currentSegment may be
+ * older than the ledger's), so the reported best must come from the ledger.
+ */
+export function bestMetricFromJsonl(
+  jsonl: string,
+  direction: "higher" | "lower",
+  fallback: number | null = null,
+): number | null {
+  try {
+    const restored = reconstructJsonlState(jsonl);
+    return findBestMetric(restored.results, restored.currentSegment, direction) ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 interface RunDetails {
   command: string;
@@ -692,7 +711,11 @@ export function createRunExperimentTool(deps: RunExperimentToolDeps): RunExperim
       // `state.bestMetric` is the restored epoch baseline, not the best kept
       // result (a re-init resets it to the baseline). Show the actual best
       // so the agent's decision gate compares against the right number.
-      const displayedBest = findBestMetric(state.results, state.currentSegment, state.bestDirection) ?? state.bestMetric;
+      const ledgerPath = autoresearchJsonlPath(workDir);
+      const fallbackBest = findBestMetric(state.results, state.currentSegment, state.bestDirection) ?? state.bestMetric;
+      const displayedBest = fs.existsSync(ledgerPath)
+        ? bestMetricFromJsonl(fs.readFileSync(ledgerPath, "utf8"), state.bestDirection, fallbackBest)
+        : fallbackBest;
       if (displayedBest !== null) {
         text += `📊 Current best ${state.metricName}: ${formatNum(displayedBest, state.metricUnit)}\n`;
       }

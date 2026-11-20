@@ -101,8 +101,9 @@ test("run_experiment reports the best kept metric after a fresh session restore"
   await keep(s, 100, {}, "baseline");
   await keep(s, 90, {}, "idea one");
 
-  // Fresh extension instance: state is restored from JSONL, where bestMetric
-  // is the epoch baseline. The displayed "Current best" must still be 90.
+  // Fresh extension instance: the in-memory results stop at 90, but a newer
+  // keep (80, lower is better) is appended directly to the durable ledger.
+  // run_experiment must read the ledger, not the stale runtime snapshot.
   const { pi, tool, command, hook } = createFakePi({ dir, sessionId: "rigor-wire", realGit: true, optimizeFixture: true });
   const ctx = makeCtx(dir, "rigor-wire", pi);
   const { default: ext } = await import(
@@ -111,6 +112,10 @@ test("run_experiment reports the best kept metric after a fresh session restore"
   ext(pi);
   await hook("session_start")({}, ctx);
   await command("autoresearch").handler("continue", ctx);
+  fs.appendFileSync(sessionFilePath(dir, "log"), [
+    JSON.stringify({ type: "config", name: "bench", metricName: "ms", metricUnit: "ms", bestDirection: "lower" }),
+    JSON.stringify({ run: 3, metric: 80, status: "keep", description: "newer ledger best" }),
+  ].join("\n") + "\n");
   const proposed = await tool("propose_hypothesis").execute("id", { description: "reporting check" }, null, null, ctx);
   const nodeId = /\b(n\d+)\b/.exec(proposed.content[0].text ?? "")?.[1];
   assert.ok(nodeId, "hypothesis registration succeeded");
@@ -121,8 +126,8 @@ test("run_experiment reports the best kept metric after a fresh session restore"
     hypothesis_id: nodeId,
   }, null, null, ctx);
   const text = run.content[0].text ?? "";
-  assert.match(text, /Current best ms: 90/, `expected best kept result, got: ${text.slice(0, 300)}`);
-  assert.doesNotMatch(text, /Current best ms: 100/, "the epoch baseline must not be presented as current best");
+  assert.match(text, /Current best ms: 80/, `expected the durable ledger best, got: ${text.slice(0, 300)}`);
+  assert.doesNotMatch(text, /Current best ms: (90|100)/, "a stale in-memory best must not win over the ledger");
 }, { timeout: 60000 });
 
 test("a new /autoresearch launch starts fresh; only /autoresearch continue restores the old ledger", async () => {
