@@ -34,7 +34,8 @@ const config = {
   campaignId: "campaign1",
   name: "bugfix",
   testCommand: "node tap.cjs",
-  proofCommands: { defect: "run-defect", fixed: "run-fixed", counterfactual: "run-counterfactual" },
+  testIdCommand: "node --test {test}",
+  proofCommands: { good: "run-good", defect: "run-defect", fixed: "run-fixed", counterfactual: "run-counterfactual" },
   scopePaths: ["src"],
   baseRef: "HEAD",
   baselineFail: 0,
@@ -79,8 +80,9 @@ test("measurer prints durable score and fails loudly on unparseable output", () 
 
   const good = measure(["--campaign", "campaign1", "--cwd", dir]);
   assert.equal(good.code, 0, good.error);
-  assert.ok(good.lines.includes("METRIC metric_version=bugfix_score_v1"));
-  assert.ok(good.lines.includes("METRIC bugfix_score_v1=10.2"));
+  assert.ok(good.lines.includes("METRIC metric_version=bugfix_score_v2"));
+  assert.ok(good.lines.includes("METRIC bugfix_score_v2=6.67"));
+  assert.ok(good.lines.includes("METRIC fix_credit=6.67"));
   assert.ok(good.lines.includes("METRIC mutation_proven_fixed=1"));
 
   // A pending decision is provisional: no durable credit, no score for the fix.

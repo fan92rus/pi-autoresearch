@@ -10,6 +10,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  DISCOVERY_CHECKS,
+  PROOF_CHECKS,
   inspectEvidence,
   isSafeCampaignId,
   validateBugfixConfig,
@@ -47,7 +49,6 @@ export interface BugfixModeToolDeps {
   measureCliPath: string;
 }
 
-const CHECK_NAMES: readonly CheckName[] = ["defect", "fixed", "counterfactual"];
 const SEVERITIES: readonly Severity[] = ["P1", "P2", "P3"];
 
 const BugfixModeParams = Type.Object({
@@ -56,7 +57,9 @@ const BugfixModeParams = Type.Object({
   config: Type.Optional(Type.Object({
     name: Type.String(),
     testCommand: Type.String(),
+    testIdCommand: Type.String({ description: "Template containing {test}, e.g. node --test {test}" }),
     proofCommands: Type.Object({
+      good: Type.String(),
       defect: Type.String(),
       fixed: Type.String(),
       counterfactual: Type.String(),
@@ -71,9 +74,13 @@ const BugfixModeParams = Type.Object({
   severity: Type.Optional(Type.String({ description: "P1 | P2 | P3" })),
   stateIds: Type.Optional(Type.Object({
     defect: Type.String(),
-    fixed: Type.String(),
-    counterfactual: Type.String(),
+    good: Type.Optional(Type.String()),
+    fixed: Type.Optional(Type.String()),
+    counterfactual: Type.Optional(Type.String()),
   })),
+  phase: Type.Optional(Type.String({ description: "discover (N immediately) | proof (2N on keep)" })),
+  detectorTests: Type.Optional(Type.Array(Type.String(), { description: "Test ids that revealed this defect." })),
+  proofTests: Type.Optional(Type.Array(Type.String(), { description: "Test ids that lock in this fix." })),
   status: Type.Optional(Type.String({ description: "keep | discard for decide" })),
   timeoutSeconds: Type.Optional(Type.Number({ description: "Per-check timeout, default 120." })),
 });
@@ -109,7 +116,7 @@ export function createBugfixModeTool(deps: BugfixModeToolDeps): ToolLike {
       "Campaign state stays under .auto/bugfix/<id>/; existing .auto/measure.sh and the working tree are not touched.",
     promptSnippet: "Prepare/run the reusable bugfix campaign with executable proofs",
     promptGuidelines: [
-      "Call prepare once with explicit project parameters, then record executable defect/fixed/counterfactual checks before decide keep.",
+      "Call prepare once with explicit project parameters. Record phase=discover with good/defect refs to pay N immediately, then phase=proof with defect/fixed/counterfactual refs before decide keep for 2N.",
       "Use the returned node command with run_experiment; a discard earns no credit but is not an invalid proof.",
       "For stagnation analysis use the existing tree_status and direction_review tools; stagnation is not proof that all defects are found.",
     ],
@@ -162,14 +169,22 @@ export function createBugfixModeTool(deps: BugfixModeToolDeps): ToolLike {
         const defectId = requiredText(params.defectId, "defectId");
         const severity = params.severity;
         const stateIds = params.stateIds;
+        const phase = params.phase === "discover" ? "discover"
+          : params.phase === undefined || params.phase === "proof" ? "proof" : null;
+        const names: readonly CheckName[] = phase === "discover" ? DISCOVERY_CHECKS : PROOF_CHECKS;
+        // Test ids are interpolated into a frozen shell template: allow only safe path-like tokens.
+        const testIds = (value: unknown): string[] => Array.isArray(value)
+          ? value.filter((entry): entry is string =>
+            typeof entry === "string" && /^[A-Za-z0-9._/-]{1,120}$/.test(entry)).slice(0, 10)
+          : [];
         const safeRef = (value: unknown): boolean =>
           typeof value === "string" && /^[A-Za-z0-9._/@^~-]{1,120}$/.test(value);
-        if (!experimentId || !defectId || !SEVERITIES.includes(severity as Severity) ||
-            !stateIds || !CHECK_NAMES.every((name) => safeRef(stateIds[name]))) {
-          return refusal("record needs experimentId, defectId, severity and three git refs in stateIds", "invalid_record");
+        if (!experimentId || !defectId || phase === null || !SEVERITIES.includes(severity as Severity) ||
+            !stateIds || !names.every((name) => safeRef(stateIds[name]))) {
+          return refusal("record needs experimentId, defectId, severity and the git refs for this phase", "invalid_record");
         }
         const stateRefs: Record<string, string> = {};
-        for (const name of CHECK_NAMES) {
+        for (const name of names) {
           const ref = stateIds[name] as string;
           const resolved = await deps.execBashScript(["-c", `git rev-parse --verify "${ref}^{commit}"`], {
             cwd: workDir, timeout: 30_000,
@@ -181,33 +196,54 @@ export function createBugfixModeTool(deps: BugfixModeToolDeps): ToolLike {
         }
         const commands = stored.value.config.proofCommands;
         const timeout = Math.max(1, Math.min(600, Math.floor(params.timeoutSeconds ?? 120)));
-        const checks: Array<{ name: CheckName; command: string; exitCode: number; output: string; killed: boolean }> = [];
+        type Check = { name: string; command: string; exitCode: number; output: string; killed: boolean };
+        const checks: Check[] = [];
+        const testChecks: Array<Check & { testId: string }> = [];
         const worktrees: string[] = [];
         const cleanupFailures: string[] = [];
         let checkoutFailure: string | null = null;
-        for (const name of CHECK_NAMES) {
+        const runInWorktree = async (name: string, ref: string, command: string): Promise<Check | null> => {
           const scratch = fs.mkdtempSync(path.join(os.tmpdir(), `bugfix-proof-${campaignId}-`));
           fs.rmdirSync(scratch);
           const posix = scratch.replace(/\\/g, "/");
           // Register before the command: a partially created worktree must still be removed.
           worktrees.push(posix);
           const added = await deps.execBashScript(
-            ["-c", `git worktree add --detach "${posix}" ${stateRefs[name]}`],
+            ["-c", `git worktree add --detach "${posix}" ${ref}`],
             { cwd: workDir, timeout: 120_000 },
           );
           if (added.code !== 0 || !fs.existsSync(scratch)) {
             checkoutFailure = `could not check out state ${name}: ${(added.stderr || added.stdout).slice(0, 300)}`;
-            break;
+            return null;
           }
-          const command = commands[name] as string;
           const result = await deps.execBashScript(["-c", command], { cwd: scratch, timeout: timeout * 1000 });
-          checks.push({
-            name,
-            command,
-            exitCode: result.code,
-            killed: result.killed,
+          return {
+            name, command, exitCode: result.code, killed: result.killed,
             output: `${result.stdout}${result.stderr}`.slice(0, 4000),
-          });
+          };
+        };
+        for (const name of names) {
+          const check = await runInWorktree(name, stateRefs[name], commands[name] as string);
+          if (check === null) break;
+          checks.push(check);
+        }
+        if (checkoutFailure === null) {
+          const prefix = phase === "discover" ? "detector" : "proof";
+          const pairs = phase === "discover"
+            ? [["good", true], ["defect", false]] as const
+            : [["fixed", true], ["counterfactual", false]] as const;
+          const ids = Array.from(new Set(testIds(
+            phase === "discover" ? params.detectorTests : params.proofTests,
+          ))).slice(0, 3);
+          for (const id of ids) {
+            for (const [state, shouldPass] of pairs) {
+              const command = stored.value.config.testIdCommand.replaceAll("{test}", id);
+              const check = await runInWorktree(`${prefix}:${id}:${state}`, stateRefs[state], command);
+              if (check === null) break;
+              testChecks.push({ ...check, testId: id });
+            }
+            if (checkoutFailure !== null) break;
+          }
         }
         for (const posix of worktrees) {
           const removed = await deps.execBashScript(["-c", `git worktree remove --force "${posix}"`], {
@@ -229,11 +265,29 @@ export function createBugfixModeTool(deps: BugfixModeToolDeps): ToolLike {
         if (cleanupFailures.length > 0) {
           return refusal(`proof worktree cleanup failed: ${cleanupFailures.join(", ")}`, "cleanup_failed");
         }
+        // A test id counts only when its own executed checks separate the states.
+        const prefix = phase === "discover" ? "detector" : "proof";
+        const pairs = phase === "discover"
+          ? [["good", true], ["defect", false]] as const
+          : [["fixed", true], ["counterfactual", false]] as const;
+        const verifiedIds = phase === "discover" ? params.detectorTests : params.proofTests;
+        const countedIds = Array.from(new Set(testIds(verifiedIds))).slice(0, 3).filter((id) =>
+          pairs.every(([state, shouldPass]) => testChecks.some((check) =>
+            check.testId === id && check.name === `${prefix}:${id}:${state}` &&
+            (shouldPass ? check.exitCode === 0 : check.exitCode !== 0),
+          )),
+        );
+        const detectorTests = phase === "discover" ? countedIds : [];
+        const proofTests = phase === "proof" ? countedIds : [];
         const evidence = {
           kind: "evidence",
           experimentId,
           defectId,
           severity,
+          phase,
+          detectorTests,
+          proofTests,
+          testChecks,
           stateIds,
           stateRefs,
           checks,
@@ -242,10 +296,16 @@ export function createBugfixModeTool(deps: BugfixModeToolDeps): ToolLike {
         appendRow(workDir, campaignId, EVIDENCE_FILE, { ...evidence, valid: proof.valid });
         return reply(
           `${proof.valid ? "Executed proof accepted" : `Executed proof rejected: ${proof.reason}`}. ` +
-          `Checked commits: ${CHECK_NAMES.map((name) => `${name}=${stateRefs[name].slice(0, 8)}`).join(", ")}. ` +
+          `Checked commits: ${names.map((name) => `${name}=${stateRefs[name].slice(0, 8)}`).join(", ")}. ` +
           `Checks: ${checks.map((check) => `${check.name}=${check.exitCode}`).join(", ")}. ` +
-          `Credit becomes durable only after decide(status=keep).`,
-          { valid: proof.valid, reason: proof.reason, exitCodes: checks.map((check) => check.exitCode) },
+          `${phase === "discover"
+            ? "Discovery credit is paid now and is not revoked by discard."
+            : "Fix credit becomes durable only after decide(status=keep)."}`,
+          {
+            valid: proof.valid, reason: proof.reason, phase,
+            detectorTests, proofTests,
+            exitCodes: checks.map((check) => check.exitCode),
+          },
         );
       }
 
