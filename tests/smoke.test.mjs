@@ -14,6 +14,7 @@ import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
 import { createFakePi, makeCtx, readConfig, readTree, readLog } from "./fake-pi.ts";
+import { sendPendingResumeIfReadyForTest, runtimeForTest } from "../extensions/pi-autoresearch/index.ts";
 
 // ──────────────────────────────────────────────────────────────────────
 // Test harness
@@ -358,7 +359,7 @@ await test("drifted turns get bounded corrective resumes, then pause", async () 
   const settle = async () => {
     await hook("before_agent_start")({ systemPrompt: "x" }, ctx);
     await hook("agent_end")({ messages: [] }, ctx);
-    await new Promise((r) => setTimeout(r, 1000)); // SETTLED_WINDOW_MS = 800
+    await sendPendingResumeIfReadyForTest(ctx, runtimeForTest(ctx));
   };
 
   await settle();
@@ -727,7 +728,7 @@ await test("flagged provenance is re-injected into the next resume", async () =>
   // Settled turn end -> plain resume must carry the flag reminder
   await hook("before_agent_start")({ systemPrompt: "x" }, ctx);
   await hook("agent_end")({ messages: [] }, ctx);
-  await new Promise((r) => setTimeout(r, 1000)); // SETTLED_WINDOW_MS = 800
+  await sendPendingResumeIfReadyForTest(ctx, runtimeForTest(ctx));
 
   const last = pi.sentMessages[pi.sentMessages.length - 1]?.text ?? "";
   assert.ok(last.includes("flagged"), `resume must carry the provenance reminder, got: ${last.slice(0, 200)}`);

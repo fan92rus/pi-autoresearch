@@ -17,6 +17,7 @@ import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
 import { createFakePi, makeCtx } from "./fake-pi.ts";
+import { sendPendingResumeIfReadyForTest, runtimeForTest } from "../extensions/pi-autoresearch/index.ts";
 
 function makeWorkDir(label) {
   const dir = path.join(os.tmpdir(), `pi-ar-autoexit-${label}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
@@ -121,7 +122,7 @@ test("after the exit no automatic continuation is sent", async () => {
   const sentBefore = h.pi.sentMessages.length;
   await h.hook("agent_start")({ messages: [] }, h.ctx);
   await h.hook("agent_end")({ messages: [] }, h.ctx);
-  await new Promise((r) => setTimeout(r, 1100));
+  await sendPendingResumeIfReadyForTest(h.ctx, runtimeForTest(h.ctx));
   assert.equal(h.pi.sentMessages.length, sentBefore, `no resume after the exit: ${JSON.stringify(h.pi.sentMessages.slice(sentBefore).map((m) => m.text))}`);
 }, { timeout: 30000 });
 

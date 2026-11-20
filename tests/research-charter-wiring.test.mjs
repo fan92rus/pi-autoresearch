@@ -17,6 +17,7 @@ import { pathToFileURL } from "node:url";
 
 import { createFakePi, makeCtx } from "./fake-pi.ts";
 import { sha256Hex } from "../extensions/pi-autoresearch/research-state.ts";
+import { sendPendingResumeIfReadyForTest, runtimeForTest } from "../extensions/pi-autoresearch/index.ts";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -588,7 +589,7 @@ test("review-4.1: the idle mechanism does not send chain continuations without a
   // An idle turn (agent_end, no experiment tools) must not produce a SECOND
   // chain continuation; at most the ordinary research drift nudge fires.
   await h.hook("agent_end")({ messages: [] }, h.ctx);
-  await new Promise((r) => setTimeout(r, 1200)); // SETTLED_WINDOW_MS = 800
+  await sendPendingResumeIfReadyForTest(h.ctx, runtimeForTest(h.ctx));
 
   const chainContinuations = h.pi.sentMessages.slice(before).filter((m) => /chain can continue|research chain/i.test(m.text));
   assert.equal(chainContinuations.length, 0, `no idle chain continuation; got: ${chainContinuations.map((m) => m.text.slice(0, 80)).join(" | ")}`);
