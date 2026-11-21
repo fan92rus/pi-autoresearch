@@ -255,44 +255,50 @@ export function createBugfixModeTool(deps: BugfixModeToolDeps): ToolLike {
             output: `${result.stdout}${result.stderr}`.slice(0, 4000),
           };
         };
-        for (const name of names) {
-          const check = await runInWorktree(name, stateRefs[name], commands[name] as string);
-          if (check === null) break;
-          checks.push(check);
-        }
-        if (checkoutFailure === null) {
-          const prefix = phase === "discover" ? "detector" : "proof";
-          const pairs = phase === "discover"
-            ? [["good", true], ["defect", false]] as const
-            : [["fixed", true], ["counterfactual", false]] as const;
-          const ids = Array.from(new Set(testIds(
-            phase === "discover" ? params.detectorTests : params.proofTests,
-          ))).slice(0, 3);
-          for (const id of ids) {
-            for (const [state, shouldPass] of pairs) {
-              const command = stored.value.config.testIdCommand.replaceAll("{test}", id);
-              const check = await runInWorktree(`${prefix}:${id}:${state}`, stateRefs[state], command);
-              if (check === null) break;
-              testChecks.push({ ...check, testId: id });
-            }
-            if (checkoutFailure !== null) break;
-          }
-        }
-        for (const posix of worktrees) {
-          const removed = await deps.execBashScript(["-c", `git worktree remove --force "${posix}"`], {
-            cwd: workDir, timeout: 30_000,
-          });
-          if (removed.code !== 0 || fs.existsSync(posix)) {
-            try {
-              fs.rmSync(posix, { recursive: true, force: true });
-            } catch {
-              cleanupFailures.push(posix);
-            }
-            const pruned = await deps.execBashScript(["-c", "git worktree prune"], { cwd: workDir, timeout: 30_000 });
-            if (pruned.code !== 0 || fs.existsSync(posix)) {
-              if (!cleanupFailures.includes(posix)) cleanupFailures.push(posix);
+        const cleanupWorktrees = async (): Promise<void> => {
+          for (const posix of worktrees) {
+            const removed = await deps.execBashScript(["-c", `git worktree remove --force "${posix}"`], {
+              cwd: workDir, timeout: 30_000,
+            });
+            if (removed.code !== 0 || fs.existsSync(posix)) {
+              try {
+                fs.rmSync(posix, { recursive: true, force: true });
+              } catch {
+                cleanupFailures.push(posix);
+              }
+              const pruned = await deps.execBashScript(["-c", "git worktree prune"], { cwd: workDir, timeout: 30_000 });
+              if (pruned.code !== 0 || fs.existsSync(posix)) {
+                if (!cleanupFailures.includes(posix)) cleanupFailures.push(posix);
+              }
             }
           }
+        };
+        try {
+          for (const name of names) {
+            const check = await runInWorktree(name, stateRefs[name], commands[name] as string);
+            if (check === null) break;
+            checks.push(check);
+          }
+          if (checkoutFailure === null) {
+            const prefix = phase === "discover" ? "detector" : "proof";
+            const pairs = phase === "discover"
+              ? [["good", true], ["defect", false]] as const
+              : [["fixed", true], ["counterfactual", false]] as const;
+            const ids = Array.from(new Set(testIds(
+              phase === "discover" ? params.detectorTests : params.proofTests,
+            ))).slice(0, 3);
+            for (const id of ids) {
+              for (const [state, shouldPass] of pairs) {
+                const command = stored.value.config.testIdCommand.replaceAll("{test}", id);
+                const check = await runInWorktree(`${prefix}:${id}:${state}`, stateRefs[state], command);
+                if (check === null) break;
+                testChecks.push({ ...check, testId: id });
+              }
+              if (checkoutFailure !== null) break;
+            }
+          }
+        } finally {
+          await cleanupWorktrees();
         }
         if (checkoutFailure) return refusal(checkoutFailure, "state_checkout_failed");
         if (cleanupFailures.length > 0) {
