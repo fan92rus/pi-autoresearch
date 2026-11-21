@@ -15,7 +15,8 @@ import { pathToFileURL } from "node:url";
 import { createFakePi, makeCtx } from "./fake-pi.ts";
 import { sessionFilePath } from "../extensions/pi-autoresearch/paths.ts";
 import { runtimeForTest } from "../extensions/pi-autoresearch/index.ts";
-import { loadTree } from "../extensions/pi-autoresearch/parallel/tree.ts";
+import { loadTree, saveTree } from "../extensions/pi-autoresearch/parallel/tree.ts";
+import { computeSimhash } from "../extensions/pi-autoresearch/parallel/simhash.ts";
 import { repeatConfidence } from "../extensions/pi-autoresearch/confidence.ts";
 
 function makeDir() {
@@ -360,4 +361,43 @@ test("bd 51n.14: revert failure warns with DIRTY-tree text; success clears the s
     /Git: reverted changes \(discard\)|Git revert failed/.test(text),
     `discard must attempt a revert: ${text.slice(0, 400)}`,
   );
+}, { timeout: 60000 });
+
+test("SimHash collision with zero lexical overlap does not block an unrelated hypothesis", async () => {
+  const dir = makeDir();
+  const s = await session(dir);
+  const english = "Verification rerun of n24 (deterministic brief-dialog release seam) on a clean tree to confirm the preliminary 50.43 zero-failure keep and that the previously reappearing brief-dialog flake is gone. No code changes.";
+  const russian = "Третий независимый прогон чемпиона для калибровки шума: подтвердить, что n55-stable состояние даёт 68.42 и 0 провалов; если результат совпадёт, это фиксирует нулевую вариативность и закрывает вопрос о шуме без изменения кода.";
+
+  // Build the historical shape from tree.json: the earlier hypothesis is a
+  // distant node (td=3) so the SIMHASH_MAYBE threshold 6 applies.
+  const tree = loadTree(dir);
+  assert.ok(tree, "tree exists after init_experiment");
+  tree.nodes.n0.nodeType = "experiment";
+  tree.nodes.n0.status = "discard";
+  tree.nodes.n0.hypothesis = english;
+  tree.nodes.n0.simhashFull = computeSimhash(english);
+  let parent = "n0";
+  for (let i = 1; i <= 3; i++) {
+    const id = `n${i}`;
+    tree.nodes[id] = {
+      ...tree.nodes.n0, id, parentId: parent, depth: i, children: [],
+      hypothesis: `unrelated timing fence ${i}`,
+      simhashFull: computeSimhash(`unrelated timing fence ${i}`),
+      status: "untested",
+    };
+    tree.nodes[parent].children.push(id);
+    parent = id;
+  }
+  tree.activeNodeId = "n3";
+  tree.nextId = 4;
+  saveTree(dir, tree);
+
+  const second = await s.tool("propose_hypothesis").execute("id", { description: russian }, null, null, s.ctx);
+  assert.doesNotMatch(second.content[0].text ?? "", /DUPLICATE|Possible duplicate/, "a 6-bit collision with no shared tokens must not be classified as a repeat");
+
+  const exact = await s.tool("propose_hypothesis").execute("id", { description: english }, null, null, s.ctx);
+  assert.match(exact.content[0].text ?? "", /DUPLICATE HYPOTHESIS/, "a genuine exact repeat must still be blocked");
+  const forced = await s.tool("propose_hypothesis").execute("id", { description: english, force: true }, null, null, s.ctx);
+  assert.match(forced.content[0].text ?? "", /Possible duplicate \(force=true\)/);
 }, { timeout: 60000 });

@@ -234,7 +234,7 @@ import {
   type ExperimentTree,
   type TreeNode,
 } from "./parallel/tree.ts";
-import { computeSimhash, hammingDistance, classifyDistance } from "./parallel/simhash.ts";
+import { computeSimhash, hammingDistance, classifyDistance, confirmedByLexicon } from "./parallel/simhash.ts";
 import { rankNodes, type RankedNode } from "./parallel/ucb1.ts";
 import { renderTree } from "./parallel/treeview.ts";
 import { repeatConfidence, keepStatus } from "./confidence.ts";
@@ -3728,7 +3728,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           distance: hammingDistance(newSimhash, n.simhashFull!),
           td: treeDist(tree, activeId, n.id),
         }))
-        .filter((x) => x.distance <= simhashThreshold(x.td))
+        .filter((x) => x.distance <= simhashThreshold(x.td) && confirmedByLexicon(hypothesisText, x.node.hypothesis))
         .sort((a, b) => a.distance - b.distance || a.td - b.td);
 
       let nodeStatus: "untested" | "duplicate" = "untested";

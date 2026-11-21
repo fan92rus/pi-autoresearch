@@ -111,6 +111,23 @@ export function hammingDistance(hexA: string, hexB: string): number {
 
 // Thresholds for 32-bit SimHash
 
+/**
+ * Lexical confirmation for a SimHash candidate. SimHash alone produces
+ * collisions between unrelated texts (observed: distance 6, zero shared
+ * tokens), so a non-identical candidate must also share significant wording.
+ * Exact/near-exact repeats pass either the Jaccard or containment branch.
+ */
+export function confirmedByLexicon(textA: string, textB: string): boolean {
+  const a = new Set(normalize(textA));
+  const b = new Set(normalize(textB));
+  if (a.size === 0 || b.size === 0) return false;
+  let shared = 0;
+  for (const token of a) if (b.has(token)) shared++;
+  const jaccard = shared / (a.size + b.size - shared);
+  const containment = shared / Math.min(a.size, b.size);
+  return jaccard >= 0.7 || containment >= 0.9;
+}
+
 /** Bit distance == 0 → identical hypothesis (near-certain duplicate). */
 export const SIMHASH_EXACT = 0;
 /** ≤3 differing bits → very likely a duplicate (standard near-duplicate bound). */
