@@ -159,6 +159,7 @@ test("checkout and prune failures block evidence and leave no worktree behind", 
     },
     scorerFilePaths: [],
     measureCliPath: "node measure.ts",
+    isBugfixMeasureCommand: () => true,
   });
 
   for (const mode of [
@@ -186,6 +187,31 @@ test("checkout and prune failures block evidence and leave no worktree behind", 
     assert.equal(fs.existsSync(path.join(dir, ".auto", "bugfix", campaignId, EVIDENCE_FILE)), false);
     for (const target of mode.addedPaths) assert.equal(fs.existsSync(target), false, `worktree leaked at ${target}`);
   }
+});
+
+test("prepare refuses a stale runtime and leaves no campaign state", async () => {
+  const dir = tempRepo("stale");
+  const bugfix = createBugfixModeTool({
+    assertModeActive: () => undefined,
+    validateWorkDir: () => null,
+    resolveWorkDir: () => dir,
+    campaignBlocksOrdinaryLoop: async () => false,
+    campaignBlockedResponse: () => ({ content: [{ type: "text", text: "blocked" }], details: {} }),
+    researchBlocksOrdinaryLoop: async () => false,
+    researchBlockedResponse: () => ({ content: [{ type: "text", text: "blocked" }], details: {} }),
+    execBashScript: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+    scorerFilePaths: [],
+    measureCliPath: "node measure.ts",
+    isBugfixMeasureCommand: () => false,
+  });
+
+  const result = await bugfix.execute("stale-1", {
+    action: "prepare", campaignId: "stale-campaign", config,
+  }, null, null, { cwd: dir });
+
+  assert.equal(result.details.reason, "stale_extension");
+  assert.match(result.content[0].text, /pi update/);
+  assert.equal(fs.existsSync(path.join(dir, ".auto", "bugfix", "stale-campaign")), false);
 });
 
 test("prepare refuses a dirty working tree instead of including foreign changes", async () => {

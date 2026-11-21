@@ -3881,6 +3881,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       bugfixMeasureCliPath,
     ],
     measureCliPath: bugfixMeasureCliPath,
+    get isBugfixMeasureCommand() { return (command: string, workDir: string) =>
+      parseBugfixMeasureCommand(command, bugfixMeasureCliPath, workDir).ok; },
   }));
 
   // -----------------------------------------------------------------------

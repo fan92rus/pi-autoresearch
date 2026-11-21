@@ -48,6 +48,8 @@ export interface BugfixModeToolDeps {
   scorerFilePaths: string[];
   /** Absolute path printed as the run_experiment command for the campaign. */
   measureCliPath: string;
+  /** Same predicate run_experiment uses; catches a stale installed runtime early. */
+  isBugfixMeasureCommand: (command: string, workDir: string) => boolean;
 }
 
 const SEVERITIES: readonly Severity[] = ["P1", "P2", "P3"];
@@ -153,6 +155,14 @@ export function createBugfixModeTool(deps: BugfixModeToolDeps): ToolLike {
         const written = writeStoredConfig(workDir, campaignId, config.value, hashes);
         if (!written.ok) return refusal(written.error, "campaign_exists");
         const command = bugfixMeasureCommand(deps.measureCliPath, campaignId, workDir);
+        if (!deps.isBugfixMeasureCommand(command, workDir)) {
+          fs.rmSync(written.value.dir, { recursive: true, force: true });
+          return refusal(
+            "Installed autoresearch extension is stale: run_experiment would reject this prepared bugfix command. " +
+            "Run `pi update https://github.com/fan92rus/pi-autoresearch` and restart the session before preparing a campaign.",
+            "stale_extension",
+          );
+        }
         return reply(
           `Bugfix campaign ${campaignId} prepared at ${written.value.filePath}.\n` +
           `Run it with run_experiment({ command: ${JSON.stringify(command)}, timeout_seconds: 600 }).\n` +

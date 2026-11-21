@@ -168,6 +168,7 @@ export function createRunExperimentTool(deps: RunExperimentToolDeps): RunExperim
       // A prepared bugfix campaign has its own measurer; recognise it only so
       // the measure.sh guard below can let that exact command through.
       const isBugfixMeasure = isBugfixCampaignMeasureCommand(params.command, workDir);
+      const looksLikeBugfixMeasure = /^\s*node\s+[^\n]*bugfix-mode-measure\.ts["']?\s+--campaign\b/.test(params.command);
       const optimizeRunGate = optimizeNotStartedGate(ctx);
       if (optimizeRunGate) return optimizeRunGate as any;
       // The config (and therefore the cap) always lives in ctx.cwd — even when
@@ -338,7 +339,9 @@ export function createRunExperimentTool(deps: RunExperimentToolDeps): RunExperim
         return {
           content: [{
             type: "text",
-            text: `❌ ${benchmarkScriptRel} exists — you must run it instead of a custom command.\n\nFound: ${autoresearchShPath}\nYour command: ${params.command}\n\nUse: run_experiment({ command: "bash ${benchmarkScriptRel}", timeout_seconds: 180 }) or run_experiment({ command: "./${benchmarkScriptRel}", timeout_seconds: 180 })`,
+            text: looksLikeBugfixMeasure
+              ? `❌ The prepared bugfix measurement command is not accepted by this runtime. The installed autoresearch extension is likely stale: run \`pi update https://github.com/fan92rus/pi-autoresearch\` and restart the session.\n\nYour command: ${params.command}`
+              : `❌ ${benchmarkScriptRel} exists — you must run it instead of a custom command.\n\nFound: ${autoresearchShPath}\nYour command: ${params.command}\n\nUse: run_experiment({ command: "bash ${benchmarkScriptRel}", timeout_seconds: 180 }) or run_experiment({ command: "./${benchmarkScriptRel}", timeout_seconds: 180 })`,
           }],
           details: {
             command: params.command,

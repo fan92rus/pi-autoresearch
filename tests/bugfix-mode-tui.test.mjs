@@ -133,6 +133,7 @@ function configureTool(dir) {
     },
     scorerFilePaths: [],
     measureCliPath: path.join(dir, "measure.mjs"),
+    isBugfixMeasureCommand: () => true,
   });
 }
 

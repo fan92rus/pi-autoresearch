@@ -69,6 +69,34 @@ test("parse rejects lookalike commands and unready campaigns", () => {
   }
 });
 
+test("a rejected bugfix-looking command explains the stale-extension cause", async () => {
+  const dir = tempRepo("lookalike");
+  const { pi, tool, command } = createFakePi({
+    dir, sessionId: `bugfix-lookalike-${path.basename(dir)}`, realGit: false,
+  });
+  const ctx = makeCtx(dir, `bugfix-lookalike-${path.basename(dir)}`, pi);
+  const ext = await import(pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")).href);
+  ext.default(pi);
+  fs.mkdirSync(path.join(dir, ".auto"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".auto", "measure.sh"), "#!/bin/sh\necho 'METRIC unrelated=0'\n");
+  await command("autoresearch").handler("bugfix", ctx);
+
+  const result = await tool("run_experiment").execute("id", {
+    command: `node --experimental-strip-types ${path.resolve(os.tmpdir(), "bugfix-mode-measure.ts")} --campaign missing --cwd ${dir}`,
+    timeout_seconds: 30,
+  }, null, null, ctx);
+
+  assert.match(text(result), /stale/, text(result));
+  assert.match(text(result), /pi update/, text(result));
+
+  const unrelated = await tool("run_experiment").execute("id", {
+    command: `node -e "console.log('bugfix-mode-measure.ts')"`,
+    timeout_seconds: 30,
+  }, null, null, ctx);
+  assert.match(text(unrelated), /must run it instead of a custom command/, "mentioning the measurer is not enough");
+  assert.doesNotMatch(text(unrelated), /stale/, text(unrelated));
+});
+
 test("a fresh bugfix campaign runs and logs without init_experiment despite measure.sh", async () => {
   const dir = tempRepo("integration");
   execFileSync("git", ["init"], { cwd: dir, stdio: "pipe" });
