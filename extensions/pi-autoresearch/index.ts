@@ -201,6 +201,7 @@ import {
 } from "./log-experiment-tool.ts";
 import { createRunExperimentTool } from "./run-experiment-tool.ts";
 import { createBugfixModeTool } from "./bugfix-mode-tool.ts";
+import { parseBugfixMeasureCommand } from "./bugfix-mode-store.ts";
 import { createCandidateBranchTool } from "./candidate-branch-tool.ts";
 import { createFinalizeResearchTool } from "./finalize-research-tool.ts";
 import { createAutoresearchCommand } from "./autoresearch-command.ts";
@@ -3887,6 +3888,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     formatElapsed: () => formatElapsed,
     getRuntime: () => getRuntime,
     isAutoresearchShCommand: () => isAutoresearchShCommand,
+    isBugfixCampaignMeasureCommand: () => (
+      command: string,
+      workDir: string,
+    ) => parseBugfixMeasureCommand(command, bugfixMeasureCliPath, workDir).ok,
     optimizeNotStartedGate: () => optimizeNotStartedGate,
     overlayTui: () => overlayTui,
     parseMetricLines: () => parseMetricLines,

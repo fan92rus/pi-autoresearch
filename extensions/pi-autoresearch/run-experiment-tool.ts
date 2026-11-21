@@ -85,6 +85,7 @@ export interface RunExperimentToolDeps {
   formatElapsed: () => (ms: number) => string;
   getRuntime: () => (ctx: ExtensionContext) => any;
   isAutoresearchShCommand: () => (command: string) => boolean;
+  isBugfixCampaignMeasureCommand: () => (command: string, workDir: string) => boolean;
   optimizeNotStartedGate: () => (ctx: ExtensionContext) => any;
   overlayTui: () => { requestRender: () => void } | null;
   parseMetricLines: () => (output: string) => Map<string, number>;
@@ -139,7 +140,8 @@ export function createRunExperimentTool(deps: RunExperimentToolDeps): RunExperim
         execBashScript, getRuntime, optimizeNotStartedGate,
         readExperimentMaxMinutes, readLedgerMaxRun, researchBlockedResponse,
         researchBlocksOrdinaryLoop, resolveWorkDir, updateWidget, validateWorkDir,
-        isAutoresearchShCommand, autoresearchJsonlPath, autoresearchScriptPath,
+        isAutoresearchShCommand, isBugfixCampaignMeasureCommand,
+        autoresearchJsonlPath, autoresearchScriptPath,
         autoresearchChecksPath, writeRunStartedMarkerWithPrefix,
         tryBeginRunIdentity, tryRecordPendingMarker, parseMetricLines,
         formatElapsed, readRunAnalysisConfig,
@@ -160,11 +162,14 @@ export function createRunExperimentTool(deps: RunExperimentToolDeps): RunExperim
           details: {},
         };
       }
-      if (await campaignBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd))) return campaignBlockedResponse();
-      if (await researchBlocksOrdinaryLoop(resolveWorkDir(ctx.cwd), ctx)) return researchBlockedResponse();
+      const workDir = resolveWorkDir(ctx.cwd);
+      if (await campaignBlocksOrdinaryLoop(workDir)) return campaignBlockedResponse();
+      if (await researchBlocksOrdinaryLoop(workDir, ctx)) return researchBlockedResponse();
+      // A prepared bugfix campaign has its own measurer; recognise it only so
+      // the measure.sh guard below can let that exact command through.
+      const isBugfixMeasure = isBugfixCampaignMeasureCommand(params.command, workDir);
       const optimizeRunGate = optimizeNotStartedGate(ctx);
       if (optimizeRunGate) return optimizeRunGate as any;
-      const workDir = resolveWorkDir(ctx.cwd);
       // The config (and therefore the cap) always lives in ctx.cwd — even when
       // workingDir redirects the experiment work elsewhere (see readConfig).
       const expMaxMinutes = readExperimentMaxMinutes(ctx.cwd);
@@ -329,7 +334,7 @@ export function createRunExperimentTool(deps: RunExperimentToolDeps): RunExperim
       // Guard: if the benchmark script exists, only allow running it
       const autoresearchShPath = autoresearchScriptPath(workDir);
       const benchmarkScriptRel = path.relative(workDir, autoresearchShPath) || path.basename(autoresearchShPath);
-      if (fs.existsSync(autoresearchShPath) && !isAutoresearchShCommand(params.command)) {
+      if (fs.existsSync(autoresearchShPath) && !isAutoresearchShCommand(params.command) && !isBugfixMeasure) {
         return {
           content: [{
             type: "text",

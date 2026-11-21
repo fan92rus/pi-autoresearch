@@ -87,6 +87,7 @@ test("getter-only adapter deps follow a mutable late binding", async () => {
     formatElapsed: shared,
     getRuntime: shared,
     isAutoresearchShCommand: shared,
+    isBugfixCampaignMeasureCommand: shared,
     optimizeNotStartedGate: shared,
     overlayTui: () => null,
     parseMetricLines: shared,

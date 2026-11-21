@@ -20,6 +20,7 @@ import {
 } from "./bugfix-mode.ts";
 import {
   appendRow,
+  bugfixMeasureCommand,
   campaignDir,
   DECISIONS_FILE,
   EVIDENCE_FILE,
@@ -151,7 +152,7 @@ export function createBugfixModeTool(deps: BugfixModeToolDeps): ToolLike {
         const hashes = hashMeasurementFiles(deps.scorerFilePaths, workDir);
         const written = writeStoredConfig(workDir, campaignId, config.value, hashes);
         if (!written.ok) return refusal(written.error, "campaign_exists");
-        const command = `node --experimental-strip-types "${deps.measureCliPath}" --campaign ${campaignId} --cwd "${workDir}"`;
+        const command = bugfixMeasureCommand(deps.measureCliPath, campaignId, workDir);
         return reply(
           `Bugfix campaign ${campaignId} prepared at ${written.value.filePath}.\n` +
           `Run it with run_experiment({ command: ${JSON.stringify(command)}, timeout_seconds: 600 }).\n` +

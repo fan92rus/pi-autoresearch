@@ -32,6 +32,50 @@ export function campaignDir(workDir: string, campaignId: unknown): string | null
   return path.join(campaignRoot(workDir), campaignId);
 }
 
+/** The exact command emitted by bugfix_mode prepare for a campaign. */
+export function bugfixMeasureCommand(measureCliPath: string, campaignId: string, workDir: string): string {
+  return `node --experimental-strip-types ${JSON.stringify(measureCliPath)} --campaign ${campaignId} --cwd ${JSON.stringify(workDir)}`;
+}
+
+/**
+ * Recognise only the canonical measurement command of an actually prepared
+ * campaign. A generic `node ...` allowlist would let any script masquerade as
+ * the bugfix scorer, so the CLI path, campaign id, cwd and stored config must
+ * all agree. The comparison is token-based (JSON-quoted paths survive spaces
+ * and Windows backslashes); chaining flags are rejected by the anchored shape.
+ */
+export function parseBugfixMeasureCommand(
+  command: string,
+  measureCliPath: string,
+  workDir: string,
+): { ok: true; campaignId: string } | { ok: false; reason: string } {
+  if (typeof command !== "string") return { ok: false, reason: "command: expected a string" };
+  const match = /^node\s+--experimental-strip-types\s+("(?:[^"\\]|\\.)*")\s+--campaign\s+([A-Za-z0-9._-]{1,64})\s+--cwd\s+("(?:[^"\\]|\\.)*")$/.exec(command.trim());
+  if (!match) return { ok: false, reason: "command: not a bugfix campaign measurement command" };
+  let cliPath: unknown;
+  let cliCwd: unknown;
+  try {
+    cliPath = JSON.parse(match[1]);
+    cliCwd = JSON.parse(match[3]);
+  } catch {
+    return { ok: false, reason: "command: invalid quoted path" };
+  }
+  if (typeof cliPath !== "string" || path.resolve(cliPath) !== path.resolve(measureCliPath)) {
+    return { ok: false, reason: "command: wrong measurer path" };
+  }
+  if (typeof cliCwd !== "string" || path.resolve(cliCwd) !== path.resolve(workDir)) {
+    return { ok: false, reason: "command: wrong working directory" };
+  }
+  const campaignId = match[2];
+  if (command.trim() !== bugfixMeasureCommand(measureCliPath, campaignId, workDir)) {
+    return { ok: false, reason: "command: non-canonical measurement command" };
+  }
+  if (!readStoredConfig(workDir, campaignId).ok) {
+    return { ok: false, reason: `campaign ${campaignId} is not prepared or its config is invalid` };
+  }
+  return { ok: true, campaignId };
+}
+
 function fileHash(filePath: string): string {
   try {
     return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
