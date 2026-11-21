@@ -731,6 +731,10 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
           ctx.ui.notify("Finish the active expedition before starting a bugfix campaign.", "info");
           return;
         }
+        if (runtime.autoresearchMode && runtime.researchChain && runtime.researchChain.expedition !== true) {
+          ctx.ui.notify("Finish the active research campaign before starting a bugfix campaign.", "info");
+          return;
+        }
         const workDir = deps.resolveWorkDir(ctx.cwd);
         if (!runtime.autoresearchMode) {
           deps.clearPersistedOffMarker(workDir);

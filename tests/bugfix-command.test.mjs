@@ -26,7 +26,7 @@ async function harness(dir) {
   const ctx = makeCtx(dir, `bugfix-command-${path.basename(dir)}`, pi);
   const ext = await import(pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")).href);
   ext.default(pi);
-  return { pi, tool, command, ctx };
+  return { pi, tool, command, ctx, ext };
 }
 
 test("bugfix is registered in help and TAB completion", () => {
@@ -59,6 +59,24 @@ test("/autoresearch bugfix turns on the gated tools and sends the proof-cycle ki
 
   const after = await h.tool("bugfix_mode").execute("id", { action: "prepare", campaignId: "bad id" }, null, null, h.ctx);
   assert.equal(after.details?.reason, "invalid_campaign_id", "the gated tool is callable after the command");
+});
+
+test("bugfix refuses to start while a non-expedition research chain is active", async () => {
+  const dir = workdir();
+  const h = await harness(dir);
+  await h.command("autoresearch").handler("on", h.ctx);
+  const rt = h.ext.runtimeForTest(h.ctx);
+  rt.researchChain = {
+    chainId: "manual-chain", workDir: dir, charterPath: "charter.md",
+    charterSha256: "0".repeat(64), charter: { stop_rules: [] },
+  };
+  const messagesBefore = h.pi.sentMessages.length;
+
+  await h.command("autoresearch").handler("bugfix ignored", h.ctx);
+
+  assert.equal(h.pi.sentMessages.length, messagesBefore, "no bugfix kickoff while a research campaign is active");
+  assert.ok(h.pi.notifications.some((n) => /Finish the active research campaign before starting a bugfix campaign/.test(n.text)),
+    "the user is told why the bugfix launch was refused");
 });
 
 test("bugfix refuses to activate when the ledger header cannot be written", async () => {
