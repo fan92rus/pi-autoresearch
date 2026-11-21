@@ -58,30 +58,104 @@ export function getBashSpawnOptions(): { shell: string; spawnArgs: string[]; det
  * killed the immediate bash child, leaving the benchmark (go test, python, ...)
  * running as an orphan indefinitely.
  */
-export function killTree(pid: number): void {
-  if (process.platform === "win32") {
+export type KillTreeReason =
+  | "killed"
+  | "already_gone"
+  | "spawn_failed"
+  | "command_failed"
+  | "timeout"
+  | "unverified";
+
+export interface KillTreeOutcome {
+  ok: boolean;
+  verified: boolean;
+  reason: KillTreeReason;
+}
+
+interface KillTreeDeps {
+  platform: NodeJS.Platform;
+  spawn: typeof spawn;
+  isAlive: (pid: number) => boolean;
+  timeoutMs: number;
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the process exists but is not signalable by this user.
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+const killTreeDefaults: KillTreeDeps = {
+  platform: process.platform,
+  spawn,
+  isAlive: processIsAlive,
+  timeoutMs: 2000,
+};
+
+export async function killTree(pid: number, deps: Partial<KillTreeDeps> = {}): Promise<KillTreeOutcome> {
+  const d = { ...killTreeDefaults, ...deps };
+
+  if (d.platform === "win32") {
     // Use taskkill on Windows to kill the process tree.
     // /F = force, /T = kill child processes (tree), /PID = target
+    let child: ReturnType<typeof spawn>;
     try {
-      spawn("taskkill", ["/F", "/T", "/PID", String(pid)], {
+      child = d.spawn("taskkill", ["/F", "/T", "/PID", String(pid)], {
         stdio: "ignore",
         detached: true,
         windowsHide: true,
       });
     } catch {
-      // Ignore errors if taskkill fails
+      return { ok: false, verified: false, reason: "spawn_failed" };
     }
-  } else {
-    // Unix: SIGKILL the process group (negative PID).
-    // SIGKILL (not SIGTERM) — cannot be caught/ignored, guarantees death.
+
+    return await new Promise<KillTreeOutcome>((resolve) => {
+      let settled = false;
+      const finish = (outcome: KillTreeOutcome): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(outcome);
+      };
+      const timer = setTimeout(
+        () => finish({ ok: false, verified: false, reason: "timeout" }),
+        d.timeoutMs,
+      );
+      child.once("error", () => finish({ ok: false, verified: false, reason: "spawn_failed" }));
+      child.once("close", (code) => {
+        if (code !== 0) {
+          finish({ ok: false, verified: false, reason: "command_failed" });
+          return;
+        }
+        const alive = d.isAlive(pid);
+        finish(
+          alive
+            ? { ok: true, verified: false, reason: "unverified" }
+            : { ok: true, verified: true, reason: "killed" },
+        );
+      });
+    });
+  }
+
+  // Unix: SIGKILL the process group (negative PID).
+  // SIGKILL (not SIGTERM) — cannot be caught/ignored, guarantees death.
+  let alreadyGone = false;
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
     try {
-      process.kill(-pid, "SIGKILL");
-    } catch {
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch {
-        // Process already dead
-      }
+      process.kill(pid, "SIGKILL");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") alreadyGone = true;
     }
   }
+  if (alreadyGone) return { ok: true, verified: true, reason: "already_gone" };
+  const alive = d.isAlive(pid);
+  return alive
+    ? { ok: true, verified: false, reason: "unverified" }
+    : { ok: true, verified: true, reason: "killed" };
 }
