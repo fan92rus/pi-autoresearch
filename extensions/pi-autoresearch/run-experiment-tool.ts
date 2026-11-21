@@ -528,10 +528,33 @@ export function createRunExperimentTool(deps: RunExperimentToolDeps): RunExperim
 
         // Timeout
         let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+        let terminationFallbackHandle: ReturnType<typeof setTimeout> | undefined;
+        let terminationReason = "killTree result pending";
         if (timeout > 0) {
           timeoutHandle = setTimeout(() => {
             processTimedOut = true;
-            if (child.pid) killTree(child.pid);
+            if (child.pid) {
+              try {
+                Promise.resolve(killTree(child.pid))
+                  .then((outcome) => {
+                    if (outcome?.reason) terminationReason = outcome.reason;
+                    if (outcome?.verified === true) terminationReason = "verified";
+                  })
+                  .catch((e) => { terminationReason = `killTree rejected: ${String(e)}`; });
+              } catch (e) {
+                terminationReason = `killTree threw: ${String(e)}`;
+              }
+            } else {
+              terminationReason = "no child pid";
+            }
+            // killTree is best-effort. If the child survives it, close never
+            // fires; bound the wait and reject instead of hanging the tool.
+            try { child.kill("SIGKILL"); } catch { /* already gone */ }
+            terminationFallbackHandle = setTimeout(() => {
+              reject(new Error(
+                `experiment timeout after ${timeout}ms: child termination unverified (${terminationReason})`,
+              ));
+            }, 1000);
           }, timeout);
         }
 
@@ -558,6 +581,7 @@ export function createRunExperimentTool(deps: RunExperimentToolDeps): RunExperim
         child.on("error", (err) => {
           clearInterval(timerInterval);
           if (timeoutHandle) clearTimeout(timeoutHandle);
+          if (terminationFallbackHandle) clearTimeout(terminationFallbackHandle);
           if (signal) signal.removeEventListener("abort", onAbort);
           reject(err);
         });
@@ -565,6 +589,7 @@ export function createRunExperimentTool(deps: RunExperimentToolDeps): RunExperim
         child.on("close", (code) => {
           clearInterval(timerInterval);
           if (timeoutHandle) clearTimeout(timeoutHandle);
+          if (terminationFallbackHandle) clearTimeout(terminationFallbackHandle);
           if (signal) signal.removeEventListener("abort", onAbort);
           if (signal?.aborted) {
             reject(new Error("aborted"));

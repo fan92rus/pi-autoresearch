@@ -731,15 +731,26 @@ export interface CandidateExecResult {
   stdout: string;
   stderr: string;
   killed: boolean;
+  /** Set only after a timeout: whether killTree confirmed the child was gone. */
+  termination?: "verified" | "unverified";
+}
+
+interface TerminationOutcome {
+  verified?: boolean;
+  reason?: string;
 }
 
 export function createCandidateExecRunner(
   spawn: typeof SpawnFn,
-  killTree: (pid: number) => void,
+  killTree: (pid: number) => TerminationOutcome | Promise<TerminationOutcome>,
   env: NodeJS.ProcessEnv,
 ): (argv: string[], opts: CandidateExecOptions) => Promise<CandidateExecResult> {
   return (argv, opts) => new Promise((resolve) => {
     let timedOut = false;
+    let terminationStarted = false;
+    let terminationVerified = false;
+    let terminationReason = "killTree result pending";
+    let fallbackHandle: ReturnType<typeof setTimeout> | undefined;
     const child = spawn(argv[0], argv.slice(1), {
       cwd: opts.cwd,
       stdio: ["ignore", "pipe", "pipe"],
@@ -748,18 +759,75 @@ export function createCandidateExecRunner(
     });
     let stdout = "";
     let stderr = "";
+    const settle = (result: CandidateExecResult): void => {
+      if (fallbackHandle) clearTimeout(fallbackHandle);
+      resolve(result);
+    };
+    const terminationNote = (): string =>
+      `\n[termination] killTree ${terminationReason}; child termination not verified`;
+    const beginTermination = (): void => {
+      if (terminationStarted) return;
+      terminationStarted = true;
+      if (child.pid) {
+        try {
+          const outcome = killTree(child.pid);
+          Promise.resolve(outcome)
+            .then((o) => {
+              if (o?.verified === true) {
+                terminationVerified = true;
+                terminationReason = "verified";
+              } else if (o?.reason) {
+                terminationReason = o.reason;
+              }
+            })
+            .catch((e) => { terminationReason = `killTree rejected: ${String(e)}`; });
+        } catch (e) {
+          terminationReason = `killTree threw: ${String(e)}`;
+        }
+      } else {
+        terminationReason = "no child pid";
+      }
+      // killTree is best-effort on Windows. A SIGKILL fallback plus a finite
+      // deadline keep the timeout bounded even when the tree survives it.
+      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      fallbackHandle = setTimeout(() => {
+        settle({
+          code: 124,
+          stdout,
+          stderr: stderr + terminationNote(),
+          killed: true,
+          termination: "unverified",
+        });
+      }, 1000);
+    };
     const timeoutHandle = opts.timeoutMs && opts.timeoutMs > 0
-      ? setTimeout(() => { timedOut = true; if (child.pid) killTree(child.pid); }, opts.timeoutMs)
+      ? setTimeout(() => { timedOut = true; beginTermination(); }, opts.timeoutMs)
       : undefined;
     child.stdout?.on("data", (d: Buffer) => { stdout += d.toString(); });
     child.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
     child.on("error", (err) => {
       if (timeoutHandle) clearTimeout(timeoutHandle);
-      resolve({ code: 127, stdout, stderr: stderr + String(err), killed: false });
+      settle({ code: 127, stdout, stderr: stderr + String(err), killed: false });
     });
     child.on("close", (code) => {
       if (timeoutHandle) clearTimeout(timeoutHandle);
-      resolve({ code: code ?? 1, stdout, stderr, killed: timedOut });
+      if (terminationStarted && !terminationVerified) {
+        settle({
+          code: 124,
+          stdout,
+          stderr: stderr + terminationNote(),
+          killed: true,
+          termination: "unverified",
+        });
+        return;
+      }
+      settle({
+        code: code ?? 1,
+        stdout,
+        stderr,
+        killed: timedOut,
+        termination: terminationStarted ? "verified" : undefined,
+      });
     });
   });
 }
