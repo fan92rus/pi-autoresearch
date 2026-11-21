@@ -9,7 +9,9 @@ import { Type } from "@sinclair/typebox";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { loadTree, saveTree } from "./parallel/tree.ts";
 import {
+  BUGFIX_METRIC_VERSION,
   DISCOVERY_CHECKS,
   PROOF_CHECKS,
   inspectEvidence,
@@ -162,6 +164,13 @@ export function createBugfixModeTool(deps: BugfixModeToolDeps): ToolLike {
             "Run `pi update https://github.com/fan92rus/pi-autoresearch` and restart the session before preparing a campaign.",
             "stale_extension",
           );
+        }
+        // Bugfix campaigns log through bugfix_mode, not init_experiment, so
+        // the tree's metric label would otherwise keep naming an older
+        // campaign scale in tree_status and the dashboard.
+        const tree = loadTree(workDir);
+        if (tree && tree.metricName !== BUGFIX_METRIC_VERSION) {
+          saveTree(workDir, { ...tree, metricName: BUGFIX_METRIC_VERSION });
         }
         return reply(
           `Bugfix campaign ${campaignId} prepared at ${written.value.filePath}.\n` +
