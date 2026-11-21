@@ -551,9 +551,10 @@ export function createRunExperimentTool(deps: RunExperimentToolDeps): RunExperim
             // fires; bound the wait and reject instead of hanging the tool.
             try { child.kill("SIGKILL"); } catch { /* already gone */ }
             terminationFallbackHandle = setTimeout(() => {
-              reject(new Error(
-                `experiment timeout after ${timeout}ms: child termination unverified (${terminationReason})`,
-              ));
+              finish(
+                null,
+                `\n[termination] killTree ${terminationReason}; child termination not verified`,
+              );
             }, 1000);
           }, timeout);
         }
@@ -586,7 +587,10 @@ export function createRunExperimentTool(deps: RunExperimentToolDeps): RunExperim
           reject(err);
         });
 
-        child.on("close", (code) => {
+        let finished = false;
+        const finish = (code: number | null, note?: string): void => {
+          if (finished) return;
+          finished = true;
           clearInterval(timerInterval);
           if (timeoutHandle) clearTimeout(timeoutHandle);
           if (terminationFallbackHandle) clearTimeout(terminationFallbackHandle);
@@ -596,13 +600,19 @@ export function createRunExperimentTool(deps: RunExperimentToolDeps): RunExperim
             return;
           }
 
+          if (note) {
+            const noteBuffer = Buffer.from(note, "utf-8");
+            outputSink.write(noteBuffer);
+            chunks.push(noteBuffer);
+          }
           const fullBuffer = Buffer.concat(chunks);
           resolve({
             exitCode: code,
             killed: processTimedOut,
             output: fullBuffer.toString("utf-8"),
           });
-        });
+        };
+        child.on("close", (code) => finish(code));
       }).finally(() => {
         outputSink.close();
         // Task 1.3: manifest AFTER the sink close — output.txt must be
