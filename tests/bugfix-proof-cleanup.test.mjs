@@ -47,7 +47,11 @@ test("proof exception cleans up all registered worktrees", async () => {
       const command = args[1] ?? "";
       const ok = (stdout = "") => ({ stdout, stderr: "", code: 0, killed: false });
       if (command.startsWith("git status")) return ok();
-      if (command.startsWith("git rev-parse --verify")) return ok("aaaaaaaaaaaaaaaaaaaa\n");
+      if (command.startsWith("git rev-parse --verify")) {
+        const ref = (command.match(/--verify "([^"]+)"/)?.[1] ?? "").replace(/\^\{commit\}$/, "");
+        const tag = ref.startsWith("a") ? "a" : ref.startsWith("b") ? "b" : "c";
+        return ok(`${tag.repeat(20)}\n`);
+      }
       if (command.startsWith("git worktree add")) {
         const target = command.match(/"([^"]+)"/)[1];
         fs.mkdirSync(target, { recursive: true });

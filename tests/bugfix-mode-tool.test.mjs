@@ -145,7 +145,11 @@ test("checkout and prune failures block evidence and leave no worktree behind", 
       const ok = (stdout = "") => ({ stdout, stderr: "", code: 0, killed: false });
       const bad = (stderr = "") => ({ stdout: "", stderr, code: 1, killed: false });
       if (command.startsWith("git status")) return ok();
-      if (command.startsWith("git rev-parse --verify")) return ok(`${mode.branch}${mode.branch}\n`);
+      if (command.startsWith("git rev-parse --verify")) {
+        const ref = (command.match(/--verify "([^"]+)"/)?.[1] ?? "").replace(/\^\{commit\}$/, "");
+        const tag = ref === "defect-state" ? "a" : ref === "fixed-state" ? "b" : "c";
+        return ok(`${tag}${mode.branch}${tag}${mode.branch}\n`);
+      }
       if (command.startsWith("git worktree add")) {
         const target = command.match(/"([^"]+)"/)[1];
         fs.mkdirSync(target, { recursive: true });

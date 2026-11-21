@@ -227,6 +227,12 @@ export function createBugfixModeTool(deps: BugfixModeToolDeps): ToolLike {
           }
           stateRefs[name] = resolved.stdout.trim();
         }
+        if (new Set(Object.values(stateRefs)).size !== names.length) {
+          return refusal(
+            `proof states must resolve to distinct commits; got ${names.map((name) => `${name}=${stateRefs[name].slice(0, 8)}`).join(", ")}`,
+            "state_refs_not_distinct",
+          );
+        }
         const commands = stored.value.config.proofCommands;
         const timeout = Math.max(1, Math.min(600, Math.floor(params.timeoutSeconds ?? 120)));
         type Check = { name: string; command: string; exitCode: number; output: string; killed: boolean };
