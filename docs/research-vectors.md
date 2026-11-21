@@ -79,7 +79,7 @@ the appropriate alias. The `/autoresearch research ...` slash command is unchang
 - While the research phase runs, the ordinary loop (`init_experiment`,
   `run_experiment`, `log_experiment`, `propose_hypothesis`,
   `finalize_research`), `candidate_branch`, all `council_*` tools and
-  the legacy `/autoresearch` flows (council, finalize, parallel-*) are
+  the legacy `/autoresearch` flows (council, finalize) are
   refused. Note-taking, measurement, analysis and precedent tools
   (`inspect_results`, `tree_status`, `record_finding`,
   `update_finding`, `log_observation`, `log_measurement_change`,
