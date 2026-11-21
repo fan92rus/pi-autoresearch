@@ -11,6 +11,7 @@ export interface Subcommand {
 
 export const SUBCOMMANDS: readonly Subcommand[] = [
   { name: "off", description: "Leave autoresearch mode." },
+  { name: "on", description: "Turn autoresearch mode back on (fresh launch or restore a saved ledger)." },
   { name: "continue", description: "Resume the previous autoresearch ledger. A plain /autoresearch <goal> starts fresh." },
   { name: "research", description: "Start a research campaign (briefing via research_brief; supports headless launch)." },
   { name: "expedition", description: "Start a research expedition (map of directions; headless launch supported)." },
