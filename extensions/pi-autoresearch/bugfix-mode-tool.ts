@@ -9,7 +9,7 @@ import { Type } from "@sinclair/typebox";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { loadTree, saveTree } from "./parallel/tree.ts";
+import { loadTree, saveTree, treeFilePath, type ExperimentTree } from "./parallel/tree.ts";
 import {
   BUGFIX_METRIC_VERSION,
   DISCOVERY_CHECKS,
@@ -52,6 +52,8 @@ export interface BugfixModeToolDeps {
   measureCliPath: string;
   /** Same predicate run_experiment uses; catches a stale installed runtime early. */
   isBugfixMeasureCommand: (command: string, workDir: string) => boolean;
+  /** Optional deterministic fault-injection seam; production leaves it unset. */
+  saveExperimentTree?: (workDir: string, tree: ExperimentTree) => void;
 }
 
 const SEVERITIES: readonly Severity[] = ["P1", "P2", "P3"];
@@ -170,7 +172,18 @@ export function createBugfixModeTool(deps: BugfixModeToolDeps): ToolLike {
         // campaign scale in tree_status and the dashboard.
         const tree = loadTree(workDir);
         if (tree && tree.metricName !== BUGFIX_METRIC_VERSION) {
-          saveTree(workDir, { ...tree, metricName: BUGFIX_METRIC_VERSION });
+          const treeBefore = JSON.stringify(tree);
+          try {
+            const writeTree = deps.saveExperimentTree ?? saveTree;
+            writeTree(workDir, { ...tree, metricName: BUGFIX_METRIC_VERSION });
+          } catch (e) {
+            fs.writeFileSync(treeFilePath(workDir), treeBefore, "utf8");
+            fs.rmSync(written.value.dir, { recursive: true, force: true });
+            return refusal(
+              `Failed to relabel the experiment tree; campaign state rolled back: ${e instanceof Error ? e.message : String(e)}`,
+              "tree_relabel_failed",
+            );
+          }
         }
         return reply(
           `Bugfix campaign ${campaignId} prepared at ${written.value.filePath}.\n` +
