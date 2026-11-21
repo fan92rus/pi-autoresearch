@@ -138,12 +138,16 @@ export function createFinalizeResearchTool(deps: FinalizeResearchToolDeps): Fina
         deps.assertModeActive(ctx);
       }
 
+      // state.bestMetric is the restored epoch baseline, not the best keep.
+      // Compute one epoch-scoped best and use it everywhere so the ledger,
+      // reply and owner-facing steer cannot disagree across measurement epochs.
+      const epochBest = findBestMetric(state.results, state.currentSegment, state.bestDirection) ?? state.bestMetric;
       const entry = {
         type: "finalize",
         reason: params.reason,
         evidence: params.evidence ?? "",
         confidence: conf,
-        best_metric: state.bestMetric,
+        best_metric: epochBest,
         run_count: state.results.length,
         timestamp: Date.now(),
       };
@@ -175,14 +179,7 @@ export function createFinalizeResearchTool(deps: FinalizeResearchToolDeps): Fina
         `   Reason: ${params.reason}\n` +
         `   Confidence: ${(conf * 100).toFixed(0)}%\n` +
         (params.evidence ? `   Evidence: ${params.evidence.slice(0, 200)}\n` : "") +
-        `   Best ${state.metricName}: ${(() => {
-          const keeps = state.results.filter((r) => r.status === "keep" && r.metric !== 0);
-          const lastSegment = keeps.at(-1)?.segment ?? state.currentSegment;
-          const best = findBestMetric(state.results, lastSegment, state.bestDirection)
-            ?? keeps.reduce<number | null>((acc, r) => acc === null || (state.bestDirection === "lower" ? r.metric < acc : r.metric > acc) ? r.metric : acc, null)
-            ?? state.bestMetric;
-          return best !== null ? formatNum(best, state.metricUnit) : "?";
-        })()}\n` +
+        `   Best ${state.metricName}: ${epochBest !== null ? formatNum(epochBest, state.metricUnit) : "?"}\n` +
         `   Total runs: ${state.results.length}\n` +
         reportNote + `\n\n` +
         `   Run /autoresearch off to finalize, or continue if you disagree.`,
@@ -191,7 +188,7 @@ export function createFinalizeResearchTool(deps: FinalizeResearchToolDeps): Fina
 
       return {
         content: [{ type: "text", text: `${expeditionNote ? `${expeditionNote}\n` : ""}${archiveNote ? `${archiveNote}\n` : ""}🏁 Finalize signal recorded (confidence=${conf}). The observer will now recommend /autoresearch off in its steers.${reportNote}` }],
-        details: { finalized: true, confidence: conf, bestMetric: state.bestMetric, reportPath, expeditionNote: expeditionNote || undefined },
+        details: { finalized: true, confidence: conf, bestMetric: epochBest, reportPath, expeditionNote: expeditionNote || undefined },
       };
     },
   };
