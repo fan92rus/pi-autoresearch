@@ -32,9 +32,15 @@ export function campaignDir(workDir: string, campaignId: unknown): string | null
   return path.join(campaignRoot(workDir), campaignId);
 }
 
-/** The exact command emitted by bugfix_mode prepare for a campaign. */
+/**
+ * The exact command emitted by bugfix_mode prepare for a campaign.
+ * POSIX-style paths are intentional: Node accepts them on Windows and they
+ * survive a second JSON/tool-call serialisation without collapsing escapes.
+ */
 export function bugfixMeasureCommand(measureCliPath: string, campaignId: string, workDir: string): string {
-  return `node --experimental-strip-types ${JSON.stringify(measureCliPath)} --campaign ${campaignId} --cwd ${JSON.stringify(workDir)}`;
+  const cli = measureCliPath.replace(/\\/g, "/");
+  const cwd = workDir.replace(/\\/g, "/");
+  return `node --experimental-strip-types ${JSON.stringify(cli)} --campaign ${campaignId} --cwd ${JSON.stringify(cwd)}`;
 }
 
 /**
