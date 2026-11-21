@@ -8,6 +8,8 @@
  */
 
 export const BUGFIX_METRIC_VERSION = "bugfix_score_v2";
+export const BUGFIX_METRIC_UNIT = "score";
+export const BUGFIX_METRIC_DIRECTION = "higher";
 
 /** Weights and penalties of this metric version. Changing them requires a new version. */
 /** Legacy v1 weights, kept only so the version bump is explicit and reviewable. */

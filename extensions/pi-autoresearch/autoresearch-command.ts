@@ -24,6 +24,14 @@ import { listResearchCampaignIds } from "./research-scan.ts";
 import { filterSubcommands, applyExperimentLimitArg, configureExperimentLimit, interactiveParallelConfig } from "./parallel/config-ui.ts";
 import type { BoundTestHooks } from "./test-hooks.ts";
 import type { ModeTransition } from "./index.ts";
+import { BUGFIX_METRIC_DIRECTION, BUGFIX_METRIC_UNIT, BUGFIX_METRIC_VERSION } from "./bugfix-mode.ts";
+
+export type ExperimentStartConfig = {
+  name: string;
+  metricName: string;
+  metricUnit: string;
+  bestDirection: "lower" | "higher";
+};
 
 /** Shared guard/notice wording: the command and the direct expedition_brief
  *  propose path must refuse and notify with exactly the same text. */
@@ -64,7 +72,7 @@ export interface AutoresearchCommandDeps {
   researchBlocksOrdinaryLoop: (workDir: string, ctx?: ExtensionContext) => Promise<boolean>;
   researchCampaignExists: (workDir: string, ctx?: ExtensionContext) => boolean;
   resolveWorkDir: (cwd: string) => string;
-  resetStateForNewLaunch: (ctx: ExtensionContext) => void;
+  resetStateForNewLaunch: (ctx: ExtensionContext, experiment?: ExperimentStartConfig) => string | null;
   saveDeadEnds: (workDir: string) => void;
   sendChainContinuation: (ctx: ExtensionContext, parentCampaignId: string) => Promise<void>;
   sendWhenReady: (ctx: ExtensionContext, message: string, opts?: { steerIfBusy?: boolean }) => void;
@@ -723,8 +731,8 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
           ctx.ui.notify("Finish the active expedition before starting a bugfix campaign.", "info");
           return;
         }
+        const workDir = deps.resolveWorkDir(ctx.cwd);
         if (!runtime.autoresearchMode) {
-          const workDir = deps.resolveWorkDir(ctx.cwd);
           deps.clearPersistedOffMarker(workDir);
           const researchGate = await deps.ordinaryLaunchResearchGate(workDir, ctx);
           if (researchGate !== "none") {
@@ -735,7 +743,20 @@ export function createAutoresearchCommand(deps: AutoresearchCommandDeps): (pi: E
             ctx.ui.notify("Candidate campaign active — continue it with candidate_branch status; the bugfix kickoff is not sent.", "info");
             return;
           }
-          deps.resetStateForNewLaunch(ctx);
+          // Seed the usual ledger session directly: the bugfix kickoff skips
+          // optimize_brief/init_experiment but still needs the right metric and
+          // direction for run_experiment/log_experiment. An already-active
+          // session keeps its own state; re-entry only sends the kickoff.
+          const startError = deps.resetStateForNewLaunch(ctx, {
+            name: "bugfix",
+            metricName: BUGFIX_METRIC_VERSION,
+            metricUnit: BUGFIX_METRIC_UNIT,
+            bestDirection: BUGFIX_METRIC_DIRECTION,
+          });
+          if (startError) {
+            ctx.ui.notify(startError, "error");
+            return;
+          }
           deps.recordAutoresearchActivation(workDir, true);
           deps.transitionAutoresearchMode(ctx, { enabled: true, uiMode: "optimization" });
           ctx.ui.notify("Bugfix mode ON — bugfix_mode tools are available", "info");

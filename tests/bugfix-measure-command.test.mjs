@@ -61,19 +61,21 @@ test("parse rejects lookalike commands and unready campaigns", () => {
     bugfixMeasureCommand(path.resolve(os.tmpdir(), "other-measure.ts"), "campaign1", dir),
     bugfixMeasureCommand(cli, "campaign1", tempRepo("wrong-cwd")),
     command.replace("--experimental-strip-types", "--experimental-strip-types --eval"),
+    ` ${command}`,
+    `${command} `,
   ];
   for (const bad of rejected) {
     assert.equal(parseBugfixMeasureCommand(bad, cli, dir).ok, false, `must reject: ${bad}`);
   }
 });
 
-test("the real run_experiment accepts a prepared bugfix command despite measure.sh", async () => {
+test("a fresh bugfix campaign runs and logs without init_experiment despite measure.sh", async () => {
   const dir = tempRepo("integration");
   execFileSync("git", ["init"], { cwd: dir, stdio: "pipe" });
   execFileSync("git", ["config", "user.name", "Test"], { cwd: dir, stdio: "pipe" });
   execFileSync("git", ["config", "user.email", "t@t.com"], { cwd: dir, stdio: "pipe" });
   const { pi, tool, command } = createFakePi({
-    dir, sessionId: `bugfix-measure-${path.basename(dir)}`, realGit: true, optimizeFixture: true,
+    dir, sessionId: `bugfix-measure-${path.basename(dir)}`, realGit: true,
   });
   const ctx = makeCtx(dir, `bugfix-measure-${path.basename(dir)}`, pi);
   const ext = await import(pathToFileURL(path.join(import.meta.dirname, "..", "extensions", "pi-autoresearch", "index.ts")).href);
@@ -88,9 +90,11 @@ test("the real run_experiment accepts a prepared bugfix command despite measure.
   execFileSync("git", ["commit", "-m", "init"], { cwd: dir, stdio: "pipe" });
 
   await command("autoresearch").handler("bugfix integration", ctx);
-  await tool("init_experiment").execute("id", {
-    name: "bugfix", metric_name: "bugfix_score_v2", metric_unit: "score", direction: "higher",
-  }, null, null, ctx);
+  const ledgerBeforeRun = fs.readFileSync(path.join(dir, ".auto", "log.jsonl"), "utf8");
+  assert.match(ledgerBeforeRun, /"name":"bugfix"/, "bugfix launch seeded the session name");
+  assert.match(ledgerBeforeRun, /"metricName":"bugfix_score_v2"/, "bugfix launch seeded the ledger header");
+  assert.match(ledgerBeforeRun, /"metricUnit":"score"/, "bugfix metric unit is score");
+  assert.match(ledgerBeforeRun, /"bestDirection":"higher"/, "bugfix metric is higher-is-better");
   const prepared = await tool("bugfix_mode").execute("id", { action: "prepare", campaignId: "campaign1", config }, null, null, ctx);
   assert.equal(prepared.details?.reason, undefined, text(prepared));
   const bugfixCommand = prepared.details?.command;
@@ -107,12 +111,18 @@ test("the real run_experiment accepts a prepared bugfix command despite measure.
   assert.doesNotMatch(text(run), /must run it instead of a custom command/, text(run));
   assert.equal(run.details?.parsedMetrics?.suite_exit, 0, "bugfix measurer ran through run_experiment");
 
+  const measured = run.details?.parsedMetrics?.bugfix_score_v2;
+  assert.equal(typeof measured, "number", "bugfix measurer emitted a bugfix_score_v2 METRIC line");
+  assert.ok(Number.isFinite(measured), "the parsed bugfix score is finite");
   const logged = await tool("log_experiment").execute("id", {
-    metric: run.details?.parsedMetrics?.bugfix_score_v2 ?? 0,
+    metric: measured,
     status: "keep",
     description: "bugfix campaign measurement",
   }, null, null, ctx);
   assert.match(text(logged), /keep/, text(logged));
   const ledger = fs.readFileSync(path.join(dir, ".auto", "log.jsonl"), "utf8");
   assert.match(ledger, /bugfix campaign measurement/, "measurement is in the durable ledger");
+  const lastRow = JSON.parse(ledger.trim().split("\n").at(-1));
+  assert.equal(lastRow.status, "keep", "the measured run is stored as a keep");
+  assert.equal(lastRow.metric, measured, "the parsed bugfix score is the kept metric");
 });

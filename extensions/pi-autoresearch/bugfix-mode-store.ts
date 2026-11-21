@@ -50,7 +50,7 @@ export function parseBugfixMeasureCommand(
   workDir: string,
 ): { ok: true; campaignId: string } | { ok: false; reason: string } {
   if (typeof command !== "string") return { ok: false, reason: "command: expected a string" };
-  const match = /^node\s+--experimental-strip-types\s+("(?:[^"\\]|\\.)*")\s+--campaign\s+([A-Za-z0-9._-]{1,64})\s+--cwd\s+("(?:[^"\\]|\\.)*")$/.exec(command.trim());
+  const match = /^node\s+--experimental-strip-types\s+("(?:[^"\\]|\\.)*")\s+--campaign\s+([A-Za-z0-9._-]{1,64})\s+--cwd\s+("(?:[^"\\]|\\.)*")$/.exec(command);
   if (!match) return { ok: false, reason: "command: not a bugfix campaign measurement command" };
   let cliPath: unknown;
   let cliCwd: unknown;
@@ -67,7 +67,7 @@ export function parseBugfixMeasureCommand(
     return { ok: false, reason: "command: wrong working directory" };
   }
   const campaignId = match[2];
-  if (command.trim() !== bugfixMeasureCommand(measureCliPath, campaignId, workDir)) {
+  if (command !== bugfixMeasureCommand(measureCliPath, campaignId, workDir)) {
     return { ok: false, reason: "command: non-canonical measurement command" };
   }
   if (!readStoredConfig(workDir, campaignId).ok) {

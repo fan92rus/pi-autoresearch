@@ -204,7 +204,7 @@ import { createBugfixModeTool } from "./bugfix-mode-tool.ts";
 import { parseBugfixMeasureCommand } from "./bugfix-mode-store.ts";
 import { createCandidateBranchTool } from "./candidate-branch-tool.ts";
 import { createFinalizeResearchTool } from "./finalize-research-tool.ts";
-import { createAutoresearchCommand } from "./autoresearch-command.ts";
+import { createAutoresearchCommand, type ExperimentStartConfig } from "./autoresearch-command.ts";
 import { createDashboardTools } from "./dashboard-tools.ts";
 import { createTreeStatusTool, createCouncilConveneTool } from "./tree-council-tools.ts";
 import { createTestHooks, testHookRegistry, type AutoresearchTestHooks, type BoundTestHooks } from "./test-hooks.ts";
@@ -2483,7 +2483,20 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   /** Fresh in-memory experiment state. A new /autoresearch launch must not
    *  inherit the previous ledger; only /autoresearch continue restores it. */
-  const resetStateForNewLaunch = (ctx: ExtensionContext) => {
+  const resetStateForNewLaunch = (ctx: ExtensionContext, experiment?: ExperimentStartConfig): string | null => {
+    // Write the ledger header before touching runtime state: a failed start
+    // must not leave a live bugfix session whose gates cannot pass.
+    if (experiment) {
+      try {
+        const jsonlPath = autoresearchJsonlPath(resolveWorkDir(ctx.cwd));
+        ensureParentDir(jsonlPath);
+        const header = JSON.stringify({ type: "config", ...experiment });
+        if (fs.existsSync(jsonlPath)) fs.appendFileSync(jsonlPath, `${header}\n`);
+        else fs.writeFileSync(jsonlPath, `${header}\n`);
+      } catch (error) {
+        return `⚠ Failed to start bugfix experiment ledger: ${error instanceof Error ? error.message : String(error)}`;
+      }
+    }
     const runtime = getRuntime(ctx);
     cancelPendingResume(runtime);
     runtime.lastRunChecks = null;
@@ -2497,6 +2510,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // by run number after a restart, so a fresh session starts empty.
     runtime.runLinks = resetRunIdentities(runtime.runLinks);
     runtime.state = createExperimentState();
+    if (experiment) Object.assign(runtime.state, experiment);
+    return null;
   };
 
   const reconstructState = (ctx: ExtensionContext) => {

@@ -61,16 +61,36 @@ test("/autoresearch bugfix turns on the gated tools and sends the proof-cycle ki
   assert.equal(after.details?.reason, "invalid_campaign_id", "the gated tool is callable after the command");
 });
 
+test("bugfix refuses to activate when the ledger header cannot be written", async () => {
+  const dir = workdir();
+  const blocker = path.join(dir, "not-a-directory");
+  fs.writeFileSync(blocker, "occupied\n");
+  const h = await harness(dir);
+  const blockedCtx = makeCtx(blocker, `bugfix-command-${path.basename(dir)}`, h.pi);
+
+  await h.command("autoresearch").handler("bugfix write failure", blockedCtx);
+
+  assert.ok(h.pi.notifications.some((n) => /Failed to start bugfix experiment ledger/.test(n.text)), "user sees the write failure");
+  assert.equal(h.pi.sentMessages.length, 0, "no kickoff is sent after a failed start");
+  const after = await h.tool("bugfix_mode").execute("id", { action: "prepare", campaignId: "bad id" }, null, null, blockedCtx);
+  assert.match(text(after), /mode is OFF/, "mode is not activated on a failed header write");
+});
+
 test("bugfix works with no goal and is re-entrant while optimization mode is already on", async () => {
   const dir = workdir();
   const h = await harness(dir);
   await h.command("autoresearch").handler("bugfix", h.ctx);
   assert.ok(h.pi.sentMessages.length >= 1, "a bare bugfix still sends the kickoff");
   assert.doesNotMatch(h.pi.sentMessages.at(-1).text, /Goal:/);
+  const ledgerPath = path.join(dir, ".auto", "log.jsonl");
+  const headers = () => fs.readFileSync(ledgerPath, "utf8").split("\n").filter((line) => line.includes('"type":"config"')).length;
+  const headersAfterFirst = headers();
+  assert.equal(headersAfterFirst, 1, "first bugfix launch seeds one session header");
 
   const count = h.pi.sentMessages.length;
   await h.command("autoresearch").handler("bugfix second pass", h.ctx);
   assert.equal(h.pi.sentMessages.length, count + 1, "re-entry sends another kickoff instead of 'already active'");
   assert.match(h.pi.sentMessages.at(-1).text, /Goal: second pass/);
   assert.ok(!h.pi.notifications.some((n) => /already active/i.test(n.text)));
+  assert.equal(headers(), headersAfterFirst, "re-entry does not reset the active session or append another header");
 });
