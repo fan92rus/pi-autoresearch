@@ -102,6 +102,8 @@ test("evidence requires executed checks with the expected outcomes", () => {
   assert.equal(inspectEvidence(proof("e1", "d", "P1", [1, 1, 1])).valid, false);
   assert.equal(inspectEvidence(proof("e1", "d", "P1", [0, 0, 1])).valid, false);
   assert.equal(inspectEvidence(proof("e1", "d", "P4", [1, 0, 1])).valid, false);
+  assert.equal(inspectEvidence(proof("e1", "d", "toString", [1, 0, 1])).valid, false);
+  assert.equal(inspectEvidence(proof("e1", "d", "constructor", [1, 0, 1])).valid, false);
   const missingOutput = proof("e1", "d");
   missingOutput.checks[0].output = undefined;
   assert.equal(inspectEvidence(missingOutput).valid, false);

@@ -231,7 +231,7 @@ export function inspectEvidence(raw: unknown): { valid: boolean; reason: string 
   if (!nonEmptyCheckField(raw.experimentId) || !nonEmptyCheckField(raw.defectId)) {
     return { valid: false, reason: "missing experimentId or defectId" };
   }
-  if (typeof raw.severity !== "string" || !(raw.severity in V2.severity)) {
+  if (typeof raw.severity !== "string" || !Object.hasOwn(V2.severity, raw.severity)) {
     return { valid: false, reason: "severity must be P1, P2 or P3" };
   }
   for (const field of ["detectorTests", "proofTests"] as const) {
