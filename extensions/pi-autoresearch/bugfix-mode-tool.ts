@@ -365,6 +365,12 @@ export function createBugfixModeTool(deps: BugfixModeToolDeps): ToolLike {
             typeof row === "object" && row !== null && (row as Record<string, unknown>).experimentId === experimentId,
           ).at(-1);
           if (!evidence) return refusal("no executed proof for this experiment", "proof_missing");
+          // Discovery rows pay immediately and are never fix credit. A keep
+          // decision must point at a proof-phase row, otherwise the reply
+          // promises durable credit that the scorer will never award.
+          if (evidence.phase !== undefined && evidence.phase !== "proof") {
+            return refusal("keep needs a proof-phase executed proof", "proof_phase_required");
+          }
           const proof = inspectEvidence(evidence);
           if (!proof.valid) return refusal(`keep refused: ${proof.reason}`, "proof_invalid");
         }

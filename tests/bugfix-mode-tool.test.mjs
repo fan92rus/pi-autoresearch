@@ -231,7 +231,7 @@ test("prepare refuses a dirty working tree instead of including foreign changes"
   assert.ok(fs.existsSync(path.join(dir, "foreign.txt")));
 });
 
-test("discovery phase records two executed checks and credits N at decision", async () => {
+test("discovery phase records two executed checks and credits N without a keep decision", async () => {
   const dir = tempRepo("discovery");
   const { tool, command, ctx } = await createHarness({ dir, sessionId: "bugfix-tool-discovery" });
   await command("autoresearch").handler("on", ctx);
@@ -267,8 +267,10 @@ test("discovery phase records two executed checks and credits N at decision", as
   const decided = await bugfix.execute("decide-discovery", {
     action: "decide", campaignId: "campaign1", experimentId: "e-discover", status: "keep",
   }, null, null, ctx);
-  assert.equal(decided.details.status, "keep");
-  const credit = evaluateCredit(evidenceRows, readRows(dir, "campaign1", DECISIONS_FILE));
+  assert.equal(decided.details.reason, "proof_phase_required");
+  const decisions = readRows(dir, "campaign1", DECISIONS_FILE);
+  assert.equal(decisions.length, 0, "discovery rows must not become keep decisions");
+  const credit = evaluateCredit(evidenceRows, decisions);
   assert.equal(credit.discoveryCount, 1);
   assert.equal(credit.fixCount, 0);
   assert.equal(credit.detectorTests, 1);
