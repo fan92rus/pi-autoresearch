@@ -359,6 +359,17 @@ export function createBugfixModeTool(deps: BugfixModeToolDeps): ToolLike {
         if (!experimentId || (params.status !== "keep" && params.status !== "discard")) {
           return refusal("decide needs experimentId and status=keep|discard", "invalid_decision");
         }
+        // The scorer treats the last decision row as authoritative, so a later
+        // decide call could silently resurrect a discarded experiment (or
+        // revoke a kept one). Each experiment gets one terminal decision.
+        const existingDecision = readRows(workDir, campaignId, DECISIONS_FILE).some((row) =>
+          typeof row === "object" && row !== null &&
+          (row as Record<string, unknown>).kind === "decision" &&
+          (row as Record<string, unknown>).experimentId === experimentId,
+        );
+        if (existingDecision) {
+          return refusal(`experiment ${experimentId} already has a recorded decision`, "decision_already_recorded");
+        }
         if (params.status === "keep") {
           const rows = readRows(workDir, campaignId, EVIDENCE_FILE);
           const evidence = rows.filter((row): row is Record<string, unknown> =>
