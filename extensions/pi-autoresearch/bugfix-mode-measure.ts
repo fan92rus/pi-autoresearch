@@ -18,7 +18,7 @@ import {
 import {
   DECISIONS_FILE,
   EVIDENCE_FILE,
-  readRows,
+  readRowsStrict,
   readStoredConfig,
   scorerChanged,
 } from "./bugfix-mode-store.ts";
@@ -77,10 +77,15 @@ export function measure(argv: string[]): { code: number; lines: string[]; error?
   } catch (error) {
     return { code: 2, lines: [], error: (error as Error).message };
   }
-  const credit = evaluateCredit(
-    readRows(workDir, campaignId, EVIDENCE_FILE),
-    readRows(workDir, campaignId, DECISIONS_FILE),
-  );
+  let credit;
+  try {
+    credit = evaluateCredit(
+      readRowsStrict(workDir, campaignId, EVIDENCE_FILE),
+      readRowsStrict(workDir, campaignId, DECISIONS_FILE),
+    );
+  } catch (error) {
+    return { code: 2, lines: [], error: (error as Error).message };
+  }
   const result = computeBugfixScore({
     config: stored.value.config,
     summary: summary.value,

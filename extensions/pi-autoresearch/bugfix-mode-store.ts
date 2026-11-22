@@ -184,3 +184,23 @@ export function readRows(workDir: string, campaignId: string, fileName: string):
     return [];
   }
 }
+
+/** Scoring path: a malformed ledger row must fail the measurement, not vanish. */
+export function readRowsStrict(workDir: string, campaignId: string, fileName: string): unknown[] {
+  const dir = campaignDir(workDir, campaignId);
+  if (dir === null) throw new Error("invalid campaignId");
+  let raw: string;
+  try {
+    raw = fs.readFileSync(path.join(dir, fileName), "utf8");
+  } catch {
+    return [];
+  }
+  return raw.split(/\r?\n/).flatMap((line, index) => {
+    if (line.trim() === "") return [];
+    try {
+      return [JSON.parse(line) as unknown];
+    } catch {
+      throw new Error(`corrupt ${fileName} row at line ${index + 1}`);
+    }
+  });
+}
